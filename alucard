@@ -180,10 +180,13 @@ parse_repo_options() {
 
 get_unblocked_afk_issues() {
   local repo_abs="$1"
-  local all issue body blockers blocked state skip
+  local all open_prs issue body blockers blocked state skip num has_pr
 
   all=$(cd "$repo_abs" && gh issue list --state open --label afk \
         --json number,title,body,labels)
+
+  # Fetch open PR bodies once; used to skip issues that already have a PR.
+  open_prs=$(cd "$repo_abs" && gh pr list --state open --json number,body)
 
   echo "$all" | jq -c '.[]' | while read -r issue; do
     body=$(echo "$issue" | jq -r '.body // ""')
@@ -198,6 +201,14 @@ get_unblocked_afk_issues() {
 
     skip=$(echo "$issue" | jq -r '
       .labels | map(.name) | any(. == "in-progress" or . == "wip")')
+
+    # Skip if an open PR already references this issue (Closes/Fixes/Refs #N).
+    if [ "$skip" = "false" ]; then
+      num=$(echo "$issue" | jq -r '.number')
+      has_pr=$(echo "$open_prs" | jq --arg n "$num" \
+        '[.[] | select(.body | test("(Closes|Fixes|Refs) #" + $n + "\\b"; "i"))] | length')
+      [ "${has_pr:-0}" -gt 0 ] && skip="true"
+    fi
 
     if [ "$blocked" = false ] && [ "$skip" = "false" ]; then
       echo "$issue"
