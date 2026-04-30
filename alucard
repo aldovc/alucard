@@ -322,7 +322,7 @@ command_run() {
   cleanup() {
     local wt
     for wt in "${CREATED_WORKTREES[@]}"; do
-      [ -d "$wt" ] && git -C "$REPO_ABS" worktree remove "$wt" --force 2>/dev/null || true
+      rm -rf "$wt"
     done
   }
   trap cleanup EXIT
@@ -334,15 +334,20 @@ command_run() {
     BRANCH="alucard/iter-${i}-$(date +%s)"
     CREATED_WORKTREES+=("$WT_HOST")
 
-    git -C "$REPO_ABS" fetch origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
-    git -C "$REPO_ABS" worktree add -B "$BRANCH" "$WT_HOST" "origin/$BASE_BRANCH"
+    # Clone locally so the container gets a self-contained .git dir.
+    # Worktrees leave a .git file pointing to the host path, which the
+    # container cannot resolve.
+    git -C "$REPO_ABS" fetch origin "$BASE_BRANCH"
+    git clone --local --no-tags --single-branch --branch "$BASE_BRANCH" "$REPO_ABS" "$WT_HOST"
+    git -C "$WT_HOST" remote set-url origin "$(git -C "$REPO_ABS" remote get-url origin)"
+    git -C "$WT_HOST" checkout -b "$BRANCH"
 
     issues=$(get_unblocked_afk_issues "$REPO_ABS")
     count=$(echo "$issues" | jq 'length')
 
     if [ "$count" -eq 0 ]; then
       echo "Queue empty. Alucard rests after $((i-1)) iterations."
-      git -C "$REPO_ABS" worktree remove "$WT_HOST" --force
+      rm -rf "$WT_HOST"
       exit 0
     fi
 
@@ -389,7 +394,7 @@ command_run() {
     rc=${PIPESTATUS[0]}
     set -e
 
-    git -C "$REPO_ABS" worktree remove "$WT_HOST" --force || true
+    rm -rf "$WT_HOST" || true
 
     if [ "$rc" -ne 0 ]; then
       echo "Iteration $i exited rc=$rc. Continuing."
