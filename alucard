@@ -315,7 +315,7 @@ command_run() {
   load_env_file "$ENV_FILE" true
   ensure_image "$IMAGE" "$AUTO_BUILD"
 
-  stream_text='select(.type == "assistant").message.content[]? | select(.type == "text").text // empty | gsub("\n"; "\r\n") | . + "\r\n\n"'
+  stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
   final_result='select(.type == "result").result // empty'
   CREATED_WORKTREES=()
 
