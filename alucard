@@ -334,6 +334,9 @@ command_run() {
     BRANCH="alucard/iter-${i}-$(date +%s)"
     CREATED_WORKTREES+=("$WT_HOST")
 
+    # Clean up any stale directory from a previous interrupted run.
+    rm -rf "$WT_HOST"
+
     # Clone locally so the container gets a self-contained .git dir.
     # Worktrees leave a .git file pointing to the host path, which the
     # container cannot resolve.
