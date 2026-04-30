@@ -369,12 +369,14 @@ command_run() {
       --memory 4g --cpus 2 \
       --read-only \
       --tmpfs /tmp:exec,size=1g \
-      --tmpfs /home/alucard:size=1g,uid=1001,gid=1001 \
+      --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
+      --user "$(id -u):$(id -g)" \
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -v "$WT_HOST:/work:rw" \
       --env-file "$ENV_FILE" \
       -e "ALUCARD_ITER=$i" \
+      -e "HOME=/home/alucard" \
       -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
       -e "GH_CONFIG_DIR=/tmp/gh" \
       "$IMAGE" \
