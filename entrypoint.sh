@@ -11,7 +11,9 @@ git config --global user.email "alucard-bot@users.noreply.github.com"
 git config --global --add safe.directory /work
 git config --global --add safe.directory '*'
 
-printf '%s\n' "$GITHUB_TOKEN" | gh auth login --with-token
-gh auth setup-git
+# gh uses GITHUB_TOKEN from env automatically; wire the same token into git
+# so `git push` works without a separate credential store.
+git config --global credential.helper "store --file /tmp/git-credentials"
+printf 'https://x-access-token:%s@github.com\n' "$GITHUB_TOKEN" > /tmp/git-credentials
 
 exec "$@"
