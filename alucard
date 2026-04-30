@@ -330,6 +330,106 @@ command_run() {
   final_result='select(.type == "result").result // empty'
   CREATED_WORKTREES=()
 
+  # Run a fresh fix agent on the branch if CI fails after a PR is opened.
+  # $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
+  ci_gate() {
+    local iter="$1" branch="$2" origin_url="$3"
+
+    local pr_num
+    pr_num=$(cd "$REPO_ABS" && \
+      gh pr list --head "$branch" --state open --json number \
+        --jq '.[0].number // empty' 2>/dev/null || true)
+
+    [ -n "${pr_num:-}" ] || return 0
+
+    echo "=== CI gate: PR #$pr_num on $branch ==="
+
+    local ci_attempt ci_rc failed_run_id failure_log wt_fix fix_log fix_rc
+    for ci_attempt in 1 2 3; do
+      echo "Polling CI (attempt $ci_attempt/3)..."
+      set +e
+      timeout 1200 bash -c "cd '$REPO_ABS' && gh pr checks '$pr_num' --watch --interval 30"
+      ci_rc=$?
+      set -e
+
+      if [ "$ci_rc" -eq 0 ]; then
+        echo "CI green — PR #$pr_num ready for review."
+        return 0
+      fi
+
+      if [ "$ci_attempt" -eq 3 ]; then
+        echo "CI still failing after 3 fix attempts — PR #$pr_num left open for manual review."
+        return 0
+      fi
+
+      echo "CI failed (attempt $ci_attempt) — launching fix agent..."
+
+      failed_run_id=$(cd "$REPO_ABS" && \
+        gh run list --pr "$pr_num" --json databaseId,conclusion \
+          --jq '[.[] | select(.conclusion=="failure")] | .[0].databaseId // empty' \
+          2>/dev/null || true)
+      failure_log=""
+      if [ -n "${failed_run_id:-}" ]; then
+        failure_log=$(cd "$REPO_ABS" && \
+          gh run view "$failed_run_id" --log-failed 2>/dev/null | head -400 || true)
+      fi
+
+      wt_fix="${WT_ROOT}/fix-${iter}-${ci_attempt}"
+      CREATED_WORKTREES+=("$wt_fix")
+      rm -rf "$wt_fix"
+      git -C "$REPO_ABS" fetch origin "$branch"
+      git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_fix"
+      git -C "$wt_fix" remote set-url origin "$origin_url"
+
+      fix_log="$LOG_DIR/iter-${iter}-fix-${ci_attempt}.jsonl"
+
+      set +e
+      timeout "${TIMEOUT_MIN}m" docker run --rm \
+        --name "alucard-fix-${iter}-${ci_attempt}" \
+        --network bridge \
+        --memory 4g --cpus 2 \
+        --read-only \
+        --tmpfs /tmp:exec,size=1g \
+        --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
+        --user "$(id -u):$(id -g)" \
+        --security-opt no-new-privileges \
+        --cap-drop ALL \
+        -v "$wt_fix:/work:rw" \
+        --env-file "$ENV_FILE" \
+        -e "ALUCARD_ITER=${iter}-fix-${ci_attempt}" \
+        -e "HOME=/home/alucard" \
+        -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
+        -e "GH_CONFIG_DIR=/tmp/gh" \
+        "$IMAGE" \
+        claude -p \
+          --verbose \
+          --output-format stream-json \
+          --include-partial-messages \
+          --permission-mode bypassPermissions \
+          --max-turns 30 \
+          --max-budget-usd 2 \
+          --fallback-model sonnet \
+          --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+          -- \
+          "CI checks are failing on PR #${pr_num} (branch: ${branch}).
+
+Failure log:
+${failure_log}
+
+Fix the failing checks: read the error output above, edit only the files needed to resolve it, run the project's own lint and test suite to confirm the fix locally, then commit and push to this branch. Do not open a new PR. Do not touch unrelated code." \
+        | grep --line-buffered '^{' \
+        | tee "$fix_log" \
+        | jq --unbuffered -rj "$stream_text"
+      fix_rc=${PIPESTATUS[0]}
+      set -e
+
+      echo ""
+      rm -rf "$wt_fix" || true
+
+      [ "$fix_rc" -ne 0 ] && echo "Fix agent exited rc=$fix_rc on attempt $ci_attempt"
+    done
+  }
+
   cleanup() {
     local wt
     for wt in "${CREATED_WORKTREES[@]}"; do
@@ -413,6 +513,8 @@ command_run() {
     set -e
 
     rm -rf "$WT_HOST" || true
+
+    ci_gate "$i" "$BRANCH" "$_origin_url"
 
     if [ "$rc" -ne 0 ]; then
       echo "Iteration $i exited rc=$rc. Continuing."
