@@ -1,0 +1,456 @@
+#!/bin/bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$SOURCE_DIR/$SOURCE"
+done
+TOOL_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+DEFAULT_IMAGE="${ALUCARD_IMAGE:-alucard:latest}"
+DEFAULT_ENV_FILE="${ALUCARD_ENV_FILE:-$TOOL_DIR/alucard.env}"
+DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
+DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  alucard run [TARGET_REPO] [options]
+  alucard queue [TARGET_REPO] [options]
+  alucard build [options]
+  alucard doctor [TARGET_REPO] [options]
+
+Commands:
+  run       Run the autonomous worker loop.
+  queue     Print the currently eligible AFK issue queue as JSON.
+  build     Build the Alucard Docker image.
+  doctor    Check local prerequisites without running the worker.
+
+Run options:
+  -C, --repo PATH              Target git repository. Defaults to
+                               ALUCARD_TARGET_REPO or the current directory.
+  -n, --iterations N           Max iterations to run. Default: 20.
+  -t, --timeout-minutes N      Per-iteration timeout. Default: 30.
+      --base BRANCH            Base branch on origin. Default: main.
+      --env-file PATH          Credential env file. Default: ./alucard.env
+                               beside this CLI.
+      --image NAME             Docker image name. Default: alucard:latest.
+      --logs-root PATH         Directory for run logs. Default: ./logs beside
+                               this CLI.
+      --no-build               Do not build the image if it is missing.
+
+Examples:
+  alucard run /path/to/target-repo --iterations 1 --timeout-minutes 10
+  ALUCARD_TARGET_REPO=/path/to/target-repo alucard run -n 20 -t 30
+  cd /path/to/target-repo && alucard queue
+EOF
+}
+
+die() {
+  echo "alucard: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+resolve_repo() {
+  local repo="$1"
+  [ -d "$repo" ] || die "target repo does not exist: $repo"
+  git -C "$repo" rev-parse --show-toplevel 2>/dev/null \
+    || die "target path is not inside a git repo: $repo"
+}
+
+load_env_file() {
+  local env_file="$1"
+  local require="$2"
+
+  if [ ! -f "$env_file" ]; then
+    [ "$require" = "false" ] && return 0
+    die "missing env file: $env_file"
+  fi
+
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_file"
+  set +a
+
+  if [ "$require" = "true" ]; then
+    [ -n "${GITHUB_TOKEN:-}" ] || die "GITHUB_TOKEN is empty in $env_file"
+    [ -n "${ANTHROPIC_API_KEY:-}" ] || die "ANTHROPIC_API_KEY is empty in $env_file"
+  fi
+}
+
+ensure_image() {
+  local image="$1"
+  local auto_build="$2"
+
+  need_cmd docker
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  [ "$auto_build" = "true" ] || die "Docker image not found: $image"
+  echo "Building $image from $TOOL_DIR..."
+  docker build -t "$image" "$TOOL_DIR"
+}
+
+parse_repo_options() {
+  TARGET_REPO="${ALUCARD_TARGET_REPO:-$PWD}"
+  IMAGE="$DEFAULT_IMAGE"
+  ENV_FILE="$DEFAULT_ENV_FILE"
+  BASE_BRANCH="$DEFAULT_BASE_BRANCH"
+  LOG_ROOT="$DEFAULT_LOG_ROOT"
+  ITERATIONS=20
+  TIMEOUT_MIN=30
+  AUTO_BUILD=true
+  TARGET_REPO_SET=false
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -C|--repo)
+        [ -n "${2:-}" ] || die "$1 requires a path"
+        TARGET_REPO="$2"
+        TARGET_REPO_SET=true
+        shift 2
+        ;;
+      -n|--iterations)
+        [ -n "${2:-}" ] || die "$1 requires a number"
+        is_uint "$2" || die "iterations must be a positive integer"
+        ITERATIONS="$2"
+        shift 2
+        ;;
+      -t|--timeout-minutes)
+        [ -n "${2:-}" ] || die "$1 requires a number"
+        is_uint "$2" || die "timeout must be a positive integer"
+        TIMEOUT_MIN="$2"
+        shift 2
+        ;;
+      --base)
+        [ -n "${2:-}" ] || die "$1 requires a branch name"
+        BASE_BRANCH="$2"
+        shift 2
+        ;;
+      --env-file)
+        [ -n "${2:-}" ] || die "$1 requires a path"
+        ENV_FILE="$2"
+        shift 2
+        ;;
+      --image)
+        [ -n "${2:-}" ] || die "$1 requires an image name"
+        IMAGE="$2"
+        shift 2
+        ;;
+      --logs-root)
+        [ -n "${2:-}" ] || die "$1 requires a path"
+        LOG_ROOT="$2"
+        shift 2
+        ;;
+      --no-build)
+        AUTO_BUILD=false
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        [ "$#" -eq 0 ] || die "unexpected arguments after --: $*"
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        [ "$TARGET_REPO_SET" = "false" ] || die "unexpected argument: $1"
+        TARGET_REPO="$1"
+        TARGET_REPO_SET=true
+        shift
+        ;;
+    esac
+  done
+}
+
+get_unblocked_afk_issues() {
+  local repo_abs="$1"
+  local all issue body blockers blocked state skip
+
+  all=$(cd "$repo_abs" && gh issue list --state open --label afk \
+        --json number,title,body,labels)
+
+  echo "$all" | jq -c '.[]' | while read -r issue; do
+    body=$(echo "$issue" | jq -r '.body // ""')
+    blockers=$(echo "$body" | grep -oE 'Blocked by #[0-9]+' \
+               | grep -oE '[0-9]+' || true)
+
+    blocked=false
+    for b in $blockers; do
+      state=$(cd "$repo_abs" && gh issue view "$b" --json state -q .state 2>/dev/null || echo "OPEN")
+      [ "$state" = "OPEN" ] && { blocked=true; break; }
+    done
+
+    skip=$(echo "$issue" | jq -r '
+      .labels | map(.name) | any(. == "in-progress" or . == "wip")')
+
+    if [ "$blocked" = false ] && [ "$skip" = "false" ]; then
+      echo "$issue"
+    fi
+  done | jq -s '.'
+}
+
+command_build() {
+  IMAGE="$DEFAULT_IMAGE"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --image)
+        [ -n "${2:-}" ] || die "$1 requires an image name"
+        IMAGE="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown build option: $1"
+        ;;
+    esac
+  done
+
+  need_cmd docker
+  docker build -t "$IMAGE" "$TOOL_DIR"
+}
+
+command_queue() {
+  parse_repo_options "$@"
+  need_cmd git
+  need_cmd gh
+  need_cmd jq
+
+  REPO_ABS=$(resolve_repo "$TARGET_REPO")
+  load_env_file "$ENV_FILE" false
+  get_unblocked_afk_issues "$REPO_ABS"
+}
+
+command_doctor() {
+  parse_repo_options "$@"
+
+  local ok=true
+  for cmd in git gh jq docker timeout; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo "ok: $cmd"
+    else
+      echo "missing: $cmd"
+      ok=false
+    fi
+  done
+
+  if [ -f "$TOOL_DIR/Dockerfile" ] && [ -f "$TOOL_DIR/entrypoint.sh" ] && [ -f "$TOOL_DIR/alucard-prompt.md" ]; then
+    echo "ok: tool files in $TOOL_DIR"
+  else
+    echo "missing: one or more tool files in $TOOL_DIR"
+    ok=false
+  fi
+
+  if [ -f "$ENV_FILE" ]; then
+    echo "ok: env file $ENV_FILE"
+    load_env_file "$ENV_FILE" false
+    [ -n "${GITHUB_TOKEN:-}" ] || { echo "missing: GITHUB_TOKEN value"; ok=false; }
+    [ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "missing: ANTHROPIC_API_KEY value"; ok=false; }
+  else
+    echo "missing: env file $ENV_FILE"
+    ok=false
+  fi
+
+  if [ -d "$TARGET_REPO" ] && REPO_ABS=$(git -C "$TARGET_REPO" rev-parse --show-toplevel 2>/dev/null); then
+    echo "ok: target repo $REPO_ABS"
+    if git -C "$REPO_ABS" config --get remote.origin.url >/dev/null; then
+      echo "ok: target repo has origin remote"
+    else
+      echo "missing: target repo origin remote"
+      ok=false
+    fi
+  else
+    echo "missing: valid target git repo at $TARGET_REPO"
+    ok=false
+  fi
+
+  if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "ok: Docker image $IMAGE"
+  else
+    echo "missing: Docker image $IMAGE (run: alucard build)"
+  fi
+
+  [ "$ok" = "true" ] || exit 1
+}
+
+command_run() {
+  parse_repo_options "$@"
+
+  need_cmd git
+  need_cmd gh
+  need_cmd jq
+  need_cmd docker
+  need_cmd timeout
+
+  [ "$ITERATIONS" -gt 0 ] || die "iterations must be greater than zero"
+  [ "$TIMEOUT_MIN" -gt 0 ] || die "timeout must be greater than zero"
+
+  REPO_ABS=$(resolve_repo "$TARGET_REPO")
+  [ -d "$(dirname "$ENV_FILE")" ] || die "env file directory does not exist: $(dirname "$ENV_FILE")"
+  ENV_FILE="$(cd "$(dirname "$ENV_FILE")" && pwd)/$(basename "$ENV_FILE")"
+  LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd)"
+  LOG_DIR="$LOG_ROOT/alucard-$(date +%Y%m%d-%H%M%S)"
+  WT_ROOT="${REPO_ABS}/.alucard-worktrees"
+
+  mkdir -p "$LOG_DIR" "$WT_ROOT"
+  load_env_file "$ENV_FILE" true
+  ensure_image "$IMAGE" "$AUTO_BUILD"
+
+  stream_text='select(.type == "assistant").message.content[]? | select(.type == "text").text // empty | gsub("\n"; "\r\n") | . + "\r\n\n"'
+  final_result='select(.type == "result").result // empty'
+  CREATED_WORKTREES=()
+
+  cleanup() {
+    local wt
+    for wt in "${CREATED_WORKTREES[@]}"; do
+      [ -d "$wt" ] && git -C "$REPO_ABS" worktree remove "$wt" --force 2>/dev/null || true
+    done
+  }
+  trap cleanup EXIT
+
+  for ((i=1; i<=ITERATIONS; i++)); do
+    echo "=== alucard iteration $i/$ITERATIONS ==="
+
+    WT_HOST="${WT_ROOT}/iter-$i"
+    BRANCH="alucard/iter-${i}-$(date +%s)"
+    CREATED_WORKTREES+=("$WT_HOST")
+
+    git -C "$REPO_ABS" fetch origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+    git -C "$REPO_ABS" worktree add -B "$BRANCH" "$WT_HOST" "origin/$BASE_BRANCH"
+
+    issues=$(get_unblocked_afk_issues "$REPO_ABS")
+    count=$(echo "$issues" | jq 'length')
+
+    if [ "$count" -eq 0 ]; then
+      echo "Queue empty. Alucard rests after $((i-1)) iterations."
+      git -C "$REPO_ABS" worktree remove "$WT_HOST" --force
+      exit 0
+    fi
+
+    commits=$(git -C "$REPO_ABS" log -n 5 --format="%H%n%ad%n%B---" --date=short "origin/$BASE_BRANCH")
+    prompt=$(<"$TOOL_DIR/alucard-prompt.md")
+    log_file="$LOG_DIR/iter-${i}.jsonl"
+
+    full_prompt="<commits>${commits}</commits>
+<issues>${issues}</issues>
+<instructions>${prompt}</instructions>"
+
+    set +e
+    timeout "${TIMEOUT_MIN}m" docker run --rm \
+      --name "alucard-iter-$i" \
+      --network bridge \
+      --memory 4g --cpus 2 \
+      --read-only \
+      --tmpfs /tmp:exec,size=1g \
+      --tmpfs /home/alucard/.cache:size=512m \
+      --tmpfs /home/alucard/.npm:size=256m \
+      --tmpfs /home/alucard/.config:size=64m \
+      --tmpfs /home/alucard/.claude:size=512m \
+      --security-opt no-new-privileges \
+      --cap-drop ALL \
+      -v "$WT_HOST:/work:rw" \
+      --env-file "$ENV_FILE" \
+      -e "ALUCARD_ITER=$i" \
+      -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
+      -e "GH_CONFIG_DIR=/tmp/gh" \
+      "$IMAGE" \
+      claude -p \
+        --verbose \
+        --output-format stream-json \
+        --include-partial-messages \
+        --permission-mode bypassPermissions \
+        --max-turns 60 \
+        --max-budget-usd 5 \
+        --fallback-model sonnet \
+        --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+        "$full_prompt" \
+      | grep --line-buffered '^{' \
+      | tee "$log_file" \
+      | jq --unbuffered -rj "$stream_text"
+    rc=${PIPESTATUS[0]}
+    set -e
+
+    git -C "$REPO_ABS" worktree remove "$WT_HOST" --force || true
+
+    if [ "$rc" -ne 0 ]; then
+      echo "Iteration $i exited rc=$rc. Continuing."
+      continue
+    fi
+
+    result=$(jq -r "$final_result" "$log_file" 2>/dev/null || echo "")
+    if [[ "$result" == *"<promise>NO MORE TASKS</promise>"* ]]; then
+      echo "Alucard signaled completion after $i iterations."
+      exit 0
+    fi
+  done
+
+  echo "Reached max iterations ($ITERATIONS)."
+}
+
+main() {
+  if [ "$#" -eq 0 ]; then
+    usage
+    exit 0
+  fi
+
+  if is_uint "${1:-}"; then
+    local old_iterations="$1"
+    shift
+    if is_uint "${1:-}"; then
+      local old_timeout="$1"
+      shift
+      set -- run --iterations "$old_iterations" --timeout-minutes "$old_timeout" "$@"
+    else
+      set -- run --iterations "$old_iterations" "$@"
+    fi
+  fi
+
+  local command="$1"
+  shift || true
+
+  case "$command" in
+    run)
+      command_run "$@"
+      ;;
+    queue)
+      command_queue "$@"
+      ;;
+    build)
+      command_build "$@"
+      ;;
+    doctor)
+      command_doctor "$@"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      if [ -d "$command" ]; then
+        command_run "$command" "$@"
+      else
+        die "unknown command: $command"
+      fi
+      ;;
+  esac
+}
+
+main "$@"
