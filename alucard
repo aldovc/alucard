@@ -369,10 +369,7 @@ command_run() {
       --memory 4g --cpus 2 \
       --read-only \
       --tmpfs /tmp:exec,size=1g \
-      --tmpfs /home/alucard/.cache:size=512m \
-      --tmpfs /home/alucard/.npm:size=256m \
-      --tmpfs /home/alucard/.config:size=64m \
-      --tmpfs /home/alucard/.claude:size=512m \
+      --tmpfs /home/alucard:size=1g,uid=1001,gid=1001 \
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -v "$WT_HOST:/work:rw" \

@@ -23,13 +23,11 @@ RUN uv python install 3.12
 
 RUN npm install -g @anthropic-ai/claude-code
 
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
 RUN useradd -m -s /bin/bash alucard
-RUN mkdir -p /home/alucard/.cache /home/alucard/.config /home/alucard/.npm /home/alucard/.claude \
- && chown -R alucard:alucard /home/alucard
 USER alucard
 WORKDIR /work
 
-COPY --chown=alucard:alucard entrypoint.sh /home/alucard/entrypoint.sh
-RUN chmod +x /home/alucard/entrypoint.sh
-
-ENTRYPOINT ["/home/alucard/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
