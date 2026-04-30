@@ -342,7 +342,11 @@ command_run() {
     # container cannot resolve.
     git -C "$REPO_ABS" fetch origin "$BASE_BRANCH"
     git clone --local --no-tags --single-branch --branch "$BASE_BRANCH" "$REPO_ABS" "$WT_HOST"
-    git -C "$WT_HOST" remote set-url origin "$(git -C "$REPO_ABS" remote get-url origin)"
+    # Always use HTTPS so the container can authenticate with GITHUB_TOKEN.
+    # Convert git@github.com:owner/repo.git → https://github.com/owner/repo.git
+    _origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
+    _origin_url="${_origin_url/git@github.com:/https://github.com/}"
+    git -C "$WT_HOST" remote set-url origin "$_origin_url"
     git -C "$WT_HOST" checkout -b "$BRANCH"
 
     issues=$(get_unblocked_afk_issues "$REPO_ABS")
