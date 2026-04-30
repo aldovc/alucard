@@ -389,6 +389,7 @@ command_run() {
         --max-budget-usd 5 \
         --fallback-model sonnet \
         --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+        -- \
         "$full_prompt" \
       | grep --line-buffered '^{' \
       | tee "$log_file" \
