@@ -57,6 +57,25 @@ For testable work:
 
 For non-testable work (config, scripts, docs), skip the test loop but still work in small verifiable steps.
 
+## Database migrations
+
+If your task requires a new migration file, guard against concurrent-iteration number conflicts before naming it:
+
+```bash
+git fetch origin
+# Collect every migration number visible on main AND all open PR branches
+USED=$(
+  {
+    git ls-tree -r origin/main -- migrations/ 2>/dev/null
+    gh pr list --json headRefName --jq '.[].headRefName' | \
+      while read b; do git ls-tree -r "origin/$b" -- migrations/ 2>/dev/null || true; done
+  } | awk '{print $4}' | grep -oP '/\K[0-9]+(?=_)' | sort -n | tail -1
+)
+NEXT=$(printf "%06d" $(( ${USED:-0} + 1 )))
+```
+
+Name your file with `$NEXT`. Two iterations that started from the same `origin/main` snapshot will otherwise both claim the same number and one will fail to apply.
+
 ## Verify
 
 Run the project's lint and test commands (e.g. `just lint && just test`). Do not proceed if they fail — fix or revert. A passing local check before commit is non-negotiable.
