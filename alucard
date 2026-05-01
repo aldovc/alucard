@@ -582,11 +582,13 @@ Focus on real issues. Do not nitpick style." \
           --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .body // ""' \
         2>/dev/null || true)
 
-      # Fall back to the decision file when the formal review wasn't posted
-      # (e.g. GitHub blocks --request-changes on your own PR).
-      if [ -z "$review_state" ] && [ -n "$_review_file_state" ]; then
-        review_state="$_review_file_state"
-        echo "No formal review found — using decision file: $review_state"
+      # Fall back to the decision file only for CHANGES_REQUESTED.
+      # An APPROVED decision without a formal review record is unreliable —
+      # self-review is always blocked when the bot both opens and reviews the PR,
+      # so a self-written APPROVED would silently skip the feedback loop.
+      if [ -z "$review_state" ] && [ "$_review_file_state" = "CHANGES_REQUESTED" ]; then
+        review_state="CHANGES_REQUESTED"
+        echo "No formal review found — using decision file: CHANGES_REQUESTED"
       fi
 
       if [ "$review_state" = "APPROVED" ]; then
@@ -749,7 +751,7 @@ Address each finding: read the relevant files, make the necessary edits, run the
         --output-format stream-json \
         --include-partial-messages \
         --permission-mode bypassPermissions \
-        --max-turns 60 \
+        --max-turns 120 \
         --max-budget-usd 5 \
         --fallback-model sonnet \
         --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
