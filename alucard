@@ -532,28 +532,40 @@ Focus on real issues. Do not nitpick style." \
           --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .state // empty' \
         2>/dev/null || true)
 
+      review_comments=$(cd "$REPO_ABS" && \
+        gh pr view "$pr_num" --json reviews \
+          --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .body // ""' \
+        2>/dev/null || true)
+
       if [ "$review_state" = "APPROVED" ]; then
         echo "PR #$pr_num approved — ready to merge."
+        cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+          "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
+
+${review_comments}" 2>/dev/null || true
         return 0
       fi
 
       if [ -z "$review_state" ]; then
         echo "Reviewer did not post a review (rc=$review_rc) — skipping review gate."
+        cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+          "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: no review posted** (rc=${review_rc})" \
+          2>/dev/null || true
         return 0
       fi
 
-      # CHANGES_REQUESTED path
+      # CHANGES_REQUESTED path — post findings for audit before acting on them
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: CHANGES_REQUESTED**
+
+${review_comments}" 2>/dev/null || true
+
       if [ "$review_cycle" -eq "$MAX_REVIEW_CYCLES" ]; then
         echo "Max review cycles ($MAX_REVIEW_CYCLES) reached — PR #$pr_num left open for manual review."
         return 0
       fi
 
       echo "Changes requested — launching feedback agent (cycle $review_cycle)..."
-
-      review_comments=$(cd "$REPO_ABS" && \
-        gh pr view "$pr_num" --json reviews \
-          --jq '[.reviews[] | select(.state == "CHANGES_REQUESTED")] | last | .body // ""' \
-        2>/dev/null || true)
 
       wt_feedback="${WT_ROOT}/feedback-${iter}-${review_cycle}"
       CREATED_WORKTREES+=("$wt_feedback")
