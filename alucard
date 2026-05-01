@@ -365,10 +365,35 @@ command_run() {
       [ -n "$_ci_err" ] && echo "$_ci_err" >&2
       set -e
 
-      # Token lacks 'checks' read permission — can't determine CI status, skip gate.
+      # Token lacks 'checks' read permission — fall back to polling gh run list.
       if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "Resource not accessible"; then
-        echo "Token lacks 'checks' read permission — CI gate skipped for PR #$pr_num."
-        return 0
+        echo "Token lacks 'checks' read permission — falling back to gh run list for PR #$pr_num..."
+        local deadline=$(( $(date +%s) + 1200 ))
+        ci_rc=1
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          local run_json
+          run_json=$(cd "$REPO_ABS" && \
+            gh run list --pr "$pr_num" --json status,conclusion,databaseId \
+              --jq '[.[] | select(.status != "queued")]' 2>/dev/null || echo "[]")
+          local total in_progress failed
+          total=$(echo "$run_json" | jq 'length')
+          in_progress=$(echo "$run_json" | jq '[.[] | select(.status != "completed")] | length')
+          failed=$(echo "$run_json" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length')
+          if [ "$total" -eq 0 ]; then
+            echo "No workflow runs found yet — waiting..."
+            sleep 30; continue
+          fi
+          if [ "$in_progress" -gt 0 ]; then
+            echo "Runs still in progress ($in_progress/$total) — waiting..."
+            sleep 30; continue
+          fi
+          if [ "$failed" -gt 0 ]; then
+            ci_rc=1
+          else
+            ci_rc=0
+          fi
+          break
+        done
       fi
 
       if [ "$ci_rc" -eq 0 ]; then
@@ -513,9 +538,14 @@ Fix the failing checks: read the error output above, edit only the files needed 
 1. Run: gh pr diff ${pr_num} to read the full diff
 2. Read any changed source files needed to understand context
 3. Evaluate: correctness, test coverage, edge cases, security
-4. If the code is acceptable: gh pr review ${pr_num} --approve --body \"LGTM\"
-5. If changes are needed, be specific and actionable:
-   gh pr review ${pr_num} --request-changes --body \"<findings>\"
+4. Decide: APPROVED (code is acceptable) or CHANGES_REQUESTED (real issues found)
+5. Post the review:
+   - Approved:  gh pr review ${pr_num} --approve --body \"LGTM\"
+   - Changes:   gh pr review ${pr_num} --request-changes --body \"<findings>\"
+   If the gh pr review command fails (e.g. GitHub blocks reviewing your own PR),
+   post the findings as a PR comment instead:
+     gh pr comment ${pr_num} --body \"<findings>\"
+6. Write your decision to /work/.alucard-review — one line, exactly APPROVED or CHANGES_REQUESTED.
 
 Focus on real issues. Do not nitpick style." \
         | grep --line-buffered '^{' \
@@ -525,6 +555,13 @@ Focus on real issues. Do not nitpick style." \
       set -e
 
       echo ""
+
+      # Read reviewer's decision file before the worktree is cleaned up.
+      local _review_file_state=""
+      if [ -f "$wt_review/.alucard-review" ]; then
+        _review_file_state=$(tr -d '[:space:]' < "$wt_review/.alucard-review")
+      fi
+
       rm -rf "$wt_review" || true
 
       review_state=$(cd "$REPO_ABS" && \
@@ -536,6 +573,13 @@ Focus on real issues. Do not nitpick style." \
         gh pr view "$pr_num" --json reviews \
           --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .body // ""' \
         2>/dev/null || true)
+
+      # Fall back to the decision file when the formal review wasn't posted
+      # (e.g. GitHub blocks --request-changes on your own PR).
+      if [ -z "$review_state" ] && [ -n "$_review_file_state" ]; then
+        review_state="$_review_file_state"
+        echo "No formal review found — using decision file: $review_state"
+      fi
 
       if [ "$review_state" = "APPROVED" ]; then
         echo "PR #$pr_num approved — ready to merge."
