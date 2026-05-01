@@ -609,6 +609,9 @@ Address each finding: read the relevant files, make the necessary edits, run the
       rm -rf "$wt_feedback" || true
 
       [ "$feedback_rc" -ne 0 ] && echo "Feedback agent exited rc=$feedback_rc on cycle $review_cycle"
+
+      # Re-check CI before the next reviewer sees the updated branch.
+      ci_gate "$iter" "$branch" "$origin_url"
     done
   }
 
