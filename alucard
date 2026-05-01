@@ -370,10 +370,11 @@ command_run() {
         echo "Token lacks 'checks' read permission — falling back to gh run list for PR #$pr_num..."
         local deadline=$(( $(date +%s) + 1200 ))
         ci_rc=1
+        local _found_runs=false
         while [ "$(date +%s)" -lt "$deadline" ]; do
           local run_json
           run_json=$(cd "$REPO_ABS" && \
-            gh run list --pr "$pr_num" --json status,conclusion,databaseId \
+            gh run list --branch "$branch" --json status,conclusion,databaseId \
               --jq '[.[] | select(.status != "queued")]' 2>/dev/null || echo "[]")
           local total in_progress failed
           total=$(echo "$run_json" | jq 'length')
@@ -383,6 +384,7 @@ command_run() {
             echo "No workflow runs found yet — waiting..."
             sleep 30; continue
           fi
+          _found_runs=true
           if [ "$in_progress" -gt 0 ]; then
             echo "Runs still in progress ($in_progress/$total) — waiting..."
             sleep 30; continue
@@ -394,6 +396,12 @@ command_run() {
           fi
           break
         done
+        # No runs appeared during the entire polling window — token likely also
+        # lacks 'actions' read permission. Skip rather than fire spurious fix agents.
+        if [ "$_found_runs" = "false" ]; then
+          echo "No CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping CI gate."
+          ci_rc=0
+        fi
       fi
 
       if [ "$ci_rc" -eq 0 ]; then
@@ -409,7 +417,7 @@ command_run() {
       echo "CI failed (attempt $ci_attempt) — launching fix agent..."
 
       failed_run_id=$(cd "$REPO_ABS" && \
-        gh run list --pr "$pr_num" --json databaseId,conclusion \
+        gh run list --branch "$branch" --json databaseId,conclusion \
           --jq '[.[] | select(.conclusion=="failure")] | .[0].databaseId // empty' \
           2>/dev/null || true)
       failure_log=""
