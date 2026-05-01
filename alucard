@@ -39,6 +39,7 @@ Run options:
       --image NAME             Docker image name. Default: alucard:latest.
       --logs-root PATH         Directory for run logs. Default: ./logs beside
                                this CLI.
+      --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 2.
       --no-build               Do not build the image if it is missing.
 
 Examples:
@@ -110,6 +111,7 @@ parse_repo_options() {
   LOG_ROOT="$DEFAULT_LOG_ROOT"
   ITERATIONS=20
   TIMEOUT_MIN=30
+  MAX_REVIEW_CYCLES=2
   AUTO_BUILD=true
   TARGET_REPO_SET=false
 
@@ -151,6 +153,12 @@ parse_repo_options() {
       --logs-root)
         [ -n "${2:-}" ] || die "$1 requires a path"
         LOG_ROOT="$2"
+        shift 2
+        ;;
+      --max-review-cycles)
+        [ -n "${2:-}" ] || die "$1 requires a number"
+        is_uint "$2" || die "max-review-cycles must be a positive integer"
+        MAX_REVIEW_CYCLES="$2"
         shift 2
         ;;
       --no-build)
@@ -443,6 +451,167 @@ Fix the failing checks: read the error output above, edit only the files needed 
     done
   }
 
+  # Run reviewer then feedback agents on the open PR, up to MAX_REVIEW_CYCLES times.
+  # $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
+  review_gate() {
+    local iter="$1" branch="$2" origin_url="$3"
+
+    local pr_num
+    pr_num=$(cd "$REPO_ABS" && \
+      gh pr list --head "$branch" --state open --json number \
+        --jq '.[0].number // empty' 2>/dev/null || true)
+
+    [ -n "${pr_num:-}" ] || return 0
+
+    echo "=== Review gate: PR #$pr_num on $branch ==="
+
+    local review_cycle wt_review review_log review_rc review_state review_comments wt_feedback feedback_log feedback_rc
+
+    for review_cycle in $(seq 1 "$MAX_REVIEW_CYCLES"); do
+      echo "Review cycle $review_cycle/$MAX_REVIEW_CYCLES — running reviewer agent..."
+
+      wt_review="${WT_ROOT}/review-${iter}-${review_cycle}"
+      CREATED_WORKTREES+=("$wt_review")
+      rm -rf "$wt_review"
+      git -C "$REPO_ABS" fetch origin "$branch"
+      git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
+      git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_review"
+      git -C "$wt_review" remote set-url origin "$origin_url"
+
+      review_log="$LOG_DIR/iter-${iter}-review-${review_cycle}.jsonl"
+
+      set +e
+      timeout "${TIMEOUT_MIN}m" docker run --rm \
+        --name "alucard-review-${iter}-${review_cycle}" \
+        --network bridge \
+        --memory 4g --cpus 2 \
+        --read-only \
+        --tmpfs /tmp:exec,size=1g \
+        --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
+        --user "$(id -u):$(id -g)" \
+        --security-opt no-new-privileges \
+        --cap-drop ALL \
+        -v "$wt_review:/work:rw" \
+        --env-file "$ENV_FILE" \
+        -e "ALUCARD_ITER=${iter}-review-${review_cycle}" \
+        -e "HOME=/home/alucard" \
+        -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
+        -e "GH_CONFIG_DIR=/tmp/gh" \
+        "$IMAGE" \
+        claude -p \
+          --verbose \
+          --output-format stream-json \
+          --include-partial-messages \
+          --permission-mode bypassPermissions \
+          --max-turns 20 \
+          --max-budget-usd 2 \
+          --fallback-model sonnet \
+          --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+          -- \
+          "You are a code reviewer. Review PR #${pr_num} on this repository.
+
+1. Run: gh pr diff ${pr_num} to read the full diff
+2. Read any changed source files needed to understand context
+3. Evaluate: correctness, test coverage, edge cases, security
+4. If the code is acceptable: gh pr review ${pr_num} --approve --body \"LGTM\"
+5. If changes are needed, be specific and actionable:
+   gh pr review ${pr_num} --request-changes --body \"<findings>\"
+
+Focus on real issues. Do not nitpick style." \
+        | grep --line-buffered '^{' \
+        | tee "$review_log" \
+        | jq --unbuffered -rj "$stream_text"
+      review_rc=${PIPESTATUS[0]}
+      set -e
+
+      echo ""
+      rm -rf "$wt_review" || true
+
+      review_state=$(cd "$REPO_ABS" && \
+        gh pr view "$pr_num" --json reviews \
+          --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .state // empty' \
+        2>/dev/null || true)
+
+      if [ "$review_state" = "APPROVED" ]; then
+        echo "PR #$pr_num approved — ready to merge."
+        return 0
+      fi
+
+      if [ -z "$review_state" ]; then
+        echo "Reviewer did not post a review (rc=$review_rc) — skipping review gate."
+        return 0
+      fi
+
+      # CHANGES_REQUESTED path
+      if [ "$review_cycle" -eq "$MAX_REVIEW_CYCLES" ]; then
+        echo "Max review cycles ($MAX_REVIEW_CYCLES) reached — PR #$pr_num left open for manual review."
+        return 0
+      fi
+
+      echo "Changes requested — launching feedback agent (cycle $review_cycle)..."
+
+      review_comments=$(cd "$REPO_ABS" && \
+        gh pr view "$pr_num" --json reviews \
+          --jq '[.reviews[] | select(.state == "CHANGES_REQUESTED")] | last | .body // ""' \
+        2>/dev/null || true)
+
+      wt_feedback="${WT_ROOT}/feedback-${iter}-${review_cycle}"
+      CREATED_WORKTREES+=("$wt_feedback")
+      rm -rf "$wt_feedback"
+      git -C "$REPO_ABS" fetch origin "$branch"
+      git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
+      git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_feedback"
+      git -C "$wt_feedback" remote set-url origin "$origin_url"
+
+      feedback_log="$LOG_DIR/iter-${iter}-feedback-${review_cycle}.jsonl"
+
+      set +e
+      timeout "${TIMEOUT_MIN}m" docker run --rm \
+        --name "alucard-feedback-${iter}-${review_cycle}" \
+        --network bridge \
+        --memory 4g --cpus 2 \
+        --read-only \
+        --tmpfs /tmp:exec,size=1g \
+        --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
+        --user "$(id -u):$(id -g)" \
+        --security-opt no-new-privileges \
+        --cap-drop ALL \
+        -v "$wt_feedback:/work:rw" \
+        --env-file "$ENV_FILE" \
+        -e "ALUCARD_ITER=${iter}-feedback-${review_cycle}" \
+        -e "HOME=/home/alucard" \
+        -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
+        -e "GH_CONFIG_DIR=/tmp/gh" \
+        "$IMAGE" \
+        claude -p \
+          --verbose \
+          --output-format stream-json \
+          --include-partial-messages \
+          --permission-mode bypassPermissions \
+          --max-turns 30 \
+          --max-budget-usd 2 \
+          --fallback-model sonnet \
+          --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+          -- \
+          "A code review has requested changes on PR #${pr_num} (branch: ${branch}).
+
+Review findings:
+${review_comments}
+
+Address each finding: read the relevant files, make the necessary edits, run the project's lint and test suite to verify, then commit and push to this branch. Do not open a new PR. Do not touch unrelated code." \
+        | grep --line-buffered '^{' \
+        | tee "$feedback_log" \
+        | jq --unbuffered -rj "$stream_text"
+      feedback_rc=${PIPESTATUS[0]}
+      set -e
+
+      echo ""
+      rm -rf "$wt_feedback" || true
+
+      [ "$feedback_rc" -ne 0 ] && echo "Feedback agent exited rc=$feedback_rc on cycle $review_cycle"
+    done
+  }
+
   cleanup() {
     local wt
     for wt in "${CREATED_WORKTREES[@]}"; do
@@ -528,6 +697,7 @@ Fix the failing checks: read the error output above, edit only the files needed 
     rm -rf "$WT_HOST" || true
 
     ci_gate "$i" "$BRANCH" "$_origin_url"
+    review_gate "$i" "$BRANCH" "$_origin_url"
 
     if [ "$rc" -ne 0 ]; then
       echo "Iteration $i exited rc=$rc. Continuing."
