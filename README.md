@@ -2,21 +2,23 @@
 
 ## What it is
 
-A containerized agent loop that picks GitHub issues off a queue, completes them one at a time in isolated git worktrees, opens PRs, and runs unattended overnight. Workflow:
+A containerized agent loop that picks GitHub issues off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended overnight. Workflow:
 
 1. **Human (Aldo) writes a PRD or plan** during the day. This is the 80% of the work.
 2. **`/to-issues` skill** breaks the plan into vertical-slice GitHub issues, labeled `afk` (autonomous-doable) or `hitl` (needs human).
 3. **Alucard runs overnight** — pulls the AFK queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
-4. **Aldo reviews PRs in the morning** and merges what's good.
+4. **CI gate** — after a PR is opened, polls CI and launches a fix agent (up to 3 attempts) if checks fail.
+5. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 2).
+6. **Aldo reviews PRs in the morning** and merges what's good.
 
 Alucard never pushes to main. Each iteration produces an independent PR.
 
 ## Architecture
 
-- **CLI / host orchestrator** (`alucard`) — bash CLI that loops, manages git worktrees on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
+- **CLI / host orchestrator** (`alucard`) — bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
 - **Compatibility shim** (`alucard.sh`) — forwards old invocations to the CLI.
-- **Container** (Dockerfile + entrypoint) — disposable per iteration. Runs `claude` CLI in headless mode with broad permissions but bounded by kernel-level isolation.
-- **Worker prompt** (`alucard-prompt.md`) — the system instructions the agent gets each iteration.
+- **Container** (Dockerfile + entrypoint) — disposable per agent run. Runs `claude` CLI in headless mode with broad permissions but bounded by kernel-level isolation. Spun up separately for the main worker, CI fix agents, reviewer agents, and feedback agents.
+- **Worker prompt** (`alucard-prompt.md`) — the system instructions the main agent gets each iteration.
 - **Skill** (`/to-issues`) — Claude Code skill that produces correctly-labeled issues from a plan/PRD, lives in `.claude/skills/to-issues/SKILL.md` in the target repo.
 
 ## Threat model and safety design
@@ -31,7 +33,7 @@ Alucard never pushes to main. Each iteration produces an independent PR.
 4. **PR-only output:** Agent never pushes to main. Branch protection on main as belt-and-suspenders.
 5. **Credential scoping:** GitHub token is fine-grained PAT, single repo, 30-day expiry. Anthropic key is dedicated worker key with monthly budget cap set in the console.
 6. **Pattern blacklist (last line):** `--disallowedTools` removes obvious foot-guns like `rm -rf /*`, `sudo`, `curl | sh`. Pattern-matching is leaky but cheap.
-7. **Hard caps per iteration:** `--max-turns 60`, `--max-budget-usd 5`, `timeout 30m`.
+7. **Hard caps per iteration:** `--max-turns 120`, `--max-budget-usd 5`, `timeout 30m`. Fix/reviewer/feedback agents use lower caps (`--max-turns 20-30`, `--max-budget-usd 2`).
 
 **What's still possible:** credential exfiltration via network. Bounded by token scoping — worst case is "attacker gets push access to one repo for up to 30 days," which is recoverable.
 
@@ -200,8 +202,7 @@ alucard queue /path/to/target-repo
 # Manually un-stick an issue if Alucard crashed mid-task
 gh issue edit <N> --remove-label in-progress
 
-# Prune leftover worktrees if the orchestrator was hard-killed
-git worktree prune
+# Prune leftover clones if the orchestrator was hard-killed
 rm -rf .alucard-worktrees/
 
 # Watch a live run
