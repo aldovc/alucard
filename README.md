@@ -4,12 +4,12 @@
 
 A containerized agent loop that picks GitHub issues off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended overnight. Workflow:
 
-1. **Human (Aldo) writes a PRD or plan** during the day. This is the 80% of the work.
+1. **You (the operator) write a PRD or plan** during the day. This is the 80% of the work.
 2. **`/to-issues` skill** breaks the plan into vertical-slice GitHub issues, labeled `afk` (autonomous-doable) or `hitl` (needs human).
 3. **Alucard runs overnight** — pulls the AFK queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
 4. **CI gate** — after a PR is opened, polls CI and launches a fix agent (up to 3 attempts) if checks fail.
 5. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 2).
-6. **Aldo reviews PRs in the morning** and merges what's good.
+6. **You review PRs in the morning** and merge what's good.
 
 Alucard never pushes to main. Each iteration produces an independent PR.
 
@@ -17,10 +17,10 @@ Alucard never pushes to main. Each iteration produces an independent PR.
 
 ```mermaid
 flowchart TD
-    A[Aldo writes PRD/plan during the day] --> B["/to-prd skill<br/>(optional: PRD → GitHub issue)"]
+    A[Operator writes PRD/plan during the day] --> B["/to-prd skill<br/>(optional: PRD → GitHub issue)"]
     B --> C["/to-issues skill<br/>vertical-slice issues, labeled afk or hitl"]
     C --> D{Label?}
-    D -->|hitl| E[Aldo handles in the morning]
+    D -->|hitl| E[Operator handles in the morning]
     D -->|afk| F[AFK queue on GitHub]
 
     F --> G[alucard run<br/>overnight loop]
@@ -40,7 +40,7 @@ flowchart TD
 
     Q --> R[Loop: next iteration<br/>until queue empty / cap hit]
     R --> G
-    Q --> S[Aldo reviews and merges<br/>in the morning]
+    Q --> S[Operator reviews and merges<br/>in the morning]
 ```
 
 ## Architecture
@@ -48,7 +48,7 @@ flowchart TD
 - **CLI / host orchestrator** (`alucard`) — bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
 - **Container** (Dockerfile + entrypoint) — disposable per agent run. Runs `claude` CLI in headless mode with broad permissions but bounded by kernel-level isolation. Spun up separately for the main worker, CI fix agents, reviewer agents, and feedback agents.
 - **Worker prompt** (`alucard-prompt.md`) — the system instructions the main agent gets each iteration.
-- **Skills** (`/to-prd`, `/to-issues`) — Claude Code skills used during PRD authoring and issue breakdown. Vendored under `.claude/skills/` in this repo and copied into each target repo's `.claude/skills/` at setup time so Aldo can invoke them while working there.
+- **Skills** (`/to-prd`, `/to-issues`) — Claude Code skills used during PRD authoring and issue breakdown. Vendored under `.claude/skills/` in this repo and copied into each target repo's `.claude/skills/` at setup time so the operator can invoke them while working there.
 
 ## Threat model and safety design
 
@@ -110,17 +110,23 @@ Alucard tooling is designed to live in a separate folder so it is reusable acros
 
 ### Install the CLI
 
+The rest of this README uses `$ALUCARD_HOME` for the path to your alucard checkout. Set it once (and add to your shell rc if you want it to stick):
+
+```bash
+export ALUCARD_HOME=/path/to/alucard
+```
+
 Make the scripts executable:
 
 ```bash
-chmod +x /home/aldo/aldovc/alucard/alucard
-chmod +x /home/aldo/aldovc/alucard/entrypoint.sh
+chmod +x "$ALUCARD_HOME/alucard"
+chmod +x "$ALUCARD_HOME/entrypoint.sh"
 ```
 
 Optional: put it on your `PATH`:
 
 ```bash
-ln -sf /home/aldo/aldovc/alucard/alucard ~/.local/bin/alucard
+ln -sf "$ALUCARD_HOME/alucard" ~/.local/bin/alucard
 ```
 
 Use it from anywhere:
@@ -136,7 +142,7 @@ alucard doctor /path/to/target-repo
 Create the local env file:
 
 ```bash
-cp /home/aldo/aldovc/alucard/alucard.env.example /home/aldo/aldovc/alucard/alucard.env
+cp "$ALUCARD_HOME/alucard.env.example" "$ALUCARD_HOME/alucard.env"
 ```
 
 1. **GitHub fine-grained PAT:**
@@ -183,8 +189,8 @@ Both skills are vendored in this repo under `alucard/.claude/skills/`. Copy them
 
 ```bash
 mkdir -p /path/to/target-repo/.claude/skills
-cp -r /home/aldo/aldovc/alucard/.claude/skills/to-prd /path/to/target-repo/.claude/skills/
-cp -r /home/aldo/aldovc/alucard/.claude/skills/to-issues /path/to/target-repo/.claude/skills/
+cp -r "$ALUCARD_HOME/.claude/skills/to-prd" /path/to/target-repo/.claude/skills/
+cp -r "$ALUCARD_HOME/.claude/skills/to-issues" /path/to/target-repo/.claude/skills/
 ```
 
 - `/to-prd` — synthesize the current conversation into a PRD and open it as a GitHub issue.
@@ -194,7 +200,7 @@ cp -r /home/aldo/aldovc/alucard/.claude/skills/to-issues /path/to/target-repo/.c
 
 ```bash
 # Build the image
-/home/aldo/aldovc/alucard/alucard build
+"$ALUCARD_HOME/alucard" build
 
 # Create one trivial AFK issue manually for the test
 cd /path/to/target-repo
@@ -215,19 +221,19 @@ Create a CHANGELOG.md at repo root with a Keep a Changelog template.
 None — can start immediately"
 
 # Run one iteration with a 10-min cap and watch
-/home/aldo/aldovc/alucard/alucard run /path/to/target-repo -n 1 -t 10
+"$ALUCARD_HOME/alucard" run /path/to/target-repo -n 1 -t 10
 ```
 
-If a PR appears within 10 minutes, the setup works. If not, check `/home/aldo/aldovc/alucard/logs/alucard-*/iter-1.jsonl` for what the agent saw and did.
+If a PR appears within 10 minutes, the setup works. If not, check `$ALUCARD_HOME/logs/alucard-*/iter-1.jsonl` for what the agent saw and did.
 
 ## Open questions for the setup agent
 
-These are choices Aldo hasn't locked yet — surface them rather than guessing:
+These are choices the operator hasn't locked yet — surface them rather than guessing:
 
 1. **Project toolchain in the Dockerfile.** The current Dockerfile has Node + git + gh + claude. If the target repo uses Python/uv/just/Rust/etc., those need to be added or the agent will fail to run `just test`.
-2. **Branch protection enforcement.** Does Aldo want admin enforcement on, or off so he can hotfix? Default off is fine for solo work.
-3. **Notification on completion.** Currently the loop just exits. Aldo might want a Telegram/Discord ping when the run finishes.
-4. **Concurrent iterations.** Current design is sequential — one container at a time. If Aldo wants parallel workers picking different issues, the `in-progress` label coordination needs to handle race conditions (gh API isn't atomic for label-add). Don't add unless asked.
+2. **Branch protection enforcement.** Do you want admin enforcement on, or off so you can hotfix? Default off is fine for solo work.
+3. **Notification on completion.** Currently the loop just exits. You might want a Telegram/Discord ping when the run finishes.
+4. **Concurrent iterations.** Current design is sequential — one container at a time. If you want parallel workers picking different issues, the `in-progress` label coordination needs to handle race conditions (gh API isn't atomic for label-add). Don't add unless asked.
 
 ## Quick-reference commands
 
@@ -248,7 +254,7 @@ gh issue edit <N> --remove-label in-progress
 rm -rf .alucard-worktrees/
 
 # Watch a live run
-tail -f /home/aldo/aldovc/alucard/logs/alucard-*/iter-*.jsonl | jq -r 'select(.type=="assistant").message.content[]?.text // empty'
+tail -f "$ALUCARD_HOME"/logs/alucard-*/iter-*.jsonl | jq -r 'select(.type=="assistant").message.content[]?.text // empty'
 ```
 
 ## Design references for the setup agent

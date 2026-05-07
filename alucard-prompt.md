@@ -95,7 +95,7 @@ git push -u origin HEAD
 gh pr create --fill --label alucard
 ```
 
-Do not merge the PR yourself. Aldo will review and merge.
+Do not merge the PR yourself. The maintainer will review and merge.
 
 ## Close out
 
