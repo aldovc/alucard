@@ -13,13 +13,43 @@ A containerized agent loop that picks GitHub issues off a queue, completes them 
 
 Alucard never pushes to main. Each iteration produces an independent PR.
 
+## Flow
+
+```mermaid
+flowchart TD
+    A[Aldo writes PRD/plan during the day] --> B["/to-prd skill<br/>(optional: PRD → GitHub issue)"]
+    B --> C["/to-issues skill<br/>vertical-slice issues, labeled afk or hitl"]
+    C --> D{Label?}
+    D -->|hitl| E[Aldo handles in the morning]
+    D -->|afk| F[AFK queue on GitHub]
+
+    F --> G[alucard run<br/>overnight loop]
+    G --> H[Pick next AFK issue,<br/>label in-progress]
+    H --> I[Spin up isolated container<br/>+ disposable worktree]
+    I --> J[Worker agent: implement,<br/>test, commit]
+    J --> K[Open PR]
+
+    K --> L{CI passes?}
+    L -->|no| M[Fix agent<br/>up to 3 attempts]
+    M --> L
+    L -->|yes| N[Reviewer agent]
+    N --> O{Findings?}
+    O -->|yes, cycles left| P[Feedback agent<br/>addresses findings]
+    P --> N
+    O -->|no, or max cycles hit| Q[PR ready for human]
+
+    Q --> R[Loop: next iteration<br/>until queue empty / cap hit]
+    R --> G
+    Q --> S[Aldo reviews and merges<br/>in the morning]
+```
+
 ## Architecture
 
 - **CLI / host orchestrator** (`alucard`) — bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
 - **Compatibility shim** (`alucard.sh`) — forwards old invocations to the CLI.
 - **Container** (Dockerfile + entrypoint) — disposable per agent run. Runs `claude` CLI in headless mode with broad permissions but bounded by kernel-level isolation. Spun up separately for the main worker, CI fix agents, reviewer agents, and feedback agents.
 - **Worker prompt** (`alucard-prompt.md`) — the system instructions the main agent gets each iteration.
-- **Skill** (`/to-issues`) — Claude Code skill that produces correctly-labeled issues from a plan/PRD, lives in `.claude/skills/to-issues/SKILL.md` in the target repo.
+- **Skills** (`/to-prd`, `/to-issues`) — Claude Code skills used during PRD authoring and issue breakdown. Vendored under `.claude/skills/` in this repo and copied into each target repo's `.claude/skills/` at setup time so Aldo can invoke them while working there.
 
 ## Threat model and safety design
 
@@ -48,6 +78,10 @@ alucard/
 ├── entrypoint.sh                # configures git identity and gh auth at container start
 ├── alucard-prompt.md            # worker system prompt
 ├── alucard.env.example          # template for credentials (real one is gitignored)
+├── .claude/
+│   └── skills/
+│       ├── to-prd/SKILL.md      # vendored — copy into target repo
+│       └── to-issues/SKILL.md   # vendored — copy into target repo
 └── .gitignore                   # ignores alucard.env and logs/
 ```
 
@@ -58,8 +92,10 @@ target-repo/
 ├── .gitignore                   # add: .alucard-worktrees/
 ├── .claude/
 │   └── skills/
+│       ├── to-prd/
+│       │   └── SKILL.md         # copy from alucard/.claude/skills/to-prd/
 │       └── to-issues/
-│           └── SKILL.md         # the to-issues skill
+│           └── SKILL.md         # copy from alucard/.claude/skills/to-issues/
 └── (your code)
 ```
 
@@ -144,9 +180,18 @@ gh api -X PUT "repos/{owner}/{repo}/branches/main/protection" \
 EOF
 ```
 
-### The `/to-issues` skill
+### The `/to-prd` and `/to-issues` skills
 
-Drop the SKILL.md from earlier in the conversation into `.claude/skills/to-issues/SKILL.md` in the target repo. This is what Aldo invokes during the day to convert a PRD into properly-labeled issues that Alucard can then pick up overnight.
+Both skills are vendored in this repo under `alucard/.claude/skills/`. Copy them into the target repo:
+
+```bash
+mkdir -p /path/to/target-repo/.claude/skills
+cp -r /home/aldo/aldovc/alucard/.claude/skills/to-prd /path/to/target-repo/.claude/skills/
+cp -r /home/aldo/aldovc/alucard/.claude/skills/to-issues /path/to/target-repo/.claude/skills/
+```
+
+- `/to-prd` — synthesize the current conversation into a PRD and open it as a GitHub issue.
+- `/to-issues` — break a PRD or plan into properly-labeled (`afk` / `hitl`) tracer-bullet issues that Alucard can pick up overnight.
 
 ### First smoke test
 
