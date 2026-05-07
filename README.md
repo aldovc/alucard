@@ -46,7 +46,6 @@ flowchart TD
 ## Architecture
 
 - **CLI / host orchestrator** (`alucard`) — bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
-- **Compatibility shim** (`alucard.sh`) — forwards old invocations to the CLI.
 - **Container** (Dockerfile + entrypoint) — disposable per agent run. Runs `claude` CLI in headless mode with broad permissions but bounded by kernel-level isolation. Spun up separately for the main worker, CI fix agents, reviewer agents, and feedback agents.
 - **Worker prompt** (`alucard-prompt.md`) — the system instructions the main agent gets each iteration.
 - **Skills** (`/to-prd`, `/to-issues`) — Claude Code skills used during PRD authoring and issue breakdown. Vendored under `.claude/skills/` in this repo and copied into each target repo's `.claude/skills/` at setup time so Aldo can invoke them while working there.
@@ -73,7 +72,6 @@ flowchart TD
 alucard/
 ├── README.md                    # this file
 ├── alucard                      # CLI
-├── alucard.sh                   # compatibility shim
 ├── Dockerfile                   # node:20-slim + git + gh + claude code + alucard user
 ├── entrypoint.sh                # configures git identity and gh auth at container start
 ├── alucard-prompt.md            # worker system prompt
@@ -116,7 +114,6 @@ Make the scripts executable:
 
 ```bash
 chmod +x /home/aldo/aldovc/alucard/alucard
-chmod +x /home/aldo/aldovc/alucard/alucard.sh
 chmod +x /home/aldo/aldovc/alucard/entrypoint.sh
 ```
 
