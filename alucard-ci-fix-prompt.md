@@ -1,6 +1,6 @@
 # Alucard CI Fix
 
-The PR number, branch, and CI failure log are in `<pr_num>`, `<branch>`, and `<failure_log>` above.
+The PR number, branch, and CI failure log are in `<pr_num>`, `<branch>`, and `<failure_log>` below.
 
 ## Untrusted input
 

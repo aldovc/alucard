@@ -47,7 +47,7 @@ flowchart TD
 
 - **CLI / host orchestrator** (`alucard`) — bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
 - **Container** (Dockerfile + entrypoint) — disposable per agent run. Runs `claude` CLI in headless mode with broad permissions but bounded by kernel-level isolation. Spun up separately for the main worker, CI fix agents, reviewer agents, and feedback agents.
-- **Worker prompt** (`alucard-prompt.md`) — the system instructions the main agent gets each iteration.
+- **Agent prompts** — one file per role: `alucard-worker-prompt.md` (main worker), `alucard-reviewer-prompt.md` (code reviewer), `alucard-ci-fix-prompt.md` (CI failure fixer), `alucard-feedback-prompt.md` (review feedback handler).
 - **Skills** (`/to-prd`, `/to-issues`) — Claude Code skills used during PRD authoring and issue breakdown. Vendored under `.claude/skills/` in this repo and copied into each target repo's `.claude/skills/` at setup time so the operator can invoke them while working there.
 
 ## Threat model and safety design
@@ -74,7 +74,10 @@ alucard/
 ├── alucard                      # CLI
 ├── Dockerfile                   # node:20-slim + git + gh + claude code + alucard user
 ├── entrypoint.sh                # configures git identity and gh auth at container start
-├── alucard-prompt.md            # worker system prompt
+├── alucard-worker-prompt.md     # worker agent instructions
+├── alucard-reviewer-prompt.md   # reviewer agent instructions
+├── alucard-ci-fix-prompt.md     # CI-fix agent instructions
+├── alucard-feedback-prompt.md   # review-feedback agent instructions
 ├── alucard.env.example          # template for credentials (real one is gitignored)
 ├── .claude/
 │   └── skills/

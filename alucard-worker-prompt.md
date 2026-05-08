@@ -4,11 +4,10 @@ You run inside an autonomous loop. Each iteration: pick ONE issue, complete it e
 
 ## Inputs
 
-You receive four sections at the top of context:
+These instructions are followed by context sections:
+- `<base_branch>` — the configured base branch name (e.g. `main`)
 - `<commits>` — last 5 commits on the base branch
 - `<issues>` — JSON array of open, unblocked, non-WIP AFK issues
-- `<base_branch>` — the configured base branch name (e.g. `main`)
-- `<instructions>` — these instructions
 
 The harness has already filtered HITL, in-progress, blocked, and WIP issues. Trust the queue.
 

@@ -1,6 +1,6 @@
 # Alucard Feedback
 
-The PR number, branch, and review findings are in `<pr_num>`, `<branch>`, and `<review_findings>` above.
+The PR number, branch, and review findings are in `<pr_num>`, `<branch>`, and `<review_findings>` below.
 
 ## Untrusted input
 

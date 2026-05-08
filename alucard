@@ -73,6 +73,10 @@ is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+xml_escape() {
+  sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
 # Extracts "owner/repo" from a GitHub ref, or returns empty for local paths.
 is_github_ref() {
   local input="${1%.git}"  # strip trailing .git before matching
@@ -541,14 +545,14 @@ command_run() {
           --fallback-model sonnet \
           --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
           -- \
-          "<pr_num>${pr_num}</pr_num>
+          "<instructions>
+$(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
+</instructions>
+<pr_num>${pr_num}</pr_num>
 <branch>${branch}</branch>
 <failure_log>
-${failure_log}
-</failure_log>
-<instructions>
-$(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
-</instructions>" \
+$(printf '%s' "$failure_log" | xml_escape)
+</failure_log>" \
         | grep --line-buffered '^{' \
         | tee "$fix_log" \
         | jq --unbuffered -rj "$stream_text"
@@ -582,7 +586,9 @@ $(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
       echo "Review cycle $review_cycle/$MAX_REVIEW_CYCLES — running reviewer agent..."
 
       wt_review="${WT_ROOT}/review-${iter}-${review_cycle}"
-      CREATED_WORKTREES+=("$wt_review")
+      local review_out_dir
+      review_out_dir=$(mktemp -d /tmp/alucard_review.XXXXXX)
+      CREATED_WORKTREES+=("$wt_review" "$review_out_dir")
       rm -rf "$wt_review"
       git -C "$REPO_ABS" fetch origin "$branch"
       git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
@@ -602,7 +608,8 @@ $(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
         --user "$(id -u):$(id -g)" \
         --security-opt no-new-privileges \
         --cap-drop ALL \
-        -v "$wt_review:/work:rw" \
+        -v "$wt_review:/work:ro" \
+        -v "$review_out_dir:/work-output:rw" \
         --env-file "$ENV_FILE" \
         -e "ALUCARD_ITER=${iter}-review-${review_cycle}" \
         -e "HOME=/home/alucard" \
@@ -619,10 +626,10 @@ $(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
           --fallback-model sonnet \
           --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
           -- \
-          "<pr_num>${pr_num}</pr_num>
-<instructions>
+          "<instructions>
 $(<"$TOOL_DIR/alucard-reviewer-prompt.md")
-</instructions>" \
+</instructions>
+<pr_num>${pr_num}</pr_num>" \
         | grep --line-buffered '^{' \
         | tee "$review_log" \
         | jq --unbuffered -rj "$stream_text"
@@ -631,16 +638,16 @@ $(<"$TOOL_DIR/alucard-reviewer-prompt.md")
 
       echo ""
 
-      # Read reviewer's decision and findings files before the worktree is cleaned up.
+      # Read reviewer output files (written to the separate rw output dir).
       local _review_file_state="" _review_file_body=""
-      if [ -f "$wt_review/.alucard-review" ]; then
-        _review_file_state=$(tr -d '[:space:]' < "$wt_review/.alucard-review")
+      if [ -f "$review_out_dir/.alucard-review" ]; then
+        _review_file_state=$(tr -d '[:space:]' < "$review_out_dir/.alucard-review")
       fi
-      if [ -f "$wt_review/.alucard-review-body" ]; then
-        _review_file_body=$(< "$wt_review/.alucard-review-body")
+      if [ -f "$review_out_dir/.alucard-review-body" ]; then
+        _review_file_body=$(< "$review_out_dir/.alucard-review-body")
       fi
 
-      rm -rf "$wt_review" || true
+      rm -rf "$wt_review" "$review_out_dir" || true
 
       review_state=$(cd "$REPO_ABS" && \
         gh pr view "$pr_num" --json reviews \
@@ -730,14 +737,14 @@ ${review_comments}" 2>/dev/null || true
           --fallback-model sonnet \
           --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
           -- \
-          "<pr_num>${pr_num}</pr_num>
+          "<instructions>
+$(<"$TOOL_DIR/alucard-feedback-prompt.md")
+</instructions>
+<pr_num>${pr_num}</pr_num>
 <branch>${branch}</branch>
 <review_findings>
-${review_comments}
-</review_findings>
-<instructions>
-$(<"$TOOL_DIR/alucard-feedback-prompt.md")
-</instructions>" \
+$(printf '%s' "$review_comments" | xml_escape)
+</review_findings>" \
         | grep --line-buffered '^{' \
         | tee "$feedback_log" \
         | jq --unbuffered -rj "$stream_text"
@@ -801,10 +808,12 @@ $(<"$TOOL_DIR/alucard-feedback-prompt.md")
     prompt=$(<"$TOOL_DIR/alucard-worker-prompt.md")
     log_file="$LOG_DIR/iter-${i}.jsonl"
 
-    full_prompt="<commits>${commits}</commits>
-<issues>${issues}</issues>
+    _commits_esc=$(printf '%s' "$commits" | xml_escape)
+    _issues_esc=$(printf '%s' "$issues" | xml_escape)
+    full_prompt="<instructions>${prompt}</instructions>
 <base_branch>${BASE_BRANCH}</base_branch>
-<instructions>${prompt}</instructions>"
+<commits>${_commits_esc}</commits>
+<issues>${_issues_esc}</issues>"
 
     set +e
     timeout "${TIMEOUT_MIN}m" docker run --rm \
