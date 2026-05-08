@@ -110,24 +110,19 @@ Alucard tooling is designed to live in a separate folder so it is reusable acros
 
 ### Install the CLI
 
-The rest of this README uses `$ALUCARD_HOME` for the path to your alucard checkout. Set it once (and add to your shell rc if you want it to stick):
-
 ```bash
-export ALUCARD_HOME=/path/to/alucard
+curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | sh
 ```
 
-Make the scripts executable:
+This clones the repo into `~/.local/share/alucard`, symlinks the `alucard` CLI into `~/.local/bin`, and writes a credential template to `~/.local/share/alucard/alucard.env`. Override defaults with env vars:
 
 ```bash
-chmod +x "$ALUCARD_HOME/alucard"
-chmod +x "$ALUCARD_HOME/entrypoint.sh"
+ALUCARD_HOME=~/tools/alucard ALUCARD_BIN_DIR=~/bin curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | sh
 ```
 
-Optional: put it on your `PATH`:
+Re-run the same command to update an existing install.
 
-```bash
-ln -sf "$ALUCARD_HOME/alucard" ~/.local/bin/alucard
-```
+The rest of this README uses `$ALUCARD_HOME` for the install path (`~/.local/share/alucard` by default).
 
 Use it from anywhere:
 
