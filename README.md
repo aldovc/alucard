@@ -1,5 +1,7 @@
 # Alucard — autonomous overnight worker loop
 
+> **Experimental — personal project.** This is built for my own workflow and goals. It works for me but has no stability guarantees, no support commitment, and will change without notice. Use at your own risk.
+
 ## What it is
 
 A containerized agent loop that picks GitHub issues off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended overnight. Workflow:
