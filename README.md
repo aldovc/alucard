@@ -111,13 +111,13 @@ Alucard tooling is designed to live in a separate folder so it is reusable acros
 ### Install the CLI
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | bash
 ```
 
 This clones the repo into `~/.local/share/alucard`, symlinks the `alucard` CLI into `~/.local/bin`, and writes a credential template to `~/.local/share/alucard/alucard.env`. Override defaults with env vars:
 
 ```bash
-ALUCARD_HOME=~/tools/alucard ALUCARD_BIN_DIR=~/bin curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | sh
+ALUCARD_HOME=~/tools/alucard ALUCARD_BIN_DIR=~/bin curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | bash
 ```
 
 Re-run the same command to update an existing install.
