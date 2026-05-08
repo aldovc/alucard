@@ -45,7 +45,7 @@ gh issue edit <N> --add-label in-progress
 
 ## Explore
 
-Read the issue body, acceptance criteria, parent (if any), and linked issues. Skim relevant code before writing.
+Fetch the issue including comments (`gh issue view <N> --comments`) before starting — prior run notes, blockers, and partial work are often there. Read the acceptance criteria, parent (if any), and linked issues. Skim relevant code before writing.
 
 ## Implement (red → green → refactor)
 
