@@ -13,6 +13,7 @@ DEFAULT_IMAGE="${ALUCARD_IMAGE:-alucard:latest}"
 DEFAULT_ENV_FILE="${ALUCARD_ENV_FILE:-$TOOL_DIR/alucard.env}"
 DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
 DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
+DEFAULT_CACHE_DIR="${ALUCARD_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/alucard}"
 
 usage() {
   cat <<'EOF'
@@ -21,6 +22,11 @@ Usage:
   alucard queue [TARGET_REPO] [options]
   alucard build [options]
   alucard doctor [TARGET_REPO] [options]
+
+TARGET_REPO accepts:
+  /path/to/local/repo          existing local git clone
+  owner/repo                   GitHub shorthand — auto-cloned on first run
+  https://github.com/owner/repo  full GitHub HTTPS URL
 
 Commands:
   run       Run the autonomous worker loop.
@@ -42,7 +48,12 @@ Run options:
       --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 2.
       --no-build               Do not build the image if it is missing.
 
+Environment:
+  ALUCARD_CACHE_DIR            Where GitHub repos are cached on first run.
+                               Default: ~/.cache/alucard  (XDG_CACHE_HOME honoured)
+
 Examples:
+  alucard run owner/repo --iterations 1
   alucard run /path/to/target-repo --iterations 1 --timeout-minutes 10
   ALUCARD_TARGET_REPO=/path/to/target-repo alucard run -n 20 -t 30
   cd /path/to/target-repo && alucard queue
@@ -62,8 +73,37 @@ is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+# Extracts "owner/repo" from a GitHub ref, or returns empty for local paths.
+is_github_ref() {
+  local input="${1%.git}"  # strip trailing .git before matching
+  if [[ "$input" =~ ^git@github\.com:([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "$input" =~ ^https://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ "$input" =~ ^([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  fi
+}
+
 resolve_repo() {
   local repo="$1"
+  local owner_repo
+  owner_repo="$(is_github_ref "$repo")"
+
+  if [ -n "$owner_repo" ]; then
+    local cache_path="${DEFAULT_CACHE_DIR}/$owner_repo"
+    if [ -d "$cache_path/.git" ]; then
+      echo "Refreshing cached clone of $owner_repo..." >&2
+      git -C "$cache_path" fetch --quiet origin
+    else
+      echo "Cloning $owner_repo into $cache_path..." >&2
+      mkdir -p "$(dirname "$cache_path")"
+      git clone --quiet "https://github.com/$owner_repo.git" "$cache_path"
+    fi
+    echo "$cache_path"
+    return
+  fi
+
   [ -d "$repo" ] || die "target repo does not exist: $repo"
   git -C "$repo" rev-parse --show-toplevel 2>/dev/null \
     || die "target path is not inside a git repo: $repo"
@@ -289,7 +329,11 @@ command_doctor() {
     ok=false
   fi
 
-  if [ -d "$TARGET_REPO" ] && REPO_ABS=$(git -C "$TARGET_REPO" rev-parse --show-toplevel 2>/dev/null); then
+  local _owner_repo
+  _owner_repo="$(is_github_ref "$TARGET_REPO")"
+  if [ -n "$_owner_repo" ]; then
+    echo "ok: target repo is GitHub ref $_owner_repo (cache: ${DEFAULT_CACHE_DIR}/$_owner_repo)"
+  elif [ -d "$TARGET_REPO" ] && REPO_ABS=$(git -C "$TARGET_REPO" rev-parse --show-toplevel 2>/dev/null); then
     echo "ok: target repo $REPO_ABS"
     if git -C "$REPO_ABS" config --get remote.origin.url >/dev/null; then
       echo "ok: target repo has origin remote"
@@ -298,7 +342,7 @@ command_doctor() {
       ok=false
     fi
   else
-    echo "missing: valid target git repo at $TARGET_REPO"
+    echo "missing: valid target git repo at $TARGET_REPO (or a GitHub ref like owner/repo)"
     ok=false
   fi
 
