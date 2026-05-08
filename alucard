@@ -325,10 +325,18 @@ command_doctor() {
     fi
   done
 
-  if [ -f "$TOOL_DIR/Dockerfile" ] && [ -f "$TOOL_DIR/entrypoint.sh" ] && [ -f "$TOOL_DIR/alucard-prompt.md" ]; then
+  local _missing_files=false
+  for _f in Dockerfile entrypoint.sh \
+             alucard-worker-prompt.md alucard-reviewer-prompt.md \
+             alucard-ci-fix-prompt.md alucard-feedback-prompt.md; do
+    if [ ! -f "$TOOL_DIR/$_f" ]; then
+      echo "missing: $TOOL_DIR/$_f"
+      _missing_files=true
+    fi
+  done
+  if [ "$_missing_files" = "false" ]; then
     echo "ok: tool files in $TOOL_DIR"
   else
-    echo "missing: one or more tool files in $TOOL_DIR"
     ok=false
   fi
 
@@ -533,12 +541,14 @@ command_run() {
           --fallback-model sonnet \
           --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
           -- \
-          "CI checks are failing on PR #${pr_num} (branch: ${branch}).
-
-Failure log:
+          "<pr_num>${pr_num}</pr_num>
+<branch>${branch}</branch>
+<failure_log>
 ${failure_log}
-
-Fix the failing checks: read the error output above, edit only the files needed to resolve it, run the project's own lint and test suite to confirm the fix locally, then commit and push to this branch. Do not open a new PR. Do not touch unrelated code." \
+</failure_log>
+<instructions>
+$(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
+</instructions>" \
         | grep --line-buffered '^{' \
         | tee "$fix_log" \
         | jq --unbuffered -rj "$stream_text"
@@ -609,22 +619,10 @@ Fix the failing checks: read the error output above, edit only the files needed 
           --fallback-model sonnet \
           --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
           -- \
-          "You are a code reviewer. Review PR #${pr_num} on this repository.
-
-1. Run: gh pr diff ${pr_num} to read the full diff
-2. Read any changed source files needed to understand context
-3. Evaluate: correctness, test coverage, edge cases, security
-4. Decide: APPROVED (code is acceptable) or CHANGES_REQUESTED (real issues found)
-5. Post the review:
-   - Approved:  gh pr review ${pr_num} --approve --body \"LGTM\"
-   - Changes:   gh pr review ${pr_num} --request-changes --body \"<findings>\"
-   If the gh pr review command fails (e.g. GitHub blocks reviewing your own PR),
-   post the findings as a PR comment instead:
-     gh pr comment ${pr_num} --body \"<findings>\"
-6. Write your decision to /work/.alucard-review — one line, exactly APPROVED or CHANGES_REQUESTED.
-7. Write the full review body (same text you posted) to /work/.alucard-review-body.
-
-Focus on real issues. Do not nitpick style." \
+          "<pr_num>${pr_num}</pr_num>
+<instructions>
+$(<"$TOOL_DIR/alucard-reviewer-prompt.md")
+</instructions>" \
         | grep --line-buffered '^{' \
         | tee "$review_log" \
         | jq --unbuffered -rj "$stream_text"
@@ -732,12 +730,14 @@ ${review_comments}" 2>/dev/null || true
           --fallback-model sonnet \
           --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
           -- \
-          "A code review has requested changes on PR #${pr_num} (branch: ${branch}).
-
-Review findings:
+          "<pr_num>${pr_num}</pr_num>
+<branch>${branch}</branch>
+<review_findings>
 ${review_comments}
-
-Address each finding: read the relevant files, make the necessary edits, run the project's lint and test suite to verify, then commit and push to this branch. Do not open a new PR. Do not touch unrelated code." \
+</review_findings>
+<instructions>
+$(<"$TOOL_DIR/alucard-feedback-prompt.md")
+</instructions>" \
         | grep --line-buffered '^{' \
         | tee "$feedback_log" \
         | jq --unbuffered -rj "$stream_text"
@@ -798,11 +798,12 @@ Address each finding: read the relevant files, make the necessary edits, run the
     fi
 
     commits=$(git -C "$REPO_ABS" log -n 5 --format="%H%n%ad%n%B---" --date=short "origin/$BASE_BRANCH")
-    prompt=$(<"$TOOL_DIR/alucard-prompt.md")
+    prompt=$(<"$TOOL_DIR/alucard-worker-prompt.md")
     log_file="$LOG_DIR/iter-${i}.jsonl"
 
     full_prompt="<commits>${commits}</commits>
 <issues>${issues}</issues>
+<base_branch>${BASE_BRANCH}</base_branch>
 <instructions>${prompt}</instructions>"
 
     set +e
