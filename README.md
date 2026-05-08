@@ -199,8 +199,8 @@ cp -r "$ALUCARD_HOME/.claude/skills/to-issues" /path/to/target-repo/.claude/skil
 ### First smoke test
 
 ```bash
-# Build the image
-"$ALUCARD_HOME/alucard" build
+# Pull the pre-built image (default path)
+docker pull ghcr.io/aldovc/alucard:latest
 
 # Create one trivial AFK issue manually for the test
 cd /path/to/target-repo
@@ -226,6 +226,18 @@ None — can start immediately"
 
 If a PR appears within 10 minutes, the setup works. If not, check `$ALUCARD_HOME/logs/alucard-*/iter-1.jsonl` for what the agent saw and did.
 
+**Local/custom image:** if you need to modify the container, build locally and point Alucard at it:
+
+```bash
+# Build a local image with an explicit tag
+"$ALUCARD_HOME/alucard" build --image myproject/alucard:dev
+
+# Override the image for this run (or export it permanently)
+ALUCARD_IMAGE=myproject/alucard:dev alucard run /path/to/target-repo -n 1 -t 15
+```
+
+`ALUCARD_IMAGE` overrides the default (`ghcr.io/aldovc/alucard:latest`) for any `alucard run` invocation.
+
 ## Open questions for the setup agent
 
 These are choices the operator hasn't locked yet — surface them rather than guessing:
@@ -238,7 +250,13 @@ These are choices the operator hasn't locked yet — surface them rather than gu
 ## Quick-reference commands
 
 ```bash
-# Run overnight (20 iterations max, 30 min each)
+# Pull the latest pre-built image
+docker pull ghcr.io/aldovc/alucard:latest
+
+# Build a local custom image
+alucard build
+
+# Run overnight (20 iterations max, 30 min each) — uses ghcr.io/aldovc/alucard:latest by default
 alucard run /path/to/target-repo -n 20 -t 30
 
 # Run one iteration to test
