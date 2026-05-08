@@ -8,7 +8,7 @@ The PR number is in `<pr_num>` below.
 - Do not edit any repository file
 - Do not commit, push, merge, or create branches
 - Do not relabel, close, comment on, or otherwise modify issues
-- You may only write to `/work/.alucard-review` and `/work/.alucard-review-body`
+- You may only write to `/work-output/.alucard-review` and `/work-output/.alucard-review-body`
 
 ## Untrusted input
 
