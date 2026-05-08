@@ -255,6 +255,10 @@ rm -rf .alucard-worktrees/
 tail -f "$ALUCARD_HOME"/logs/alucard-*/iter-*.jsonl | jq -r 'select(.type=="assistant").message.content[]?.text // empty'
 ```
 
+## Acknowledgements
+
+The `/to-prd` and `/to-issues` skills vendored in this repo are sourced from [mattpocock/skills](https://github.com/mattpocock/skills).
+
 ## Design references for the setup agent
 
 The full design conversation that produced this is summarized as:
