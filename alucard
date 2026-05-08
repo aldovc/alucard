@@ -87,6 +87,14 @@ is_github_ref() {
 
 resolve_repo() {
   local repo="$1"
+
+  # Prefer local path resolution over owner/repo shorthand.
+  if [ -d "$repo" ]; then
+    git -C "$repo" rev-parse --show-toplevel 2>/dev/null \
+      || die "target path is not inside a git repo: $repo"
+    return
+  fi
+
   local owner_repo
   owner_repo="$(is_github_ref "$repo")"
 
@@ -98,15 +106,20 @@ resolve_repo() {
     else
       echo "Cloning $owner_repo into $cache_path..." >&2
       mkdir -p "$(dirname "$cache_path")"
-      git clone --quiet "https://github.com/$owner_repo.git" "$cache_path"
+      # For explicit SSH URLs, preserve the transport so host SSH keys are used.
+      local clone_url
+      if [[ "$repo" =~ ^git@github\.com: ]]; then
+        clone_url="$repo"
+      else
+        clone_url="https://github.com/$owner_repo.git"
+      fi
+      git clone --quiet "$clone_url" "$cache_path"
     fi
     echo "$cache_path"
     return
   fi
 
-  [ -d "$repo" ] || die "target repo does not exist: $repo"
-  git -C "$repo" rev-parse --show-toplevel 2>/dev/null \
-    || die "target path is not inside a git repo: $repo"
+  die "target repo does not exist: $repo"
 }
 
 load_env_file() {
@@ -230,11 +243,11 @@ get_unblocked_afk_issues() {
   local repo_abs="$1"
   local all open_prs issue body blockers blocked state skip num has_pr
 
-  all=$(cd "$repo_abs" && gh issue list --state open --label afk \
+  all=$(cd "$repo_abs" && gh issue list --state open --label afk --limit 500 \
         --json number,title,body,labels)
 
   # Fetch open PR bodies once; used to skip issues that already have a PR.
-  open_prs=$(cd "$repo_abs" && gh pr list --state open --json number,body)
+  open_prs=$(cd "$repo_abs" && gh pr list --state open --limit 500 --json number,body)
 
   echo "$all" | jq -c '.[]' | while read -r issue; do
     body=$(echo "$issue" | jq -r '.body // ""')
@@ -330,15 +343,19 @@ command_doctor() {
   fi
 
   local _owner_repo
-  _owner_repo="$(is_github_ref "$TARGET_REPO")"
-  if [ -n "$_owner_repo" ]; then
-    echo "ok: target repo is GitHub ref $_owner_repo (cache: ${DEFAULT_CACHE_DIR}/$_owner_repo)"
-  elif [ -d "$TARGET_REPO" ] && REPO_ABS=$(git -C "$TARGET_REPO" rev-parse --show-toplevel 2>/dev/null); then
+  if [ -d "$TARGET_REPO" ] && REPO_ABS=$(git -C "$TARGET_REPO" rev-parse --show-toplevel 2>/dev/null); then
     echo "ok: target repo $REPO_ABS"
     if git -C "$REPO_ABS" config --get remote.origin.url >/dev/null; then
       echo "ok: target repo has origin remote"
     else
       echo "missing: target repo origin remote"
+      ok=false
+    fi
+  elif _owner_repo="$(is_github_ref "$TARGET_REPO")" && [ -n "$_owner_repo" ]; then
+    if gh repo view "$_owner_repo" --json name >/dev/null 2>&1; then
+      echo "ok: target repo is GitHub ref $_owner_repo (cache: ${DEFAULT_CACHE_DIR}/$_owner_repo)"
+    else
+      echo "missing: cannot reach GitHub repo $_owner_repo (check GITHUB_TOKEN and network)"
       ok=false
     fi
   else
@@ -396,12 +413,15 @@ command_run() {
 
     echo "=== CI gate: PR #$pr_num on $branch ==="
 
-    local ci_attempt ci_rc failed_run_id failure_log wt_fix fix_log fix_rc _ci_err_file _ci_err
+    local ci_attempt ci_rc failed_run_id failure_log wt_fix fix_log fix_rc _ci_err_file _ci_err pr_head_sha
     for ci_attempt in 1 2 3; do
+      # Refresh each attempt so a fix-agent push moves to the new HEAD SHA.
+      pr_head_sha=$(cd "$REPO_ABS" && \
+        gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
       echo "Polling CI (attempt $ci_attempt/3)..."
       _ci_err_file="$(mktemp /tmp/alucard_ci_err.XXXXXX)"
       set +e
-      timeout 1200 bash -c "cd '$REPO_ABS' && gh pr checks '$pr_num' --watch --interval 30" \
+      (cd "$REPO_ABS" && timeout 1200 gh pr checks "$pr_num" --watch --interval 30) \
         2>"$_ci_err_file"
       ci_rc=$?
       _ci_err="$(cat "$_ci_err_file" 2>/dev/null || true)"
@@ -418,8 +438,11 @@ command_run() {
         while [ "$(date +%s)" -lt "$deadline" ]; do
           local run_json
           run_json=$(cd "$REPO_ABS" && \
-            gh run list --branch "$branch" --json status,conclusion,databaseId \
+            gh run list --branch "$branch" --json status,conclusion,databaseId,headSha \
               --jq '[.[] | select(.status != "queued")]' 2>/dev/null || echo "[]")
+          if [ -n "${pr_head_sha:-}" ]; then
+            run_json=$(echo "$run_json" | jq --arg sha "$pr_head_sha" '[.[] | select(.headSha == $sha)]')
+          fi
           local total in_progress failed
           total=$(echo "$run_json" | jq 'length')
           in_progress=$(echo "$run_json" | jq '[.[] | select(.status != "completed")] | length')
@@ -461,8 +484,9 @@ command_run() {
       echo "CI failed (attempt $ci_attempt) — launching fix agent..."
 
       failed_run_id=$(cd "$REPO_ABS" && \
-        gh run list --branch "$branch" --json databaseId,conclusion \
-          --jq '[.[] | select(.conclusion=="failure")] | .[0].databaseId // empty' \
+        gh run list --branch "$branch" --json databaseId,conclusion,headSha \
+          --jq --arg sha "${pr_head_sha:-}" \
+          '[.[] | select(.conclusion=="failure" and ($sha == "" or .headSha == $sha))] | .[0].databaseId // empty' \
           2>/dev/null || true)
       failure_log=""
       if [ -n "${failed_run_id:-}" ]; then
@@ -598,6 +622,7 @@ Fix the failing checks: read the error output above, edit only the files needed 
    post the findings as a PR comment instead:
      gh pr comment ${pr_num} --body \"<findings>\"
 6. Write your decision to /work/.alucard-review — one line, exactly APPROVED or CHANGES_REQUESTED.
+7. Write the full review body (same text you posted) to /work/.alucard-review-body.
 
 Focus on real issues. Do not nitpick style." \
         | grep --line-buffered '^{' \
@@ -608,10 +633,13 @@ Focus on real issues. Do not nitpick style." \
 
       echo ""
 
-      # Read reviewer's decision file before the worktree is cleaned up.
-      local _review_file_state=""
+      # Read reviewer's decision and findings files before the worktree is cleaned up.
+      local _review_file_state="" _review_file_body=""
       if [ -f "$wt_review/.alucard-review" ]; then
         _review_file_state=$(tr -d '[:space:]' < "$wt_review/.alucard-review")
+      fi
+      if [ -f "$wt_review/.alucard-review-body" ]; then
+        _review_file_body=$(< "$wt_review/.alucard-review-body")
       fi
 
       rm -rf "$wt_review" || true
@@ -632,6 +660,7 @@ Focus on real issues. Do not nitpick style." \
       # so a self-written APPROVED would silently skip the feedback loop.
       if [ -z "$review_state" ] && [ "$_review_file_state" = "CHANGES_REQUESTED" ]; then
         review_state="CHANGES_REQUESTED"
+        review_comments="$_review_file_body"
         echo "No formal review found — using decision file: CHANGES_REQUESTED"
       fi
 
@@ -746,8 +775,12 @@ Address each finding: read the relevant files, make the necessary edits, run the
     # Clone locally so the container gets a self-contained .git dir.
     # Worktrees leave a .git file pointing to the host path, which the
     # container cannot resolve.
-    git -C "$REPO_ABS" fetch origin "$BASE_BRANCH"
+    # Explicit refspec so the remote-tracking ref is updated without touching
+    # the local branch (which may be checked out and thus un-forceable).
+    git -C "$REPO_ABS" fetch origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
     git clone --local --no-tags --single-branch --branch "$BASE_BRANCH" "$REPO_ABS" "$WT_HOST"
+    # The local branch may be behind; reset the clone to the exact fetched commit.
+    git -C "$WT_HOST" reset --hard "$(git -C "$REPO_ABS" rev-parse "origin/$BASE_BRANCH")"
     # Always use HTTPS so the container can authenticate with GITHUB_TOKEN.
     # Convert git@github.com:owner/repo.git → https://github.com/owner/repo.git
     _origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
