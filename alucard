@@ -9,7 +9,7 @@ while [ -L "$SOURCE" ]; do
 done
 TOOL_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-DEFAULT_IMAGE="${ALUCARD_IMAGE:-alucard:latest}"
+DEFAULT_IMAGE="${ALUCARD_IMAGE:-ghcr.io/aldovc/alucard:latest}"
 DEFAULT_ENV_FILE="${ALUCARD_ENV_FILE:-$TOOL_DIR/alucard.env}"
 DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
 DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
