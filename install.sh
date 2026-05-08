@@ -51,7 +51,8 @@ cat <<EOF
 
 Done. Next steps:
   1. Edit $ALUCARD_HOME/alucard.env — add GITHUB_TOKEN and ANTHROPIC_API_KEY
-  2. Build the Docker image:       alucard build
+  2. Pull the pre-built image:     docker pull ghcr.io/aldovc/alucard:latest
+     (or build locally:            alucard build)
   3. Run against a repo:           alucard run /path/to/repo --iterations 1
 
 Full docs: https://github.com/aldovc/alucard#readme

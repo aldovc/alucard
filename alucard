@@ -9,7 +9,7 @@ while [ -L "$SOURCE" ]; do
 done
 TOOL_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-DEFAULT_IMAGE="${ALUCARD_IMAGE:-alucard:latest}"
+DEFAULT_IMAGE="${ALUCARD_IMAGE:-ghcr.io/aldovc/alucard:latest}"
 DEFAULT_ENV_FILE="${ALUCARD_ENV_FILE:-$TOOL_DIR/alucard.env}"
 DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
 DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
@@ -42,7 +42,7 @@ Run options:
       --base BRANCH            Base branch on origin. Default: main.
       --env-file PATH          Credential env file. Default: ./alucard.env
                                beside this CLI.
-      --image NAME             Docker image name. Default: alucard:latest.
+      --image NAME             Docker image name. Default: ghcr.io/aldovc/alucard:latest.
       --logs-root PATH         Directory for run logs. Default: ./logs beside
                                this CLI.
       --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 2.
@@ -378,7 +378,7 @@ command_doctor() {
   if docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "ok: Docker image $IMAGE"
   else
-    echo "missing: Docker image $IMAGE (run: alucard build)"
+    echo "missing: Docker image $IMAGE (run: docker pull ghcr.io/aldovc/alucard:latest, or alucard build for a local image)"
   fi
 
   [ "$ok" = "true" ] || exit 1
