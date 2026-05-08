@@ -229,11 +229,11 @@ If a PR appears within 10 minutes, the setup works. If not, check `$ALUCARD_HOME
 **Local/custom image:** if you need to modify the container, build locally and point Alucard at it:
 
 ```bash
-# Build a local image
-"$ALUCARD_HOME/alucard" build
+# Build a local image with an explicit tag
+"$ALUCARD_HOME/alucard" build --image myproject/alucard:dev
 
 # Override the image for this run (or export it permanently)
-ALUCARD_IMAGE=alucard:latest alucard run /path/to/target-repo -n 1 -t 15
+ALUCARD_IMAGE=myproject/alucard:dev alucard run /path/to/target-repo -n 1 -t 15
 ```
 
 `ALUCARD_IMAGE` overrides the default (`ghcr.io/aldovc/alucard:latest`) for any `alucard run` invocation.

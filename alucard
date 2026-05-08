@@ -42,7 +42,7 @@ Run options:
       --base BRANCH            Base branch on origin. Default: main.
       --env-file PATH          Credential env file. Default: ./alucard.env
                                beside this CLI.
-      --image NAME             Docker image name. Default: alucard:latest.
+      --image NAME             Docker image name. Default: ghcr.io/aldovc/alucard:latest.
       --logs-root PATH         Directory for run logs. Default: ./logs beside
                                this CLI.
       --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 2.
