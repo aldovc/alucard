@@ -245,13 +245,29 @@ parse_repo_options() {
 
 get_unblocked_afk_issues() {
   local repo_abs="$1"
-  local all open_prs issue body blockers blocked state skip num has_pr
+  local all open_prs issue body blockers blocked state skip num has_pr _gh_repo owner repo
 
   all=$(cd "$repo_abs" && gh issue list --state open --label afk --limit 500 \
         --json number,title,body,labels)
 
-  # Fetch open PR bodies once; used to skip issues that already have a PR.
-  open_prs=$(cd "$repo_abs" && gh pr list --state open --limit 500 --json number,body)
+  # Use GitHub's own closing-issue graph so PR detection is never left to LLM
+  # output format — GitHub parses the PR body; we just read the result.
+  _gh_repo=$(cd "$repo_abs" && gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || true)
+  owner="${_gh_repo%%/*}"
+  repo="${_gh_repo#*/}"
+  open_prs="[]"
+  if [ -n "$owner" ] && [ -n "$repo" ]; then
+    open_prs=$(cd "$repo_abs" && gh api graphql \
+      -f query='query($owner:String!,$repo:String!){
+        repository(owner:$owner,name:$repo){
+          pullRequests(states:OPEN,first:100){
+            nodes{number,closingIssuesReferences(first:25){nodes{number}}}
+          }
+        }
+      }' \
+      -f owner="$owner" -f repo="$repo" \
+      --jq '.data.repository.pullRequests.nodes' 2>/dev/null || echo "[]")
+  fi
 
   echo "$all" | jq -c '.[]' | while read -r issue; do
     body=$(echo "$issue" | jq -r '.body // ""')
@@ -267,11 +283,11 @@ get_unblocked_afk_issues() {
     skip=$(echo "$issue" | jq -r '
       .labels | map(.name) | any(. == "in-progress" or . == "wip")')
 
-    # Skip if an open PR already references this issue (Closes/Fixes/Refs #N).
+    # Skip if GitHub's own closing-issue graph links an open PR to this issue.
     if [ "$skip" = "false" ]; then
       num=$(echo "$issue" | jq -r '.number')
-      has_pr=$(echo "$open_prs" | jq --arg n "$num" \
-        '[.[] | select(.body | test("(Closes|Fixes|Refs) #" + $n + "\\b"; "i"))] | length')
+      has_pr=$(echo "$open_prs" | jq --argjson n "$num" \
+        '[.[] | select((.closingIssuesReferences.nodes // []) | map(.number) | contains([$n]))] | length')
       [ "${has_pr:-0}" -gt 0 ] && skip="true"
     fi
 
