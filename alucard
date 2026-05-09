@@ -449,7 +449,7 @@ command_run() {
       echo "Polling CI (attempt $ci_attempt/3)..."
       _ci_err_file="$(mktemp /tmp/alucard_ci_err.XXXXXX)"
       set +e
-      (cd "$REPO_ABS" && timeout 1200 gh pr checks "$pr_num" --watch --interval 30) \
+      (cd "$REPO_ABS" && timeout 2700 gh pr checks "$pr_num" --watch --interval 30) \
         2>"$_ci_err_file"
       ci_rc=$?
       _ci_err="$(cat "$_ci_err_file" 2>/dev/null || true)"
@@ -460,7 +460,7 @@ command_run() {
       # Token lacks 'checks' read permission — fall back to polling gh run list.
       if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "Resource not accessible"; then
         echo "Token lacks 'checks' read permission — falling back to gh run list for PR #$pr_num..."
-        local deadline=$(( $(date +%s) + 1200 ))
+        local deadline=$(( $(date +%s) + 2700 ))
         ci_rc=1
         local _found_runs=false
         while [ "$(date +%s)" -lt "$deadline" ]; do

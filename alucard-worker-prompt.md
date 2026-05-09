@@ -93,8 +93,15 @@ You are on a branch the harness already created from the latest base branch. Com
 
 ```bash
 git push -u origin HEAD
-gh pr create --fill --label alucard
+gh pr create --label alucard \
+  --title "<conventional-commit title>" \
+  --body "Closes #N
+
+## Summary
+<what changed and why>"
 ```
+
+**Always use an explicit `--body` with `Closes #N` on the first line.** Never rely on `--fill` — it does not reliably propagate closing references from commit messages into the PR body, which prevents the issue from auto-closing on merge and breaks the queue deduplication that prevents duplicate work.
 
 Do not merge the PR yourself. The maintainer will review and merge.
 
