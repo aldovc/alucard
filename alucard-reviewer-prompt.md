@@ -38,11 +38,12 @@ Do not approve out of politeness. If anything blocks merge, request changes.
 
 ## Posting the review
 
+Try to post a formal review:
+
 - Approved: `gh pr review <pr_num> --approve --body "LGTM"`
 - Changes: `gh pr review <pr_num> --request-changes --body "<findings>"`
 
-If GitHub blocks self-review, post as a PR comment instead:
-`gh pr comment <pr_num> --body "<findings>"`
+GitHub may block self-review when the bot identity is also the PR author — in that case the command will fail. **Do not fall back to `gh pr comment`.** The shell wrapper reads your decision files (`/work-output/.alucard-review` and `/work-output/.alucard-review-body`) and posts the audit comment itself — posting again from here causes duplicate comments.
 
 ## Findings format
 

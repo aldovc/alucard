@@ -715,6 +715,31 @@ ${review_comments}" 2>/dev/null || true
 
       echo "Changes requested — launching feedback agent (cycle $review_cycle)..."
 
+      # Augment reviewer findings with human-authored PR comments so the
+      # feedback agent sees the user's questions/asks alongside the reviewer's
+      # findings. Note: alucard runs under a human PAT, so author-based filtering
+      # would also drop legitimate human comments. Instead, filter by body prefix
+      # — all wrapper-posted comments start with "**🤖 Alucard …**". Reviewer
+      # prompt no longer falls back to `gh pr comment`, so this prefix uniquely
+      # identifies bot-self comments going forward.
+      local human_comments feedback_findings
+      human_comments=$(cd "$REPO_ABS" && \
+        gh pr view "$pr_num" --json comments --jq '.comments' 2>/dev/null \
+        | jq -r '[.[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
+        2>/dev/null || true)
+      feedback_findings="$review_comments"
+      if [ -n "$human_comments" ]; then
+        feedback_findings="${feedback_findings}
+
+---
+
+## Additional human PR comments
+
+Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment\` rather than silently ignored.
+
+${human_comments}"
+      fi
+
       wt_feedback="${WT_ROOT}/feedback-${iter}-${review_cycle}"
       CREATED_WORKTREES+=("$wt_feedback")
       rm -rf "$wt_feedback"
@@ -748,7 +773,7 @@ ${review_comments}" 2>/dev/null || true
           --output-format stream-json \
           --include-partial-messages \
           --permission-mode bypassPermissions \
-          --max-turns 30 \
+          --max-turns 50 \
           --max-budget-usd 2 \
           --fallback-model sonnet \
           --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
@@ -759,7 +784,7 @@ $(<"$TOOL_DIR/alucard-feedback-prompt.md")
 <pr_num>${pr_num}</pr_num>
 <branch>${branch}</branch>
 <review_findings>
-$(printf '%s' "$review_comments" | xml_escape)
+$(printf '%s' "$feedback_findings" | xml_escape)
 </review_findings>" \
         | grep --line-buffered '^{' \
         | tee "$feedback_log" \

@@ -246,6 +246,15 @@ These are choices the operator hasn't locked yet — surface them rather than gu
 2. **Branch protection enforcement.** Do you want admin enforcement on, or off so you can hotfix? Default off is fine for solo work.
 3. **Notification on completion.** Currently the loop just exits. You might want a Telegram/Discord ping when the run finishes.
 4. **Concurrent iterations.** Current design is sequential — one container at a time. If you want parallel workers picking different issues, the `in-progress` label coordination needs to handle race conditions (gh API isn't atomic for label-add). Don't add unless asked.
+5. **Two-identity reviewer (deferred).** Right now the worker, reviewer, fix, and feedback agents all share one `GITHUB_TOKEN`. GitHub blocks formal `gh pr review --approve` / `--request-changes` when the PR author and reviewer are the same identity (this is a hardcoded product rule — not configurable in branch protection, repo, or org settings). Consequence: the reviewer can only post audit comments via the shell wrapper, which don't satisfy branch-protection "require N approvals" rules. To enable real approval-gated merging, split into two identities:
+   - `GITHUB_TOKEN` (worker) — opens PRs, pushes commits, comments on issues. Used by worker, fix, and feedback agents.
+   - `GITHUB_REVIEWER_TOKEN` (reviewer) — separate PAT or GitHub App installation token, scoped to PR-read + PR-review write on the target repo. Used only by the reviewer agent's container.
+
+   Plumbing sketch when implemented:
+   - Add `GITHUB_REVIEWER_TOKEN=` to `alucard.env.example` and the docs above.
+   - In `alucard`, the reviewer `docker run` block (around the `--name "alucard-review-…"` invocation) overrides `GITHUB_TOKEN` with the reviewer token: drop `--env-file` for `GITHUB_TOKEN` and pass `-e GITHUB_TOKEN="$GITHUB_REVIEWER_TOKEN"` explicitly. Worker/fix/feedback blocks stay unchanged.
+   - Restore `gh pr review --approve` / `--request-changes` as primary in `alucard-reviewer-prompt.md` (the dedup logic in the shell already prefers a formal review over the decision file).
+   - Remove the defensive comment at `alucard:679–686` that distrusts file-based APPROVED — once formal reviews work, the file fallback is no longer the only path.
 
 ## Quick-reference commands
 
