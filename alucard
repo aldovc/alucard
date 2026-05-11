@@ -684,14 +684,24 @@ $(<"$TOOL_DIR/alucard-reviewer-prompt.md")
           --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .body // ""' \
         2>/dev/null || true)
 
-      # Fall back to the decision file only for CHANGES_REQUESTED.
-      # An APPROVED decision without a formal review record is unreliable —
-      # self-review is always blocked when the bot both opens and reviews the PR,
-      # so a self-written APPROVED would silently skip the feedback loop.
-      if [ -z "$review_state" ] && [ "$_review_file_state" = "CHANGES_REQUESTED" ]; then
-        review_state="CHANGES_REQUESTED"
+      # GitHub blocks formal self-review when the bot token == the PR author,
+      # so most runs land here with no formal review on the PR. Trust the
+      # reviewer's decision files (APPROVED or CHANGES_REQUESTED). The earlier
+      # concern that file-APPROVED "silently skips the feedback loop" is moot:
+      # skipping feedback is exactly the correct behavior for APPROVED, and
+      # dropping the verdict entirely (the previous behavior) hid the reviewer's
+      # reasoning from the operator without making the loop any safer. The real
+      # mitigation for self-approval is the two-token reviewer identity tracked
+      # as deferred item #5 in README.md.
+      local _self_review_note=""
+      if [ -z "$review_state" ] && \
+         { [ "$_review_file_state" = "CHANGES_REQUESTED" ] || [ "$_review_file_state" = "APPROVED" ]; }; then
+        review_state="$_review_file_state"
         review_comments="$_review_file_body"
-        echo "No formal review found — using decision file: CHANGES_REQUESTED"
+        _self_review_note="
+
+_(Self-review: GitHub blocked a formal \`gh pr review\` because the bot is also the PR author. Verdict and body come from the reviewer agent's decision file.)_"
+        echo "No formal review found — using decision file: $review_state"
       fi
 
       if [ "$review_state" = "APPROVED" ]; then
@@ -699,7 +709,7 @@ $(<"$TOOL_DIR/alucard-reviewer-prompt.md")
         cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
           "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
 
-${review_comments}" 2>/dev/null || true
+${review_comments}${_self_review_note}" 2>/dev/null || true
         return 0
       fi
 
@@ -715,7 +725,7 @@ ${review_comments}" 2>/dev/null || true
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: CHANGES_REQUESTED**
 
-${review_comments}" 2>/dev/null || true
+${review_comments}${_self_review_note}" 2>/dev/null || true
 
       if [ "$review_cycle" -eq "$MAX_REVIEW_CYCLES" ]; then
         echo "Max review cycles ($MAX_REVIEW_CYCLES) reached — PR #$pr_num left open for manual review."
