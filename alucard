@@ -302,7 +302,7 @@ print_usage_report() {
 
   [ -d "$log_dir" ] || return 0
 
-  local -a labels inps outs crs cws turnss costs
+  local -a labels=() inps=() outs=() crs=() cws=() turnss=() costs=()
   local f base label mid
   local total_inp=0 total_out=0 total_cr=0 total_cw=0 total_turns=0
   local total_cost="0"
