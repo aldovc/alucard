@@ -297,6 +297,87 @@ get_unblocked_afk_issues() {
   done | jq -s '.'
 }
 
+print_usage_report() {
+  local log_dir="$1"
+
+  [ -d "$log_dir" ] || return 0
+
+  local -a labels inps outs crs cws turnss costs
+  local f base label mid
+  local total_inp=0 total_out=0 total_cr=0 total_cw=0 total_turns=0
+  local total_cost="0"
+
+  while IFS= read -r f; do
+    base=$(basename "$f" .jsonl)
+    case "$base" in
+      iter-*-fix-*)
+        mid="${base#iter-}"; label="ci-fix ${mid/-fix-/.}" ;;
+      iter-*-review-*)
+        mid="${base#iter-}"; label="review ${mid/-review-/.}" ;;
+      iter-*-feedback-*)
+        mid="${base#iter-}"; label="feedback ${mid/-feedback-/.}" ;;
+      iter-*)
+        label="worker ${base#iter-}" ;;
+      *)
+        label="$base" ;;
+    esac
+
+    local inp out cr cw turns cost
+    IFS=$'\t' read -r inp out cr cw turns cost < <(
+      tail -n 20 "$f" | grep '"type":"result"' | tail -1 \
+        | jq -r 'select(.type == "result") |
+            [
+              (.usage.input_tokens // 0),
+              (.usage.output_tokens // 0),
+              (.usage.cache_read_input_tokens // 0),
+              (.usage.cache_creation_input_tokens // 0),
+              (.num_turns // 0),
+              (.total_cost_usd // 0)
+            ] | @tsv' 2>/dev/null || true
+    )
+
+    [ -z "${inp:-}" ] && continue
+
+    labels+=("$label")
+    inps+=("$inp")
+    outs+=("$out")
+    crs+=("$cr")
+    cws+=("$cw")
+    turnss+=("$turns")
+    costs+=("$cost")
+
+    total_inp=$((total_inp + inp))
+    total_out=$((total_out + out))
+    total_cr=$((total_cr + cr))
+    total_cw=$((total_cw + cw))
+    total_turns=$((total_turns + turns))
+    total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
+  done < <(find "$log_dir" -maxdepth 1 -name '*.jsonl' 2>/dev/null | sort)
+
+  [ "${#labels[@]}" -eq 0 ] && return 0
+
+  local sep
+  sep=$(printf '%86s' '' | tr ' ' '-')
+
+  printf '\n=== Alucard Token Usage: %s ===\n' "$(basename "$log_dir")"
+  printf '%-22s  %10s  %8s  %12s  %12s  %5s  %8s\n' \
+    "Agent" "Input" "Output" "Cache Read" "Cache Write" "Turns" "Cost"
+  printf '%s\n' "$sep"
+
+  local i
+  for i in "${!labels[@]}"; do
+    printf '%-22s  %10s  %8s  %12s  %12s  %5s  %8s\n' \
+      "${labels[$i]}" "${inps[$i]}" "${outs[$i]}" "${crs[$i]}" "${cws[$i]}" \
+      "${turnss[$i]}" "$(printf '$%.3f' "${costs[$i]}")"
+  done
+
+  printf '%s\n' "$sep"
+  printf '%-22s  %10s  %8s  %12s  %12s  %5s  %8s\n' \
+    "TOTAL" "$total_inp" "$total_out" "$total_cr" "$total_cw" "$total_turns" \
+    "$(printf '$%.3f' "$total_cost")"
+  printf '\n'
+}
+
 command_build() {
   IMAGE="$DEFAULT_IMAGE"
 
@@ -826,6 +907,7 @@ $(printf '%s' "$feedback_findings" | xml_escape)
     for wt in "${CREATED_WORKTREES[@]}"; do
       rm -rf "$wt"
     done
+    print_usage_report "$LOG_DIR"
   }
   trap cleanup EXIT
 
