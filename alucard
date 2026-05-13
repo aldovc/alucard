@@ -323,18 +323,21 @@ print_usage_report() {
     esac
 
     local inp out cr cw turns cost
+    # read returns non-zero on empty input; guard with || true so set -e doesn't
+    # abort the report when a log has no result line (timeout, Ctrl+C, etc.)
     IFS=$'\t' read -r inp out cr cw turns cost < <(
       tail -n 20 "$f" | grep '"type":"result"' | tail -1 \
         | jq -r 'select(.type == "result") |
+            ([ .modelUsage // {} | to_entries[] | .value ] as $m |
             [
-              (.usage.input_tokens // 0),
-              (.usage.output_tokens // 0),
-              (.usage.cache_read_input_tokens // 0),
-              (.usage.cache_creation_input_tokens // 0),
+              ([$m[].inputTokens            // 0] | add // 0),
+              ([$m[].outputTokens           // 0] | add // 0),
+              ([$m[].cacheReadInputTokens   // 0] | add // 0),
+              ([$m[].cacheCreationInputTokens // 0] | add // 0),
               (.num_turns // 0),
               (.total_cost_usd // 0)
-            ] | @tsv' 2>/dev/null || true
-    )
+            ]) | @tsv' 2>/dev/null || true
+    ) || true
 
     [ -z "${inp:-}" ] && continue
 
@@ -352,7 +355,7 @@ print_usage_report() {
     total_cw=$((total_cw + cw))
     total_turns=$((total_turns + turns))
     total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
-  done < <(find "$log_dir" -maxdepth 1 -name '*.jsonl' 2>/dev/null | sort)
+  done < <(find "$log_dir" -maxdepth 1 -name '*.jsonl' 2>/dev/null | sort -V)
 
   [ "${#labels[@]}" -eq 0 ] && return 0
 
