@@ -28,6 +28,33 @@ Review the PR end to end:
 6. Check CI status: `gh pr checks <pr_num>`
 7. Evaluate security — any injection, auth bypass, data exposure, or trust-boundary issues?
 
+## Engineering standards checklist
+
+Flag any of the following as **CHANGES_REQUESTED**. These are not style preferences — each category represents a class of bugs, maintenance traps, or design failures.
+
+### Correctness hazards
+- **Fire-and-forget without exception logging**: `asyncio.create_task(...)` silently drops exceptions. Every detached task must attach a done-callback that logs failures.
+- **Raw secrets in function signatures**: tokens, API keys, or credentials passed as plain `str` parameters must be encapsulated in a config or client object — they must not be threaded through call chains where they leak into logs or tracebacks.
+- **Missing input validation at trust boundaries**: data from webhooks, external APIs, or user input must be validated before use; trust internal application code, not external callers.
+
+### Contract and layer violations
+- **Abstraction bypass**: if the codebase already has a helper for an external call (e.g. `send_reply` for Telegram), new code touching the same API must use it — never re-implement the same call inline.
+- **Layer crossing**: a router must not download files; a domain model must not make HTTP calls; a service must not format user-facing strings. Each layer has a contract — flag crossings regardless of whether they "work."
+- **Workarounds dressed as solutions**: if the implementation patches around a constraint (test monkey-patching, skipping validation, hardcoding a value to pass a test) rather than solving it properly, flag it. Shortcuts that exist only to satisfy acceptance criteria are bugs deferred.
+
+### Reusability and DRY
+- **Duplicated logic**: if the same behaviour (URL construction, error handling, response formatting) appears in two or more places, flag it. The fix is extraction, not tolerance.
+- **Deferred imports without justification**: `import` inside a function body hides dependencies. Flag unless a comment names the specific circular-import being avoided.
+
+### Magic values
+- **Magic numbers**: unnamed numeric literals that carry domain meaning (thresholds, limits, timeouts, status codes) must be named constants.
+- **Magic strings**: hardcoded external URLs, status strings, or message templates embedded in logic must be constants or config — not inline literals.
+
+### Anti-patterns
+- **God function**: a single function that downloads, classifies, routes, and dispatches is doing four jobs. Flag functions whose responsibilities cannot be stated in one sentence.
+- **Stringly-typed dispatch**: using raw strings or untyped values to branch on behaviour where an enum or polymorphism would make invalid states unrepresentable.
+- **Swallowed exceptions**: bare `except Exception: pass` or logging without re-raise (unless the fallback behaviour is explicit and intentional) hides bugs. Flag any exception handler that does not either recover deliberately or propagate.
+
 ## Verdict
 
 **APPROVED** — all acceptance criteria are met, CI is green, and there are no correctness, security, or test gaps that should block merge.

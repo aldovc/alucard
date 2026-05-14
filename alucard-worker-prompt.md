@@ -77,6 +77,32 @@ NEXT=$(printf "%06d" $(( ${USED:-0} + 1 )))
 
 Name your file with `$NEXT`. Two iterations that started from the same base-branch snapshot will otherwise both claim the same number and one will fail to apply.
 
+## Self-review before commit
+
+Before running lint and tests, read your own diff and check for each of the following. Fix any you find — the reviewer will catch them if you don't.
+
+**Correctness hazards**
+- Every `asyncio.create_task(...)` has a done-callback that logs exceptions.
+- No token, API key, or credential is passed as a plain `str` parameter through more than one function boundary.
+- External/user input is validated at the trust boundary before use.
+
+**Contract and layer violations**
+- You are not re-implementing a call that an existing helper already makes.
+- Each function stays in its layer: routers route, services process, clients talk to external APIs.
+- Nothing in the implementation exists only to satisfy a test or pass acceptance criteria by patching around the real problem.
+
+**Reusability and DRY**
+- No logic block appears in two places. If it does, extract it.
+- Any `import` inside a function body has a comment naming the circular-import it avoids.
+
+**Magic values**
+- Every numeric or string literal that carries domain meaning is a named constant.
+- No external service URL is an inline string in a function body.
+
+**Anti-patterns**
+- Each function's responsibility can be stated in one sentence. If it cannot, split it.
+- No `except` block silently swallows an exception without either a deliberate fallback or explicit logging.
+
 ## Verify
 
 Run the project's lint and test commands (e.g. `just lint && just test`). Do not proceed if they fail — fix or revert. A passing local check before commit is non-negotiable.
