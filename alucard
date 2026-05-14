@@ -381,6 +381,90 @@ print_usage_report() {
   printf '\n'
 }
 
+# Post a collapsible markdown token-usage table to the GitHub issue closed by
+# this iteration's PR.
+# $1 = iteration index, $2 = branch, $3 = repo abs path, $4 = log dir
+post_iteration_usage() {
+  local iter="$1" branch="$2" repo_abs="$3" log_dir="$4"
+
+  local pr_num
+  pr_num=$(cd "$repo_abs" && \
+    gh pr list --head "$branch" --state all --json number \
+      --jq '.[0].number // empty' 2>/dev/null || true)
+  [ -n "${pr_num:-}" ] || return 0
+
+  local issue_num
+  issue_num=$(cd "$repo_abs" && \
+    gh pr view "$pr_num" --json body --jq '.body' 2>/dev/null \
+    | grep -oiE '(closes|fixes|resolves)[[:space:]]+#[0-9]+' \
+    | grep -oE '[0-9]+' | head -1 || true)
+  [ -n "${issue_num:-}" ] || return 0
+
+  local -a rows=()
+  local total_inp=0 total_out=0 total_cr=0 total_cw=0 total_turns=0
+  local total_cost="0"
+  local f base label mid inp out cr cw turns cost
+
+  while IFS= read -r f; do
+    base=$(basename "$f" .jsonl)
+    case "$base" in
+      iter-${iter}-fix-*)
+        mid="${base#iter-}"; label="ci-fix ${mid/-fix-/.}" ;;
+      iter-${iter}-review-*)
+        mid="${base#iter-}"; label="review ${mid/-review-/.}" ;;
+      iter-${iter}-feedback-*)
+        mid="${base#iter-}"; label="feedback ${mid/-feedback-/.}" ;;
+      iter-${iter})
+        label="worker $iter" ;;
+      *)
+        continue ;;
+    esac
+
+    IFS=$'\t' read -r inp out cr cw turns cost < <(
+      tail -n 20 "$f" | grep '"type":"result"' | tail -1 \
+        | jq -r 'select(.type == "result") |
+            ([ .modelUsage // {} | to_entries[] | .value ] as $m |
+            [
+              ([$m[].inputTokens              // 0] | add // 0),
+              ([$m[].outputTokens             // 0] | add // 0),
+              ([$m[].cacheReadInputTokens     // 0] | add // 0),
+              ([$m[].cacheCreationInputTokens // 0] | add // 0),
+              (.num_turns // 0),
+              (.total_cost_usd // 0)
+            ]) | @tsv' 2>/dev/null || true
+    ) || true
+
+    [ -z "${inp:-}" ] && continue
+
+    rows+=("| ${label} | ${inp} | ${out} | ${cr} | ${cw} | ${turns} | \$$(printf '%.3f' "${cost}") |")
+    total_inp=$((total_inp + inp))
+    total_out=$((total_out + out))
+    total_cr=$((total_cr + cr))
+    total_cw=$((total_cw + cw))
+    total_turns=$((total_turns + turns))
+    total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
+  done < <(
+    { find "$log_dir" -maxdepth 1 -name "iter-${iter}.jsonl" 2>/dev/null
+      find "$log_dir" -maxdepth 1 -name "iter-${iter}-*.jsonl" 2>/dev/null
+    } | sort -V
+  )
+
+  [ "${#rows[@]}" -eq 0 ] && return 0
+
+  local body
+  body="<details><summary>🤖 Alucard token usage (iteration ${iter})</summary>
+
+| Agent | Input | Output | Cache Read | Cache Write | Turns | Cost |
+|-------|------:|-------:|-----------:|------------:|------:|-----:|
+$(printf '%s\n' "${rows[@]}")
+| **TOTAL** | **${total_inp}** | **${total_out}** | **${total_cr}** | **${total_cw}** | **${total_turns}** | **\$$(printf '%.3f' "${total_cost}")** |
+
+</details>"
+
+  echo "Posting token usage to issue #${issue_num}..."
+  cd "$repo_abs" && gh issue comment "$issue_num" --body "$body" 2>/dev/null || true
+}
+
 command_build() {
   IMAGE="$DEFAULT_IMAGE"
 
@@ -999,6 +1083,7 @@ $(printf '%s' "$feedback_findings" | xml_escape)
 
     ci_gate "$i" "$BRANCH" "$_origin_url"
     review_gate "$i" "$BRANCH" "$_origin_url"
+    post_iteration_usage "$i" "$BRANCH" "$REPO_ABS" "$LOG_DIR"
 
     if [ "$rc" -ne 0 ]; then
       echo "Iteration $i exited rc=$rc. Continuing."
