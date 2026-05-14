@@ -151,6 +151,7 @@ cp "$ALUCARD_HOME/alucard.env.example" "$ALUCARD_HOME/alucard.env"
    - Permissions: Contents R/W, Issues R/W, Pull requests R/W, Metadata R
    - Expiry: 30 days
    - Paste into `alucard.env` as `GITHUB_TOKEN=`
+   - **Note:** Fine-grained PATs cannot access the GitHub GraphQL `statusCheckRollup` field — GitHub has not shipped a "Checks" permission for fine-grained tokens ([known limitation](https://github.com/cli/cli/issues/12597)). Alucard detects this and falls back to polling `gh run list`, which works correctly. If you want the primary `gh pr checks --watch` path, use a **classic PAT with `repo` scope** instead.
 
 2. **Anthropic worker API key:**
    - console.anthropic.com → API keys → create new key named "alucard-worker"
