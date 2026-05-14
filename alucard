@@ -45,7 +45,7 @@ Run options:
       --image NAME             Docker image name. Default: ghcr.io/aldovc/alucard:latest.
       --logs-root PATH         Directory for run logs. Default: ./logs beside
                                this CLI.
-      --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 2.
+      --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 3.
       --no-build               Do not build the image if it is missing.
 
 Environment:
@@ -168,7 +168,7 @@ parse_repo_options() {
   LOG_ROOT="$DEFAULT_LOG_ROOT"
   ITERATIONS=20
   TIMEOUT_MIN=30
-  MAX_REVIEW_CYCLES=2
+  MAX_REVIEW_CYCLES=3
   AUTO_BUILD=true
   TARGET_REPO_SET=false
 

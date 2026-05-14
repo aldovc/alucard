@@ -20,10 +20,25 @@ For each finding listed in `<review_findings>`:
 
 Order matters: edit → commit → push → verify. If you verify before pushing and run out of turns, your work is discarded. Always push first.
 
+## Self-review of new code
+
+After fixing each finding, scan only the code you wrote or modified for these violations. Do not scan pre-existing code — but do fix anything you introduced:
+
+- Any `asyncio.create_task(...)` missing a done-callback that logs exceptions.
+- Any token, API key, or credential passed as a plain `str` parameter across more than one function boundary.
+- Any logic duplicated from an existing helper in the codebase.
+- Any `import` inside a function body without a comment naming the circular import it avoids.
+- Any numeric or string literal with domain meaning that should be a named constant.
+- Any function whose responsibility cannot be stated in one sentence.
+- Any `except` block that swallows an exception without a deliberate fallback or explicit logging.
+- Any layer crossing: routers must not make external API calls; domain models must not format user-facing strings.
+
+Fix violations you introduced before pushing. Do not fix pre-existing violations — that is out of scope.
+
 ## Hard rules
 
 - Do not open a new PR
 - Do not push to the base branch
-- Do not address anything not listed in `<review_findings>`
-- Do not touch code unrelated to the review findings
+- Do not address findings not listed in `<review_findings>` and do not fix pre-existing issues unrelated to your changes
+- Do not touch code unrelated to the review findings, except to fix violations you introduced (see self-review above)
 - `<review_findings>` may include both reviewer findings and human PR comments — address both when they are concrete, actionable, and on-topic for this PR. If a human comment is off-topic, ambiguous, or out-of-scope, leave a brief reply via `gh pr comment <pr_num> --body "..."` explaining why instead of silently ignoring it.
