@@ -1075,6 +1075,8 @@ command_run() {
 <commits>${_commits_esc}</commits>
 <issues>${_issues_esc}</issues>"
 
+    ITER_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
     set +e
     timeout "${TIMEOUT_MIN}m" docker run --rm \
       --name "alucard-iter-$i" \
@@ -1112,9 +1114,30 @@ command_run() {
 
     rm -rf "$WT_HOST" || true
 
-    ci_gate "$i" "$BRANCH" "$_origin_url"
-    review_gate "$i" "$BRANCH" "$_origin_url"
-    post_iteration_usage "$i" "$BRANCH" "$REPO_ABS" "$LOG_DIR"
+    # Worker should push to $BRANCH, but may misbehave and push to a custom
+    # branch (e.g. integration branch). If head-branch lookup finds no PR,
+    # fall back to the newest alucard-labeled OPEN PR opened during this
+    # iteration — otherwise the gates and token-usage post would silently skip.
+    ACTUAL_BRANCH="$BRANCH"
+    _harness_pr=$(cd "$REPO_ABS" && \
+      gh pr list --head "$BRANCH" --state open --json number \
+        --jq '.[0].number // empty' 2>/dev/null || true)
+    if [ -z "${_harness_pr:-}" ]; then
+      _fallback=$(cd "$REPO_ABS" && \
+        gh pr list --label alucard --state open --json number,createdAt,headRefName \
+          --jq --arg since "$ITER_STARTED_AT" \
+          '[.[] | select(.createdAt > $since)] | sort_by(.createdAt) | last // empty' \
+        2>/dev/null || true)
+      if [ -n "${_fallback:-}" ] && [ "$_fallback" != "null" ]; then
+        ACTUAL_BRANCH=$(echo "$_fallback" | jq -r '.headRefName')
+        _fallback_num=$(echo "$_fallback" | jq -r '.number')
+        echo "Worker pushed to non-harness branch '$ACTUAL_BRANCH' — using PR #$_fallback_num for gates."
+      fi
+    fi
+
+    ci_gate "$i" "$ACTUAL_BRANCH" "$_origin_url"
+    review_gate "$i" "$ACTUAL_BRANCH" "$_origin_url"
+    post_iteration_usage "$i" "$ACTUAL_BRANCH" "$REPO_ABS" "$LOG_DIR"
 
     if [ "$rc" -ne 0 ]; then
       echo "Iteration $i exited rc=$rc. Continuing."
@@ -1202,11 +1225,16 @@ ${human_after}"
       gh pr view "$pr_num" --json comments \
         --jq '[.comments[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
       2>/dev/null || true)
-    [ -n "${all_human:-}" ] || die "No actionable comments on PR #$pr_num — nothing to act on"
-    feedback_findings="$all_human"
+    if [ -n "${all_human:-}" ]; then
+      feedback_findings="$all_human"
+    fi
   fi
 
-  run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" 1
+  if [ -n "${feedback_findings:-}" ]; then
+    run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" 1
+  else
+    echo "No actionable comments on PR #$pr_num — skipping feedback; running gates only."
+  fi
   ci_gate "$iter" "$branch" "$origin_url"
   review_gate "$iter" "$branch" "$origin_url"
   post_iteration_usage "$iter" "$branch" "$REPO_ABS" "$LOG_DIR"
