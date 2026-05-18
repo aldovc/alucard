@@ -187,7 +187,7 @@ any_role_uses() {
   local provider="${1:?any_role_uses requires a PROVIDER argument}"
   local role resolved
   for role in WORKER CI_FIX REVIEWER FEEDBACK; do
-    resolved=$(resolve_provider "$role")
+    resolved=$(resolve_provider "$role") || return $?
     [ "$resolved" = "$provider" ] && return 0
   done
   return 1
