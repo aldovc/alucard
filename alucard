@@ -639,7 +639,9 @@ $(printf '%s' "$feedback_findings" | xml_escape)
   echo ""
   rm -rf "$wt_feedback" || true
 
-  [ "$feedback_rc" -ne 0 ] && echo "Feedback agent exited rc=$feedback_rc on cycle $cycle"
+  if [ "$feedback_rc" -ne 0 ]; then
+    echo "Feedback agent exited rc=$feedback_rc on cycle $cycle"
+  fi
 }
 
 # Run a fresh fix agent on the branch if CI fails after a PR is opened.
@@ -804,7 +806,9 @@ $(printf '%s' "$failure_log" | xml_escape)
     echo ""
     rm -rf "$wt_fix" || true
 
-    [ "$fix_rc" -ne 0 ] && echo "Fix agent exited rc=$fix_rc on attempt $ci_attempt"
+    if [ "$fix_rc" -ne 0 ]; then
+      echo "Fix agent exited rc=$fix_rc on attempt $ci_attempt"
+    fi
   done
 }
 
