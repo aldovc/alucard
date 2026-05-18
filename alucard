@@ -22,6 +22,7 @@ Usage:
   alucard queue [TARGET_REPO] [options]
   alucard build [options]
   alucard doctor [TARGET_REPO] [options]
+  alucard continue <PR_NUM> [TARGET_REPO] [options]
 
 TARGET_REPO accepts:
   /path/to/local/repo          existing local git clone
@@ -33,6 +34,7 @@ Commands:
   queue     Print the currently eligible AFK issue queue as JSON.
   build     Build the Alucard Docker image.
   doctor    Check local prerequisites without running the worker.
+  continue  Re-run the feedback+CI+review pipeline on a parked PR.
 
 Run options:
   -C, --repo PATH              Target git repository. Defaults to
@@ -48,6 +50,11 @@ Run options:
       --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 3.
       --no-build               Do not build the image if it is missing.
 
+Continue options:
+  <PR_NUM>                     Open PR number to continue (required, positional).
+  Same flags as run apply: -C, -t, --env-file, --image, --logs-root,
+  --max-review-cycles, --no-build.
+
 Environment:
   ALUCARD_CACHE_DIR            Where GitHub repos are cached on first run.
                                Default: ~/.cache/alucard  (XDG_CACHE_HOME honoured)
@@ -57,6 +64,7 @@ Examples:
   alucard run /path/to/target-repo --iterations 1 --timeout-minutes 10
   ALUCARD_TARGET_REPO=/path/to/target-repo alucard run -n 20 -t 30
   cd /path/to/target-repo && alucard queue
+  alucard continue 174 -C /path/to/target-repo
 EOF
 }
 
@@ -568,6 +576,415 @@ command_doctor() {
   [ "$ok" = "true" ] || exit 1
 }
 
+# Run one feedback container against the PR's head branch.
+# $1=iter $2=branch $3=origin_url $4=pr_num $5=feedback_findings $6=cycle
+# Uses globals: WT_ROOT REPO_ABS LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
+#               CREATED_WORKTREES stream_text
+run_feedback_once() {
+  local iter="$1" branch="$2" origin_url="$3" pr_num="$4" feedback_findings="$5" cycle="$6"
+  local wt_feedback feedback_log feedback_rc
+
+  wt_feedback="${WT_ROOT}/feedback-${iter}-${cycle}"
+  CREATED_WORKTREES+=("$wt_feedback")
+  rm -rf "$wt_feedback"
+  git -C "$REPO_ABS" fetch origin "$branch"
+  git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
+  git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_feedback"
+  git -C "$wt_feedback" remote set-url origin "$origin_url"
+
+  feedback_log="$LOG_DIR/iter-${iter}-feedback-${cycle}.jsonl"
+
+  set +e
+  timeout "${TIMEOUT_MIN}m" docker run --rm \
+    --name "alucard-feedback-${iter}-${cycle}" \
+    --network bridge \
+    --memory 4g --cpus 2 \
+    --read-only \
+    --tmpfs /tmp:exec,size=1g \
+    --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
+    --user "$(id -u):$(id -g)" \
+    --security-opt no-new-privileges \
+    --cap-drop ALL \
+    -v "$wt_feedback:/work:rw" \
+    --env-file "$ENV_FILE" \
+    -e "ALUCARD_ITER=${iter}-feedback-${cycle}" \
+    -e "HOME=/home/alucard" \
+    -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
+    -e "GH_CONFIG_DIR=/tmp/gh" \
+    "$IMAGE" \
+    claude -p \
+      --verbose \
+      --output-format stream-json \
+      --include-partial-messages \
+      --permission-mode bypassPermissions \
+      --max-turns 50 \
+      --max-budget-usd 2 \
+      --fallback-model sonnet \
+      --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+      -- \
+      "<instructions>
+$(<"$TOOL_DIR/alucard-feedback-prompt.md")
+</instructions>
+<pr_num>${pr_num}</pr_num>
+<branch>${branch}</branch>
+<review_findings>
+$(printf '%s' "$feedback_findings" | xml_escape)
+</review_findings>" \
+    | grep --line-buffered '^{' \
+    | tee "$feedback_log" \
+    | jq --unbuffered -rj "$stream_text"
+  feedback_rc=${PIPESTATUS[0]}
+  set -e
+
+  echo ""
+  rm -rf "$wt_feedback" || true
+
+  [ "$feedback_rc" -ne 0 ] && echo "Feedback agent exited rc=$feedback_rc on cycle $cycle"
+}
+
+# Run a fresh fix agent on the branch if CI fails after a PR is opened.
+# $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
+# Uses globals: REPO_ABS WT_ROOT LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
+#               CREATED_WORKTREES stream_text
+ci_gate() {
+  local iter="$1" branch="$2" origin_url="$3"
+
+  local pr_num
+  pr_num=$(cd "$REPO_ABS" && \
+    gh pr list --head "$branch" --state open --json number \
+      --jq '.[0].number // empty' 2>/dev/null || true)
+
+  [ -n "${pr_num:-}" ] || return 0
+
+  echo "=== CI gate: PR #$pr_num on $branch ==="
+
+  local ci_attempt ci_rc failed_run_id failure_log wt_fix fix_log fix_rc _ci_err_file _ci_err pr_head_sha
+  for ci_attempt in 1 2 3; do
+    # Refresh each attempt so a fix-agent push moves to the new HEAD SHA.
+    pr_head_sha=$(cd "$REPO_ABS" && \
+      gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+    echo "Polling CI (attempt $ci_attempt/3)..."
+    _ci_err_file="$(mktemp /tmp/alucard_ci_err.XXXXXX)"
+    set +e
+    (cd "$REPO_ABS" && timeout 2700 gh pr checks "$pr_num" --watch --interval 30) \
+      2>"$_ci_err_file"
+    ci_rc=$?
+    _ci_err="$(cat "$_ci_err_file" 2>/dev/null || true)"
+    rm -f "$_ci_err_file"
+    [ -n "$_ci_err" ] && echo "$_ci_err" >&2
+    set -e
+
+    # No CI workflows configured (or none triggered for this PR's changed
+    # paths) — treat as a pass. Without this, `gh pr checks --watch` exits 1
+    # with "no checks reported", which falls through to the fix-agent loop
+    # and burns budget trying to repair CI that does not exist.
+    if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "no checks reported"; then
+      echo "No checks configured for PR #$pr_num — skipping CI gate."
+      ci_rc=0
+    fi
+
+    # Token lacks 'checks' read permission — fall back to polling gh run list.
+    if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "Resource not accessible"; then
+      echo "Token lacks 'checks' read permission — falling back to gh run list for PR #$pr_num..."
+      local deadline=$(( $(date +%s) + 2700 ))
+      ci_rc=1
+      local _found_runs=false
+      while [ "$(date +%s)" -lt "$deadline" ]; do
+        local run_json
+        run_json=$(cd "$REPO_ABS" && \
+          gh run list --branch "$branch" --json status,conclusion,databaseId,headSha \
+            --jq '[.[] | select(.status != "queued")]' 2>/dev/null || echo "[]")
+        if [ -n "${pr_head_sha:-}" ]; then
+          run_json=$(echo "$run_json" | jq --arg sha "$pr_head_sha" '[.[] | select(.headSha == $sha)]')
+        fi
+        local total in_progress failed
+        total=$(echo "$run_json" | jq 'length')
+        in_progress=$(echo "$run_json" | jq '[.[] | select(.status != "completed")] | length')
+        failed=$(echo "$run_json" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length')
+        if [ "$total" -eq 0 ]; then
+          echo "No workflow runs found yet — waiting..."
+          sleep 30; continue
+        fi
+        _found_runs=true
+        if [ "$in_progress" -gt 0 ]; then
+          echo "Runs still in progress ($in_progress/$total) — waiting..."
+          sleep 30; continue
+        fi
+        if [ "$failed" -gt 0 ]; then
+          ci_rc=1
+        else
+          ci_rc=0
+        fi
+        break
+      done
+      # No runs appeared during the entire polling window — token likely also
+      # lacks 'actions' read permission. Skip rather than fire spurious fix agents.
+      if [ "$_found_runs" = "false" ]; then
+        echo "No CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping CI gate."
+        ci_rc=0
+      fi
+    fi
+
+    if [ "$ci_rc" -eq 0 ]; then
+      echo "CI green — PR #$pr_num ready for review."
+      return 0
+    fi
+
+    if [ "$ci_attempt" -eq 3 ]; then
+      echo "CI still failing after 3 fix attempts — PR #$pr_num left open for manual review."
+      return 0
+    fi
+
+    echo "CI failed (attempt $ci_attempt) — launching fix agent..."
+
+    failed_run_id=$(cd "$REPO_ABS" && \
+      gh run list --branch "$branch" --json databaseId,conclusion,headSha \
+        --jq --arg sha "${pr_head_sha:-}" \
+        '[.[] | select(.conclusion=="failure" and ($sha == "" or .headSha == $sha))] | .[0].databaseId // empty' \
+        2>/dev/null || true)
+    failure_log=""
+    if [ -n "${failed_run_id:-}" ]; then
+      failure_log=$(cd "$REPO_ABS" && \
+        gh run view "$failed_run_id" --log-failed 2>/dev/null | head -400 || true)
+    fi
+
+    wt_fix="${WT_ROOT}/fix-${iter}-${ci_attempt}"
+    CREATED_WORKTREES+=("$wt_fix")
+    rm -rf "$wt_fix"
+    git -C "$REPO_ABS" fetch origin "$branch"
+    # fetch only creates origin/$branch; create a local branch so --local clone can find it
+    git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
+    git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_fix"
+    git -C "$wt_fix" remote set-url origin "$origin_url"
+
+    fix_log="$LOG_DIR/iter-${iter}-fix-${ci_attempt}.jsonl"
+
+    set +e
+    timeout "${TIMEOUT_MIN}m" docker run --rm \
+      --name "alucard-fix-${iter}-${ci_attempt}" \
+      --network bridge \
+      --memory 4g --cpus 2 \
+      --read-only \
+      --tmpfs /tmp:exec,size=1g \
+      --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
+      --user "$(id -u):$(id -g)" \
+      --security-opt no-new-privileges \
+      --cap-drop ALL \
+      -v "$wt_fix:/work:rw" \
+      --env-file "$ENV_FILE" \
+      -e "ALUCARD_ITER=${iter}-fix-${ci_attempt}" \
+      -e "HOME=/home/alucard" \
+      -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
+      -e "GH_CONFIG_DIR=/tmp/gh" \
+      "$IMAGE" \
+      claude -p \
+        --verbose \
+        --output-format stream-json \
+        --include-partial-messages \
+        --permission-mode bypassPermissions \
+        --max-turns 30 \
+        --max-budget-usd 2 \
+        --fallback-model sonnet \
+        --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+        -- \
+        "<instructions>
+$(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
+</instructions>
+<pr_num>${pr_num}</pr_num>
+<branch>${branch}</branch>
+<failure_log>
+$(printf '%s' "$failure_log" | xml_escape)
+</failure_log>" \
+      | grep --line-buffered '^{' \
+      | tee "$fix_log" \
+      | jq --unbuffered -rj "$stream_text"
+    fix_rc=${PIPESTATUS[0]}
+    set -e
+
+    echo ""
+    rm -rf "$wt_fix" || true
+
+    [ "$fix_rc" -ne 0 ] && echo "Fix agent exited rc=$fix_rc on attempt $ci_attempt"
+  done
+}
+
+# Run reviewer then feedback agents on the open PR, up to MAX_REVIEW_CYCLES times.
+# $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
+# Uses globals: REPO_ABS WT_ROOT LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
+#               CREATED_WORKTREES stream_text MAX_REVIEW_CYCLES
+review_gate() {
+  local iter="$1" branch="$2" origin_url="$3"
+
+  local pr_num
+  pr_num=$(cd "$REPO_ABS" && \
+    gh pr list --head "$branch" --state open --json number \
+      --jq '.[0].number // empty' 2>/dev/null || true)
+
+  [ -n "${pr_num:-}" ] || return 0
+
+  echo "=== Review gate: PR #$pr_num on $branch ==="
+
+  local review_cycle wt_review review_log review_rc review_state review_comments
+
+  for review_cycle in $(seq 1 "$MAX_REVIEW_CYCLES"); do
+    echo "Review cycle $review_cycle/$MAX_REVIEW_CYCLES — running reviewer agent..."
+
+    wt_review="${WT_ROOT}/review-${iter}-${review_cycle}"
+    local review_out_dir
+    review_out_dir=$(mktemp -d /tmp/alucard_review.XXXXXX)
+    CREATED_WORKTREES+=("$wt_review" "$review_out_dir")
+    rm -rf "$wt_review"
+    git -C "$REPO_ABS" fetch origin "$branch"
+    git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
+    git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_review"
+    git -C "$wt_review" remote set-url origin "$origin_url"
+
+    review_log="$LOG_DIR/iter-${iter}-review-${review_cycle}.jsonl"
+
+    set +e
+    timeout "${TIMEOUT_MIN}m" docker run --rm \
+      --name "alucard-review-${iter}-${review_cycle}" \
+      --network bridge \
+      --memory 4g --cpus 2 \
+      --read-only \
+      --tmpfs /tmp:exec,size=1g \
+      --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
+      --user "$(id -u):$(id -g)" \
+      --security-opt no-new-privileges \
+      --cap-drop ALL \
+      -v "$wt_review:/work:ro" \
+      -v "$review_out_dir:/work-output:rw" \
+      --env-file "$ENV_FILE" \
+      -e "ALUCARD_ITER=${iter}-review-${review_cycle}" \
+      -e "HOME=/home/alucard" \
+      -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
+      -e "GH_CONFIG_DIR=/tmp/gh" \
+      "$IMAGE" \
+      claude -p \
+        --verbose \
+        --output-format stream-json \
+        --include-partial-messages \
+        --permission-mode bypassPermissions \
+        --max-turns 20 \
+        --max-budget-usd 2 \
+        --fallback-model sonnet \
+        --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+        -- \
+        "<instructions>
+$(<"$TOOL_DIR/alucard-reviewer-prompt.md")
+</instructions>
+<pr_num>${pr_num}</pr_num>" \
+      | grep --line-buffered '^{' \
+      | tee "$review_log" \
+      | jq --unbuffered -rj "$stream_text"
+    review_rc=${PIPESTATUS[0]}
+    set -e
+
+    echo ""
+
+    # Read reviewer output files (written to the separate rw output dir).
+    local _review_file_state="" _review_file_body=""
+    if [ -f "$review_out_dir/.alucard-review" ]; then
+      _review_file_state=$(tr -d '[:space:]' < "$review_out_dir/.alucard-review")
+    fi
+    if [ -f "$review_out_dir/.alucard-review-body" ]; then
+      _review_file_body=$(< "$review_out_dir/.alucard-review-body")
+    fi
+
+    rm -rf "$wt_review" "$review_out_dir" || true
+
+    review_state=$(cd "$REPO_ABS" && \
+      gh pr view "$pr_num" --json reviews \
+        --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .state // empty' \
+      2>/dev/null || true)
+
+    review_comments=$(cd "$REPO_ABS" && \
+      gh pr view "$pr_num" --json reviews \
+        --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .body // ""' \
+      2>/dev/null || true)
+
+    # GitHub blocks formal self-review when the bot token == the PR author,
+    # so most runs land here with no formal review on the PR. Trust the
+    # reviewer's decision files (APPROVED or CHANGES_REQUESTED). The earlier
+    # concern that file-APPROVED "silently skips the feedback loop" is moot:
+    # skipping feedback is exactly the correct behavior for APPROVED, and
+    # dropping the verdict entirely (the previous behavior) hid the reviewer's
+    # reasoning from the operator without making the loop any safer. The real
+    # mitigation for self-approval is the two-token reviewer identity tracked
+    # as deferred item #5 in README.md.
+    local _self_review_note=""
+    if [ -z "$review_state" ] && \
+       { [ "$_review_file_state" = "CHANGES_REQUESTED" ] || [ "$_review_file_state" = "APPROVED" ]; }; then
+      review_state="$_review_file_state"
+      review_comments="$_review_file_body"
+      _self_review_note="
+
+_(Self-review: GitHub blocked a formal \`gh pr review\` because the bot is also the PR author. Verdict and body come from the reviewer agent's decision file.)_"
+      echo "No formal review found — using decision file: $review_state"
+    fi
+
+    if [ "$review_state" = "APPROVED" ]; then
+      echo "PR #$pr_num approved — ready to merge."
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
+
+${review_comments}${_self_review_note}" 2>/dev/null || true
+      return 0
+    fi
+
+    if [ -z "$review_state" ]; then
+      echo "Reviewer did not post a review (rc=$review_rc) — skipping review gate."
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: no review posted** (rc=${review_rc})" \
+        2>/dev/null || true
+      return 0
+    fi
+
+    # CHANGES_REQUESTED path — post findings for audit before acting on them
+    cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+      "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: CHANGES_REQUESTED**
+
+${review_comments}${_self_review_note}" 2>/dev/null || true
+
+    if [ "$review_cycle" -eq "$MAX_REVIEW_CYCLES" ]; then
+      echo "Max review cycles ($MAX_REVIEW_CYCLES) reached — PR #$pr_num left open for manual review."
+      return 0
+    fi
+
+    echo "Changes requested — launching feedback agent (cycle $review_cycle)..."
+
+    # Augment reviewer findings with human-authored PR comments so the
+    # feedback agent sees the user's questions/asks alongside the reviewer's
+    # findings. Note: alucard runs under a human PAT, so author-based filtering
+    # would also drop legitimate human comments. Instead, filter by body prefix
+    # — all wrapper-posted comments start with "**🤖 Alucard …**". Reviewer
+    # prompt no longer falls back to `gh pr comment`, so this prefix uniquely
+    # identifies bot-self comments going forward.
+    local human_comments feedback_findings
+    human_comments=$(cd "$REPO_ABS" && \
+      gh pr view "$pr_num" --json comments --jq '.comments' 2>/dev/null \
+      | jq -r '[.[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
+      2>/dev/null || true)
+    feedback_findings="$review_comments"
+    if [ -n "$human_comments" ]; then
+      feedback_findings="${feedback_findings}
+
+---
+
+## Additional human PR comments
+
+Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment\` rather than silently ignored.
+
+${human_comments}"
+    fi
+
+    run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" "$review_cycle"
+
+    # Re-check CI before the next reviewer sees the updated branch.
+    ci_gate "$iter" "$branch" "$origin_url"
+  done
+}
+
 command_run() {
   parse_repo_options "$@"
 
@@ -594,400 +1011,6 @@ command_run() {
   stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
   final_result='select(.type == "result").result // empty'
   CREATED_WORKTREES=()
-
-  # Run a fresh fix agent on the branch if CI fails after a PR is opened.
-  # $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
-  ci_gate() {
-    local iter="$1" branch="$2" origin_url="$3"
-
-    local pr_num
-    pr_num=$(cd "$REPO_ABS" && \
-      gh pr list --head "$branch" --state open --json number \
-        --jq '.[0].number // empty' 2>/dev/null || true)
-
-    [ -n "${pr_num:-}" ] || return 0
-
-    echo "=== CI gate: PR #$pr_num on $branch ==="
-
-    local ci_attempt ci_rc failed_run_id failure_log wt_fix fix_log fix_rc _ci_err_file _ci_err pr_head_sha
-    for ci_attempt in 1 2 3; do
-      # Refresh each attempt so a fix-agent push moves to the new HEAD SHA.
-      pr_head_sha=$(cd "$REPO_ABS" && \
-        gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
-      echo "Polling CI (attempt $ci_attempt/3)..."
-      _ci_err_file="$(mktemp /tmp/alucard_ci_err.XXXXXX)"
-      set +e
-      (cd "$REPO_ABS" && timeout 2700 gh pr checks "$pr_num" --watch --interval 30) \
-        2>"$_ci_err_file"
-      ci_rc=$?
-      _ci_err="$(cat "$_ci_err_file" 2>/dev/null || true)"
-      rm -f "$_ci_err_file"
-      [ -n "$_ci_err" ] && echo "$_ci_err" >&2
-      set -e
-
-      # No CI workflows configured (or none triggered for this PR's changed
-      # paths) — treat as a pass. Without this, `gh pr checks --watch` exits 1
-      # with "no checks reported", which falls through to the fix-agent loop
-      # and burns budget trying to repair CI that does not exist.
-      if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "no checks reported"; then
-        echo "No checks configured for PR #$pr_num — skipping CI gate."
-        ci_rc=0
-      fi
-
-      # Token lacks 'checks' read permission — fall back to polling gh run list.
-      if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "Resource not accessible"; then
-        echo "Token lacks 'checks' read permission — falling back to gh run list for PR #$pr_num..."
-        local deadline=$(( $(date +%s) + 2700 ))
-        ci_rc=1
-        local _found_runs=false
-        while [ "$(date +%s)" -lt "$deadline" ]; do
-          local run_json
-          run_json=$(cd "$REPO_ABS" && \
-            gh run list --branch "$branch" --json status,conclusion,databaseId,headSha \
-              --jq '[.[] | select(.status != "queued")]' 2>/dev/null || echo "[]")
-          if [ -n "${pr_head_sha:-}" ]; then
-            run_json=$(echo "$run_json" | jq --arg sha "$pr_head_sha" '[.[] | select(.headSha == $sha)]')
-          fi
-          local total in_progress failed
-          total=$(echo "$run_json" | jq 'length')
-          in_progress=$(echo "$run_json" | jq '[.[] | select(.status != "completed")] | length')
-          failed=$(echo "$run_json" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length')
-          if [ "$total" -eq 0 ]; then
-            echo "No workflow runs found yet — waiting..."
-            sleep 30; continue
-          fi
-          _found_runs=true
-          if [ "$in_progress" -gt 0 ]; then
-            echo "Runs still in progress ($in_progress/$total) — waiting..."
-            sleep 30; continue
-          fi
-          if [ "$failed" -gt 0 ]; then
-            ci_rc=1
-          else
-            ci_rc=0
-          fi
-          break
-        done
-        # No runs appeared during the entire polling window — token likely also
-        # lacks 'actions' read permission. Skip rather than fire spurious fix agents.
-        if [ "$_found_runs" = "false" ]; then
-          echo "No CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping CI gate."
-          ci_rc=0
-        fi
-      fi
-
-      if [ "$ci_rc" -eq 0 ]; then
-        echo "CI green — PR #$pr_num ready for review."
-        return 0
-      fi
-
-      if [ "$ci_attempt" -eq 3 ]; then
-        echo "CI still failing after 3 fix attempts — PR #$pr_num left open for manual review."
-        return 0
-      fi
-
-      echo "CI failed (attempt $ci_attempt) — launching fix agent..."
-
-      failed_run_id=$(cd "$REPO_ABS" && \
-        gh run list --branch "$branch" --json databaseId,conclusion,headSha \
-          --jq --arg sha "${pr_head_sha:-}" \
-          '[.[] | select(.conclusion=="failure" and ($sha == "" or .headSha == $sha))] | .[0].databaseId // empty' \
-          2>/dev/null || true)
-      failure_log=""
-      if [ -n "${failed_run_id:-}" ]; then
-        failure_log=$(cd "$REPO_ABS" && \
-          gh run view "$failed_run_id" --log-failed 2>/dev/null | head -400 || true)
-      fi
-
-      wt_fix="${WT_ROOT}/fix-${iter}-${ci_attempt}"
-      CREATED_WORKTREES+=("$wt_fix")
-      rm -rf "$wt_fix"
-      git -C "$REPO_ABS" fetch origin "$branch"
-      # fetch only creates origin/$branch; create a local branch so --local clone can find it
-      git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
-      git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_fix"
-      git -C "$wt_fix" remote set-url origin "$origin_url"
-
-      fix_log="$LOG_DIR/iter-${iter}-fix-${ci_attempt}.jsonl"
-
-      set +e
-      timeout "${TIMEOUT_MIN}m" docker run --rm \
-        --name "alucard-fix-${iter}-${ci_attempt}" \
-        --network bridge \
-        --memory 4g --cpus 2 \
-        --read-only \
-        --tmpfs /tmp:exec,size=1g \
-        --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
-        --user "$(id -u):$(id -g)" \
-        --security-opt no-new-privileges \
-        --cap-drop ALL \
-        -v "$wt_fix:/work:rw" \
-        --env-file "$ENV_FILE" \
-        -e "ALUCARD_ITER=${iter}-fix-${ci_attempt}" \
-        -e "HOME=/home/alucard" \
-        -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-        -e "GH_CONFIG_DIR=/tmp/gh" \
-        "$IMAGE" \
-        claude -p \
-          --verbose \
-          --output-format stream-json \
-          --include-partial-messages \
-          --permission-mode bypassPermissions \
-          --max-turns 30 \
-          --max-budget-usd 2 \
-          --fallback-model sonnet \
-          --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
-          -- \
-          "<instructions>
-$(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
-</instructions>
-<pr_num>${pr_num}</pr_num>
-<branch>${branch}</branch>
-<failure_log>
-$(printf '%s' "$failure_log" | xml_escape)
-</failure_log>" \
-        | grep --line-buffered '^{' \
-        | tee "$fix_log" \
-        | jq --unbuffered -rj "$stream_text"
-      fix_rc=${PIPESTATUS[0]}
-      set -e
-
-      echo ""
-      rm -rf "$wt_fix" || true
-
-      [ "$fix_rc" -ne 0 ] && echo "Fix agent exited rc=$fix_rc on attempt $ci_attempt"
-    done
-  }
-
-  # Run reviewer then feedback agents on the open PR, up to MAX_REVIEW_CYCLES times.
-  # $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
-  review_gate() {
-    local iter="$1" branch="$2" origin_url="$3"
-
-    local pr_num
-    pr_num=$(cd "$REPO_ABS" && \
-      gh pr list --head "$branch" --state open --json number \
-        --jq '.[0].number // empty' 2>/dev/null || true)
-
-    [ -n "${pr_num:-}" ] || return 0
-
-    echo "=== Review gate: PR #$pr_num on $branch ==="
-
-    local review_cycle wt_review review_log review_rc review_state review_comments wt_feedback feedback_log feedback_rc
-
-    for review_cycle in $(seq 1 "$MAX_REVIEW_CYCLES"); do
-      echo "Review cycle $review_cycle/$MAX_REVIEW_CYCLES — running reviewer agent..."
-
-      wt_review="${WT_ROOT}/review-${iter}-${review_cycle}"
-      local review_out_dir
-      review_out_dir=$(mktemp -d /tmp/alucard_review.XXXXXX)
-      CREATED_WORKTREES+=("$wt_review" "$review_out_dir")
-      rm -rf "$wt_review"
-      git -C "$REPO_ABS" fetch origin "$branch"
-      git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
-      git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_review"
-      git -C "$wt_review" remote set-url origin "$origin_url"
-
-      review_log="$LOG_DIR/iter-${iter}-review-${review_cycle}.jsonl"
-
-      set +e
-      timeout "${TIMEOUT_MIN}m" docker run --rm \
-        --name "alucard-review-${iter}-${review_cycle}" \
-        --network bridge \
-        --memory 4g --cpus 2 \
-        --read-only \
-        --tmpfs /tmp:exec,size=1g \
-        --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
-        --user "$(id -u):$(id -g)" \
-        --security-opt no-new-privileges \
-        --cap-drop ALL \
-        -v "$wt_review:/work:ro" \
-        -v "$review_out_dir:/work-output:rw" \
-        --env-file "$ENV_FILE" \
-        -e "ALUCARD_ITER=${iter}-review-${review_cycle}" \
-        -e "HOME=/home/alucard" \
-        -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-        -e "GH_CONFIG_DIR=/tmp/gh" \
-        "$IMAGE" \
-        claude -p \
-          --verbose \
-          --output-format stream-json \
-          --include-partial-messages \
-          --permission-mode bypassPermissions \
-          --max-turns 20 \
-          --max-budget-usd 2 \
-          --fallback-model sonnet \
-          --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
-          -- \
-          "<instructions>
-$(<"$TOOL_DIR/alucard-reviewer-prompt.md")
-</instructions>
-<pr_num>${pr_num}</pr_num>" \
-        | grep --line-buffered '^{' \
-        | tee "$review_log" \
-        | jq --unbuffered -rj "$stream_text"
-      review_rc=${PIPESTATUS[0]}
-      set -e
-
-      echo ""
-
-      # Read reviewer output files (written to the separate rw output dir).
-      local _review_file_state="" _review_file_body=""
-      if [ -f "$review_out_dir/.alucard-review" ]; then
-        _review_file_state=$(tr -d '[:space:]' < "$review_out_dir/.alucard-review")
-      fi
-      if [ -f "$review_out_dir/.alucard-review-body" ]; then
-        _review_file_body=$(< "$review_out_dir/.alucard-review-body")
-      fi
-
-      rm -rf "$wt_review" "$review_out_dir" || true
-
-      review_state=$(cd "$REPO_ABS" && \
-        gh pr view "$pr_num" --json reviews \
-          --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .state // empty' \
-        2>/dev/null || true)
-
-      review_comments=$(cd "$REPO_ABS" && \
-        gh pr view "$pr_num" --json reviews \
-          --jq '[.reviews[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")] | last | .body // ""' \
-        2>/dev/null || true)
-
-      # GitHub blocks formal self-review when the bot token == the PR author,
-      # so most runs land here with no formal review on the PR. Trust the
-      # reviewer's decision files (APPROVED or CHANGES_REQUESTED). The earlier
-      # concern that file-APPROVED "silently skips the feedback loop" is moot:
-      # skipping feedback is exactly the correct behavior for APPROVED, and
-      # dropping the verdict entirely (the previous behavior) hid the reviewer's
-      # reasoning from the operator without making the loop any safer. The real
-      # mitigation for self-approval is the two-token reviewer identity tracked
-      # as deferred item #5 in README.md.
-      local _self_review_note=""
-      if [ -z "$review_state" ] && \
-         { [ "$_review_file_state" = "CHANGES_REQUESTED" ] || [ "$_review_file_state" = "APPROVED" ]; }; then
-        review_state="$_review_file_state"
-        review_comments="$_review_file_body"
-        _self_review_note="
-
-_(Self-review: GitHub blocked a formal \`gh pr review\` because the bot is also the PR author. Verdict and body come from the reviewer agent's decision file.)_"
-        echo "No formal review found — using decision file: $review_state"
-      fi
-
-      if [ "$review_state" = "APPROVED" ]; then
-        echo "PR #$pr_num approved — ready to merge."
-        cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-          "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
-
-${review_comments}${_self_review_note}" 2>/dev/null || true
-        return 0
-      fi
-
-      if [ -z "$review_state" ]; then
-        echo "Reviewer did not post a review (rc=$review_rc) — skipping review gate."
-        cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-          "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: no review posted** (rc=${review_rc})" \
-          2>/dev/null || true
-        return 0
-      fi
-
-      # CHANGES_REQUESTED path — post findings for audit before acting on them
-      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: CHANGES_REQUESTED**
-
-${review_comments}${_self_review_note}" 2>/dev/null || true
-
-      if [ "$review_cycle" -eq "$MAX_REVIEW_CYCLES" ]; then
-        echo "Max review cycles ($MAX_REVIEW_CYCLES) reached — PR #$pr_num left open for manual review."
-        return 0
-      fi
-
-      echo "Changes requested — launching feedback agent (cycle $review_cycle)..."
-
-      # Augment reviewer findings with human-authored PR comments so the
-      # feedback agent sees the user's questions/asks alongside the reviewer's
-      # findings. Note: alucard runs under a human PAT, so author-based filtering
-      # would also drop legitimate human comments. Instead, filter by body prefix
-      # — all wrapper-posted comments start with "**🤖 Alucard …**". Reviewer
-      # prompt no longer falls back to `gh pr comment`, so this prefix uniquely
-      # identifies bot-self comments going forward.
-      local human_comments feedback_findings
-      human_comments=$(cd "$REPO_ABS" && \
-        gh pr view "$pr_num" --json comments --jq '.comments' 2>/dev/null \
-        | jq -r '[.[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
-        2>/dev/null || true)
-      feedback_findings="$review_comments"
-      if [ -n "$human_comments" ]; then
-        feedback_findings="${feedback_findings}
-
----
-
-## Additional human PR comments
-
-Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment\` rather than silently ignored.
-
-${human_comments}"
-      fi
-
-      wt_feedback="${WT_ROOT}/feedback-${iter}-${review_cycle}"
-      CREATED_WORKTREES+=("$wt_feedback")
-      rm -rf "$wt_feedback"
-      git -C "$REPO_ABS" fetch origin "$branch"
-      git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
-      git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_feedback"
-      git -C "$wt_feedback" remote set-url origin "$origin_url"
-
-      feedback_log="$LOG_DIR/iter-${iter}-feedback-${review_cycle}.jsonl"
-
-      set +e
-      timeout "${TIMEOUT_MIN}m" docker run --rm \
-        --name "alucard-feedback-${iter}-${review_cycle}" \
-        --network bridge \
-        --memory 4g --cpus 2 \
-        --read-only \
-        --tmpfs /tmp:exec,size=1g \
-        --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
-        --user "$(id -u):$(id -g)" \
-        --security-opt no-new-privileges \
-        --cap-drop ALL \
-        -v "$wt_feedback:/work:rw" \
-        --env-file "$ENV_FILE" \
-        -e "ALUCARD_ITER=${iter}-feedback-${review_cycle}" \
-        -e "HOME=/home/alucard" \
-        -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-        -e "GH_CONFIG_DIR=/tmp/gh" \
-        "$IMAGE" \
-        claude -p \
-          --verbose \
-          --output-format stream-json \
-          --include-partial-messages \
-          --permission-mode bypassPermissions \
-          --max-turns 50 \
-          --max-budget-usd 2 \
-          --fallback-model sonnet \
-          --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
-          -- \
-          "<instructions>
-$(<"$TOOL_DIR/alucard-feedback-prompt.md")
-</instructions>
-<pr_num>${pr_num}</pr_num>
-<branch>${branch}</branch>
-<review_findings>
-$(printf '%s' "$feedback_findings" | xml_escape)
-</review_findings>" \
-        | grep --line-buffered '^{' \
-        | tee "$feedback_log" \
-        | jq --unbuffered -rj "$stream_text"
-      feedback_rc=${PIPESTATUS[0]}
-      set -e
-
-      echo ""
-      rm -rf "$wt_feedback" || true
-
-      [ "$feedback_rc" -ne 0 ] && echo "Feedback agent exited rc=$feedback_rc on cycle $review_cycle"
-
-      # Re-check CI before the next reviewer sees the updated branch.
-      ci_gate "$iter" "$branch" "$origin_url"
-    done
-  }
 
   cleanup() {
     local wt
@@ -1100,6 +1123,108 @@ $(printf '%s' "$feedback_findings" | xml_escape)
   echo "Reached max iterations ($ITERATIONS)."
 }
 
+command_continue() {
+  local pr_arg="${1:-}"
+  is_uint "$pr_arg" || die "usage: alucard continue <PR_NUM> [options] — PR_NUM must be a positive integer"
+  local pr_num="$pr_arg"
+  shift
+
+  parse_repo_options "$@"
+
+  need_cmd git
+  need_cmd gh
+  need_cmd jq
+  need_cmd docker
+  need_cmd timeout
+
+  REPO_ABS=$(resolve_repo "$TARGET_REPO")
+  [ -d "$(dirname "$ENV_FILE")" ] || die "env file directory does not exist: $(dirname "$ENV_FILE")"
+  ENV_FILE="$(cd "$(dirname "$ENV_FILE")" && pwd)/$(basename "$ENV_FILE")"
+  LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd)"
+  LOG_DIR="$LOG_ROOT/alucard-$(date +%Y%m%d-%H%M%S)"
+  WT_ROOT="${REPO_ABS}/.alucard-worktrees"
+
+  mkdir -p "$LOG_DIR" "$WT_ROOT"
+  load_env_file "$ENV_FILE" true
+  ensure_image "$IMAGE" "$AUTO_BUILD"
+
+  stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
+  CREATED_WORKTREES=()
+
+  cleanup() {
+    local wt
+    for wt in "${CREATED_WORKTREES[@]}"; do
+      rm -rf "$wt"
+    done
+    print_usage_report "$LOG_DIR"
+  }
+  trap cleanup EXIT
+
+  local pr_json pr_state branch origin_url
+  pr_json=$(cd "$REPO_ABS" && \
+    gh pr view "$pr_num" --json state,headRefName,headRefOid,url 2>/dev/null) \
+    || die "PR #$pr_num not found in target repo"
+  pr_state=$(echo "$pr_json" | jq -r '.state')
+  [ "$pr_state" = "OPEN" ] || die "PR #$pr_num is not open (state: $pr_state)"
+  branch=$(echo "$pr_json" | jq -r '.headRefName')
+
+  origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
+  origin_url="${origin_url/git@github.com:/https://github.com/}"
+
+  local iter
+  iter="continue-$(date +%s)"
+
+  echo "=== alucard continue: PR #$pr_num on $branch (iter $iter) ==="
+
+  # Build review_findings: last CHANGES_REQUESTED bot comment + all subsequent human comments.
+  # If no CHANGES_REQUESTED bot comment exists, fall back to all non-bot comments.
+  local last_bot_cr_body bot_cr_time human_after feedback_findings
+  last_bot_cr_body=$(cd "$REPO_ABS" && \
+    gh pr view "$pr_num" --json comments \
+      --jq '.comments | map(select(.body | startswith("**🤖 Alucard") and contains("CHANGES_REQUESTED"))) | last | .body // empty' \
+    2>/dev/null || true)
+
+  if [ -n "${last_bot_cr_body:-}" ]; then
+    bot_cr_time=$(cd "$REPO_ABS" && \
+      gh pr view "$pr_num" --json comments \
+        --jq '.comments | map(select(.body | startswith("**🤖 Alucard") and contains("CHANGES_REQUESTED"))) | last | .createdAt // empty' \
+      2>/dev/null || true)
+    human_after=""
+    if [ -n "${bot_cr_time:-}" ]; then
+      human_after=$(cd "$REPO_ABS" && \
+        gh pr view "$pr_num" --json comments \
+          --jq --arg since "$bot_cr_time" \
+          '[.comments[] | select((.body | startswith("**🤖 Alucard") | not) and .createdAt > $since) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
+        2>/dev/null || true)
+    fi
+    feedback_findings="$last_bot_cr_body"
+    if [ -n "${human_after:-}" ]; then
+      feedback_findings="${feedback_findings}
+
+---
+
+## Additional human PR comments
+
+Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment\` rather than silently ignored.
+
+${human_after}"
+    fi
+  else
+    local all_human
+    all_human=$(cd "$REPO_ABS" && \
+      gh pr view "$pr_num" --json comments \
+        --jq '[.comments[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
+      2>/dev/null || true)
+    [ -n "${all_human:-}" ] || die "No actionable comments on PR #$pr_num — nothing to act on"
+    feedback_findings="$all_human"
+  fi
+
+  run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" 1
+  ci_gate "$iter" "$branch" "$origin_url"
+  review_gate "$iter" "$branch" "$origin_url"
+  post_iteration_usage "$iter" "$branch" "$REPO_ABS" "$LOG_DIR"
+}
+
 main() {
   if [ "$#" -eq 0 ]; then
     usage
@@ -1133,6 +1258,9 @@ main() {
       ;;
     doctor)
       command_doctor "$@"
+      ;;
+    continue)
+      command_continue "$@"
       ;;
     help|-h|--help)
       usage
