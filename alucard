@@ -985,18 +985,7 @@ ${human_comments}"
   done
 }
 
-command_run() {
-  parse_repo_options "$@"
-
-  need_cmd git
-  need_cmd gh
-  need_cmd jq
-  need_cmd docker
-  need_cmd timeout
-
-  [ "$ITERATIONS" -gt 0 ] || die "iterations must be greater than zero"
-  [ "$TIMEOUT_MIN" -gt 0 ] || die "timeout must be greater than zero"
-
+setup_run_environment() {
   REPO_ABS=$(resolve_repo "$TARGET_REPO")
   [ -d "$(dirname "$ENV_FILE")" ] || die "env file directory does not exist: $(dirname "$ENV_FILE")"
   ENV_FILE="$(cd "$(dirname "$ENV_FILE")" && pwd)/$(basename "$ENV_FILE")"
@@ -1009,7 +998,6 @@ command_run() {
   ensure_image "$IMAGE" "$AUTO_BUILD"
 
   stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
-  final_result='select(.type == "result").result // empty'
   CREATED_WORKTREES=()
 
   cleanup() {
@@ -1020,6 +1008,22 @@ command_run() {
     print_usage_report "$LOG_DIR"
   }
   trap cleanup EXIT
+}
+
+command_run() {
+  parse_repo_options "$@"
+
+  need_cmd git
+  need_cmd gh
+  need_cmd jq
+  need_cmd docker
+  need_cmd timeout
+
+  [ "$ITERATIONS" -gt 0 ] || die "iterations must be greater than zero"
+  [ "$TIMEOUT_MIN" -gt 0 ] || die "timeout must be greater than zero"
+
+  setup_run_environment
+  final_result='select(.type == "result").result // empty'
 
   for ((i=1; i<=ITERATIONS; i++)); do
     echo "=== alucard iteration $i/$ITERATIONS ==="
@@ -1137,28 +1141,7 @@ command_continue() {
   need_cmd docker
   need_cmd timeout
 
-  REPO_ABS=$(resolve_repo "$TARGET_REPO")
-  [ -d "$(dirname "$ENV_FILE")" ] || die "env file directory does not exist: $(dirname "$ENV_FILE")"
-  ENV_FILE="$(cd "$(dirname "$ENV_FILE")" && pwd)/$(basename "$ENV_FILE")"
-  LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd)"
-  LOG_DIR="$LOG_ROOT/alucard-$(date +%Y%m%d-%H%M%S)"
-  WT_ROOT="${REPO_ABS}/.alucard-worktrees"
-
-  mkdir -p "$LOG_DIR" "$WT_ROOT"
-  load_env_file "$ENV_FILE" true
-  ensure_image "$IMAGE" "$AUTO_BUILD"
-
-  stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
-  CREATED_WORKTREES=()
-
-  cleanup() {
-    local wt
-    for wt in "${CREATED_WORKTREES[@]}"; do
-      rm -rf "$wt"
-    done
-    print_usage_report "$LOG_DIR"
-  }
-  trap cleanup EXIT
+  setup_run_environment
 
   local pr_json pr_state branch origin_url
   pr_json=$(cd "$REPO_ABS" && \
