@@ -185,9 +185,10 @@ resolve_provider() {
 # Returns 0 if any of the four agent roles resolves to PROVIDER, 1 otherwise.
 any_role_uses() {
   local provider="${1:?any_role_uses requires a PROVIDER argument}"
-  local role
+  local role resolved
   for role in WORKER CI_FIX REVIEWER FEEDBACK; do
-    [ "$(resolve_provider "$role")" = "$provider" ] && return 0
+    resolved=$(resolve_provider "$role")
+    [ "$resolved" = "$provider" ] && return 0
   done
   return 1
 }

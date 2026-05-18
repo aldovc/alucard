@@ -111,6 +111,10 @@ any_role_uses codex    && pass "all-codex: any_role_uses codex is true"  || fail
 any_role_uses claude   && fail "all-codex: any_role_uses claude should be false" || pass "all-codex: any_role_uses claude is false"
 unset ALUCARD_PROVIDER
 
+export ALUCARD_WORKER_PROVIDER=invalid
+assert_exit "any_role_uses exits non-zero when a role has an invalid provider" 1 any_role_uses claude
+unset ALUCARD_WORKER_PROVIDER
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
