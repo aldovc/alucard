@@ -168,6 +168,30 @@ ensure_image() {
   docker build -t "$image" "$TOOL_DIR"
 }
 
+# Resolves the AI provider for a given agent ROLE.
+# Checks ALUCARD_<ROLE>_PROVIDER, falls back to ALUCARD_PROVIDER, then 'claude'.
+# Valid values: claude, codex. Exits non-zero on an unrecognized value.
+resolve_provider() {
+  local role="${1:?resolve_provider requires a ROLE argument}"
+  local var="ALUCARD_${role}_PROVIDER"
+  local value="${!var:-}"
+  local provider="${value:-${ALUCARD_PROVIDER:-claude}}"
+  case "$provider" in
+    claude|codex) echo "$provider" ;;
+    *) die "unrecognized provider '${provider}' for role ${role}: must be 'claude' or 'codex'" ;;
+  esac
+}
+
+# Returns 0 if any of the four agent roles resolves to PROVIDER, 1 otherwise.
+any_role_uses() {
+  local provider="${1:?any_role_uses requires a PROVIDER argument}"
+  local role
+  for role in WORKER CI_FIX REVIEWER FEEDBACK; do
+    [ "$(resolve_provider "$role")" = "$provider" ] && return 0
+  done
+  return 1
+}
+
 parse_repo_options() {
   TARGET_REPO="${ALUCARD_TARGET_REPO:-$PWD}"
   IMAGE="$DEFAULT_IMAGE"
@@ -1258,4 +1282,4 @@ main() {
   esac
 }
 
-main "$@"
+[[ "${BASH_SOURCE[0]}" != "${0}" ]] || main "$@"
