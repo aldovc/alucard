@@ -74,7 +74,7 @@ flowchart TD
 alucard/
 ├── README.md                    # this file
 ├── alucard                      # CLI
-├── Dockerfile                   # node:20-slim + git + gh + claude code + alucard user
+├── Dockerfile                   # node:24.14.0-slim + git + gh + claude code + alucard user
 ├── entrypoint.sh                # configures git identity and gh auth at container start
 ├── alucard-worker-prompt.md     # worker agent instructions
 ├── alucard-reviewer-prompt.md   # reviewer agent instructions
