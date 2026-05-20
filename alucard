@@ -1156,7 +1156,7 @@ command_run() {
     invoke_agent \
       "iter-$i" \
       "$log_file" \
-      120 5 \
+      120 10 \
       "$full_prompt" \
       -v "$WT_HOST:/work:rw" \
       -e "ALUCARD_ITER=$i"
