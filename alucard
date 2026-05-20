@@ -1027,7 +1027,7 @@ command_run() {
   [ "$TIMEOUT_MIN" -gt 0 ] || die "timeout must be greater than zero"
 
   setup_run_environment
-  final_result='select(.type == "result").result // empty'
+  local final_result='select(.type == "result").result // empty'
 
   for ((i=1; i<=ITERATIONS; i++)); do
     echo "=== alucard iteration $i/$ITERATIONS ==="
@@ -1168,16 +1168,18 @@ command_continue() {
   need_cmd docker
   need_cmd timeout
 
-  setup_run_environment
-
-  local pr_json pr_state branch origin_url
-  pr_json=$(cd "$REPO_ABS" && \
-    gh pr view "$pr_num" --json state,headRefName,headRefOid,url 2>/dev/null) \
+  local _early_repo pr_json pr_state branch
+  _early_repo=$(resolve_repo "$TARGET_REPO")
+  pr_json=$(cd "$_early_repo" && \
+    gh pr view "$pr_num" --json state,headRefName 2>/dev/null) \
     || die "PR #$pr_num not found in target repo"
   pr_state=$(echo "$pr_json" | jq -r '.state')
   [ "$pr_state" = "OPEN" ] || die "PR #$pr_num is not open (state: $pr_state)"
   branch=$(echo "$pr_json" | jq -r '.headRefName')
 
+  setup_run_environment
+
+  local origin_url
   origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
   origin_url="${origin_url/git@github.com:/https://github.com/}"
 
@@ -1188,23 +1190,23 @@ command_continue() {
 
   # Build review_findings: last CHANGES_REQUESTED bot comment + all subsequent human comments.
   # If no CHANGES_REQUESTED bot comment exists, fall back to all non-bot comments.
-  local last_bot_cr_body bot_cr_time human_after feedback_findings
-  last_bot_cr_body=$(cd "$REPO_ABS" && \
-    gh pr view "$pr_num" --json comments \
-      --jq '.comments | map(select(.body | startswith("**🤖 Alucard") and contains("CHANGES_REQUESTED"))) | last | .body // empty' \
+  local _comments_json last_bot_cr_body bot_cr_time human_after feedback_findings
+  _comments_json=$(cd "$REPO_ABS" && \
+    gh pr view "$pr_num" --json comments 2>/dev/null || echo '{"comments":[]}')
+
+  last_bot_cr_body=$(echo "$_comments_json" | jq -r \
+    '.comments | map(select(.body | startswith("**🤖 Alucard") and contains("CHANGES_REQUESTED"))) | last | .body // empty' \
+    2>/dev/null || true)
+  bot_cr_time=$(echo "$_comments_json" | jq -r \
+    '.comments | map(select(.body | startswith("**🤖 Alucard") and contains("CHANGES_REQUESTED"))) | last | .createdAt // empty' \
     2>/dev/null || true)
 
   if [ -n "${last_bot_cr_body:-}" ]; then
-    bot_cr_time=$(cd "$REPO_ABS" && \
-      gh pr view "$pr_num" --json comments \
-        --jq '.comments | map(select(.body | startswith("**🤖 Alucard") and contains("CHANGES_REQUESTED"))) | last | .createdAt // empty' \
-      2>/dev/null || true)
     human_after=""
     if [ -n "${bot_cr_time:-}" ]; then
-      human_after=$(cd "$REPO_ABS" && \
-        gh pr view "$pr_num" --json comments \
-          --jq --arg since "$bot_cr_time" \
-          '[.comments[] | select((.body | startswith("**🤖 Alucard") | not) and .createdAt > $since) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
+      human_after=$(echo "$_comments_json" | jq -r \
+        --arg since "$bot_cr_time" \
+        '[.comments[] | select((.body | startswith("**🤖 Alucard") | not) and .createdAt > $since) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
         2>/dev/null || true)
     fi
     feedback_findings="$last_bot_cr_body"
@@ -1221,9 +1223,8 @@ ${human_after}"
     fi
   else
     local all_human
-    all_human=$(cd "$REPO_ABS" && \
-      gh pr view "$pr_num" --json comments \
-        --jq '[.comments[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
+    all_human=$(echo "$_comments_json" | jq -r \
+      '[.comments[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
       2>/dev/null || true)
     if [ -n "${all_human:-}" ]; then
       feedback_findings="$all_human"
