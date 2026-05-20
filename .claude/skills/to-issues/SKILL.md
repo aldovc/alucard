@@ -25,7 +25,7 @@ Each slice is **AFK** or **HITL**:
 - **AFK** — implementable and mergeable without human interaction. Crisp acceptance criteria, no architectural ambiguity, no design judgement.
 - **HITL** — needs a human. Architectural decision, design review, ambiguous tradeoff, anything where "just pick" isn't safe.
 
-Prefer AFK. But **if you find yourself stretching to justify an AFK label, it's HITL.** An AFK issue the worker gets stuck on at 3am is worse than an honest HITL you handle in the morning.
+Prefer AFK. But **if you find yourself stretching to justify an AFK label, it's HITL.** An AFK issue the worker gets stuck on mid-run is worse than an honest HITL you handle when you check back.
 
 <vertical-slice-rules>
 - Each slice delivers a narrow but COMPLETE path through every relevant layer

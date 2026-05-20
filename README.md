@@ -1,17 +1,17 @@
-# Alucard — autonomous overnight worker loop
+# Alucard — autonomous worker loop
 
 > **Experimental — personal project.** This is built for my own workflow and goals. It works for me but has no stability guarantees, no support commitment, and will change without notice. Use at your own risk.
 
 ## What it is
 
-A containerized agent loop that picks GitHub issues off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended overnight. Workflow:
+A containerized agent loop that picks GitHub issues off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended in the background. Workflow:
 
-1. **You (the operator) write a PRD or plan** during the day. This is the 80% of the work.
+1. **You (the operator) write a PRD or plan** up front. This is the 80% of the work.
 2. **`/to-issues` skill** breaks the plan into vertical-slice GitHub issues, labeled `afk` (autonomous-doable) or `hitl` (needs human).
-3. **Alucard runs overnight** — pulls the AFK queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
+3. **Alucard runs unattended** — pulls the AFK queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
 4. **CI gate** — after a PR is opened, polls CI and launches a fix agent (up to 3 attempts) if checks fail.
 5. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 2).
-6. **You review PRs in the morning** and merge what's good.
+6. **You review PRs when you check back** and merge what's good.
 
 Alucard never pushes to main. Each iteration produces an independent PR.
 
@@ -19,13 +19,13 @@ Alucard never pushes to main. Each iteration produces an independent PR.
 
 ```mermaid
 flowchart TD
-    A[Operator writes PRD/plan during the day] --> B["/to-prd skill<br/>(optional: PRD → GitHub issue)"]
+    A[Operator writes PRD/plan up front] --> B["/to-prd skill<br/>(optional: PRD → GitHub issue)"]
     B --> C["/to-issues skill<br/>vertical-slice issues, labeled afk or hitl"]
     C --> D{Label?}
-    D -->|hitl| E[Operator handles in the morning]
+    D -->|hitl| E[Operator handles when they check back]
     D -->|afk| F[AFK queue on GitHub]
 
-    F --> G[alucard run<br/>overnight loop]
+    F --> G[alucard run<br/>unattended loop]
     G --> H[Pick next AFK issue,<br/>label in-progress]
     H --> I[Spin up isolated container<br/>+ disposable worktree]
     I --> J[Worker agent: implement,<br/>test, commit]
@@ -42,7 +42,7 @@ flowchart TD
 
     Q --> R[Loop: next iteration<br/>until queue empty / cap hit]
     R --> G
-    Q --> S[Operator reviews and merges<br/>in the morning]
+    Q --> S[Operator reviews and merges<br/>when they check back]
 ```
 
 ## Architecture
@@ -54,7 +54,7 @@ flowchart TD
 
 ## Threat model and safety design
 
-**The risk:** `claude` runs in `bypassPermissions` mode (no prompts, full tool access) so the agent doesn't get stuck overnight on a missing tool permission. Without isolation, a confused or prompt-injected agent could `rm -rf` your home directory or exfiltrate credentials.
+**The risk:** `claude` runs in `bypassPermissions` mode (no prompts, full tool access) so the agent doesn't get stuck mid-run on a missing tool permission. Without isolation, a confused or prompt-injected agent could `rm -rf` your home directory or exfiltrate credentials.
 
 **The defenses, layered:**
 
@@ -195,7 +195,7 @@ cp -r "$ALUCARD_HOME/.claude/skills/to-issues" /path/to/target-repo/.claude/skil
 ```
 
 - `/to-prd` — synthesize the current conversation into a PRD and open it as a GitHub issue.
-- `/to-issues` — break a PRD or plan into properly-labeled (`afk` / `hitl`) tracer-bullet issues that Alucard can pick up overnight.
+- `/to-issues` — break a PRD or plan into properly-labeled (`afk` / `hitl`) tracer-bullet issues that Alucard can pick up unattended.
 
 ### First smoke test
 
@@ -266,7 +266,7 @@ docker pull ghcr.io/aldovc/alucard:latest
 # Build a local custom image
 alucard build
 
-# Run overnight (20 iterations max, 30 min each) — uses ghcr.io/aldovc/alucard:latest by default
+# Run unattended (20 iterations max, 30 min each) — uses ghcr.io/aldovc/alucard:latest by default
 alucard run /path/to/target-repo -n 20 -t 30
 
 # Run one iteration to test
