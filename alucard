@@ -152,7 +152,12 @@ load_env_file() {
 
   if [ "$require" = "true" ]; then
     [ -n "${GITHUB_TOKEN:-}" ] || die "GITHUB_TOKEN is empty in $env_file"
-    [ -n "${ANTHROPIC_API_KEY:-}" ] || die "ANTHROPIC_API_KEY is empty in $env_file"
+    if any_role_uses claude; then
+      [ -n "${ANTHROPIC_API_KEY:-}" ] || die "ANTHROPIC_API_KEY is empty in $env_file"
+    fi
+    if any_role_uses codex; then
+      [ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY is empty in $env_file"
+    fi
   fi
 }
 
@@ -573,7 +578,20 @@ command_doctor() {
     echo "ok: env file $ENV_FILE"
     load_env_file "$ENV_FILE" false
     [ -n "${GITHUB_TOKEN:-}" ] || { echo "missing: GITHUB_TOKEN value"; ok=false; }
-    [ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "missing: ANTHROPIC_API_KEY value"; ok=false; }
+    if any_role_uses claude; then
+      if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        echo "ok: ANTHROPIC_API_KEY"
+      else
+        echo "missing: ANTHROPIC_API_KEY value"; ok=false
+      fi
+    fi
+    if any_role_uses codex; then
+      if [ -n "${OPENAI_API_KEY:-}" ]; then
+        echo "ok: OPENAI_API_KEY"
+      else
+        echo "missing: OPENAI_API_KEY value"; ok=false
+      fi
+    fi
   else
     echo "missing: env file $ENV_FILE"
     ok=false
