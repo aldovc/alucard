@@ -30,13 +30,13 @@ source "$ALUCARD"
 
 # ── Env file fixtures ─────────────────────────────────────────────────────────
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+TEST_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TEST_TMPDIR"' EXIT
 
-CLAUDE_ENV="$TMPDIR/claude.env"
-CODEX_ENV="$TMPDIR/codex.env"
-BOTH_ENV="$TMPDIR/both.env"
-NONE_ENV="$TMPDIR/none.env"
+CLAUDE_ENV="$TEST_TMPDIR/claude.env"
+CODEX_ENV="$TEST_TMPDIR/codex.env"
+BOTH_ENV="$TEST_TMPDIR/both.env"
+NONE_ENV="$TEST_TMPDIR/none.env"
 
 printf 'GITHUB_TOKEN=gh_test\nANTHROPIC_API_KEY=sk-ant-test\n'                               > "$CLAUDE_ENV"
 printf 'GITHUB_TOKEN=gh_test\nOPENAI_API_KEY=sk-oai-test\n'                                  > "$CODEX_ENV"
@@ -103,6 +103,52 @@ t_codex_missing_key()   { all_codex;  load_env_file "$NONE_ENV"  true; }
 
 assert_exit "active claude provider: missing ANTHROPIC_API_KEY exits 1" 1 t_claude_missing_key
 assert_exit "active codex provider: missing OPENAI_API_KEY exits 1"    1 t_codex_missing_key
+
+# ── Helpers: assert presence/absence of a pattern in command output ──────────
+
+assert_output_contains() {
+  local label="$1" pattern="$2"
+  shift 2
+  local out
+  out=$(( "$@" ) 2>&1) || true
+  if echo "$out" | grep -qF "$pattern"; then
+    pass "$label"
+  else
+    fail "$label (expected '$pattern' not found in output)"
+  fi
+}
+
+assert_output_absent() {
+  local label="$1" pattern="$2"
+  shift 2
+  local out
+  out=$(( "$@" ) 2>&1) || true
+  if ! echo "$out" | grep -qF "$pattern"; then
+    pass "$label"
+  else
+    fail "$label (unexpected '$pattern' found in output)"
+  fi
+}
+
+# ── Test group 5: command_doctor credential output ────────────────────────────
+# command_doctor is called with --env-file to point at our fixtures.
+# Only credential-related output lines are asserted; unrelated doctor checks
+# (missing docker, tool files, etc.) may emit "missing:" lines but don't exit
+# early, so the credential section is always reached when the env file exists.
+
+td_claude()       { all_claude; command_doctor --env-file "$CLAUDE_ENV"; }
+td_codex()        { all_codex;  command_doctor --env-file "$CODEX_ENV";  }
+td_mixed()        { mixed;      command_doctor --env-file "$BOTH_ENV";   }
+td_codex_none()   { all_codex;  command_doctor --env-file "$NONE_ENV";   }
+
+assert_output_contains "doctor claude-only: ok ANTHROPIC_API_KEY present"          "ok: ANTHROPIC_API_KEY"         td_claude
+assert_output_absent   "doctor claude-only: OPENAI_API_KEY not checked"            "OPENAI_API_KEY"                td_claude
+assert_output_contains "doctor codex-only: ok OPENAI_API_KEY present"              "ok: OPENAI_API_KEY"            td_codex
+assert_output_absent   "doctor codex-only: ANTHROPIC_API_KEY not checked"          "ANTHROPIC_API_KEY"             td_codex
+assert_output_contains "doctor mixed: ok ANTHROPIC_API_KEY present"                "ok: ANTHROPIC_API_KEY"         td_mixed
+assert_output_contains "doctor mixed: ok OPENAI_API_KEY present"                   "ok: OPENAI_API_KEY"            td_mixed
+assert_output_contains "doctor codex-only missing key: reports missing OPENAI"     "missing: OPENAI_API_KEY value" td_codex_none
+assert_output_absent   "doctor codex-only missing key: ANTHROPIC not checked"      "ANTHROPIC_API_KEY"             td_codex_none
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
