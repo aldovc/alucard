@@ -1146,6 +1146,11 @@ command_run() {
 <issues>${_issues_esc}</issues>"
 
     ITER_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    # Snapshot which issues are already in-progress so we can detect what the
+    # worker newly claimed and roll that label back if it never opened a PR.
+    _in_progress_before=$(cd "$REPO_ABS" && \
+      gh issue list --state open --label in-progress --limit 500 --json number \
+        --jq '[.[].number]' 2>/dev/null || echo '[]')
 
     set +e
     invoke_agent \
@@ -1158,17 +1163,18 @@ command_run() {
     rc=$?
     set -e
 
-    rm -rf "$WT_HOST" || true
-
     # Worker should push to $BRANCH, but may misbehave and push to a custom
     # branch (e.g. integration branch). If head-branch lookup finds no PR,
     # fall back to the newest alucard-labeled OPEN PR opened during this
     # iteration — otherwise the gates and token-usage post would silently skip.
     ACTUAL_BRANCH="$BRANCH"
+    _pr_found=false
     _harness_pr=$(cd "$REPO_ABS" && \
       gh pr list --head "$BRANCH" --state open --json number \
         --jq '.[0].number // empty' 2>/dev/null || true)
-    if [ -z "${_harness_pr:-}" ]; then
+    if [ -n "${_harness_pr:-}" ]; then
+      _pr_found=true
+    else
       _fallback=$(cd "$REPO_ABS" && \
         gh pr list --label alucard --state open --json number,createdAt,headRefName \
           --jq --arg since "$ITER_STARTED_AT" \
@@ -1178,11 +1184,101 @@ command_run() {
         ACTUAL_BRANCH=$(echo "$_fallback" | jq -r '.headRefName')
         _fallback_num=$(echo "$_fallback" | jq -r '.number')
         echo "Worker pushed to non-harness branch '$ACTUAL_BRANCH' — using PR #$_fallback_num for gates."
+        _pr_found=true
+      fi
+    fi
+    _recovery_pr=false
+
+    # Worker exited (timeout, budget, error) before opening a PR. Two failure
+    # modes to recover from:
+    #   1. Worker made commits but was killed before `git push` / `gh pr create`
+    #      — the worktree is about to be deleted, so push it now and open a
+    #      draft recovery PR so `alucard continue <PR_NUM>` can resume.
+    #   2. Worker claimed an issue (`gh issue edit <N> --add-label in-progress`)
+    #      but never produced any commits — strip the label so the queue filter
+    #      doesn't lock the issue out of future runs.
+    if [ "$_pr_found" = false ]; then
+      _in_progress_after=$(cd "$REPO_ABS" && \
+        gh issue list --state open --label in-progress --limit 500 --json number \
+          --jq '[.[].number]' 2>/dev/null || echo '[]')
+      _newly_claimed=$(jq -nc \
+        --argjson before "$_in_progress_before" \
+        --argjson after "$_in_progress_after" \
+        '$after - $before' 2>/dev/null || echo '[]')
+
+      if [ -d "$WT_HOST/.git" ]; then
+        # Stage and commit any uncommitted changes — work-in-progress would
+        # otherwise die with the worktree.
+        if [ -n "$(git -C "$WT_HOST" status --porcelain 2>/dev/null)" ]; then
+          echo "Worker left uncommitted changes — committing for recovery."
+          git -C "$WT_HOST" add -A 2>/dev/null || true
+          git -C "$WT_HOST" \
+            -c user.email=alucard@noreply.local \
+            -c user.name=alucard \
+            commit -m "wip: alucard recovery — uncommitted worker state" \
+            2>/dev/null || true
+        fi
+        _commits_ahead=$(git -C "$WT_HOST" rev-list --count \
+          "origin/$BASE_BRANCH..HEAD" 2>/dev/null || echo 0)
+        if [ "$_commits_ahead" -gt 0 ]; then
+          _recover_branch=$(git -C "$WT_HOST" rev-parse --abbrev-ref HEAD \
+            2>/dev/null || echo "$BRANCH")
+          echo "Worker rc=$rc left $_commits_ahead commit(s) on $_recover_branch — pushing to preserve work."
+          if git -C "$WT_HOST" push -u origin "$_recover_branch" 2>&1; then
+            # Closes #N on the first line lets the queue dedup filter
+            # (closingIssuesReferences in get_unblocked_afk_issues) match
+            # the issue to this PR so the issue isn't re-picked.
+            _closes_line=""
+            for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
+              _closes_line="Closes #${_n}"
+              break
+            done
+            _stub_body="${_closes_line}
+
+**🤖 Alucard recovery PR** — worker exited rc=${rc} before opening a PR. Its commits have been pushed here so the work isn't lost.
+
+Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or close this PR if the work isn't salvageable."
+            _stub_title="wip: alucard recovery — iter ${i} (worker killed rc=${rc})"
+            if _new_pr_url=$(cd "$REPO_ABS" && \
+              gh pr create \
+                --head "$_recover_branch" \
+                --base "$BASE_BRANCH" \
+                --label alucard \
+                --draft \
+                --title "$_stub_title" \
+                --body "$_stub_body" 2>&1); then
+              echo "Opened recovery PR: $_new_pr_url"
+              ACTUAL_BRANCH="$_recover_branch"
+              _recovery_pr=true
+            else
+              echo "Could not open recovery PR: $_new_pr_url"
+            fi
+          else
+            echo "Could not push $_recover_branch to origin — work is lost."
+          fi
+        fi
+      fi
+
+      # No PR exists and recovery didn't produce one — strip the in-progress
+      # label so the next run can re-pick the issue.
+      if [ "$_recovery_pr" = false ]; then
+        for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
+          echo "Worker claimed #$_n but produced no PR — removing 'in-progress' label."
+          (cd "$REPO_ABS" && gh issue edit "$_n" --remove-label in-progress) \
+            2>/dev/null || true
+        done
       fi
     fi
 
-    ci_gate "$i" "$ACTUAL_BRANCH" "$_origin_url"
-    review_gate "$i" "$ACTUAL_BRANCH" "$_origin_url"
+    rm -rf "$WT_HOST" || true
+
+    # Skip CI/review gates on recovery PRs — the work is incomplete by
+    # definition. The user should vet the diff and run `alucard continue`
+    # to resume gates against the recovered branch.
+    if [ "$_recovery_pr" = false ]; then
+      ci_gate "$i" "$ACTUAL_BRANCH" "$_origin_url"
+      review_gate "$i" "$ACTUAL_BRANCH" "$_origin_url"
+    fi
     post_iteration_usage "$i" "$ACTUAL_BRANCH" "$REPO_ABS" "$LOG_DIR"
 
     if [ "$rc" -ne 0 ]; then
