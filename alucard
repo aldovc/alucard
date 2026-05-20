@@ -203,9 +203,9 @@ any_role_uses() {
 # Run one agent container and stream its output to a log file.
 # $1 = role tag (container name becomes alucard-<role>)
 # $2 = log file path (JSONL stream written here via tee)
-# $3 = --max-turns value
-# $4 = --max-budget-usd value
-# $5 = prompt text passed as the -- argument
+# $3 = --max-turns value (Claude only)
+# $4 = --max-budget-usd value (Claude only)
+# $5 = prompt text (Claude: passed as -- argument; Codex: fed via stdin)
 # $6+ = extra docker args (volumes, env vars specific to this call-site)
 # Uses globals: TIMEOUT_MIN ENV_FILE IMAGE stream_text
 # Returns the docker run exit code.
@@ -213,37 +213,70 @@ invoke_agent() {
   local role="$1" log_file="$2" max_turns="$3" max_budget="$4" prompt="$5"
   shift 5
 
-  timeout "${TIMEOUT_MIN}m" docker run --rm \
-    --name "alucard-${role}" \
-    --network bridge \
-    --memory 4g --cpus 2 \
-    --read-only \
-    --tmpfs /tmp:exec,size=1g \
-    --tmpfs "/home/alucard:size=1g,uid=$(id -u),gid=$(id -g)" \
-    --user "$(id -u):$(id -g)" \
-    --security-opt no-new-privileges \
-    --cap-drop ALL \
-    --env-file "$ENV_FILE" \
-    -e "HOME=/home/alucard" \
-    -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-    -e "GH_CONFIG_DIR=/tmp/gh" \
-    "$@" \
-    "$IMAGE" \
-    claude -p \
-      --verbose \
-      --output-format stream-json \
-      --include-partial-messages \
-      --permission-mode bypassPermissions \
-      --max-turns "$max_turns" \
-      --max-budget-usd "$max_budget" \
-      --fallback-model sonnet \
-      --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
-      -- \
-      "$prompt" \
-    | grep --line-buffered '^{' \
-    | tee "$log_file" \
-    | jq --unbuffered -rj "$stream_text"
-  return "${PIPESTATUS[0]}"
+  # Map role tag prefix to the symbolic role name resolve_provider expects.
+  local provider_role
+  case "$role" in
+    iter-*)     provider_role="WORKER" ;;
+    fix-*)      provider_role="CI_FIX" ;;
+    review-*)   provider_role="REVIEWER" ;;
+    feedback-*) provider_role="FEEDBACK" ;;
+    *)          provider_role="WORKER" ;;
+  esac
+
+  local provider
+  provider=$(resolve_provider "$provider_role")
+
+  local -a _docker_args=(
+    --name "alucard-${role}"
+    --network bridge
+    --memory 4g --cpus 2
+    --read-only
+    --tmpfs /tmp:exec,size=1g
+    --tmpfs "/home/alucard:size=1g,uid=$(id -u),gid=$(id -g)"
+    --user "$(id -u):$(id -g)"
+    --security-opt no-new-privileges
+    --cap-drop ALL
+    --env-file "$ENV_FILE"
+    -e "HOME=/home/alucard"
+    -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig"
+    -e "GH_CONFIG_DIR=/tmp/gh"
+    "$@"
+    "$IMAGE"
+  )
+
+  if [ "$provider" = "codex" ]; then
+    local codex_model="${ALUCARD_CODEX_MODEL:-gpt-4o}"
+    # Prompt is fed via process substitution so PIPESTATUS[0] captures docker's exit.
+    timeout "${TIMEOUT_MIN}m" docker run --rm -i \
+      "${_docker_args[@]}" \
+      codex exec \
+        --dangerously-bypass-approvals-and-sandbox \
+        --json \
+        --ephemeral \
+        -m "$codex_model" \
+        - \
+      < <(printf '%s' "$prompt") \
+      | tee "$log_file"
+    return "${PIPESTATUS[0]}"
+  else
+    timeout "${TIMEOUT_MIN}m" docker run --rm \
+      "${_docker_args[@]}" \
+      claude -p \
+        --verbose \
+        --output-format stream-json \
+        --include-partial-messages \
+        --permission-mode bypassPermissions \
+        --max-turns "$max_turns" \
+        --max-budget-usd "$max_budget" \
+        --fallback-model sonnet \
+        --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+        -- \
+        "$prompt" \
+      | grep --line-buffered '^{' \
+      | tee "$log_file" \
+      | jq --unbuffered -rj "$stream_text"
+    return "${PIPESTATUS[0]}"
+  fi
 }
 
 parse_repo_options() {
