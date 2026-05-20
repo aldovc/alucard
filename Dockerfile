@@ -21,7 +21,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 RUN uv python install 3.12
 
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code @openai/codex
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
