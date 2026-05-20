@@ -207,7 +207,7 @@ any_role_uses() {
 # $4 = --max-budget-usd value (Claude only)
 # $5 = prompt text (Claude: passed as -- argument; Codex: fed via stdin)
 # $6+ = extra docker args (volumes, env vars specific to this call-site)
-# Uses globals: TIMEOUT_MIN ENV_FILE IMAGE stream_text
+# Uses globals: TIMEOUT_MIN ENV_FILE IMAGE stream_text codex_stream_text
 # Returns the docker run exit code.
 invoke_agent() {
   local role="$1" log_file="$2" max_turns="$3" max_budget="$4" prompt="$5"
@@ -256,7 +256,9 @@ invoke_agent() {
         -m "$codex_model" \
         - \
       < <(printf '%s' "$prompt") \
-      | tee "$log_file"
+      | grep --line-buffered '^{' \
+      | tee "$log_file" \
+      | jq --unbuffered -rj "$codex_stream_text"
     return "${PIPESTATUS[0]}"
   else
     timeout "${TIMEOUT_MIN}m" docker run --rm \
@@ -1069,6 +1071,7 @@ setup_run_environment() {
   ensure_image "$IMAGE" "$AUTO_BUILD"
 
   stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
+  codex_stream_text='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" else empty end'
   CREATED_WORKTREES=()
 
   cleanup() {

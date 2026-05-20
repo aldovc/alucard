@@ -16,4 +16,10 @@ git config --global --add safe.directory '*'
 git config --global credential.helper "store --file /tmp/git-credentials"
 printf 'https://x-access-token:%s@github.com\n' "$GITHUB_TOKEN" > /tmp/git-credentials
 
+# Codex CLI's Responses websocket ignores OPENAI_API_KEY and only reads
+# ~/.codex/auth.json. Pre-populate it via `codex login --with-api-key`.
+if [ -n "${OPENAI_API_KEY:-}" ] && command -v codex >/dev/null 2>&1; then
+  printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null 2>&1 || true
+fi
+
 exec "$@"
