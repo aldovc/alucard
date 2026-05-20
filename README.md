@@ -285,6 +285,30 @@ rm -rf .alucard-worktrees/
 tail -f "$ALUCARD_HOME"/logs/alucard-*/iter-*.jsonl | jq -r 'select(.type=="assistant").message.content[]?.text // empty'
 ```
 
+## Releases
+
+```bash
+# Tag and publish a new release
+git tag v0.2.0
+git push --tags
+```
+
+The push triggers `.github/workflows/docker-publish.yml`, which builds and publishes:
+
+| Image tag | Meaning |
+|-----------|---------|
+| `ghcr.io/aldovc/alucard:vX.Y.Z` | Exact release — pinned, reproducible |
+| `ghcr.io/aldovc/alucard:vX.Y` | Floating minor — patch updates only |
+| `ghcr.io/aldovc/alucard:vX` | Floating major — any compatible update |
+| `ghcr.io/aldovc/alucard:latest` | Tracks `main` — unpinned |
+| `ghcr.io/aldovc/alucard:<short-sha>` | Every push, for debugging |
+
+`:latest` is also updated on every tag push — it always points to the most recently published image (tag or main push, whichever came last).
+
+**Pinning:** operators who want reproducible runs can set `ALUCARD_IMAGE=ghcr.io/aldovc/alucard:v0.1.0`. `:latest` stays the default.
+
+**CLI version:** `alucard version` (or `alucard --version`) prints the version derived from `git describe` against the CLI source directory. On a tagged checkout it shows `v0.1.0`; on a post-tag commit, `v0.1.0-3-gabc1234`; on an untagged tree, the short SHA.
+
 ## Acknowledgements
 
 The `/to-prd` and `/to-issues` skills vendored in this repo are sourced from [mattpocock/skills](https://github.com/mattpocock/skills).

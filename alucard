@@ -23,6 +23,7 @@ Usage:
   alucard build [options]
   alucard doctor [TARGET_REPO] [options]
   alucard continue <PR_NUM> [TARGET_REPO] [options]
+  alucard version
 
 TARGET_REPO accepts:
   /path/to/local/repo          existing local git clone
@@ -35,6 +36,7 @@ Commands:
   build     Build the Alucard Docker image.
   doctor    Check local prerequisites without running the worker.
   continue  Re-run the feedback+CI+review pipeline on a parked PR.
+  version   Print the CLI version and exit.
 
 Run options:
   -C, --repo PATH              Target git repository. Defaults to
@@ -495,6 +497,12 @@ command_build() {
 
   need_cmd docker
   docker build -t "$IMAGE" "$TOOL_DIR"
+}
+
+command_version() {
+  local ver
+  ver=$(git -C "$TOOL_DIR" describe --tags --always --dirty 2>/dev/null) || ver="unknown"
+  echo "$ver"
 }
 
 command_queue() {
@@ -1277,6 +1285,9 @@ main() {
       ;;
     continue)
       command_continue "$@"
+      ;;
+    version|--version|-V)
+      command_version
       ;;
     help|-h|--help)
       usage

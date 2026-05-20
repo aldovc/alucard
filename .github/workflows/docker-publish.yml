@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*.*.*'
 
 permissions:
   contents: read
@@ -28,7 +30,19 @@ jobs:
         id: sha
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Compute semver tags
+        id: semver
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME}"          # e.g. v0.1.0
+          MINOR="${TAG%.*}"                 # e.g. v0.1
+          MAJOR="${MINOR%.*}"              # e.g. v0
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
+          echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (main branch)
+        if: github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -36,3 +50,16 @@ jobs:
           tags: |
             ghcr.io/aldovc/alucard:latest
             ghcr.io/aldovc/alucard:${{ steps.sha.outputs.short }}
+
+      - name: Build and push (semver tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/aldovc/alucard:latest
+            ghcr.io/aldovc/alucard:${{ steps.sha.outputs.short }}
+            ghcr.io/aldovc/alucard:${{ steps.semver.outputs.tag }}
+            ghcr.io/aldovc/alucard:${{ steps.semver.outputs.minor }}
+            ghcr.io/aldovc/alucard:${{ steps.semver.outputs.major }}
