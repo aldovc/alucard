@@ -221,25 +221,29 @@ invoke_agent() {
   local provider
   provider=$(resolve_provider "$provider_role")
 
+  local -a _docker_args=(
+    --name "alucard-${role}"
+    --network bridge
+    --memory 4g --cpus 2
+    --read-only
+    --tmpfs /tmp:exec,size=1g
+    --tmpfs "/home/alucard:size=1g,uid=$(id -u),gid=$(id -g)"
+    --user "$(id -u):$(id -g)"
+    --security-opt no-new-privileges
+    --cap-drop ALL
+    --env-file "$ENV_FILE"
+    -e "HOME=/home/alucard"
+    -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig"
+    -e "GH_CONFIG_DIR=/tmp/gh"
+    "$@"
+    "$IMAGE"
+  )
+
   if [ "$provider" = "codex" ]; then
     local codex_model="${ALUCARD_CODEX_MODEL:-gpt-4o}"
     # Prompt is fed via process substitution so PIPESTATUS[0] captures docker's exit.
     timeout "${TIMEOUT_MIN}m" docker run --rm -i \
-      --name "alucard-${role}" \
-      --network bridge \
-      --memory 4g --cpus 2 \
-      --read-only \
-      --tmpfs /tmp:exec,size=1g \
-      --tmpfs "/home/alucard:size=1g,uid=$(id -u),gid=$(id -g)" \
-      --user "$(id -u):$(id -g)" \
-      --security-opt no-new-privileges \
-      --cap-drop ALL \
-      --env-file "$ENV_FILE" \
-      -e "HOME=/home/alucard" \
-      -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-      -e "GH_CONFIG_DIR=/tmp/gh" \
-      "$@" \
-      "$IMAGE" \
+      "${_docker_args[@]}" \
       codex exec \
         --dangerously-bypass-approvals-and-sandbox \
         --json \
@@ -251,21 +255,7 @@ invoke_agent() {
     return "${PIPESTATUS[0]}"
   else
     timeout "${TIMEOUT_MIN}m" docker run --rm \
-      --name "alucard-${role}" \
-      --network bridge \
-      --memory 4g --cpus 2 \
-      --read-only \
-      --tmpfs /tmp:exec,size=1g \
-      --tmpfs "/home/alucard:size=1g,uid=$(id -u),gid=$(id -g)" \
-      --user "$(id -u):$(id -g)" \
-      --security-opt no-new-privileges \
-      --cap-drop ALL \
-      --env-file "$ENV_FILE" \
-      -e "HOME=/home/alucard" \
-      -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-      -e "GH_CONFIG_DIR=/tmp/gh" \
-      "$@" \
-      "$IMAGE" \
+      "${_docker_args[@]}" \
       claude -p \
         --verbose \
         --output-format stream-json \
