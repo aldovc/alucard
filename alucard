@@ -195,6 +195,52 @@ any_role_uses() {
   return 1
 }
 
+# Run one agent container and stream its output to a log file.
+# $1 = role tag (container name becomes alucard-<role>)
+# $2 = log file path (JSONL stream written here via tee)
+# $3 = --max-turns value
+# $4 = --max-budget-usd value
+# $5 = prompt text passed as the -- argument
+# $6+ = extra docker args (volumes, env vars specific to this call-site)
+# Uses globals: TIMEOUT_MIN ENV_FILE IMAGE stream_text
+# Returns the docker run exit code.
+invoke_agent() {
+  local role="$1" log_file="$2" max_turns="$3" max_budget="$4" prompt="$5"
+  shift 5
+
+  timeout "${TIMEOUT_MIN}m" docker run --rm \
+    --name "alucard-${role}" \
+    --network bridge \
+    --memory 4g --cpus 2 \
+    --read-only \
+    --tmpfs /tmp:exec,size=1g \
+    --tmpfs "/home/alucard:size=1g,uid=$(id -u),gid=$(id -g)" \
+    --user "$(id -u):$(id -g)" \
+    --security-opt no-new-privileges \
+    --cap-drop ALL \
+    --env-file "$ENV_FILE" \
+    -e "HOME=/home/alucard" \
+    -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
+    -e "GH_CONFIG_DIR=/tmp/gh" \
+    "$@" \
+    "$IMAGE" \
+    claude -p \
+      --verbose \
+      --output-format stream-json \
+      --include-partial-messages \
+      --permission-mode bypassPermissions \
+      --max-turns "$max_turns" \
+      --max-budget-usd "$max_budget" \
+      --fallback-model sonnet \
+      --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
+      -- \
+      "$prompt" \
+    | grep --line-buffered '^{' \
+    | tee "$log_file" \
+    | jq --unbuffered -rj "$stream_text"
+  return "${PIPESTATUS[0]}"
+}
+
 parse_repo_options() {
   TARGET_REPO="${ALUCARD_TARGET_REPO:-$PWD}"
   IMAGE="$DEFAULT_IMAGE"
@@ -627,46 +673,25 @@ run_feedback_once() {
 
   feedback_log="$LOG_DIR/iter-${iter}-feedback-${cycle}.jsonl"
 
-  set +e
-  timeout "${TIMEOUT_MIN}m" docker run --rm \
-    --name "alucard-feedback-${iter}-${cycle}" \
-    --network bridge \
-    --memory 4g --cpus 2 \
-    --read-only \
-    --tmpfs /tmp:exec,size=1g \
-    --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
-    --user "$(id -u):$(id -g)" \
-    --security-opt no-new-privileges \
-    --cap-drop ALL \
-    -v "$wt_feedback:/work:rw" \
-    --env-file "$ENV_FILE" \
-    -e "ALUCARD_ITER=${iter}-feedback-${cycle}" \
-    -e "HOME=/home/alucard" \
-    -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-    -e "GH_CONFIG_DIR=/tmp/gh" \
-    "$IMAGE" \
-    claude -p \
-      --verbose \
-      --output-format stream-json \
-      --include-partial-messages \
-      --permission-mode bypassPermissions \
-      --max-turns 50 \
-      --max-budget-usd 2 \
-      --fallback-model sonnet \
-      --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
-      -- \
-      "<instructions>
+  local _feedback_prompt
+  _feedback_prompt="<instructions>
 $(<"$TOOL_DIR/alucard-feedback-prompt.md")
 </instructions>
 <pr_num>${pr_num}</pr_num>
 <branch>${branch}</branch>
 <review_findings>
 $(printf '%s' "$feedback_findings" | xml_escape)
-</review_findings>" \
-    | grep --line-buffered '^{' \
-    | tee "$feedback_log" \
-    | jq --unbuffered -rj "$stream_text"
-  feedback_rc=${PIPESTATUS[0]}
+</review_findings>"
+
+  set +e
+  invoke_agent \
+    "feedback-${iter}-${cycle}" \
+    "$feedback_log" \
+    50 2 \
+    "$_feedback_prompt" \
+    -v "$wt_feedback:/work:rw" \
+    -e "ALUCARD_ITER=${iter}-feedback-${cycle}"
+  feedback_rc=$?
   set -e
 
   echo ""
@@ -794,46 +819,25 @@ ci_gate() {
 
     fix_log="$LOG_DIR/iter-${iter}-fix-${ci_attempt}.jsonl"
 
-    set +e
-    timeout "${TIMEOUT_MIN}m" docker run --rm \
-      --name "alucard-fix-${iter}-${ci_attempt}" \
-      --network bridge \
-      --memory 4g --cpus 2 \
-      --read-only \
-      --tmpfs /tmp:exec,size=1g \
-      --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
-      --user "$(id -u):$(id -g)" \
-      --security-opt no-new-privileges \
-      --cap-drop ALL \
-      -v "$wt_fix:/work:rw" \
-      --env-file "$ENV_FILE" \
-      -e "ALUCARD_ITER=${iter}-fix-${ci_attempt}" \
-      -e "HOME=/home/alucard" \
-      -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-      -e "GH_CONFIG_DIR=/tmp/gh" \
-      "$IMAGE" \
-      claude -p \
-        --verbose \
-        --output-format stream-json \
-        --include-partial-messages \
-        --permission-mode bypassPermissions \
-        --max-turns 30 \
-        --max-budget-usd 2 \
-        --fallback-model sonnet \
-        --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
-        -- \
-        "<instructions>
+    local _fix_prompt
+    _fix_prompt="<instructions>
 $(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
 </instructions>
 <pr_num>${pr_num}</pr_num>
 <branch>${branch}</branch>
 <failure_log>
 $(printf '%s' "$failure_log" | xml_escape)
-</failure_log>" \
-      | grep --line-buffered '^{' \
-      | tee "$fix_log" \
-      | jq --unbuffered -rj "$stream_text"
-    fix_rc=${PIPESTATUS[0]}
+</failure_log>"
+
+    set +e
+    invoke_agent \
+      "fix-${iter}-${ci_attempt}" \
+      "$fix_log" \
+      30 2 \
+      "$_fix_prompt" \
+      -v "$wt_fix:/work:rw" \
+      -e "ALUCARD_ITER=${iter}-fix-${ci_attempt}"
+    fix_rc=$?
     set -e
 
     echo ""
@@ -878,43 +882,22 @@ review_gate() {
 
     review_log="$LOG_DIR/iter-${iter}-review-${review_cycle}.jsonl"
 
-    set +e
-    timeout "${TIMEOUT_MIN}m" docker run --rm \
-      --name "alucard-review-${iter}-${review_cycle}" \
-      --network bridge \
-      --memory 4g --cpus 2 \
-      --read-only \
-      --tmpfs /tmp:exec,size=1g \
-      --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
-      --user "$(id -u):$(id -g)" \
-      --security-opt no-new-privileges \
-      --cap-drop ALL \
-      -v "$wt_review:/work:ro" \
-      -v "$review_out_dir:/work-output:rw" \
-      --env-file "$ENV_FILE" \
-      -e "ALUCARD_ITER=${iter}-review-${review_cycle}" \
-      -e "HOME=/home/alucard" \
-      -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-      -e "GH_CONFIG_DIR=/tmp/gh" \
-      "$IMAGE" \
-      claude -p \
-        --verbose \
-        --output-format stream-json \
-        --include-partial-messages \
-        --permission-mode bypassPermissions \
-        --max-turns 20 \
-        --max-budget-usd 2 \
-        --fallback-model sonnet \
-        --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
-        -- \
-        "<instructions>
+    local _review_prompt
+    _review_prompt="<instructions>
 $(<"$TOOL_DIR/alucard-reviewer-prompt.md")
 </instructions>
-<pr_num>${pr_num}</pr_num>" \
-      | grep --line-buffered '^{' \
-      | tee "$review_log" \
-      | jq --unbuffered -rj "$stream_text"
-    review_rc=${PIPESTATUS[0]}
+<pr_num>${pr_num}</pr_num>"
+
+    set +e
+    invoke_agent \
+      "review-${iter}-${review_cycle}" \
+      "$review_log" \
+      20 2 \
+      "$_review_prompt" \
+      -v "$wt_review:/work:ro" \
+      -v "$review_out_dir:/work-output:rw" \
+      -e "ALUCARD_ITER=${iter}-review-${review_cycle}"
+    review_rc=$?
     set -e
 
     echo ""
@@ -1111,38 +1094,14 @@ command_run() {
     ITER_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     set +e
-    timeout "${TIMEOUT_MIN}m" docker run --rm \
-      --name "alucard-iter-$i" \
-      --network bridge \
-      --memory 4g --cpus 2 \
-      --read-only \
-      --tmpfs /tmp:exec,size=1g \
-      --tmpfs /home/alucard:size=1g,uid="$(id -u)",gid="$(id -g)" \
-      --user "$(id -u):$(id -g)" \
-      --security-opt no-new-privileges \
-      --cap-drop ALL \
+    invoke_agent \
+      "iter-$i" \
+      "$log_file" \
+      120 5 \
+      "$full_prompt" \
       -v "$WT_HOST:/work:rw" \
-      --env-file "$ENV_FILE" \
-      -e "ALUCARD_ITER=$i" \
-      -e "HOME=/home/alucard" \
-      -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig" \
-      -e "GH_CONFIG_DIR=/tmp/gh" \
-      "$IMAGE" \
-      claude -p \
-        --verbose \
-        --output-format stream-json \
-        --include-partial-messages \
-        --permission-mode bypassPermissions \
-        --max-turns 120 \
-        --max-budget-usd 5 \
-        --fallback-model sonnet \
-        --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
-        -- \
-        "$full_prompt" \
-      | grep --line-buffered '^{' \
-      | tee "$log_file" \
-      | jq --unbuffered -rj "$stream_text"
-    rc=${PIPESTATUS[0]}
+      -e "ALUCARD_ITER=$i"
+    rc=$?
     set -e
 
     rm -rf "$WT_HOST" || true
