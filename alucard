@@ -270,7 +270,8 @@ invoke_agent() {
         --permission-mode bypassPermissions \
         --max-turns "$max_turns" \
         --max-budget-usd "$max_budget" \
-        --fallback-model sonnet \
+        --model sonnet \
+        --fallback-model haiku \
         --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
         -- \
         "$prompt" \
