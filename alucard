@@ -1193,6 +1193,15 @@ command_run() {
     rc=$?
     set -e
 
+    # Provider billing failure is terminal — re-running 20 iterations against
+    # the same exhausted account just burns time and leaks stub branches. Bail
+    # the whole run on the first sighting so the user can top up and retry.
+    if [ -f "$log_file" ] && grep -q '"error":"billing_error"' "$log_file"; then
+      echo "alucard: provider returned billing_error (credit balance too low) — aborting run."
+      rm -rf "$WT_HOST"
+      exit 2
+    fi
+
     # Worker should push to $BRANCH, but may misbehave and push to a custom
     # branch (e.g. integration branch). If head-branch lookup finds no PR,
     # fall back to the newest alucard-labeled OPEN PR opened during this
