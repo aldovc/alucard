@@ -6,6 +6,29 @@ export GH_CONFIG_DIR="${GH_CONFIG_DIR:-/tmp/gh}"
 
 mkdir -p "$(dirname "$GIT_CONFIG_GLOBAL")" "$GH_CONFIG_DIR"
 
+# Block Bash tool calls with dangerouslyDisableSandbox=true via a PreToolUse hook.
+# That flag deletes the shell CWD (/work) on use, wedging every subsequent tool
+# call for the rest of the iteration. The container is already sandboxed by the
+# host docker config; the flag enables nothing useful for any agent role.
+mkdir -p "$HOME/.claude"
+cat > "$HOME/.claude/settings.json" <<'JSON'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -e '.tool_input.dangerouslyDisableSandbox == true' >/dev/null 2>&1 && { echo 'alucard: dangerouslyDisableSandbox is forbidden inside the harness container — it deletes the shell CWD and wedges the iteration. Use a regular Bash call instead.' >&2; exit 2; } || exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
+JSON
+
 git config --global user.name "alucard-bot"
 git config --global user.email "alucard-bot@users.noreply.github.com"
 git config --global --add safe.directory /work

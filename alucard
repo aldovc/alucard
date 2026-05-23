@@ -1289,8 +1289,18 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
 
     result=$(jq -r "$final_result" "$log_file" 2>/dev/null || echo "")
     if [[ "$result" == *"<promise>NO MORE TASKS</promise>"* ]]; then
-      echo "Alucard signaled completion after $i iterations."
-      exit 0
+      # Verify before trusting — a wedged worker (e.g. sandbox CWD got deleted
+      # mid-iteration, all subsequent tools fail) also emits this promise as a
+      # last resort. Trust it only if the queue is independently empty. A
+      # query failure here falls through to "keep going" rather than exit,
+      # since a transient GitHub blip shouldn't kill a 20-iter overnight run.
+      _remaining=""
+      _remaining=$(get_unblocked_afk_issues "$REPO_ABS" | jq 'length' 2>/dev/null || true)
+      if [ "${_remaining:-}" = "0" ]; then
+        echo "Alucard signaled completion after $i iterations (queue verified empty)."
+        exit 0
+      fi
+      echo "Worker promised NO MORE TASKS but queue still has ${_remaining:-unknown} unblocked issue(s) — ignoring (likely a wedged iteration). Continuing."
     fi
   done
 
