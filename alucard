@@ -231,8 +231,9 @@ invoke_agent() {
     --network bridge
     --memory 4g --cpus 2
     --read-only
-    --tmpfs /tmp:exec,size=1g
-    --tmpfs "/home/alucard:size=1g,uid=$(id -u),gid=$(id -g)"
+    --tmpfs /tmp:exec,size=2g
+    --tmpfs "/home/alucard:size=2g,uid=$(id -u),gid=$(id -g)"
+    --ulimit "nofile=8192:8192"
     --user "$(id -u):$(id -g)"
     --security-opt no-new-privileges
     --cap-drop ALL
@@ -244,6 +245,20 @@ invoke_agent() {
     "$IMAGE"
   )
 
+  # Wedge detector: if /work goes "deleted" in the harness's CWD tracking,
+  # every subsequent tool call fails silently and the iteration burns budget
+  # thrashing. Kill the container as soon as we see the marker so the wrapper
+  # can move on to the next iteration.
+  (
+    while [ ! -e "$log_file" ]; do sleep 0.2; done
+    tail -F "$log_file" 2>/dev/null \
+      | grep --line-buffered -m1 -F 'Shell cwd was reset to /work (deleted)' >/dev/null \
+      && { echo "alucard: detected /work wedge in alucard-${role} — killing container" >&2; \
+           docker kill "alucard-${role}" >/dev/null 2>&1; } || true
+  ) &
+  local _watcher_pid=$!
+
+  local _rc
   if [ "$provider" = "codex" ]; then
     local codex_model="${ALUCARD_CODEX_MODEL:-gpt-4o}"
     # Prompt is fed via process substitution so PIPESTATUS[0] captures docker's exit.
@@ -259,7 +274,7 @@ invoke_agent() {
       | grep --line-buffered '^{' \
       | tee "$log_file" \
       | jq --unbuffered -rj "$codex_stream_text"
-    return "${PIPESTATUS[0]}"
+    _rc=${PIPESTATUS[0]}
   else
     timeout "${TIMEOUT_MIN}m" docker run --rm \
       "${_docker_args[@]}" \
@@ -278,8 +293,15 @@ invoke_agent() {
       | grep --line-buffered '^{' \
       | tee "$log_file" \
       | jq --unbuffered -rj "$stream_text"
-    return "${PIPESTATUS[0]}"
+    _rc=${PIPESTATUS[0]}
   fi
+
+  # Reap the wedge watcher (and its tail/grep children) whether or not it triggered.
+  pkill -P "$_watcher_pid" 2>/dev/null || true
+  kill "$_watcher_pid" 2>/dev/null || true
+  wait "$_watcher_pid" 2>/dev/null || true
+
+  return "$_rc"
 }
 
 parse_repo_options() {

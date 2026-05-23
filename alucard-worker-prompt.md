@@ -57,6 +57,10 @@ For testable work:
 
 For non-testable work (config, scripts, docs), skip the test loop but still work in small verifiable steps.
 
+## Commit cadence
+
+Commit in small chunks — every 3–5 file changes, after each cohesive step, before running the full test suite. The harness has worktree-disposal recovery: if your iteration is killed mid-stream by timeout, budget, or a tool failure, any commits already made will be pushed to a draft recovery PR for the next iteration to resume from. **Uncommitted work dies with the worktree.** A single end-of-iteration commit is the worst-case shape — partial progress vanishes if anything goes wrong before then.
+
 ## Database migrations
 
 If your task requires a new migration file, guard against concurrent-iteration number conflicts before naming it.
