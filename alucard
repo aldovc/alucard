@@ -1247,7 +1247,16 @@ command_run() {
           _recover_branch=$(git -C "$WT_HOST" rev-parse --abbrev-ref HEAD \
             2>/dev/null || echo "$BRANCH")
           echo "Worker rc=$rc left $_commits_ahead commit(s) on $_recover_branch — pushing to preserve work."
-          if git -C "$WT_HOST" push -u origin "$_recover_branch" 2>&1; then
+          # Recovery push runs on the host, not in the container. The worktree's
+          # origin was rewritten to HTTPS so the in-container worker could auth
+          # via GITHUB_TOKEN, but the host has no HTTPS credential helper — that
+          # push would hang on an interactive `Username for https://github.com:`
+          # prompt. Flip origin back to the cached clone's URL (proven to work
+          # for host-side fetch) before pushing, and disable terminal prompts so
+          # any future remote-URL mishap fails loudly instead of wedging.
+          _host_origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
+          git -C "$WT_HOST" remote set-url origin "$_host_origin_url"
+          if GIT_TERMINAL_PROMPT=0 git -C "$WT_HOST" push -u origin "$_recover_branch" 2>&1; then
             # Closes #N on the first line lets the queue dedup filter
             # (closingIssuesReferences in get_unblocked_afk_issues) match
             # the issue to this PR so the issue isn't re-picked.
