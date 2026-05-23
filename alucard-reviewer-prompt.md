@@ -5,7 +5,7 @@ The PR number is in `<pr_num>` below.
 
 ## Contract
 
-- Do not edit any repository file
+- `/work` is mounted **read-only**. Do not attempt to edit repository files, install dependencies, create `.venv`s, or run anything that writes into the checkout — it will fail. Static review only.
 - Do not commit, push, merge, or create branches
 - Do not relabel, close, comment on, or otherwise modify issues
 - You may only write to `/work-output/.alucard-review` and `/work-output/.alucard-review-body`
@@ -25,8 +25,9 @@ Review the PR end to end:
 3. Read the full diff: `gh pr diff <pr_num>`
 4. Read changed source files for context beyond the diff
 5. Check test coverage — do the tests cover the changed behaviour and edge cases?
-6. Check CI status: `gh pr checks <pr_num>`
-7. Evaluate security — any injection, auth bypass, data exposure, or trust-boundary issues?
+6. Evaluate security — any injection, auth bypass, data exposure, or trust-boundary issues?
+
+CI status is verified by the harness in a separate loop — do not call `gh pr checks` or query `statusCheckRollup`. The container's token lacks the required scope and the harness already gates merge on CI independently.
 
 ## Engineering standards checklist
 
