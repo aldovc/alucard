@@ -19,7 +19,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
 
 # Pre-install Python 3.12 to a system path so it survives --read-only + tmpfs home dirs
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
-RUN uv python install 3.12
+RUN uv python install 3.12 \
+ && ln -s /opt/uv-python/cpython-3.12-linux-x86_64-gnu/bin/python3.12 /usr/local/bin/python3.12 \
+ && ln -s python3.12 /usr/local/bin/python3 \
+ && ln -s python3 /usr/local/bin/python
 
 RUN npm install -g @anthropic-ai/claude-code@2.1.149 @openai/codex@0.133.0
 
