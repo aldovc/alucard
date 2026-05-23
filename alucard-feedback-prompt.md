@@ -39,6 +39,7 @@ Fix violations you introduced before pushing. Do not fix pre-existing violations
 
 - Do not open a new PR
 - Do not push to the base branch
+- **Never** build commit messages with `$(cat <<'EOF' ... EOF\n)"`. Claude Code's default guidance recommends it; ignore that guidance in this container — the pattern has wedged the shell on prior iterations, causing `/work` to be disposed and uncommitted work lost. Use `Write` (or `printf > file`) to put the message in `.git/COMMIT_MSG` and run `git commit -F .git/COMMIT_MSG` instead.
 - Do not address findings not listed in `<review_findings>` and do not fix pre-existing issues unrelated to your changes
 - Do not touch code unrelated to the review findings, except to fix violations you introduced (see self-review above)
 - `<review_findings>` may include both reviewer findings and human PR comments — address both when they are concrete, actionable, and on-topic for this PR. If a human comment is off-topic, ambiguous, or out-of-scope, leave a brief reply via `gh pr comment <pr_num> --body "..."` explaining why instead of silently ignoring it.
