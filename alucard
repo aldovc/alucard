@@ -1141,6 +1141,13 @@ command_run() {
     git clone --local --no-tags --single-branch --branch "$BASE_BRANCH" "$REPO_ABS" "$WT_HOST"
     # The local branch may be behind; reset the clone to the exact fetched commit.
     git -C "$WT_HOST" reset --hard "$(git -C "$REPO_ABS" rev-parse "origin/$BASE_BRANCH")"
+    # Snapshot the base SHA the worker starts from. The worktree's own
+    # `origin/$BASE_BRANCH` tracks REPO_ABS's *local* main, which is frozen at
+    # the cached clone's creation time — so it drifts behind the real GitHub
+    # main over time and `origin/main..HEAD` reports phantom commits the worker
+    # never made. Using a pinned base SHA measures only what this iteration
+    # added on top of where it started.
+    _base_sha="$(git -C "$WT_HOST" rev-parse HEAD)"
     # Always use HTTPS so the container can authenticate with GITHUB_TOKEN.
     # Convert git@github.com:owner/repo.git → https://github.com/owner/repo.git
     _origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
@@ -1241,8 +1248,12 @@ command_run() {
             commit -m "wip: alucard recovery — uncommitted worker state" \
             2>/dev/null || true
         fi
+        # Compare against the SHA pinned at clone time, not the worktree's
+        # `origin/$BASE_BRANCH` ref — that ref tracks REPO_ABS's stale local
+        # main and reports phantom commits whenever GitHub main has advanced
+        # since REPO_ABS was first cloned.
         _commits_ahead=$(git -C "$WT_HOST" rev-list --count \
-          "origin/$BASE_BRANCH..HEAD" 2>/dev/null || echo 0)
+          "${_base_sha}..HEAD" 2>/dev/null || echo 0)
         if [ "$_commits_ahead" -gt 0 ]; then
           _recover_branch=$(git -C "$WT_HOST" rev-parse --abbrev-ref HEAD \
             2>/dev/null || echo "$BRANCH")
