@@ -29,6 +29,13 @@ Review the PR end to end:
 
 CI status is verified by the harness in a separate loop — do not call `gh pr checks` or query `statusCheckRollup`. The container's token lacks the required scope and the harness already gates merge on CI independently.
 
+## Mechanical checks — run these first
+
+Fast, high-yield, and able to catch deploy-breaking bugs that green CI hides. Do them before the judgment-based review below. `/work` is read-only but readable — use `rg` against the checkout.
+
+- **Phantom imports.** For every new `import X` / `from X import Y` the diff adds from an *internal* module, grep the target module for the definition of each symbol. A symbol that is imported, referenced, and patched in tests but never defined is an `ImportError` at module load — every route through that module 500s on deploy, yet patch-based tests stay green. Flag any symbol whose definition you cannot locate as **High severity**.
+- **Patch-based test smell.** When a test `patch()`es a symbol at its import site (e.g. `patch("family_brain.bot.router.get_tasks_client_factory")`), confirm the real symbol exists at that path. Such tests pass even when the underlying module would fail to import, so a passing suite is not evidence the symbol exists — verify it directly.
+
 ## Engineering standards checklist
 
 Flag any of the following as **CHANGES_REQUESTED**. These are not style preferences — each category represents a class of bugs, maintenance traps, or design failures.
@@ -37,9 +44,12 @@ Flag any of the following as **CHANGES_REQUESTED**. These are not style preferen
 - **Fire-and-forget without exception logging**: `asyncio.create_task(...)` silently drops exceptions. Every detached task must attach a done-callback that logs failures.
 - **Raw secrets in function signatures**: tokens, API keys, or credentials passed as plain `str` parameters must be encapsulated in a config or client object — they must not be threaded through call chains where they leak into logs or tracebacks.
 - **Missing input validation at trust boundaries**: data from webhooks, external APIs, or user input must be validated before use; trust internal application code, not external callers.
+- **Cleanup missing on a code path**: for every release/rollback/cleanup call the diff adds (release-claim, delete-resource, unlock), enumerate every exit of the enclosing function — each `return` as well as each `raise` — and confirm the cleanup fires on all of them. Flag any exit where it is absent. The silent `return None` path (a token-mismatch race, an early guard) is the common miss; so is a bare cleanup call inside a handler that can itself raise and mask the original error.
 
 ### Contract and layer violations
 - **Abstraction bypass**: if the codebase already has a helper for an external call (e.g. `send_reply` for Telegram), new code touching the same API must use it — never re-implement the same call inline.
+- **Partial abstraction**: when the diff introduces a class/module to consolidate a scattered pattern but migrates only some callsites (e.g. `edit_message` moved to a new client while `send_message`/`send_reply` keep their inline `httpx` calls), flag it. A half-migrated abstraction leaves timeout and error logic diverging across multiple places — worse than not extracting at all. Either every callsite of the old pattern is migrated or the PR body names the ones deliberately deferred.
+- **Interface change not propagated**: when a Protocol or shared method signature gains a parameter, list every implementation and caller and flag any that the diff left unchanged. A new optional `actions` kwarg wired into `publish_text` but not its siblings `publish_template`/`publish_prompt` silently makes the feature unreachable from those entry points.
 - **Layer crossing**: a router must not download files; a domain model must not make HTTP calls; a service must not format user-facing strings. Each layer has a contract — flag crossings regardless of whether they "work."
 - **Workarounds dressed as solutions**: if the implementation patches around a constraint (test monkey-patching, skipping validation, hardcoding a value to pass a test) rather than solving it properly, flag it. Shortcuts that exist only to satisfy acceptance criteria are bugs deferred.
 

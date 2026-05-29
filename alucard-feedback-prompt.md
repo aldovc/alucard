@@ -24,6 +24,8 @@ Order matters: edit → commit → push → verify. If you verify before pushing
 
 After fixing each finding, scan only the code you wrote or modified for these violations. Do not scan pre-existing code — but do fix anything you introduced:
 
+- Any symbol you newly imported from an internal module that is not actually defined there — a green test suite hides this when a test `patch()`es the symbol, and you push before verifying, so confirm the import resolves (`python -c "import the.module"`, or grep the target). A phantom import is a deploy-time `ImportError`.
+- Any cleanup/rollback you added (release-claim, delete-resource, unlock) that does not fire on *every* exit of the function — each `return` as well as each `raise`, not only the `except` blocks.
 - Any `asyncio.create_task(...)` missing a done-callback that logs exceptions.
 - Any token, API key, or credential passed as a plain `str` parameter across more than one function boundary.
 - Any logic duplicated from an existing helper in the codebase.
