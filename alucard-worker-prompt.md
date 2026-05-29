@@ -90,6 +90,12 @@ Before running lint and tests, read your own diff and check for each of the foll
 - No token, API key, or credential is passed as a plain `str` parameter through more than one function boundary.
 - External/user input is validated at the trust boundary before use.
 
+**Completeness** — the gaps a green test suite hides
+- Every symbol you import from an internal module is actually *defined* there, not merely planned. A name you referenced across files and patched in tests but never wrote is an `ImportError` at module load — see the runnable check in Verify below.
+- Cleanup runs on *every* exit. When you add rollback/release logic (release a claim, delete a resource, unlock), enumerate every way the function leaves — each `return` as well as each `raise`/`except` — and confirm the cleanup fires on all of them. The silent `return None` path (a token-mismatch race, an early guard) is the one most often missed; and a bare cleanup call inside a handler that can itself raise will mask the original exception.
+- Abstractions are migrated fully, not halfway. If you introduce a class or helper that consolidates a scattered pattern (HTTP client, retry, formatting), grep for every existing callsite of the old pattern and either migrate it or note in the PR body why it is left as tech debt. Don't leave timeout/error logic diverging across three places.
+- Signature changes reach every call site. When you add a parameter to a method or function, grep all call sites and confirm each one forwards the new argument or intentionally omits it — including sibling entry points that share the method but weren't the focus of the feature.
+
 **Contract and layer violations**
 - You are not re-implementing a call that an existing helper already makes.
 - Each function stays in its layer: routers route, services process, clients talk to external APIs.
@@ -109,7 +115,9 @@ Before running lint and tests, read your own diff and check for each of the foll
 
 ## Verify
 
-Run the project's lint and test commands (e.g. `just lint && just test`). Do not proceed if they fail — fix or revert. A passing local check before commit is non-negotiable.
+**Import-existence check first.** Before lint and tests, verify every symbol your diff imports from an internal module is actually defined there. Tests that `patch()` a symbol at its import site inject the name into the module namespace and pass even when the definition was never written — so a green suite is not proof the import resolves, and the failure only surfaces as a deploy-time `ImportError`. For each internal module you touched, do a real load: in Python, `python -c "import the.module.path"` (or `from the.module import the_symbol`); otherwise grep the target module for each symbol's definition. This is mechanical and catches a deploy-breaking bug class in seconds. (Where the language has a build/typecheck step that already fails on an undefined symbol, that step covers this — the check matters most for interpreted code.)
+
+Then run the project's lint and test commands (e.g. `just lint && just test`). Do not proceed if they fail — fix or revert. A passing local check before commit is non-negotiable.
 
 ## Commit
 
