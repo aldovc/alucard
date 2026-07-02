@@ -1,3 +1,4 @@
 alucard.env
 logs/
 .claude/settings.local.json
+.alucard/

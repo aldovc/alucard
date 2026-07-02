@@ -32,7 +32,8 @@ TARGET_REPO accepts:
 
 Commands:
   run       Run the autonomous worker loop.
-  queue     Print the currently eligible AFK issue queue as JSON.
+  queue     Print the currently eligible task queue as JSON — GitHub issues,
+            or a local tasks file when one is configured or auto-detected.
   build     Build the Alucard Docker image.
   doctor    Check local prerequisites without running the worker.
   continue  Re-run the feedback+CI+review pipeline on a parked PR.
@@ -51,6 +52,12 @@ Run options:
                                this CLI.
       --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 3.
       --no-build               Do not build the image if it is missing.
+      --tasks PATH             Read tasks from a local tasks file instead of
+                               the GitHub issue queue. Defaults to
+                               ALUCARD_TASKS_FILE, else auto-detects
+                               .alucard/tasks.md in the target repo.
+      --github                 Force the GitHub issue queue even when a local
+                               tasks file exists.
 
 Continue options:
   <PR_NUM>                     Open PR number to continue (required, positional).
@@ -60,6 +67,8 @@ Continue options:
 Environment:
   ALUCARD_CACHE_DIR            Where GitHub repos are cached on first run.
                                Default: ~/.cache/alucard  (XDG_CACHE_HOME honoured)
+  ALUCARD_TASKS_FILE           Default tasks file for the local task source
+                               (equivalent to passing --tasks).
 
 Examples:
   alucard run owner/repo --iterations 1
@@ -315,6 +324,9 @@ parse_repo_options() {
   MAX_REVIEW_CYCLES=3
   AUTO_BUILD=true
   TARGET_REPO_SET=false
+  TASKS_FILE="${ALUCARD_TASKS_FILE:-}"
+  TASKS_FILE_FROM_FLAG=false
+  FORCE_GITHUB=false
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -364,6 +376,16 @@ parse_repo_options() {
         ;;
       --no-build)
         AUTO_BUILD=false
+        shift
+        ;;
+      --tasks)
+        [ -n "${2:-}" ] || die "$1 requires a path"
+        TASKS_FILE="$2"
+        TASKS_FILE_FROM_FLAG=true
+        shift 2
+        ;;
+      --github)
+        FORCE_GITHUB=true
         shift
         ;;
       -h|--help)
@@ -439,6 +461,171 @@ get_unblocked_afk_issues() {
       echo "$issue"
     fi
   done | jq -s '.'
+}
+
+# ── Local task source ─────────────────────────────────────────────────────────
+# A tasks file is one markdown file per plan: everything above the first task
+# heading is the plan's parent context; each `## [<state>] <id>: <title>`
+# section is a task. States: " " queued, ">" PR in flight, "x" done,
+# "h" human task (never queued). File order is queue order.
+
+# Parse a tasks file into {parent_context, tasks, errors} without filtering.
+# Pure and offline — structure only, no eligibility decisions, no network.
+# Each task carries: id, state, title (PR suffix stripped), pr (from a
+# trailing "(PR #N)" title suffix, else null), line (heading line number,
+# for doctor diagnostics), body (raw markdown until the next task heading).
+parse_tasks_file() {
+  local file="$1"
+  jq -R -s '
+    "^## \\[(?<st>[ >xh])\\] (?<id>[A-Za-z0-9_-]+): (?<title>.+)$" as $heading_re
+    | gsub("\r"; "")
+    | split("\n") as $lines
+    | reduce range(0; $lines | length) as $i (
+        {header: [], tasks: [], errors: [], cur: null};
+        $lines[$i] as $l
+        | if ($l | test("^##[[:space:]]*\\[")) then
+            ([$l | capture($heading_re)] | .[0]) as $m
+            | if $m == null then
+                .errors += ["line \($i + 1): malformed task heading: \($l)"]
+              else
+                .tasks += (if .cur == null then [] else [.cur] end)
+                | .cur = {
+                    id: $m.id,
+                    state: $m.st,
+                    title: ($m.title | sub("[[:space:]]*\\(PR #[0-9]+\\)[[:space:]]*$"; "")),
+                    pr: ([$m.title | capture("\\(PR #(?<n>[0-9]+)\\)[[:space:]]*$") | .n | tonumber] | .[0]),
+                    line: ($i + 1),
+                    body_lines: []
+                  }
+              end
+          elif .cur == null then
+            .header += [$l]
+          else
+            .cur.body_lines += [$l]
+          end
+      )
+    | .tasks += (if .cur == null then [] else [.cur] end)
+    | {
+        parent_context: (.header | join("\n") | sub("\\n+$"; "")),
+        errors,
+        tasks: [ .tasks[] | {
+            id, state, title, pr, line,
+            body: (.body_lines | join("\n") | sub("^\\n+"; "") | sub("\\n+$"; ""))
+          } ]
+      }
+  ' < "$file"
+}
+
+# Eligible queue from a tasks file: state " " tasks whose blockers are all
+# satisfied, in file order. `Blocked by:` task ids must be [x]; GitHub-issue
+# blockers ("Blocked by #N", or "#N" tokens in a Blocked by: line) must be
+# closed, mirroring the GitHub-mode convention. Unknown task ids block
+# conservatively — `alucard doctor` reports them loudly. Dies on parse
+# errors: a malformed file should kill the run at launch, not mid-night.
+# Emits a JSON array of {id, title, body}.
+get_unblocked_local_tasks() {
+  local file="$1" repo_abs="$2"
+  local parsed errors candidates task ref state blocked
+
+  parsed=$(parse_tasks_file "$file")
+  errors=$(echo "$parsed" | jq -r '.errors[]')
+  [ -z "$errors" ] || die "invalid tasks file $file:
+$errors"
+
+  candidates=$(echo "$parsed" | jq -c '
+    (.tasks | map({key: .id, value: .state}) | from_entries) as $states
+    | .tasks[]
+    | select(.state == " ")
+    | (.body | split("\n") | map(select(test("^Blocked by:")))
+       | map(sub("^Blocked by:"; "") | [scan("[^,[:space:]]+")])
+       | flatten) as $tokens
+    | ($tokens | map(select(. != "none" and (startswith("#") | not)))) as $task_blockers
+    | (($tokens | map(select(startswith("#")) | ltrimstr("#")))
+        + [.body | scan("Blocked by #([0-9]+)") | .[0]]
+       | unique) as $issue_blockers
+    | select([$task_blockers[] | $states[.] // "?"] | all(. == "x"))
+    | {id, title, body, issue_blockers: $issue_blockers}
+  ')
+
+  echo "$candidates" | while IFS= read -r task; do
+    [ -n "$task" ] || continue
+
+    blocked=false
+    for ref in $(echo "$task" | jq -r '.issue_blockers[]'); do
+      state=$(cd "$repo_abs" && gh issue view "$ref" --json state -q .state 2>/dev/null || echo "OPEN")
+      [ "$state" = "OPEN" ] && { blocked=true; break; }
+    done
+
+    if [ "$blocked" = false ]; then
+      echo "$task" | jq -c 'del(.issue_blockers)'
+    fi
+  done | jq -s '.'
+}
+
+# Structural validation for doctor: prints one problem per line, returns 1 if
+# any. Offline by design — GitHub blocker states are a queue-time concern.
+validate_tasks_file() {
+  local file="$1" problems
+  problems=$(parse_tasks_file "$file" | jq -r '
+    (.tasks | map(.id)) as $ids
+    | .errors[],
+      (.tasks | group_by(.id) | .[] | select(length > 1)
+        | "line \(.[-1].line): duplicate task id \(.[0].id) (first used at line \(.[0].line))"),
+      (.tasks[] as $t
+        | ($t.body | split("\n") | map(select(test("^Blocked by:")))
+           | map(sub("^Blocked by:"; "") | [scan("[^,[:space:]]+")])
+           | flatten
+           | map(select(. != "none" and (startswith("#") | not)))
+           | .[]) as $ref
+        | select(($ids | index($ref)) == null)
+        | "line \($t.line): task \($t.id) blocked by unknown task id \($ref)"),
+      (select((.parent_context | gsub("[[:space:]]+"; "") | length) == 0)
+        | "line 1: empty header — no parent context above the first task heading"),
+      (select((.tasks | length) == 0)
+        | "line 1: no task headings found")
+  ')
+  [ -z "$problems" ] || { printf '%s\n' "$problems"; return 1; }
+}
+
+# Decide where this invocation's tasks come from. Sets TASK_SOURCE
+# (github|file) and, for file mode, TASKS_FILE_ABS. Precedence: --github
+# beats everything except an explicit --tasks (the combination is an error),
+# then --tasks/ALUCARD_TASKS_FILE, then an auto-detected .alucard/tasks.md in
+# the target repo, else the GitHub issue queue.
+resolve_task_source() {
+  local repo_abs="${1:-}"
+  TASK_SOURCE="github"
+  TASKS_FILE_ABS=""
+
+  if [ "$FORCE_GITHUB" = "true" ]; then
+    [ "$TASKS_FILE_FROM_FLAG" = "false" ] || die "--tasks and --github are mutually exclusive"
+    return 0
+  fi
+
+  if [ -n "$TASKS_FILE" ]; then
+    [ -f "$TASKS_FILE" ] || die "tasks file not found: $TASKS_FILE"
+    TASKS_FILE_ABS="$(cd "$(dirname "$TASKS_FILE")" && pwd)/$(basename "$TASKS_FILE")"
+    TASK_SOURCE="file"
+    return 0
+  fi
+
+  if [ -n "$repo_abs" ] && [ -f "$repo_abs/.alucard/tasks.md" ]; then
+    TASKS_FILE_ABS="$repo_abs/.alucard/tasks.md"
+    TASK_SOURCE="file"
+  fi
+}
+
+# Task-source seam: consumers ask this dispatcher for the eligible queue,
+# never a source function directly. A source implements: the eligible queue
+# (here), in-flight marking, state reconciliation, the PR linkage line, prior
+# notes, and the usage-report destination — everything else is source-blind.
+get_task_queue() {
+  local repo_abs="$1"
+  case "$TASK_SOURCE" in
+    file)   get_unblocked_local_tasks "$TASKS_FILE_ABS" "$repo_abs" ;;
+    github) get_unblocked_afk_issues "$repo_abs" ;;
+    *)      die "unknown task source: ${TASK_SOURCE:-unset}" ;;
+  esac
 }
 
 print_usage_report() {
@@ -647,7 +834,8 @@ command_queue() {
 
   REPO_ABS=$(resolve_repo "$TARGET_REPO")
   load_env_file "$ENV_FILE" false
-  get_unblocked_afk_issues "$REPO_ABS"
+  resolve_task_source "$REPO_ABS"
+  get_task_queue "$REPO_ABS"
 }
 
 command_doctor() {
@@ -726,6 +914,24 @@ command_doctor() {
     echo "ok: Docker image $IMAGE"
   else
     echo "missing: Docker image $IMAGE (run: docker pull ghcr.io/aldovc/alucard:latest, or alucard build for a local image)"
+  fi
+
+  resolve_task_source "${REPO_ABS:-}"
+  if [ "$TASK_SOURCE" = "file" ]; then
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "skipped: tasks file validation ($TASKS_FILE_ABS) — jq missing"
+    else
+      local _tasks_problems _todo
+      if _tasks_problems=$(validate_tasks_file "$TASKS_FILE_ABS"); then
+        _todo=$(parse_tasks_file "$TASKS_FILE_ABS" \
+          | jq '[.tasks[] | select(.state == " ")] | length')
+        echo "ok: tasks file $TASKS_FILE_ABS (local task source, ${_todo} todo)"
+      else
+        echo "invalid: tasks file $TASKS_FILE_ABS"
+        printf '%s\n' "$_tasks_problems" | sed 's/^/  - /'
+        ok=false
+      fi
+    fi
   fi
 
   [ "$ok" = "true" ] || exit 1
@@ -1118,6 +1324,14 @@ command_run() {
 
   [ "$ITERATIONS" -gt 0 ] || die "iterations must be greater than zero"
   [ "$TIMEOUT_MIN" -gt 0 ] || die "timeout must be greater than zero"
+
+  # The local task source has queue/doctor support only so far; run-loop
+  # dispatch is the next slice. Fail loudly before any env/image setup rather
+  # than silently running the GitHub queue while a tasks file is configured.
+  local _early_repo
+  _early_repo=$(resolve_repo "$TARGET_REPO")
+  resolve_task_source "$_early_repo"
+  [ "$TASK_SOURCE" = "github" ] || die "tasks file detected ($TASKS_FILE_ABS): 'alucard run' does not consume the local task source yet — pass --github to run the GitHub issue queue"
 
   setup_run_environment
   local final_result='select(.type == "result").result // empty'
