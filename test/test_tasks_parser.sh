@@ -43,6 +43,15 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if printf '%s' "$haystack" | grep -qF "$needle"; then
+    fail "$label (output unexpectedly contains '$needle')"
+  else
+    pass "$label"
+  fi
+}
+
 # Source alucard to load helper functions without running main.
 # The BASH_SOURCE guard in alucard prevents main from executing when sourced.
 # shellcheck disable=SC1090
@@ -155,6 +164,56 @@ assert_eq "dispatch: file source returns the local queue" "1,4" \
 
 TASK_SOURCE="bogus"
 assert_exit "dispatch: unknown source dies" 1 get_task_queue "$SCRIPT_DIR/.."
+
+# ── Test group 6: build_worker_prompt ────────────────────────────────────────
+
+TASK_SOURCE="github"
+BASE_BRANCH="main"
+build_worker_prompt '[{"number":1,"title":"t","body":"b"}]' 'line1
+line2' "INSTRUCTIONS"
+EXPECTED_GH='<instructions>INSTRUCTIONS</instructions>
+<base_branch>main</base_branch>
+<commits>line1
+line2</commits>
+<issues>[{"number":1,"title":"t","body":"b"}]</issues>'
+assert_eq "prompt: github mode format is byte-identical" "$EXPECTED_GH" "$FULL_PROMPT"
+assert_eq "prompt: github mode leaves no dispatched task id" "" "$DISPATCHED_TASK_ID"
+
+build_worker_prompt '[]' 'a <b> & c' "I"
+assert_contains "prompt: xml-escapes injected content" "a &lt;b&gt; &amp; c" "$FULL_PROMPT"
+
+TASK_SOURCE="file"
+TASKS_FILE_ABS="$FIX_BASIC"
+BASE_BRANCH="main"
+FQUEUE=$(get_unblocked_local_tasks "$FIX_BASIC" "$SCRIPT_DIR/..")
+build_worker_prompt "$FQUEUE" "commit log" "INSTRUCTIONS"
+assert_eq "prompt: file mode dispatches the first eligible task" "1" "$DISPATCHED_TASK_ID"
+assert_contains "prompt: file mode marks the task source" "<task_source>file</task_source>" "$FULL_PROMPT"
+assert_contains "prompt: file mode injects parent context verbatim" \
+  "Shared context for the parser tests" "$FULL_PROMPT"
+assert_contains "prompt: file mode injects the chosen task" "First queued task" "$FULL_PROMPT"
+assert_not_contains "prompt: file mode injects no issues array" "<issues>" "$FULL_PROMPT"
+assert_not_contains "prompt: file mode injects only the first task" \
+  "Unblocked because its blocker is done" "$FULL_PROMPT"
+
+# ── Test group 7: mark_task_in_flight ────────────────────────────────────────
+
+WORK_FILE=$(mktemp /tmp/alucard_test_mark.XXXXXX)
+cp "$FIX_BASIC" "$WORK_FILE"
+
+mark_task_in_flight "$WORK_FILE" 1 42
+assert_eq "mark: heading flipped with PR annotation" \
+  "## [>] 1: First queued task (PR #42)" "$(sed -n '6p' "$WORK_FILE")"
+assert_eq "mark: exactly one line changed" "1" \
+  "$(diff "$FIX_BASIC" "$WORK_FILE" | grep -c '^<')"
+assert_eq "mark: flipped task leaves the queue" "4" \
+  "$(get_unblocked_local_tasks "$WORK_FILE" "$SCRIPT_DIR/.." | jq -r '[.[].id] | join(",")')"
+
+assert_exit "mark: unknown task id returns 1" 1 mark_task_in_flight "$WORK_FILE" 99 43
+assert_eq "mark: failed mark leaves the file untouched" "1" \
+  "$(diff "$FIX_BASIC" "$WORK_FILE" | grep -c '^<')"
+
+rm -f "$WORK_FILE"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

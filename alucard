@@ -587,6 +587,32 @@ validate_tasks_file() {
   [ -z "$problems" ] || { printf '%s\n' "$problems"; return 1; }
 }
 
+# Local-source in-flight marking: flip the dispatched task's heading from
+# "[ ]" to "[>]" and append "(PR #N)" so the queue skips it while the PR is
+# open and the reconcile pass can track the outcome. Single-line edit keyed
+# on the task id, written atomically. Silent on a missing heading (returns 1)
+# — callers own the failure message.
+mark_task_in_flight() {
+  local file="$1" task_id="$2" pr_num="$3"
+  local tmp
+  tmp=$(mktemp "${file}.XXXXXX") || return 1
+  if awk -v id="$task_id" -v pr="$pr_num" '
+    !done && $0 ~ ("^## \\[ \\] " id ": ") {
+      sub(/^## \[ \]/, "## [>]")
+      $0 = $0 " (PR #" pr ")"
+      done = 1
+    }
+    { print }
+    END { exit done ? 0 : 1 }
+  ' "$file" > "$tmp"; then
+    chmod --reference="$file" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
 # Decide where this invocation's tasks come from. Sets TASK_SOURCE
 # (github|file) and, for file mode, TASKS_FILE_ABS. Precedence: --github
 # beats everything except an explicit --tasks (the combination is an error),
@@ -617,8 +643,9 @@ resolve_task_source() {
 
 # Task-source seam: consumers ask this dispatcher for the eligible queue,
 # never a source function directly. A source implements: the eligible queue
-# (here), in-flight marking, state reconciliation, the PR linkage line, prior
-# notes, and the usage-report destination — everything else is source-blind.
+# (here), in-flight marking (mark_task_in_flight), state reconciliation, the
+# PR linkage line ("Closes #N" / "Task: <id>"), prior notes, and the
+# usage-report destination — everything else is source-blind.
 get_task_queue() {
   local repo_abs="$1"
   case "$TASK_SOURCE" in
@@ -724,12 +751,13 @@ post_iteration_usage() {
       --jq '.[0].number // empty' 2>/dev/null || true)
   [ -n "${pr_num:-}" ] || return 0
 
+  # Local-source PRs carry "Task: <id>" instead of a closing keyword — no
+  # issue to comment on, so the table falls back to the PR itself below.
   local issue_num
   issue_num=$(cd "$repo_abs" && \
     gh pr view "$pr_num" --json body --jq '.body' 2>/dev/null \
     | grep -oiE '(closes|fixes|resolves)[[:space:]]+#[0-9]+' \
     | grep -oE '[0-9]+' | head -1 || true)
-  [ -n "${issue_num:-}" ] || return 0
 
   local -a rows=()
   local total_inp=0 total_out=0 total_cr=0 total_cw=0 total_turns=0
@@ -792,8 +820,13 @@ $(printf '%s\n' "${rows[@]}")
 
 </details>"
 
-  echo "Posting token usage to issue #${issue_num}..."
-  cd "$repo_abs" && gh issue comment "$issue_num" --body "$body" 2>/dev/null || true
+  if [ -n "${issue_num:-}" ]; then
+    echo "Posting token usage to issue #${issue_num}..."
+    cd "$repo_abs" && gh issue comment "$issue_num" --body "$body" 2>/dev/null || true
+  else
+    echo "Posting token usage to PR #${pr_num}..."
+    cd "$repo_abs" && gh pr comment "$pr_num" --body "$body" 2>/dev/null || true
+  fi
 }
 
 command_build() {
@@ -1313,6 +1346,38 @@ setup_run_environment() {
   trap cleanup EXIT
 }
 
+# Build the worker prompt for one iteration. GitHub mode injects the whole
+# queue and the worker picks; file mode injects exactly ONE task — the first
+# eligible in file order — plus the plan's parent context, so bundling and
+# mispicking are structurally impossible. Sets FULL_PROMPT and, in file mode,
+# DISPATCHED_TASK_ID (used for PR linkage and recovery attribution).
+build_worker_prompt() {
+  local queue="$1" commits="$2" instructions="$3"
+  local _commits_esc _task _task_esc _parent_esc _issues_esc
+
+  _commits_esc=$(printf '%s' "$commits" | xml_escape)
+  DISPATCHED_TASK_ID=""
+
+  if [ "$TASK_SOURCE" = "file" ]; then
+    _task=$(echo "$queue" | jq -c '.[0]')
+    DISPATCHED_TASK_ID=$(echo "$_task" | jq -r '.id')
+    _task_esc=$(printf '%s' "$_task" | xml_escape)
+    _parent_esc=$(parse_tasks_file "$TASKS_FILE_ABS" | jq -r '.parent_context' | xml_escape)
+    FULL_PROMPT="<instructions>${instructions}</instructions>
+<task_source>file</task_source>
+<base_branch>${BASE_BRANCH}</base_branch>
+<commits>${_commits_esc}</commits>
+<parent_context>${_parent_esc}</parent_context>
+<task>${_task_esc}</task>"
+  else
+    _issues_esc=$(printf '%s' "$queue" | xml_escape)
+    FULL_PROMPT="<instructions>${instructions}</instructions>
+<base_branch>${BASE_BRANCH}</base_branch>
+<commits>${_commits_esc}</commits>
+<issues>${_issues_esc}</issues>"
+  fi
+}
+
 command_run() {
   parse_repo_options "$@"
 
@@ -1325,15 +1390,9 @@ command_run() {
   [ "$ITERATIONS" -gt 0 ] || die "iterations must be greater than zero"
   [ "$TIMEOUT_MIN" -gt 0 ] || die "timeout must be greater than zero"
 
-  # The local task source has queue/doctor support only so far; run-loop
-  # dispatch is the next slice. Fail loudly before any env/image setup rather
-  # than silently running the GitHub queue while a tasks file is configured.
-  local _early_repo
-  _early_repo=$(resolve_repo "$TARGET_REPO")
-  resolve_task_source "$_early_repo"
-  [ "$TASK_SOURCE" = "github" ] || die "tasks file detected ($TASKS_FILE_ABS): 'alucard run' does not consume the local task source yet — pass --github to run the GitHub issue queue"
-
   setup_run_environment
+  resolve_task_source "$REPO_ABS"
+  [ "$TASK_SOURCE" = "github" ] || echo "Local task source: $TASKS_FILE_ABS"
   local final_result='select(.type == "result").result // empty'
 
   for ((i=1; i<=ITERATIONS; i++)); do
@@ -1369,7 +1428,7 @@ command_run() {
     git -C "$WT_HOST" remote set-url origin "$_origin_url"
     git -C "$WT_HOST" checkout -b "$BRANCH"
 
-    issues=$(get_unblocked_afk_issues "$REPO_ABS")
+    issues=$(get_task_queue "$REPO_ABS")
     count=$(echo "$issues" | jq 'length')
 
     if [ "$count" -eq 0 ]; then
@@ -1382,19 +1441,22 @@ command_run() {
     prompt=$(<"$TOOL_DIR/alucard-worker-prompt.md")
     log_file="$LOG_DIR/iter-${i}.jsonl"
 
-    _commits_esc=$(printf '%s' "$commits" | xml_escape)
-    _issues_esc=$(printf '%s' "$issues" | xml_escape)
-    full_prompt="<instructions>${prompt}</instructions>
-<base_branch>${BASE_BRANCH}</base_branch>
-<commits>${_commits_esc}</commits>
-<issues>${_issues_esc}</issues>"
+    build_worker_prompt "$issues" "$commits" "$prompt"
+    full_prompt="$FULL_PROMPT"
+    if [ "$TASK_SOURCE" = "file" ]; then
+      echo "Dispatching task ${DISPATCHED_TASK_ID}: $(echo "$issues" | jq -r '.[0].title')"
+    fi
 
     ITER_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     # Snapshot which issues are already in-progress so we can detect what the
     # worker newly claimed and roll that label back if it never opened a PR.
-    _in_progress_before=$(cd "$REPO_ABS" && \
-      gh issue list --state open --label in-progress --limit 500 --json number \
-        --jq '[.[].number]' 2>/dev/null || echo '[]')
+    # Local mode has no claim step — nothing to snapshot or roll back.
+    _in_progress_before="[]"
+    if [ "$TASK_SOURCE" = "github" ]; then
+      _in_progress_before=$(cd "$REPO_ABS" && \
+        gh issue list --state open --label in-progress --limit 500 --json number \
+          --jq '[.[].number]' 2>/dev/null || echo '[]')
+    fi
 
     set +e
     invoke_agent \
@@ -1422,11 +1484,13 @@ command_run() {
     # iteration — otherwise the gates and token-usage post would silently skip.
     ACTUAL_BRANCH="$BRANCH"
     _pr_found=false
+    _iter_pr_num=""
     _harness_pr=$(cd "$REPO_ABS" && \
       gh pr list --head "$BRANCH" --state open --json number \
         --jq '.[0].number // empty' 2>/dev/null || true)
     if [ -n "${_harness_pr:-}" ]; then
       _pr_found=true
+      _iter_pr_num="$_harness_pr"
     else
       _fallback=$(cd "$REPO_ABS" && \
         gh pr list --label alucard --state open --json number,createdAt,headRefName \
@@ -1438,9 +1502,19 @@ command_run() {
         _fallback_num=$(echo "$_fallback" | jq -r '.number')
         echo "Worker pushed to non-harness branch '$ACTUAL_BRANCH' — using PR #$_fallback_num for gates."
         _pr_found=true
+        _iter_pr_num="$_fallback_num"
       fi
     fi
     _recovery_pr=false
+
+    # Local source: mark the dispatched task in-flight so the next iteration
+    # skips it while the PR is open. This is the local analog of GitHub's
+    # closing-issues dedup. A miss means the heading was edited mid-run —
+    # stop before the loop dispatches the same task twice.
+    if [ "$TASK_SOURCE" = "file" ] && [ "$_pr_found" = true ]; then
+      mark_task_in_flight "$TASKS_FILE_ABS" "$DISPATCHED_TASK_ID" "$_iter_pr_num" \
+        || die "could not mark task ${DISPATCHED_TASK_ID} in-flight in $TASKS_FILE_ABS (heading edited mid-run?) — PR #${_iter_pr_num} is pushed and safe; fix the heading, then resume gates with 'alucard continue ${_iter_pr_num}'"
+    fi
 
     # Worker exited (timeout, budget, error) before opening a PR. Two failure
     # modes to recover from:
@@ -1451,13 +1525,16 @@ command_run() {
     #      but never produced any commits — strip the label so the queue filter
     #      doesn't lock the issue out of future runs.
     if [ "$_pr_found" = false ]; then
-      _in_progress_after=$(cd "$REPO_ABS" && \
-        gh issue list --state open --label in-progress --limit 500 --json number \
-          --jq '[.[].number]' 2>/dev/null || echo '[]')
-      _newly_claimed=$(jq -nc \
-        --argjson before "$_in_progress_before" \
-        --argjson after "$_in_progress_after" \
-        '$after - $before' 2>/dev/null || echo '[]')
+      _newly_claimed="[]"
+      if [ "$TASK_SOURCE" = "github" ]; then
+        _in_progress_after=$(cd "$REPO_ABS" && \
+          gh issue list --state open --label in-progress --limit 500 --json number \
+            --jq '[.[].number]' 2>/dev/null || echo '[]')
+        _newly_claimed=$(jq -nc \
+          --argjson before "$_in_progress_before" \
+          --argjson after "$_in_progress_after" \
+          '$after - $before' 2>/dev/null || echo '[]')
+      fi
 
       if [ -d "$WT_HOST/.git" ]; then
         # Stage and commit any uncommitted changes — work-in-progress would
@@ -1493,12 +1570,17 @@ command_run() {
           if GIT_TERMINAL_PROMPT=0 git -C "$WT_HOST" push -u origin "$_recover_branch" 2>&1; then
             # Closes #N on the first line lets the queue dedup filter
             # (closingIssuesReferences in get_unblocked_afk_issues) match
-            # the issue to this PR so the issue isn't re-picked.
+            # the issue to this PR so the issue isn't re-picked. The local
+            # source uses a Task: line plus the in-flight heading flip below.
             _closes_line=""
-            for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
-              _closes_line="Closes #${_n}"
-              break
-            done
+            if [ "$TASK_SOURCE" = "file" ]; then
+              _closes_line="Task: ${DISPATCHED_TASK_ID}"
+            else
+              for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
+                _closes_line="Closes #${_n}"
+                break
+              done
+            fi
             _stub_body="${_closes_line}
 
 **🤖 Alucard recovery PR** — worker exited rc=${rc} before opening a PR. Its commits have been pushed here so the work isn't lost.
@@ -1516,6 +1598,11 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
               echo "Opened recovery PR: $_new_pr_url"
               ACTUAL_BRANCH="$_recover_branch"
               _recovery_pr=true
+              if [ "$TASK_SOURCE" = "file" ]; then
+                _recovery_pr_num="${_new_pr_url##*/}"
+                mark_task_in_flight "$TASKS_FILE_ABS" "$DISPATCHED_TASK_ID" "$_recovery_pr_num" \
+                  || die "could not mark task ${DISPATCHED_TASK_ID} in-flight in $TASKS_FILE_ABS — recovery PR #${_recovery_pr_num} is pushed and safe; fix the heading before the next run"
+              fi
             else
               echo "Could not open recovery PR: $_new_pr_url"
             fi
@@ -1526,8 +1613,10 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
       fi
 
       # No PR exists and recovery didn't produce one — strip the in-progress
-      # label so the next run can re-pick the issue.
-      if [ "$_recovery_pr" = false ]; then
+      # label so the next run can re-pick the issue. Local mode never
+      # claimed anything, so there is nothing to strip and the still-"[ ]"
+      # task is naturally re-picked next iteration.
+      if [ "$_recovery_pr" = false ] && [ "$TASK_SOURCE" = "github" ]; then
         for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
           echo "Worker claimed #$_n but produced no PR — removing 'in-progress' label."
           (cd "$REPO_ABS" && gh issue edit "$_n" --remove-label in-progress) \
@@ -1560,7 +1649,7 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
       # query failure here falls through to "keep going" rather than exit,
       # since a transient GitHub blip shouldn't kill a 20-iter overnight run.
       _remaining=""
-      _remaining=$(get_unblocked_afk_issues "$REPO_ABS" | jq 'length' 2>/dev/null || true)
+      _remaining=$(get_task_queue "$REPO_ABS" | jq 'length' 2>/dev/null || true)
       if [ "${_remaining:-}" = "0" ]; then
         echo "Alucard signaled completion after $i iterations (queue verified empty)."
         exit 0

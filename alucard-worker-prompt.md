@@ -7,9 +7,25 @@ You run inside an autonomous loop. Each iteration: pick ONE issue, complete it e
 These instructions are followed by context sections:
 - `<base_branch>` — the configured base branch name (e.g. `main`)
 - `<commits>` — last 5 commits on the base branch
-- `<issues>` — JSON array of open, unblocked, non-WIP AFK issues
+- `<issues>` — JSON array of open, unblocked, non-WIP AFK issues (GitHub mode)
+
+In local tasks mode — marked by `<task_source>file</task_source>` — `<issues>` is replaced by:
+- `<parent_context>` — the plan's shared context; implement against its constraints
+- `<task>` — the ONE task for this iteration (JSON: id, title, body)
 
 The harness has already filtered HITL, in-progress, blocked, and WIP issues. Trust the queue.
+
+## Local tasks mode
+
+When `<task_source>file</task_source>` is present, the queue lives in a local file owned by the harness — GitHub Issues are NOT involved. Everything below still applies, with these overrides:
+
+- Work ONLY on the task in `<task>`. There is no queue to pick from — the harness already chose.
+- Skip the claim step and every `gh issue` command: there is no issue to label, view, edit, comment on, or close.
+- The PR body's first line MUST be `Task: <id>` (e.g. `Task: 3`). NEVER write `Closes #N` or any issue-closing keyword — task ids are not issue numbers, and a closing keyword would close an unrelated GitHub issue in this repository.
+- Commit messages reference the task as `Task: <id>` instead of `Closes #N` / `Refs #N`.
+- In the PR body, list every acceptance criterion from the task with its status (done / partial — what remains / skipped — why). This replaces ticking checkboxes on an issue.
+- If the task title mentions a previous PR (`previous attempt: PR #N`), read it before starting: `gh pr view <N> --comments` — prior work, review findings, and blockers are there.
+- Do not look for or edit the tasks file itself: it is not in your worktree. The harness updates it when your PR opens and merges.
 
 ## Termination
 
