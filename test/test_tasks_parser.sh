@@ -192,6 +192,8 @@ line2</commits>
 <issues>[{"number":1,"title":"t","body":"b"}]</issues>'
 assert_eq "prompt: github mode format is byte-identical" "$EXPECTED_GH" "$FULL_PROMPT"
 assert_eq "prompt: github mode leaves no dispatched task id" "" "$DISPATCHED_TASK_ID"
+assert_eq "prompt: github mode leaves TASK_XML empty" "" "$TASK_XML"
+assert_eq "prompt: github mode leaves PARENT_CONTEXT_XML empty" "" "$PARENT_CONTEXT_XML"
 
 build_worker_prompt '[]' 'a <b> & c' "I"
 assert_contains "prompt: xml-escapes injected content" "a &lt;b&gt; &amp; c" "$FULL_PROMPT"
@@ -209,6 +211,23 @@ assert_contains "prompt: file mode injects the chosen task" "First queued task" 
 assert_not_contains "prompt: file mode injects no issues array" "<issues>" "$FULL_PROMPT"
 assert_not_contains "prompt: file mode injects only the first task" \
   "Unblocked because its blocker is done" "$FULL_PROMPT"
+assert_contains "prompt: file mode sets TASK_XML for the reviewer" "First queued task" "$TASK_XML"
+assert_contains "prompt: file mode sets PARENT_CONTEXT_XML for the reviewer" \
+  "Shared context for the parser tests" "$PARENT_CONTEXT_XML"
+
+# ── Test group 6b: append_task_context ───────────────────────────────────────
+
+REVIEW_BASE='<instructions>x</instructions>
+<pr_num>7</pr_num>'
+
+assert_eq "review prompt: github mode (empty task_xml) is unchanged" \
+  "$REVIEW_BASE" "$(append_task_context "$REVIEW_BASE" "" "")"
+
+APPENDED=$(append_task_context "$REVIEW_BASE" '{"id":"1"}' 'shared plan context')
+assert_contains "review prompt: file mode appends <task>" '<task>{"id":"1"}</task>' "$APPENDED"
+assert_contains "review prompt: file mode appends <parent_context>" \
+  "<parent_context>shared plan context</parent_context>" "$APPENDED"
+assert_contains "review prompt: file mode keeps the base prompt" "$REVIEW_BASE" "$APPENDED"
 
 # ── Test group 7: mark_task_in_flight ────────────────────────────────────────
 

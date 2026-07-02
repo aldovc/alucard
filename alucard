@@ -1251,12 +1251,28 @@ $(printf '%s' "$failure_log" | xml_escape)
   done
 }
 
+# Appends <task>/<parent_context> to a reviewer prompt when local-mode task
+# context is available (task_xml non-empty); a no-op in github mode, where
+# the reviewer prompt's own fallback instructs it to `gh issue view` instead.
+append_task_context() {
+  local prompt="$1" task_xml="$2" parent_xml="$3"
+  if [ -n "$task_xml" ]; then
+    printf '%s\n<task>%s</task>\n<parent_context>%s</parent_context>' \
+      "$prompt" "$task_xml" "$parent_xml"
+  else
+    printf '%s' "$prompt"
+  fi
+}
+
 # Run reviewer then feedback agents on the open PR, up to MAX_REVIEW_CYCLES times.
 # $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
+# $4 = task XML (file mode only, empty in github mode)
+# $5 = parent context XML (file mode only, empty in github mode)
 # Uses globals: REPO_ABS WT_ROOT LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
 #               CREATED_WORKTREES stream_text MAX_REVIEW_CYCLES
 review_gate() {
   local iter="$1" branch="$2" origin_url="$3"
+  local task_xml="${4:-}" parent_context_xml="${5:-}"
 
   local pr_num
   pr_num=$(cd "$REPO_ABS" && \
@@ -1289,6 +1305,7 @@ review_gate() {
 $(<"$TOOL_DIR/alucard-reviewer-prompt.md")
 </instructions>
 <pr_num>${pr_num}</pr_num>"
+    _review_prompt=$(append_task_context "$_review_prompt" "$task_xml" "$parent_context_xml")
 
     set +e
     invoke_agent \
@@ -1456,12 +1473,16 @@ build_worker_prompt() {
 <commits>${_commits_esc}</commits>
 <parent_context>${_parent_esc}</parent_context>
 <task>${_task_esc}</task>"
+    TASK_XML="$_task_esc"
+    PARENT_CONTEXT_XML="$_parent_esc"
   else
     _issues_esc=$(printf '%s' "$queue" | xml_escape)
     FULL_PROMPT="<instructions>${instructions}</instructions>
 <base_branch>${BASE_BRANCH}</base_branch>
 <commits>${_commits_esc}</commits>
 <issues>${_issues_esc}</issues>"
+    TASK_XML=""
+    PARENT_CONTEXT_XML=""
   fi
 }
 
@@ -1719,7 +1740,7 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
     # to resume gates against the recovered branch.
     if [ "$_recovery_pr" = false ]; then
       ci_gate "$i" "$ACTUAL_BRANCH" "$_origin_url"
-      review_gate "$i" "$ACTUAL_BRANCH" "$_origin_url"
+      review_gate "$i" "$ACTUAL_BRANCH" "$_origin_url" "$TASK_XML" "$PARENT_CONTEXT_XML"
     fi
     post_iteration_usage "$i" "$ACTUAL_BRANCH" "$REPO_ABS" "$LOG_DIR"
 
