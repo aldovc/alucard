@@ -167,7 +167,7 @@ Blocked by: 1
 ### Lifecycle / morning-after flow
 
 - Each iteration, the harness picks the first eligible (`[ ]`, unblocked) task itself and hands the worker exactly that one task plus the parent context — no queue to pick from, so bundling is structurally impossible.
-- There is no claim/label step in local mode — no `in-progress` label, no `gh issue` calls at all. Runs are sequential, so nothing else can grab the same task mid-run.
+- There is no claim/label step in local mode — no `in-progress` label. Runs are sequential, so nothing else can grab the same task mid-run. Local task blockers should use task ids (`Blocked by: 1, 2`); legacy `Blocked by #N` issue blockers still require `gh issue view` access so open GitHub issues can keep tasks blocked.
 - When a PR opens, the harness flips the task's heading from `[ ]` to `[>] … (PR #N)` — a single atomic line edit.
 - The PR body's first line is `Task: <id>`, never a GitHub closing keyword — task ids aren't issue numbers, and a stray `Closes #N` would close an unrelated issue in the target repo.
 - Reconciling a `[>]` task's outcome back into the file (merged → `[x]`, closed unmerged → back to `[ ]` with a pointer to the failed attempt) is not automatic yet — until it is, flip the heading to `[x]` by hand once you've merged the PR, so anything blocked on that task unblocks on the next run.
@@ -175,7 +175,7 @@ Blocked by: 1
 
 ### Reduced PAT scope
 
-Local mode never calls the GitHub Issues API, so the fine-grained PAT described in [Credentials to provision](#credentials-to-provision) needs only **Contents R/W, Pull requests R/W, Metadata R** — drop `Issues R/W` if a repo runs exclusively in local mode.
+Local mode can run without the GitHub Issues API when local tasks use task-id blockers exclusively (`Blocked by: 1, 2`). In that case, the fine-grained PAT described in [Credentials to provision](#credentials-to-provision) needs only **Contents R/W, Pull requests R/W, Metadata R** — drop `Issues R/W`. If any local task uses the legacy `Blocked by #N` GitHub-issue form, keep **Issues read** access so the queue can resolve whether that issue is still open.
 
 ## Setup checklist for the new folder
 
@@ -225,7 +225,7 @@ cp "$ALUCARD_HOME/alucard.env.example" "$ALUCARD_HOME/alucard.env"
    - Expiry: 30 days
    - Paste into `alucard.env` as `GITHUB_TOKEN=`
    - **Note:** Fine-grained PATs cannot access the GitHub GraphQL `statusCheckRollup` field — GitHub has not shipped a "Checks" permission for fine-grained tokens ([known limitation](https://github.com/cli/cli/issues/12597)). Alucard detects this and falls back to polling `gh run list`, which works correctly. If you want the primary `gh pr checks --watch` path, use a **classic PAT with `repo` scope** instead.
-   - **Local task source:** running a repo exclusively off a [local tasks file](#local-task-source) instead of GitHub issues needs only Contents R/W, Pull requests R/W, Metadata R — drop `Issues R/W`.
+   - **Local task source:** running a repo exclusively off a [local tasks file](#local-task-source) instead of GitHub issues needs only Contents R/W, Pull requests R/W, Metadata R — drop `Issues R/W` only when local tasks use task-id blockers exclusively. Keep Issues read access for legacy `Blocked by #N` issue blockers.
 
 2. **Anthropic worker API key:**
    - console.anthropic.com → API keys → create new key named "alucard-worker"
