@@ -24,7 +24,7 @@ RUN uv python install 3.12 \
  && ln -s python3.12 /usr/local/bin/python3 \
  && ln -s python3 /usr/local/bin/python
 
-RUN npm install -g @anthropic-ai/claude-code@2.1.149 @openai/codex@0.133.0
+RUN npm install -g @anthropic-ai/claude-code@2.1.198 @openai/codex@0.142.5
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

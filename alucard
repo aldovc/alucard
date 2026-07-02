@@ -260,7 +260,7 @@ invoke_agent() {
 
   local _rc
   if [ "$provider" = "codex" ]; then
-    local codex_model="${ALUCARD_CODEX_MODEL:-gpt-4o}"
+    local codex_model="${ALUCARD_CODEX_MODEL:-gpt-5.5}"
     # Prompt is fed via process substitution so PIPESTATUS[0] captures docker's exit.
     timeout "${TIMEOUT_MIN}m" docker run --rm -i \
       "${_docker_args[@]}" \
