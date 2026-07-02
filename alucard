@@ -613,6 +613,73 @@ mark_task_in_flight() {
   fi
 }
 
+# Local analog of GitHub's auto-close-on-merge: before the queue is built,
+# check every "[>] <id>: <title> (PR #N)" heading against that PR's actual
+# state. Merged flips to "[x]" (the "(PR #N)" suffix stays, as history);
+# closed-without-merging flips back to "[ ]" and rewrites the suffix to
+# "(previous attempt: PR #N)" so the next dispatch — and the worker prompt's
+# "previous attempt" instruction — can find it; open PRs are left alone (the
+# task stays skipped, same as today). One `gh pr view` per in-flight heading.
+# A `gh` failure (auth, network, rate limit) skips that task's line entirely
+# rather than writing a guess — fail safe, never fail dirty. Rewrite is
+# atomic (temp file + rename) and touches only the matched heading lines;
+# every other byte, including untouched in-flight headings, is preserved.
+reconcile_tasks_file() {
+  local file="$1" repo_abs="$2"
+  local parsed inflight id pr state actions tmp
+
+  parsed=$(parse_tasks_file "$file") || return 0
+  inflight=$(echo "$parsed" | jq -c '.tasks[] | select(.state == ">" and .pr != null) | {id, pr}')
+  [ -n "$inflight" ] || return 0
+
+  actions=$(mktemp) || return 1
+  : > "$actions"
+
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    id=$(echo "$t" | jq -r '.id')
+    pr=$(echo "$t" | jq -r '.pr')
+    state=$(cd "$repo_abs" && gh pr view "$pr" --json state -q .state 2>/dev/null) || continue
+    case "$state" in
+      MERGED) printf '%s\t%s\tx\n' "$id" "$pr" >> "$actions" ;;
+      CLOSED) printf '%s\t%s\t \n' "$id" "$pr" >> "$actions" ;;
+      *) : ;; # OPEN (or anything else) — leave the heading alone
+    esac
+  done <<< "$inflight"
+
+  if [ ! -s "$actions" ]; then
+    rm -f "$actions"
+    return 0
+  fi
+
+  tmp=$(mktemp "${file}.XXXXXX") || { rm -f "$actions"; return 1; }
+  if awk -F'\t' '
+    NR == FNR { newstate[$1] = $3; pr[$1] = $2; next }
+    {
+      for (id in newstate) {
+        pat = "^## \\[>\\] " id ": .*\\(PR #" pr[id] "\\)[[:space:]]*$"
+        if ($0 ~ pat) {
+          if (newstate[id] == "x") {
+            sub(/^## \[>\]/, "## [x]")
+          } else {
+            sub(/^## \[>\]/, "## [ ]")
+            sub("\\(PR #" pr[id] "\\)[[:space:]]*$", "(previous attempt: PR #" pr[id] ")")
+          }
+          break
+        }
+      }
+      print
+    }
+  ' "$actions" "$file" > "$tmp"; then
+    rm -f "$actions"
+    chmod --reference="$file" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$file"
+  else
+    rm -f "$actions" "$tmp"
+    return 1
+  fi
+}
+
 # Decide where this invocation's tasks come from. Sets TASK_SOURCE
 # (github|file) and, for file mode, TASKS_FILE_ABS. Precedence: --github
 # beats everything except an explicit --tasks (the combination is an error),
@@ -643,13 +710,15 @@ resolve_task_source() {
 
 # Task-source seam: consumers ask this dispatcher for the eligible queue,
 # never a source function directly. A source implements: the eligible queue
-# (here), in-flight marking (mark_task_in_flight), state reconciliation, the
-# PR linkage line ("Closes #N" / "Task: <id>"), prior notes, and the
-# usage-report destination — everything else is source-blind.
+# (here), in-flight marking (mark_task_in_flight), state reconciliation
+# (reconcile_tasks_file), the PR linkage line ("Closes #N" / "Task: <id>"),
+# prior notes, and the usage-report destination — everything else is
+# source-blind.
 get_task_queue() {
   local repo_abs="$1"
   case "$TASK_SOURCE" in
-    file)   get_unblocked_local_tasks "$TASKS_FILE_ABS" "$repo_abs" ;;
+    file)   reconcile_tasks_file "$TASKS_FILE_ABS" "$repo_abs"
+            get_unblocked_local_tasks "$TASKS_FILE_ABS" "$repo_abs" ;;
     github) get_unblocked_afk_issues "$repo_abs" ;;
     *)      die "unknown task source: ${TASK_SOURCE:-unset}" ;;
   esac
