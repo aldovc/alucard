@@ -158,9 +158,23 @@ rm -rf "$FAKE_REPO"
 
 # ── Test group 5: get_task_queue dispatch ────────────────────────────────────
 
-TASK_SOURCE="file" TASKS_FILE_ABS="$FIX_BASIC"
+gh() {
+  if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$3" = "123" ]; then
+    echo "OPEN"
+    return 0
+  fi
+  return 1
+}
+
+DISPATCH_FILE=$(mktemp /tmp/alucard_test_dispatch.XXXXXX)
+cp "$FIX_BASIC" "$DISPATCH_FILE"
+TASK_SOURCE="file" TASKS_FILE_ABS="$DISPATCH_FILE"
 assert_eq "dispatch: file source returns the local queue" "1,4" \
   "$(get_task_queue "$SCRIPT_DIR/.." | jq -r '[.[].id] | join(",")')"
+assert_eq "dispatch: leaves tracked fixture untouched" "0" \
+  "$(diff "$FIX_BASIC" "$DISPATCH_FILE" | grep -c '^<')"
+rm -f "$DISPATCH_FILE"
+unset -f gh
 
 TASK_SOURCE="bogus"
 assert_exit "dispatch: unknown source dies" 1 get_task_queue "$SCRIPT_DIR/.."
@@ -239,6 +253,18 @@ assert_eq "reconcile: merged PR flips heading to [x], keeps (PR #N)" \
 assert_eq "reconcile: merged case touches exactly one line" "1" \
   "$(diff "$FIX_BASIC" "$RECONCILE_FILE" | grep -c '^<')"
 rm -f "$RECONCILE_FILE"
+
+RECONCILE_FILE=$(mktemp /tmp/alucard_test_reconcile.XXXXXX)
+EXPECTED_RECONCILE_FILE=$(mktemp /tmp/alucard_test_reconcile_expected.XXXXXX)
+printf '## [>] 1: No newline (PR #123)' > "$RECONCILE_FILE"
+printf '## [x] 1: No newline (PR #123)' > "$EXPECTED_RECONCILE_FILE"
+MOCK_PR_STATE=merged reconcile_tasks_file "$RECONCILE_FILE" "$SCRIPT_DIR/.."
+if cmp -s "$EXPECTED_RECONCILE_FILE" "$RECONCILE_FILE"; then
+  pass "reconcile: merged PR preserves missing final newline"
+else
+  fail "reconcile: merged PR preserves missing final newline"
+fi
+rm -f "$RECONCILE_FILE" "$EXPECTED_RECONCILE_FILE"
 
 RECONCILE_FILE=$(mktemp /tmp/alucard_test_reconcile.XXXXXX)
 cp "$FIX_BASIC" "$RECONCILE_FILE"
