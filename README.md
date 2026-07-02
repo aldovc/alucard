@@ -104,6 +104,79 @@ target-repo/
 
 Alucard tooling is designed to live in a separate folder so it is reusable across projects. Point the CLI at a target repo with a positional path, `--repo`, or `ALUCARD_TARGET_REPO`.
 
+## Local task source
+
+GitHub issues are the default queue, but Alucard can also read tasks from a plain markdown file — no issue tracker, no per-repo labels, no `Issues` PAT scope. Useful for personal repos where opening a GitHub issue per planning slice is more ceremony than the work deserves.
+
+### Format
+
+One file per plan, by default `.alucard/tasks.md` inside the target repo (gitignored — a host-side ledger, never committed or pushed). Everything above the first task heading is the plan's shared **parent context**, injected verbatim into every worker and reviewer prompt so individual tasks stay terse without drifting from the plan. Each `## [<state>] <id>: <title>` heading starts a task; everything until the next task heading is its free-form body.
+
+States:
+
+| State | Meaning |
+|-------|---------|
+| `[ ]` | Queued — eligible for the next iteration |
+| `[>]` | PR in flight — the harness appends `(PR #N)` to the title when it dispatches the task |
+| `[x]` | Done |
+| `[h]` | Human task (HITL) — never queued, but kept in the file so the whole plan lives in one artifact |
+
+A task can declare dependencies with a bare `Blocked by:` line in its body (comma-separated task ids, or `none`); the harness also honors the legacy `Blocked by #N` GitHub-issue form (an open blocker issue keeps the task blocked). File order is queue order — reprioritizing is moving lines, not relabeling.
+
+**Worked example** (`.alucard/tasks.md`):
+
+```markdown
+# Widget export — CSV and JSON
+
+Ship a CSV/JSON export for the widget list. Reuse the existing
+`/api/widgets` endpoint; no new query params beyond `format`.
+
+## [ ] 1: Add `format` query param and CSV/JSON serializers
+
+## What to build
+
+Extend `/api/widgets/export` to accept `?format=csv|json`.
+
+## Acceptance criteria
+
+- [ ] `?format=json` returns the existing JSON shape unchanged
+- [ ] `?format=csv` returns a CSV with a header row
+
+Blocked by: none
+
+## [h] 2: Decide whether export is rate-limited
+
+Large lists could make this endpoint expensive — cap, paginate, or rate-limit?
+
+Blocked by: none
+
+## [ ] 3: Add a "Download" button
+
+Blocked by: 1
+```
+
+`alucard queue` against this file returns exactly task `1` — task `2` is HITL (never queued) and task `3` stays blocked until task `1` reaches `[x]`.
+
+### Flags and auto-detection
+
+- `--tasks PATH` / `ALUCARD_TASKS_FILE` — use this tasks file instead of the GitHub queue.
+- Auto-detect: with neither flag set, `alucard` looks for `.alucard/tasks.md` in the target repo and switches to it automatically.
+- `--github` — force the GitHub issue queue even when a local tasks file is present or configured. Combining `--tasks` and `--github` is an error.
+- `alucard doctor` validates the file structurally (duplicate ids, dangling `Blocked by:` references, empty header, malformed headings) with line numbers, before a run ever starts.
+
+### Lifecycle / morning-after flow
+
+- Each iteration, the harness picks the first eligible (`[ ]`, unblocked) task itself and hands the worker exactly that one task plus the parent context — no queue to pick from, so bundling is structurally impossible.
+- There is no claim/label step in local mode — no `in-progress` label, no `gh issue` calls at all. Runs are sequential, so nothing else can grab the same task mid-run.
+- When a PR opens, the harness flips the task's heading from `[ ]` to `[>] … (PR #N)` — a single atomic line edit.
+- The PR body's first line is `Task: <id>`, never a GitHub closing keyword — task ids aren't issue numbers, and a stray `Closes #N` would close an unrelated issue in the target repo.
+- Reconciling a `[>]` task's outcome back into the file (merged → `[x]`, closed unmerged → back to `[ ]` with a pointer to the failed attempt) is not automatic yet — until it is, flip the heading to `[x]` by hand once you've merged the PR, so anything blocked on that task unblocks on the next run.
+- `alucard queue` shows exactly what the next iteration would pick up at any time — the file doubles as the morning-after dashboard.
+
+### Reduced PAT scope
+
+Local mode never calls the GitHub Issues API, so the fine-grained PAT described in [Credentials to provision](#credentials-to-provision) needs only **Contents R/W, Pull requests R/W, Metadata R** — drop `Issues R/W` if a repo runs exclusively in local mode.
+
 ## Setup checklist for the new folder
 
 ### Prerequisites on the host
@@ -152,6 +225,7 @@ cp "$ALUCARD_HOME/alucard.env.example" "$ALUCARD_HOME/alucard.env"
    - Expiry: 30 days
    - Paste into `alucard.env` as `GITHUB_TOKEN=`
    - **Note:** Fine-grained PATs cannot access the GitHub GraphQL `statusCheckRollup` field — GitHub has not shipped a "Checks" permission for fine-grained tokens ([known limitation](https://github.com/cli/cli/issues/12597)). Alucard detects this and falls back to polling `gh run list`, which works correctly. If you want the primary `gh pr checks --watch` path, use a **classic PAT with `repo` scope** instead.
+   - **Local task source:** running a repo exclusively off a [local tasks file](#local-task-source) instead of GitHub issues needs only Contents R/W, Pull requests R/W, Metadata R — drop `Issues R/W`.
 
 2. **Anthropic worker API key:**
    - console.anthropic.com → API keys → create new key named "alucard-worker"
@@ -195,7 +269,7 @@ cp -r "$ALUCARD_HOME/.claude/skills/to-issues" /path/to/target-repo/.claude/skil
 ```
 
 - `/to-prd` — synthesize the current conversation into a PRD and open it as a GitHub issue.
-- `/to-issues` — break a PRD or plan into properly-labeled (`afk` / `hitl`) tracer-bullet issues that Alucard can pick up unattended.
+- `/to-issues` — break a PRD or plan into properly-labeled (`afk` / `hitl`) tracer-bullet issues that Alucard can pick up unattended. Publishes to GitHub issues by default, or to a [local tasks file](#local-task-source) — it asks which target when both are plausible.
 
 ### First smoke test
 
@@ -274,6 +348,12 @@ alucard run /path/to/target-repo -n 1 -t 15
 
 # Check what's in the queue right now
 alucard queue /path/to/target-repo
+
+# Run against a local tasks file instead of GitHub issues
+alucard run /path/to/target-repo --tasks .alucard/tasks.md -n 1 -t 15
+
+# Validate a tasks file (duplicate ids, dangling blockers, malformed headings)
+alucard doctor /path/to/target-repo
 
 # Manually un-stick an issue if Alucard crashed mid-task
 gh issue edit <N> --remove-label in-progress
