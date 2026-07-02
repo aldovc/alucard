@@ -237,6 +237,7 @@ cp "$ALUCARD_HOME/alucard.env.example" "$ALUCARD_HOME/alucard.env"
 ```bash
 # Add gitignores
 cat >> .gitignore <<'EOF'
+.alucard/tasks.md
 .alucard-worktrees/
 EOF
 
@@ -350,7 +351,7 @@ alucard run /path/to/target-repo -n 1 -t 15
 alucard queue /path/to/target-repo
 
 # Run against a local tasks file instead of GitHub issues
-alucard run /path/to/target-repo --tasks .alucard/tasks.md -n 1 -t 15
+alucard run /path/to/target-repo --tasks /path/to/target-repo/.alucard/tasks.md -n 1 -t 15
 
 # Validate a tasks file (duplicate ids, dangling blockers, malformed headings)
 alucard doctor /path/to/target-repo

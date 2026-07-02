@@ -149,6 +149,6 @@ Relevant files, gotchas, prior art — anything to save the worker exploration t
 
 Use `## [h] <id>: <title>` in place of `## [ ] <id>: <title>` for HITL slices. `Blocked by:` takes comma-separated task ids, or the literal `none` — it must start at column 0 exactly as written (`Blocked by:`, no `##` heading around it) for the parser to find it; everything else in the body is freeform and ignored by the parser.
 
-Before finishing, re-check the file against the grammar: no duplicate ids, every `Blocked by:` id refers to a task defined earlier in the file, the header isn't empty, every heading matches `## [ >xh] <id>: <title>` exactly. If the `alucard` CLI is available, confirm with `alucard doctor --tasks .alucard/tasks.md <target-repo>` (or from inside the target repo, `alucard doctor`, which auto-detects the file) — it reports the same problems with line numbers.
+Before finishing, re-check the file against the grammar: no duplicate ids, every `Blocked by:` id refers to a task defined earlier in the file, the header isn't empty, every heading matches `## [ >xh] <id>: <title>` exactly. If the `alucard` CLI is available, confirm with `alucard doctor --tasks <target-repo>/.alucard/tasks.md <target-repo>` (or from inside the target repo, `alucard doctor`, which auto-detects the file) — it reports the same problems with line numbers.
 
 Do NOT create GitHub issues for a plan published locally, and do NOT close or modify any parent issue.
