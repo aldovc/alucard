@@ -4,7 +4,7 @@
 set -euo pipefail
 
 API_KEY="${OPENAI_API_KEY:-}"
-MODEL="${1:-${ALUCARD_CODEX_MODEL:-gpt-5.5}}"
+MODEL="${1:-${ALUCARD_CODEX_MODEL:-gpt-5.6-terra}}"
 BASE_URL="https://api.openai.com/v1"
 
 if [[ -z "$API_KEY" ]]; then
@@ -22,7 +22,7 @@ PAYLOAD=$(cat <<EOF
 {
   "model": "$MODEL",
   "input": "Say hello",
-  "max_output_tokens": 10
+  "max_output_tokens": 16
 }
 EOF
 )
