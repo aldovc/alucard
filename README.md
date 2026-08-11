@@ -10,7 +10,7 @@ A containerized agent loop that picks GitHub issues off a queue, completes them 
 2. **`/to-issues` skill** breaks the plan into vertical-slice GitHub issues, labeled `afk` (autonomous-doable) or `hitl` (needs human).
 3. **Alucard runs unattended** — pulls the AFK queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
 4. **CI gate** — after a PR is opened, polls CI and launches a fix agent (up to 3 attempts) if checks fail.
-5. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 2).
+5. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 10).
 6. **You review PRs when you check back** and merge what's good.
 
 Alucard never pushes to main. Each iteration produces an independent PR.
