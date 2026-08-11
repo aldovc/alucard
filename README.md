@@ -10,8 +10,12 @@ A containerized agent loop that picks GitHub issues off a queue, completes them 
 2. **`/to-issues` skill** breaks the plan into vertical-slice GitHub issues, labeled `afk` (autonomous-doable) or `hitl` (needs human).
 3. **Alucard runs unattended** — pulls the AFK queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
 4. **CI gate** — after a PR is opened, polls CI and launches a fix agent (up to 3 attempts) if checks fail.
-5. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 10).
+5. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 10). The loop ends early on `APPROVED` or `BLOCKED` (see [Loop convergence](#loop-convergence)).
 6. **You review PRs when you check back** and merge what's good.
+
+Before the first iteration, a **toolchain preflight** checks that the container can actually install the target repo's dependencies (`uv sync` / `npm ci`, detected at the repo root or one level down). The result is printed at startup, saved to `toolchain-preflight.txt` in the log directory, and passed to every reviewer.
+
+The image is stamped with a hash of the `Dockerfile` and `entrypoint.sh` that built it, and rebuilt automatically when they change — an existing tag is not proof the image is current, and a Dockerfile fix sitting inert behind a cached tag is how the toolchain stayed broken for 25 review cycles. `--no-build` warns instead.
 
 Alucard never pushes to main. Each iteration produces an independent PR.
 
@@ -52,6 +56,25 @@ flowchart TD
 - **Agent prompts** — one file per role: `alucard-worker-prompt.md` (main worker), `alucard-reviewer-prompt.md` (code reviewer), `alucard-ci-fix-prompt.md` (CI failure fixer), `alucard-feedback-prompt.md` (review feedback handler).
 - **Skills** (`/to-prd`, `/to-issues`) — Claude Code skills used during PRD authoring and issue breakdown. Vendored under `.claude/skills/` in this repo and copied into each target repo's `.claude/skills/` at setup time so the operator can invoke them while working there.
 
+## Loop convergence
+
+The review gate can end four ways:
+
+| Verdict | What it means | What happens |
+|---|---|---|
+| `APPROVED` | Nothing merge-blocking left. | Loop ends, PR ready to merge. |
+| `CHANGES_REQUESTED` | Merge-blocking issues **a feedback agent can fix in the container**. | Feedback agent runs, then the next cycle. |
+| `BLOCKED` | Code work is done; merge is gated on something no agent can do — a human-only acceptance criterion, a live deploy, a credential the container does not hold. | Loop ends, PR labeled `needs-human`, reviewer's reasoning posted. |
+| *(cycles exhausted)* | The loop hit `--max-review-cycles`. | PR left open for manual review. |
+
+Without `BLOCKED`, the loop had only two ends — approval or exhaustion — so a finding no agent could act on was re-reported until the budget ran out. The failure mode this fixes ([zodiac#40](https://github.com/aldovc/zodiac/pull/40)): 25 review cycles across 4 runs, ~20 of them re-reporting the same "trigger the Cloud Scheduler job manually and attach production evidence" finding into a container with no `gcloud`. Zero approvals, and the feedback agent eventually drifted into rewriting unrelated production logic because that was the only thing it *could* change.
+
+Three mechanisms keep the loop converging:
+
+- **Blocked-findings ledger.** When the feedback agent hits a finding it cannot action, it writes `/work-output/.alucard-blocked` instead of posting a "blocked" comment. The harness posts that once as a `**🤖 Alucard blocked findings**` marker comment and feeds it to every later reviewer as `<known_blockers>`, which they are instructed not to re-report. The ledger is reloaded from the PR at the start of each run, so a re-run does not rediscover it.
+- **Reviewers read the conversation.** Each reviewer reads prior cycles' findings and the feedback agent's replies before judging, so a finding already fixed or already recorded as blocked is not raised again at a new line number.
+- **Toolchain status.** Reviewers are told whether the container can install dependencies at all. When it cannot, they review the tests as written but do not demand test *output* no agent on the PR could produce.
+
 ## Threat model and safety design
 
 **The risk:** `claude` runs in `bypassPermissions` mode (no prompts, full tool access) so the agent doesn't get stuck mid-run on a missing tool permission. Without isolation, a confused or prompt-injected agent could `rm -rf` your home directory or exfiltrate credentials.
@@ -81,6 +104,7 @@ alucard/
 ├── alucard-ci-fix-prompt.md     # CI-fix agent instructions
 ├── alucard-feedback-prompt.md   # review-feedback agent instructions
 ├── alucard.env.example          # template for credentials (real one is gitignored)
+├── test/                        # bash unit tests — `for t in test/*.sh; do bash "$t"; done`
 ├── .claude/
 │   └── skills/
 │       ├── to-prd/SKILL.md      # vendored — copy into target repo

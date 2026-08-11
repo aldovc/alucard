@@ -170,12 +170,12 @@ Do not merge the PR yourself. The maintainer will review and merge.
 ## Close out
 
 If every acceptance criterion is genuinely done:
-- Tick all `- [ ]` boxes in the issue body via `gh issue edit <N> --body "..."`
+- Tick all `- [ ]` boxes in the issue body via `gh issue edit <N> --body-file <file>` — an issue body is always multi-line, so `--body "..."` would post literal `\n` sequences
 - Remove `in-progress` label
 - The PR's `Closes #N` will close the issue on merge
 
 If the task is partial:
-- Comment on the issue: what's done, what remains, blockers
+- Comment on the issue: what's done, what remains, blockers — again via `--body-file` for anything multi-line
 - Remove `in-progress` so the next iteration can resume
 - Still open the PR with the partial work
 

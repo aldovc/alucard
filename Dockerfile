@@ -1,7 +1,13 @@
 FROM node:24.14.0-slim
 
+# build-essential + pkg-config are not optional: without a C compiler, any
+# dependency with a native extension (pyswisseph, psycopg2, lxml, node-gyp
+# packages) fails to build, so `uv sync` / `npm ci` never completes and the
+# agents cannot run the target repo's lint or test suite at all. Agents then
+# push unverified code for the whole run — see the zodiac#40 post-mortem.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl jq ripgrep ca-certificates gnupg openssh-client \
+      build-essential pkg-config \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \

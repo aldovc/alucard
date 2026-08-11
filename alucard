@@ -51,7 +51,8 @@ Run options:
       --logs-root PATH         Directory for run logs. Default: ./logs beside
                                this CLI.
       --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 10.
-      --no-build               Do not build the image if it is missing.
+      --no-build               Do not build the image if it is missing or
+                               stale. Warns instead of rebuilding.
       --tasks PATH             Read tasks from a local tasks file instead of
                                the GitHub issue queue. Defaults to
                                ALUCARD_TASKS_FILE, else auto-detects
@@ -170,18 +171,78 @@ load_env_file() {
   fi
 }
 
+# Content hash of the files that define the image.
+#
+# Content- rather than mtime-based for two reasons: a fresh checkout rewrites
+# mtimes and would force a spurious rebuild, and — the blocker — a fully cached
+# rebuild leaves Docker's .Created at the *original* layer time, so an mtime
+# comparison never converges and rebuilds on every single run.
+# $1 = tool dir. Echoes a sha256 hex digest.
+build_inputs_hash() {
+  local dir="$1" f
+  {
+    for f in "$dir/Dockerfile" "$dir/entrypoint.sh"; do
+      if [ -f "$f" ]; then
+        # Name marker so moving content between the two files still changes
+        # the digest.
+        printf '=== %s\n' "$(basename "$f")"
+        cat "$f"
+      fi
+    done
+  } | sha256sum | cut -d' ' -f1
+}
+
+BUILD_INPUTS_LABEL="alucard.build-inputs"
+
+# Build the image, stamping it with the hash of its build inputs. The label is
+# image config, not a layer, so it updates even when every layer is cached.
+build_image() {
+  local image="$1" hash="$2"
+  docker build --label "${BUILD_INPUTS_LABEL}=${hash}" -t "$image" "$TOOL_DIR"
+}
+
 ensure_image() {
   local image="$1"
   local auto_build="$2"
 
   need_cmd docker
-  if docker image inspect "$image" >/dev/null 2>&1; then
+
+  local want_hash
+  want_hash=$(build_inputs_hash "$TOOL_DIR")
+
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    [ "$auto_build" = "true" ] || die "Docker image not found: $image"
+    echo "Building $image from $TOOL_DIR..."
+    build_image "$image" "$want_hash"
     return 0
   fi
 
-  [ "$auto_build" = "true" ] || die "Docker image not found: $image"
-  echo "Building $image from $TOOL_DIR..."
-  docker build -t "$image" "$TOOL_DIR"
+  # An existing tag is not proof the image is current. A Dockerfile fix — a
+  # missing C compiler, say — would otherwise sit inert behind the cached tag
+  # on every future run, which is exactly how the toolchain stayed broken for
+  # 25 review cycles.
+  local have_hash
+  have_hash=$(docker image inspect \
+    -f "{{index .Config.Labels \"${BUILD_INPUTS_LABEL}\"}}" "$image" 2>/dev/null || true)
+  # Go's text/template renders a missing key as "<no value>".
+  [ "$have_hash" = "<no value>" ] && have_hash=""
+
+  if [ "$have_hash" = "$want_hash" ]; then
+    return 0
+  fi
+
+  if [ "$auto_build" != "true" ]; then
+    if [ -z "$have_hash" ]; then
+      echo "Warning: $image carries no build-input stamp — it predates this check and may be stale." >&2
+    else
+      echo "Warning: $image was built from different Dockerfile/entrypoint.sh content than $TOOL_DIR holds now." >&2
+    fi
+    echo "         Rebuild with 'docker build -t $image $TOOL_DIR', or drop --no-build." >&2
+    return 0
+  fi
+
+  echo "Rebuilding $image — Dockerfile or entrypoint.sh changed since the image was built..."
+  build_image "$image" "$want_hash"
 }
 
 # Resolves the AI provider for a given agent ROLE.
@@ -1059,14 +1120,20 @@ command_doctor() {
 
 # Run one feedback container against the PR's head branch.
 # $1=iter $2=branch $3=origin_url $4=pr_num $5=feedback_findings $6=cycle
+# Sets: FEEDBACK_BLOCKED — findings the agent could not resolve in-container
+#       (missing credentials/tooling). Empty when everything was actionable.
 # Uses globals: WT_ROOT REPO_ABS LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
 #               CREATED_WORKTREES stream_text
 run_feedback_once() {
   local iter="$1" branch="$2" origin_url="$3" pr_num="$4" feedback_findings="$5" cycle="$6"
   local wt_feedback feedback_log feedback_rc
 
+  FEEDBACK_BLOCKED=""
+
   wt_feedback="${WT_ROOT}/feedback-${iter}-${cycle}"
-  CREATED_WORKTREES+=("$wt_feedback")
+  local feedback_out_dir
+  feedback_out_dir=$(mktemp -d /tmp/alucard_feedback.XXXXXX)
+  CREATED_WORKTREES+=("$wt_feedback" "$feedback_out_dir")
   rm -rf "$wt_feedback"
   git -C "$REPO_ABS" fetch origin "$branch"
   git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
@@ -1092,12 +1159,18 @@ $(printf '%s' "$feedback_findings" | xml_escape)
     50 2 \
     "$_feedback_prompt" \
     -v "$wt_feedback:/work:rw" \
+    -v "$feedback_out_dir:/work-output:rw" \
     -e "ALUCARD_ITER=${iter}-feedback-${cycle}"
   feedback_rc=$?
   set -e
 
   echo ""
-  rm -rf "$wt_feedback" || true
+
+  if [ -f "$feedback_out_dir/.alucard-blocked" ]; then
+    FEEDBACK_BLOCKED=$(< "$feedback_out_dir/.alucard-blocked")
+  fi
+
+  rm -rf "$wt_feedback" "$feedback_out_dir" || true
 
   if [ "$feedback_rc" -ne 0 ]; then
     echo "Feedback agent exited rc=$feedback_rc on cycle $cycle"
@@ -1264,6 +1337,32 @@ append_task_context() {
   fi
 }
 
+# Reconcile the formal GitHub review state with the reviewer's decision file.
+#
+# BLOCKED has no GitHub equivalent — a reviewer that reaches it can only post
+# `--request-changes` formally — so the decision file wins for that one verdict.
+# Otherwise a formal review outranks the file, and the file is the fallback for
+# the common case where GitHub refused the review because the bot is also the
+# PR author.
+#
+# $1 = formal state (may be empty), $2 = decision-file state (may be empty)
+# Echoes the effective verdict; returns 1 when neither source yields one.
+resolve_review_verdict() {
+  local formal="$1" file_state="$2"
+  if [ "$file_state" = "BLOCKED" ]; then
+    printf 'BLOCKED'
+    return 0
+  fi
+  if [ -n "$formal" ]; then
+    printf '%s' "$formal"
+    return 0
+  fi
+  case "$file_state" in
+    APPROVED|CHANGES_REQUESTED) printf '%s' "$file_state" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Run reviewer then feedback agents on the open PR, up to MAX_REVIEW_CYCLES times.
 # $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
 # $4 = task XML (file mode only, empty in github mode)
@@ -1285,6 +1384,18 @@ review_gate() {
 
   local review_cycle wt_review review_log review_rc review_state review_comments
 
+  # Blocked-findings ledger. Seeded from marker comments already on the PR so a
+  # re-run does not spend its whole budget rediscovering what a previous run
+  # already established was unfixable in-container.
+  local blocked_ledger
+  blocked_ledger=$(cd "$REPO_ABS" && \
+    gh pr view "$pr_num" --json comments --jq \
+      '[.comments[] | select(.body | startswith("**🤖 Alucard blocked findings**")) | .body] | join("\n\n")' \
+    2>/dev/null || true)
+  if [ -n "$blocked_ledger" ]; then
+    echo "Loaded blocked-findings ledger from PR #$pr_num."
+  fi
+
   for review_cycle in $(seq 1 "$MAX_REVIEW_CYCLES"); do
     echo "Review cycle $review_cycle/$MAX_REVIEW_CYCLES — running reviewer agent..."
 
@@ -1304,7 +1415,14 @@ review_gate() {
     _review_prompt="<instructions>
 $(<"$TOOL_DIR/alucard-reviewer-prompt.md")
 </instructions>
-<pr_num>${pr_num}</pr_num>"
+<pr_num>${pr_num}</pr_num>
+<review_cycle>${review_cycle} of ${MAX_REVIEW_CYCLES}</review_cycle>
+<toolchain_status>
+$(printf '%s' "${TOOLCHAIN_STATUS:-Unknown — no preflight result available.}" | xml_escape)
+</toolchain_status>
+<known_blockers>
+$(printf '%s' "${blocked_ledger:-None recorded.}" | xml_escape)
+</known_blockers>"
     _review_prompt=$(append_task_context "$_review_prompt" "$task_xml" "$parent_context_xml")
 
     set +e
@@ -1344,22 +1462,30 @@ $(<"$TOOL_DIR/alucard-reviewer-prompt.md")
 
     # GitHub blocks formal self-review when the bot token == the PR author,
     # so most runs land here with no formal review on the PR. Trust the
-    # reviewer's decision files (APPROVED or CHANGES_REQUESTED). The earlier
+    # reviewer's decision files — see resolve_review_verdict for the precedence
+    # rules, including BLOCKED, which GitHub cannot express at all. The earlier
     # concern that file-APPROVED "silently skips the feedback loop" is moot:
     # skipping feedback is exactly the correct behavior for APPROVED, and
     # dropping the verdict entirely (the previous behavior) hid the reviewer's
     # reasoning from the operator without making the loop any safer. The real
     # mitigation for self-approval is the two-token reviewer identity tracked
     # as deferred item #5 in README.md.
-    local _self_review_note=""
-    if [ -z "$review_state" ] && \
-       { [ "$_review_file_state" = "CHANGES_REQUESTED" ] || [ "$_review_file_state" = "APPROVED" ]; }; then
-      review_state="$_review_file_state"
+    local _formal_state="$review_state" _self_review_note=""
+    review_state=$(resolve_review_verdict "$_formal_state" "$_review_file_state" || true)
+
+    if [ -n "$review_state" ] && [ "$review_state" != "$_formal_state" ]; then
+      # The verdict came from the decision file rather than a formal review.
       review_comments="$_review_file_body"
-      _self_review_note="
+      if [ -z "$_formal_state" ]; then
+        _self_review_note="
 
 _(Self-review: GitHub blocked a formal \`gh pr review\` because the bot is also the PR author. Verdict and body come from the reviewer agent's decision file.)_"
-      echo "No formal review found — using decision file: $review_state"
+      else
+        _self_review_note="
+
+_(Verdict \`${review_state}\` comes from the reviewer agent's decision file — GitHub has no such review state, so the formal review reads \`${_formal_state}\`.)_"
+      fi
+      echo "Using reviewer decision file: $review_state"
     fi
 
     if [ "$review_state" = "APPROVED" ]; then
@@ -1368,6 +1494,23 @@ _(Self-review: GitHub blocked a formal \`gh pr review\` because the bot is also 
         "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
 
 ${review_comments}${_self_review_note}" 2>/dev/null || true
+      return 0
+    fi
+
+    # Convergence exit. Without this the loop has only two ends — APPROVED or
+    # cycle exhaustion — so a finding no agent can act on (missing CLI, missing
+    # credentials, a human-only acceptance criterion) is re-reported until the
+    # budget runs out, and the feedback agent drifts into unrelated code
+    # looking for something it *can* change.
+    if [ "$review_state" = "BLOCKED" ]; then
+      echo "PR #$pr_num is blocked on human action — ending the review loop at cycle $review_cycle."
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: BLOCKED — needs human**
+
+The remaining merge-blocking work cannot be done inside the harness container. Alucard stopped the review loop here rather than spend the remaining $((MAX_REVIEW_CYCLES - review_cycle)) cycle(s) re-reporting it.
+
+${review_comments}${_self_review_note}" 2>/dev/null || true
+      cd "$REPO_ABS" && gh pr edit "$pr_num" --add-label "needs-human" 2>/dev/null || true
       return 0
     fi
 
@@ -1385,8 +1528,19 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
 
 ${review_comments}${_self_review_note}" 2>/dev/null || true
 
+    # Exhaustion is a distinct outcome from "still working", and the operator
+    # reads it on the PR, not in a log they were asleep for. Without this the
+    # final comment is an ordinary cycle-N CHANGES_REQUESTED and the PR looks
+    # identical whether the loop gave up or is still mid-flight.
     if [ "$review_cycle" -eq "$MAX_REVIEW_CYCLES" ]; then
       echo "Max review cycles ($MAX_REVIEW_CYCLES) reached — PR #$pr_num left open for manual review."
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "**🤖 Alucard gave up after ${MAX_REVIEW_CYCLES}/${MAX_REVIEW_CYCLES} review cycles — needs human**
+
+The reviewer still wants changes and the cycle budget is spent, so no feedback agent ran for the findings above. Nothing further is queued for this PR.
+
+If the same finding has been repeating, it is probably one no agent in this loop can act on — the reviewer should have returned BLOCKED, and the prompt may need sharpening. If the findings kept changing, raise \`--max-review-cycles\` or land what is here and open follow-ups." 2>/dev/null || true
+      cd "$REPO_ABS" && gh pr edit "$pr_num" --add-label "needs-human" 2>/dev/null || true
       return 0
     fi
 
@@ -1412,16 +1566,133 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
 
 ## Additional human PR comments
 
-Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment\` rather than silently ignored.
+Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment --body-file <file>\` rather than silently ignored.
 
 ${human_comments}"
     fi
 
     run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" "$review_cycle"
 
+    # Record what the feedback agent could not act on, so the next reviewer is
+    # told not to re-report it instead of rediscovering it every cycle. Posted
+    # as a marker comment, which is also how a later run reloads the ledger.
+    if [ -n "${FEEDBACK_BLOCKED:-}" ]; then
+      local _blocked_body
+      _blocked_body="**🤖 Alucard blocked findings** (cycle ${review_cycle}/${MAX_REVIEW_CYCLES})
+
+The feedback agent could not resolve these inside the harness container. Later review cycles are instructed to treat them as known blockers and not re-report them.
+
+${FEEDBACK_BLOCKED}"
+      echo "Feedback agent reported blocked findings — recording on PR #$pr_num."
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body "$_blocked_body" 2>/dev/null || true
+      blocked_ledger="${blocked_ledger}
+
+${_blocked_body}"
+    fi
+
     # Re-check CI before the next reviewer sees the updated branch.
     ci_gate "$iter" "$branch" "$origin_url"
   done
+}
+
+# Detect how to install the target repo's dependencies. Checks the repo root
+# first, then exactly one level down — a backend/ or server/ subdir owning the
+# manifest is the common layout in these repos.
+# $1 = repo root. Echoes "<install_cmd><TAB><dir>"; returns 1 when no manifest.
+detect_dependency_install() {
+  local root="$1" found
+  if [ -f "$root/pyproject.toml" ]; then printf 'uv sync\t.'; return 0; fi
+  if [ -f "$root/package-lock.json" ]; then printf 'npm ci\t.'; return 0; fi
+  # sort keeps the pick deterministic across filesystems.
+  found=$(cd "$root" && find . -mindepth 2 -maxdepth 2 -name pyproject.toml \
+    -not -path './.git/*' 2>/dev/null | sort | head -1)
+  if [ -n "$found" ]; then printf 'uv sync\t%s' "$(dirname "${found#./}")"; return 0; fi
+  found=$(cd "$root" && find . -mindepth 2 -maxdepth 2 -name package-lock.json \
+    -not -path './.git/*' 2>/dev/null | sort | head -1)
+  if [ -n "$found" ]; then printf 'npm ci\t%s' "$(dirname "${found#./}")"; return 0; fi
+  return 1
+}
+
+# Verify once, at run start, that the container can actually build the target
+# repo's dependencies. Without this the failure is rediscovered independently
+# by every agent in every cycle — each reporting "lint/tests blocked" — while
+# unverified code keeps getting pushed for the whole run. Result is surfaced to
+# the reviewer so it never demands test evidence the agents provably cannot
+# produce, and to the operator as a startup banner.
+# Sets: TOOLCHAIN_STATUS (one-liner injected into the reviewer prompt)
+# Uses globals: REPO_ABS BASE_BRANCH LOG_DIR ENV_FILE IMAGE TIMEOUT_MIN
+toolchain_preflight() {
+  TOOLCHAIN_STATUS=""
+
+  local detected install_cmd manifest_dir
+  if ! detected=$(detect_dependency_install "$REPO_ABS"); then
+    TOOLCHAIN_STATUS="No Python or Node manifest found — dependency preflight skipped."
+    echo "Toolchain preflight: no manifest found, skipping."
+    return 0
+  fi
+  install_cmd="${detected%%$'\t'*}"
+  manifest_dir="${detected##*$'\t'}"
+
+  echo "Toolchain preflight: running \`$install_cmd\` in ${manifest_dir}/ ..."
+
+  local preflight_dir preflight_log rc
+  preflight_dir=$(mktemp -d /tmp/alucard_preflight.XXXXXX)
+  CREATED_WORKTREES+=("$preflight_dir")
+  preflight_log="$LOG_DIR/toolchain-preflight.txt"
+
+  if ! git clone --local --no-tags --single-branch --branch "$BASE_BRANCH" \
+       "$REPO_ABS" "$preflight_dir" >/dev/null 2>&1; then
+    TOOLCHAIN_STATUS="Preflight clone of ${BASE_BRANCH} failed — dependency build unverified."
+    echo "Toolchain preflight: clone failed, skipping."
+    return 0
+  fi
+
+  set +e
+  timeout "${TIMEOUT_MIN}m" docker run --rm \
+    --name "alucard-preflight-$$" \
+    --network bridge \
+    --memory 4g --cpus 2 \
+    --read-only \
+    --tmpfs /tmp:exec,size=2g \
+    --tmpfs "/home/alucard:size=2g,uid=$(id -u),gid=$(id -g)" \
+    --ulimit "nofile=8192:8192" \
+    --user "$(id -u):$(id -g)" \
+    --security-opt no-new-privileges \
+    --cap-drop ALL \
+    --env-file "$ENV_FILE" \
+    -e "HOME=/home/alucard" \
+    -v "$preflight_dir:/work:rw" \
+    -w "/work/${manifest_dir}" \
+    "$IMAGE" \
+    bash -lc "$install_cmd" >"$preflight_log" 2>&1
+  rc=$?
+  set -e
+
+  rm -rf "$preflight_dir" || true
+
+  if [ "$rc" -eq 0 ]; then
+    TOOLCHAIN_STATUS="OK — \`$install_cmd\` completes in the container. Agents can run this repo's lint and test suite; missing test evidence is a real gap."
+    echo "Toolchain preflight: OK."
+    return 0
+  fi
+
+  TOOLCHAIN_STATUS="BROKEN — \`$install_cmd\` fails in ${manifest_dir}/ inside the container (rc=${rc}). Agents CANNOT install dependencies, so they cannot run this repo's lint or test suite. Do not raise findings that require local test execution or test output as evidence; they are unfixable until the container image is repaired."
+  echo ""
+  echo "########################################################################"
+  echo "# TOOLCHAIN PREFLIGHT FAILED"
+  echo "#"
+  echo "#   \`$install_cmd\` in ${manifest_dir}/ exited $rc inside $IMAGE."
+  echo "#   Agents will NOT be able to run this repo's lint or test suite,"
+  echo "#   so every push this run is unverified."
+  echo "#"
+  echo "#   Full output: $preflight_log"
+  echo "#   Last lines:"
+  # Command substitution strips trailing newlines, so printf restores exactly
+  # one — a log without a final newline would otherwise eat the closing rule.
+  printf '%s\n' "$(tail -15 "$preflight_log" 2>/dev/null | sed 's/^/#     /')"
+  echo "########################################################################"
+  echo ""
+  return 0
 }
 
 setup_run_environment() {
@@ -1448,6 +1719,8 @@ setup_run_environment() {
     print_usage_report "$LOG_DIR"
   }
   trap cleanup EXIT
+
+  toolchain_preflight
 }
 
 # Build the worker prompt for one iteration. GitHub mode injects the whole
@@ -1832,7 +2105,7 @@ command_continue() {
 
 ## Additional human PR comments
 
-Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment\` rather than silently ignored.
+Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment --body-file <file>\` rather than silently ignored.
 
 ${human_after}"
     fi
