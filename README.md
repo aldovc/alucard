@@ -87,7 +87,7 @@ Three mechanisms keep the loop converging:
 4. **PR-only output:** Agent never pushes to main. Branch protection on main as belt-and-suspenders.
 5. **Credential scoping:** GitHub token is fine-grained PAT, single repo, 30-day expiry. Anthropic key is dedicated worker key with monthly budget cap set in the console.
 6. **Pattern blacklist (last line):** `--disallowedTools` removes obvious foot-guns like `rm -rf /*`, `sudo`, `curl | sh`. Pattern-matching is leaky but cheap.
-7. **Hard caps per iteration:** `--max-turns 120`, `--max-budget-usd 5`, `timeout 30m`. Fix/reviewer/feedback agents use lower caps (`--max-turns 20-30`, `--max-budget-usd 2`).
+7. **Hard caps per iteration:** `--max-turns 180`, `--max-budget-usd 5`, `timeout 30m`. Fix/reviewer/feedback agents use lower caps (`--max-turns 20-30`, `--max-budget-usd 2`).
 
 **What's still possible:** credential exfiltration via network. Bounded by token scoping — worst case is "attacker gets push access to one repo for up to 30 days," which is recoverable.
 
