@@ -191,30 +191,25 @@ parse_repo_options() {
   IMAGE="alucard-test-image"
 }
 setup_run_environment() {
-  LOG_DIR="$BILLING_LOG_DIR"
-  WT_ROOT="$TEST_DIR/billing-worktrees"
+  LOG_DIR="${TEST_RUN_LOG_DIR:-$BILLING_LOG_DIR}"
+  WT_ROOT="${TEST_WT_ROOT:-$TEST_DIR/billing-worktrees}"
   ENV_FILE="$TEST_DIR/alucard.env"
   CREATED_WORKTREES=()
   mkdir -p "$LOG_DIR" "$WT_ROOT"
 }
 resolve_task_source() { TASK_SOURCE="github"; }
-get_task_queue() { printf '%s\n' '[{}]'; }
+get_task_queue() { printf '%s\n' "${TEST_TASK_QUEUE:-[{}]}"; }
 build_worker_prompt() { FULL_PROMPT="test prompt"; }
 
 # ── Test group 4: empty queue closes the active iteration ───────────────────
 
 EMPTY_LOG_DIR="$TEST_DIR/empty-logs"
 export ALUCARD_TEST_JQ_LENGTH=0
-get_task_queue() { printf '%s\n' '[]'; }
-setup_run_environment() {
-  LOG_DIR="$EMPTY_LOG_DIR"
-  WT_ROOT="$TEST_DIR/empty-worktrees"
-  ENV_FILE="$TEST_DIR/alucard.env"
-  CREATED_WORKTREES=()
-  mkdir -p "$LOG_DIR" "$WT_ROOT"
-}
+TEST_TASK_QUEUE='[]'
+TEST_RUN_LOG_DIR="$EMPTY_LOG_DIR"
+TEST_WT_ROOT="$TEST_DIR/empty-worktrees"
 (command_run) >/dev/null 2>&1
-unset ALUCARD_TEST_JQ_LENGTH
+unset ALUCARD_TEST_JQ_LENGTH TEST_TASK_QUEUE TEST_RUN_LOG_DIR TEST_WT_ROOT
 
 mapfile -t empty_events < <(cut -f2- "$EMPTY_LOG_DIR/events.log" | grep -E \
   '^(Iteration 1/1 start|Iteration 1/1 end:|Run end: queue empty)')
@@ -227,15 +222,6 @@ assert_eq "empty queue records the run end last" \
   "Run end: queue empty — alucard rests after 0 iterations." "${empty_events[2]:-}"
 
 # ── Test group 5: billing abort closes the active iteration ─────────────────
-
-setup_run_environment() {
-  LOG_DIR="$BILLING_LOG_DIR"
-  WT_ROOT="$TEST_DIR/billing-worktrees"
-  ENV_FILE="$TEST_DIR/alucard.env"
-  CREATED_WORKTREES=()
-  mkdir -p "$LOG_DIR" "$WT_ROOT"
-}
-get_task_queue() { printf '%s\n' '[{}]'; }
 
 export ALUCARD_TEST_DOCKER_RUN_EXIT=7
 export ALUCARD_TEST_DOCKER_RUN_OUTPUT='{"error":"billing_error"}'
