@@ -338,11 +338,10 @@ scan_agent_errors() {
 }
 
 # Sandbox flags shared by every container we run (agents and the toolchain
-# preflight): fills the nameref array named by $1. Centralized so the two
-# call sites cannot drift apart on resource limits or lockdown flags.
+# preflight). Kept in one global array so the call sites cannot drift apart
+# on resource limits or lockdown flags, while remaining compatible with Bash 3.2.
 docker_sandbox_args() {
-  local -n _docker_sandbox_args_out="$1"
-  _docker_sandbox_args_out=(
+  DOCKER_SANDBOX_ARGS=(
     --network bridge
     --memory 4g --cpus 2
     --read-only
@@ -1841,8 +1840,7 @@ toolchain_preflight() {
     return 0
   fi
 
-  local -a _sandbox_args
-  docker_sandbox_args _sandbox_args
+  docker_sandbox_args
 
   set +e
   timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
