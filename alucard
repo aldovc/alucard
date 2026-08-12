@@ -14,6 +14,7 @@ DEFAULT_ENV_FILE="${ALUCARD_ENV_FILE:-$TOOL_DIR/alucard.env}"
 DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
 DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
 DEFAULT_CACHE_DIR="${ALUCARD_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/alucard}"
+CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
 
 usage() {
   cat <<'EOF'
@@ -270,6 +271,30 @@ any_role_uses() {
   return 1
 }
 
+# Scan a completed agent's log for provider-reported errors and print them to
+# stderr, tagged with role and exit code. Confirmed live: every codex run for
+# a week began with a "Model metadata ... not found, defaulting to fallback"
+# item.completed error and nothing surfaced it — operators ran degraded
+# blind. Runs after the container exits, so it covers errors that showed up
+# mid-stream (codex_stream_text already echoes those live) as well as ones
+# only visible in the final claude result line.
+scan_agent_errors() {
+  local role="$1" log_file="$2" provider="$3" rc="$4"
+  [ -f "$log_file" ] || return 0
+  if [ "$provider" = "codex" ]; then
+    jq -r --arg role "$role" --arg rc "$rc" \
+      'select(.type == "item.completed" and .item.type == "error") |
+       "alucard: " + $role + " (rc=" + $rc + ") codex error: " + .item.message' \
+      "$log_file" >&2 2>/dev/null || true
+  else
+    jq -r --arg role "$role" --arg rc "$rc" \
+      'select(.type == "result") | select(.is_error == true or .subtype != "success") |
+       "alucard: " + $role + " (rc=" + $rc + ") claude error (subtype=" + (.subtype // "unknown") + "): " +
+       ((.result // "") | .[0:200])' \
+      "$log_file" >&2 2>/dev/null || true
+  fi
+}
+
 # Run one agent container and stream its output to a log file.
 # $1 = role tag (container name becomes alucard-<role>)
 # $2 = log file path (JSONL stream written here via tee)
@@ -370,6 +395,8 @@ invoke_agent() {
   pkill -P "$_watcher_pid" 2>/dev/null || true
   kill "$_watcher_pid" 2>/dev/null || true
   wait "$_watcher_pid" 2>/dev/null || true
+
+  scan_agent_errors "$role" "$log_file" "$provider" "$_rc"
 
   return "$_rc"
 }
@@ -1756,7 +1783,7 @@ setup_run_environment() {
   ensure_image "$IMAGE" "$AUTO_BUILD"
 
   stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
-  codex_stream_text='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" else empty end'
+  codex_stream_text="$CODEX_STREAM_TEXT"
   CREATED_WORKTREES=()
 
   cleanup() {
