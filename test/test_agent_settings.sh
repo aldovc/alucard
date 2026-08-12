@@ -66,8 +66,8 @@ invoke_and_capture() {
   local role="$1" max_turns="$2" max_budget="$3"
   ALUCARD_TEST_CAPTURE="$TEST_TMPDIR/${role}.args"
   export ALUCARD_TEST_CAPTURE
-  invoke_agent "$role" "$TEST_TMPDIR/${role}.log" "$max_turns" "$max_budget" prompt
-  >/dev/null}
+  invoke_agent "$role" "$TEST_TMPDIR/${role}.log" "$max_turns" "$max_budget" prompt > /dev/null
+}
 
 assert_claude_args() {
   local role="$1" max_turns="$2" max_budget="$3" model="$4" fallback_model="$5"
