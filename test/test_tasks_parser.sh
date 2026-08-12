@@ -183,14 +183,15 @@ assert_exit "dispatch: unknown source dies" 1 get_task_queue "$SCRIPT_DIR/.."
 
 TASK_SOURCE="github"
 BASE_BRANCH="main"
-build_worker_prompt '[{"number":1,"title":"t","body":"b"}]' 'line1
+build_worker_prompt '[{"number":1,"title":"t","body":"b","labels":[{"name":"afk"},{"name":"bug"}]}]' 'line1
 line2' "INSTRUCTIONS"
 EXPECTED_GH='<instructions>INSTRUCTIONS</instructions>
 <base_branch>main</base_branch>
 <commits>line1
 line2</commits>
-<issues>[{"number":1,"title":"t","body":"b"}]</issues>'
-assert_eq "prompt: github mode format is byte-identical" "$EXPECTED_GH" "$FULL_PROMPT"
+<issues>[{"number":1,"title":"t","labels":["afk","bug"]}]</issues>'
+assert_eq "prompt: github mode slims issues to number/title/labels" "$EXPECTED_GH" "$FULL_PROMPT"
+assert_not_contains "prompt: github mode drops issue body" '"body"' "$FULL_PROMPT"
 assert_eq "prompt: github mode leaves no dispatched task id" "" "$DISPATCHED_TASK_ID"
 assert_eq "prompt: github mode leaves TASK_XML empty" "" "$TASK_XML"
 assert_eq "prompt: github mode leaves PARENT_CONTEXT_XML empty" "" "$PARENT_CONTEXT_XML"

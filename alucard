@@ -1824,7 +1824,13 @@ build_worker_prompt() {
     TASK_XML="$_task_esc"
     PARENT_CONTEXT_XML="$_parent_esc"
   else
-    _issues_esc=$(printf '%s' "$queue" | xml_escape)
+    # Slim to number/title/labels only: the worker prompt instructs the
+    # agent to `gh issue view <N> --comments` for the issue it picks, so
+    # shipping every body here pays for it twice on the pick and wastes it
+    # on every issue the agent doesn't pick. Full `queue` (with bodies) is
+    # still what filtering and `alucard queue` use — this trims only what
+    # goes on the wire to the worker.
+    _issues_esc=$(echo "$queue" | jq -c '[.[] | {number, title, labels: [.labels[].name]}]' | xml_escape)
     FULL_PROMPT="<instructions>${instructions}</instructions>
 <base_branch>${BASE_BRANCH}</base_branch>
 <commits>${_commits_esc}</commits>
