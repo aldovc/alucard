@@ -380,12 +380,11 @@ invoke_agent() {
   local provider
   provider=$(resolve_provider "$provider_role")
 
-  local -a _sandbox_args
-  docker_sandbox_args _sandbox_args
+  docker_sandbox_args
 
   local -a _docker_args=(
     --name "alucard-${role}"
-    "${_sandbox_args[@]}"
+    "${DOCKER_SANDBOX_ARGS[@]}"
     --env-file "$ENV_FILE"
     -e "HOME=/home/alucard"
     -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig"
@@ -1845,7 +1844,7 @@ toolchain_preflight() {
   set +e
   timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
     --name "alucard-preflight-$$" \
-    "${_sandbox_args[@]}" \
+    "${DOCKER_SANDBOX_ARGS[@]}" \
     --env-file "$ENV_FILE" \
     -e "HOME=/home/alucard" \
     -v "$preflight_dir:/work:rw" \
