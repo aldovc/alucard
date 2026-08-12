@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run test suite
+        run: |
+          for t in test/test_*.sh; do
+            echo "== $t"
+            bash "$t" || exit 1
+          done
+
+      # --severity=warning skips info-level notes (SC2015 `&& … || true` and
+      # SC2016 single-quoted GraphQL are deliberate idioms throughout).
+      # SC2034 is excluded because the test fixtures set globals that the
+      # sourced functions consume — shellcheck cannot see across the source
+      # boundary and flags every one as unused.
+      - name: ShellCheck
+        run: |
+          shellcheck --severity=warning --exclude=SC2034 \
+            alucard entrypoint.sh install.sh test-*.sh test/*.sh
