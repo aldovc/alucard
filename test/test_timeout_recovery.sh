@@ -123,7 +123,7 @@ run_agent_and_capture_exit() {
   local actual_exit=0
   export ALUCARD_WORKER_PROVIDER="$provider"
   export ALUCARD_TEST_DOCKER_RUN_EXIT="$docker_exit"
-  invoke_agent "$role" "$log_file" 10 1 'test prompt' || actual_exit=$?
+  invoke_agent "$role" "$log_file" 10 1 'test prompt' >/dev/null || actual_exit=$?
   unset ALUCARD_WORKER_PROVIDER ALUCARD_TEST_DOCKER_RUN_EXIT
   printf '%s' "$actual_exit"
 }
