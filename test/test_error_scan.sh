@@ -57,7 +57,7 @@ cat > "$codex_log" <<'EOF'
 EOF
 
 out=$(jq --unbuffered -rj "$CODEX_STREAM_TEXT" < "$codex_log")
-assert_contains "live codex stream emits error warning" \
+  '⚠ codex error: Model metadata for `gpt-5.6-terra` not found' "$out"
   "⚠ codex error: Model metadata for `gpt-5.6-terra` not found" "$out"
 
 out=$(scan_agent_errors "fix-3" "$codex_log" "codex" "0" 2>&1)
