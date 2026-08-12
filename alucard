@@ -2001,6 +2001,8 @@ command_run() {
     count=$(echo "$issues" | jq 'length')
 
     if [ "$count" -eq 0 ]; then
+      _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
+      log_event "Iteration $i/$ITERATIONS end: rc=0 duration=${_iter_duration}s"
       log_event "Run end: queue empty — alucard rests after $((i-1)) iterations."
       rm -rf "$WT_HOST"
       exit 0
