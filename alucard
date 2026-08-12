@@ -127,6 +127,19 @@ die() {
   exit 1
 }
 
+# Timestamped run journal: prints "HH:MM:SS <msg>" to stdout and appends
+# "<ISO-8601-UTC><TAB><msg>" to $LOG_DIR/events.log, so an overnight run
+# leaves a reconstructable timeline even when the console scrollback is gone
+# and a log simply stops mid-command with no record of why. A no-op on the
+# file side when LOG_DIR isn't set yet (e.g. command_queue never calls
+# setup_run_environment) — console output still happens.
+log_event() {
+  local msg="$1"
+  printf '%s %s\n' "$(date +%H:%M:%S)" "$msg"
+  [ -n "${LOG_DIR:-}" ] && [ -d "$LOG_DIR" ] || return 0
+  printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >> "$LOG_DIR/events.log"
+}
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
@@ -363,6 +376,9 @@ invoke_agent() {
   local provider
   provider=$(resolve_provider "$provider_role")
 
+  local _start_epoch
+  _start_epoch=$(date +%s)
+
   local -a _docker_args=(
     --name "alucard-${role}"
     --network bridge
@@ -444,6 +460,13 @@ invoke_agent() {
   wait "$_watcher_pid" 2>/dev/null || true
 
   scan_agent_errors "$role" "$log_file" "$provider" "$_rc"
+
+  local _duration=$(( $(date +%s) - _start_epoch ))
+  local _timeout_note=""
+  case "$_rc" in
+    124|137) _timeout_note=" (timeout)" ;;
+  esac
+  log_event "Agent ${role} end: rc=${_rc} duration=${_duration}s${_timeout_note}"
 
   return "$_rc"
 }
@@ -1289,7 +1312,7 @@ command_doctor() {
 #               CREATED_WORKTREES stream_text
 run_feedback_once() {
   local iter="$1" branch="$2" origin_url="$3" pr_num="$4" feedback_findings="$5" cycle="$6"
-  local wt_feedback feedback_log feedback_rc
+  local wt_feedback feedback_log
 
   FEEDBACK_BLOCKED=""
 
@@ -1324,7 +1347,6 @@ $(printf '%s' "$feedback_findings" | xml_escape)
     -v "$wt_feedback:/work:rw" \
     -v "$feedback_out_dir:/work-output:rw" \
     -e "ALUCARD_ITER=${iter}-feedback-${cycle}"
-  feedback_rc=$?
   set -e
 
   echo ""
@@ -1334,10 +1356,6 @@ $(printf '%s' "$feedback_findings" | xml_escape)
   fi
 
   rm -rf "$wt_feedback" "$feedback_out_dir" || true
-
-  if [ "$feedback_rc" -ne 0 ]; then
-    echo "Feedback agent exited rc=$feedback_rc on cycle $cycle"
-  fi
 }
 
 # Run a fresh fix agent on the branch if CI fails after a PR is opened.
@@ -1356,7 +1374,7 @@ ci_gate() {
 
   echo "=== CI gate: PR #$pr_num on $branch ==="
 
-  local ci_attempt ci_rc failed_run_id failure_log wt_fix fix_log fix_rc _ci_err_file _ci_err pr_head_sha
+  local ci_attempt ci_rc failed_run_id failure_log wt_fix fix_log _ci_err_file _ci_err pr_head_sha
   for ci_attempt in 1 2 3; do
     # Refresh each attempt so a fix-agent push moves to the new HEAD SHA.
     pr_head_sha=$(cd "$REPO_ABS" && \
@@ -1377,13 +1395,13 @@ ci_gate() {
     # with "no checks reported", which falls through to the fix-agent loop
     # and burns budget trying to repair CI that does not exist.
     if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "no checks reported"; then
-      echo "No checks configured for PR #$pr_num — skipping CI gate."
+      log_event "CI gate: no checks configured for PR #$pr_num — skipping."
       ci_rc=0
     fi
 
     # Token lacks 'checks' read permission — fall back to polling gh run list.
     if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "Resource not accessible"; then
-      echo "Token lacks 'checks' read permission — falling back to gh run list for PR #$pr_num..."
+      log_event "CI gate: token lacks 'checks' read permission — falling back to gh run list for PR #$pr_num."
       local deadline=$(( $(date +%s) + 2700 ))
       ci_rc=1
       local _found_runs=false
@@ -1418,22 +1436,22 @@ ci_gate() {
       # No runs appeared during the entire polling window — token likely also
       # lacks 'actions' read permission. Skip rather than fire spurious fix agents.
       if [ "$_found_runs" = "false" ]; then
-        echo "No CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping CI gate."
+        log_event "CI gate: no CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping."
         ci_rc=0
       fi
     fi
 
     if [ "$ci_rc" -eq 0 ]; then
-      echo "CI green — PR #$pr_num ready for review."
+      log_event "CI gate: PR #$pr_num green — ready for review."
       return 0
     fi
 
     if [ "$ci_attempt" -eq 3 ]; then
-      echo "CI still failing after 3 fix attempts — PR #$pr_num left open for manual review."
+      log_event "CI gate: PR #$pr_num still failing after 3 fix attempts — left open for manual review."
       return 0
     fi
 
-    echo "CI failed (attempt $ci_attempt) — launching fix agent..."
+    log_event "CI gate: PR #$pr_num failed (attempt $ci_attempt) — launching fix agent."
 
     failed_run_id=$(cd "$REPO_ABS" && \
       gh run list --branch "$branch" --json databaseId,conclusion,headSha \
@@ -1475,15 +1493,10 @@ $(printf '%s' "$failure_log" | xml_escape)
       "$_fix_prompt" \
       -v "$wt_fix:/work:rw" \
       -e "ALUCARD_ITER=${iter}-fix-${ci_attempt}"
-    fix_rc=$?
     set -e
 
     echo ""
     rm -rf "$wt_fix" || true
-
-    if [ "$fix_rc" -ne 0 ]; then
-      echo "Fix agent exited rc=$fix_rc on attempt $ci_attempt"
-    fi
   done
 }
 
@@ -1556,7 +1569,7 @@ review_gate() {
       '[.comments[] | select(.body | startswith("**🤖 Alucard blocked findings**")) | .body] | join("\n\n")' \
     2>/dev/null || true)
   if [ -n "$blocked_ledger" ]; then
-    echo "Loaded blocked-findings ledger from PR #$pr_num."
+    log_event "Blocked-ledger loaded from PR #$pr_num."
   fi
 
   for review_cycle in $(seq 1 "$MAX_REVIEW_CYCLES"); do
@@ -1648,11 +1661,11 @@ _(Self-review: GitHub blocked a formal \`gh pr review\` because the bot is also 
 
 _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — GitHub has no such review state, so the formal review reads \`${_formal_state}\`.)_"
       fi
-      echo "Using reviewer decision file: $review_state"
+      log_event "Review gate: using reviewer decision file, verdict=$review_state"
     fi
 
     if [ "$review_state" = "APPROVED" ]; then
-      echo "PR #$pr_num approved — ready to merge."
+      log_event "Review gate: PR #$pr_num approved — ready to merge."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
 
@@ -1666,7 +1679,7 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
     # budget runs out, and the feedback agent drifts into unrelated code
     # looking for something it *can* change.
     if [ "$review_state" = "BLOCKED" ]; then
-      echo "PR #$pr_num is blocked on human action — ending the review loop at cycle $review_cycle."
+      log_event "Review gate: PR #$pr_num blocked on human action — ending review loop at cycle $review_cycle."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: BLOCKED — needs human**
 
@@ -1678,7 +1691,7 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
     fi
 
     if [ -z "$review_state" ]; then
-      echo "Reviewer did not post a review (rc=$review_rc) — skipping review gate."
+      log_event "Review gate: reviewer did not post a review (rc=$review_rc) — skipping."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: no review posted** (rc=${review_rc})" \
         2>/dev/null || true
@@ -1696,7 +1709,7 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
     # final comment is an ordinary cycle-N CHANGES_REQUESTED and the PR looks
     # identical whether the loop gave up or is still mid-flight.
     if [ "$review_cycle" -eq "$MAX_REVIEW_CYCLES" ]; then
-      echo "Max review cycles ($MAX_REVIEW_CYCLES) reached — PR #$pr_num left open for manual review."
+      log_event "Review gate: max review cycles ($MAX_REVIEW_CYCLES) reached — PR #$pr_num left open for manual review."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "**🤖 Alucard gave up after ${MAX_REVIEW_CYCLES}/${MAX_REVIEW_CYCLES} review cycles — needs human**
 
@@ -1707,7 +1720,7 @@ If the same finding has been repeating, it is probably one no agent in this loop
       return 0
     fi
 
-    echo "Changes requested — launching feedback agent (cycle $review_cycle)..."
+    log_event "Review gate: changes requested — launching feedback agent (cycle $review_cycle)."
 
     # Augment reviewer findings with human-authored PR comments so the
     # feedback agent sees the user's questions/asks alongside the reviewer's
@@ -1746,7 +1759,7 @@ ${human_comments}"
 The feedback agent could not resolve these inside the harness container. Later review cycles are instructed to treat them as known blockers and not re-report them.
 
 ${FEEDBACK_BLOCKED}"
-      echo "Feedback agent reported blocked findings — recording on PR #$pr_num."
+      log_event "Blocked-ledger updated on PR #$pr_num (cycle ${review_cycle})."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body "$_blocked_body" 2>/dev/null || true
       blocked_ledger="${blocked_ledger}
 
@@ -1790,7 +1803,7 @@ toolchain_preflight() {
   local detected install_cmd manifest_dir
   if ! detected=$(detect_dependency_install "$REPO_ABS"); then
     TOOLCHAIN_STATUS="No Python or Node manifest found — dependency preflight skipped."
-    echo "Toolchain preflight: no manifest found, skipping."
+    log_event "Toolchain preflight: no manifest found, skipping."
     return 0
   fi
   install_cmd="${detected%%$'\t'*}"
@@ -1806,7 +1819,7 @@ toolchain_preflight() {
   if ! git clone --local --no-tags --single-branch --branch "$BASE_BRANCH" \
        "$REPO_ABS" "$preflight_dir" >/dev/null 2>&1; then
     TOOLCHAIN_STATUS="Preflight clone of ${BASE_BRANCH} failed — dependency build unverified."
-    echo "Toolchain preflight: clone failed, skipping."
+    log_event "Toolchain preflight: clone of ${BASE_BRANCH} failed, skipping."
     return 0
   fi
 
@@ -1836,11 +1849,12 @@ toolchain_preflight() {
 
   if [ "$rc" -eq 0 ]; then
     TOOLCHAIN_STATUS="OK — \`$install_cmd\` completes in the container. Agents can run this repo's lint and test suite; missing test evidence is a real gap."
-    echo "Toolchain preflight: OK."
+    log_event "Toolchain preflight: OK — \`$install_cmd\` verified in ${manifest_dir}/."
     return 0
   fi
 
   TOOLCHAIN_STATUS="BROKEN — \`$install_cmd\` fails in ${manifest_dir}/ inside the container (rc=${rc}). Agents CANNOT install dependencies, so they cannot run this repo's lint or test suite. Do not raise findings that require local test execution or test output as evidence; they are unfixable until the container image is repaired."
+  log_event "Toolchain preflight: BROKEN — \`$install_cmd\` failed in ${manifest_dir}/ (rc=${rc})."
   echo ""
   echo "########################################################################"
   echo "# TOOLCHAIN PREFLIGHT FAILED"
@@ -1943,11 +1957,15 @@ command_run() {
 
   setup_run_environment
   resolve_task_source "$REPO_ABS"
-  [ "$TASK_SOURCE" = "github" ] || echo "Local task source: $TASKS_FILE_ABS"
+  local _task_source_desc="$TASK_SOURCE"
+  [ "$TASK_SOURCE" = "file" ] && _task_source_desc="file ($TASKS_FILE_ABS)"
+  log_event "Run start: repo=$REPO_ABS task_source=$_task_source_desc image=$IMAGE"
   local final_result='select(.type == "result").result // empty'
 
   for ((i=1; i<=ITERATIONS; i++)); do
     echo "=== alucard iteration $i/$ITERATIONS ==="
+    _iter_start_epoch=$(date +%s)
+    log_event "Iteration $i/$ITERATIONS start"
 
     WT_HOST="${WT_ROOT}/iter-$i"
     BRANCH="alucard/iter-${i}-$(date +%s)"
@@ -1983,7 +2001,9 @@ command_run() {
     count=$(echo "$issues" | jq 'length')
 
     if [ "$count" -eq 0 ]; then
-      echo "Queue empty. Alucard rests after $((i-1)) iterations."
+      _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
+      log_event "Iteration $i/$ITERATIONS end: rc=0 duration=${_iter_duration}s"
+      log_event "Run end: queue empty — alucard rests after $((i-1)) iterations."
       rm -rf "$WT_HOST"
       exit 0
     fi
@@ -2024,7 +2044,9 @@ command_run() {
     # the same exhausted account just burns time and leaks stub branches. Bail
     # the whole run on the first sighting so the user can top up and retry.
     if [ -f "$log_file" ] && grep -q '"error":"billing_error"' "$log_file"; then
-      echo "alucard: provider returned billing_error (credit balance too low) — aborting run."
+      _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
+      log_event "Iteration $i/$ITERATIONS end: rc=$rc duration=${_iter_duration}s"
+      log_event "Run end: provider returned billing_error (credit balance too low) — aborting run."
       rm -rf "$WT_HOST"
       exit 2
     fi
@@ -2042,6 +2064,7 @@ command_run() {
     if [ -n "${_harness_pr:-}" ]; then
       _pr_found=true
       _iter_pr_num="$_harness_pr"
+      log_event "PR found: #$_iter_pr_num on $ACTUAL_BRANCH"
     else
       _fallback=$(cd "$REPO_ABS" && \
         gh pr list --label alucard --state open --json number,createdAt,headRefName \
@@ -2051,7 +2074,7 @@ command_run() {
       if [ -n "${_fallback:-}" ] && [ "$_fallback" != "null" ]; then
         ACTUAL_BRANCH=$(echo "$_fallback" | jq -r '.headRefName')
         _fallback_num=$(echo "$_fallback" | jq -r '.number')
-        echo "Worker pushed to non-harness branch '$ACTUAL_BRANCH' — using PR #$_fallback_num for gates."
+        log_event "PR found (non-harness branch): #$_fallback_num on $ACTUAL_BRANCH"
         _pr_found=true
         _iter_pr_num="$_fallback_num"
       fi
@@ -2108,7 +2131,7 @@ command_run() {
         if [ "$_commits_ahead" -gt 0 ]; then
           _recover_branch=$(git -C "$WT_HOST" rev-parse --abbrev-ref HEAD \
             2>/dev/null || echo "$BRANCH")
-          echo "Worker rc=$rc left $_commits_ahead commit(s) on $_recover_branch — pushing to preserve work."
+          log_event "Recovery: worker rc=$rc left $_commits_ahead commit(s) on $_recover_branch — pushing to preserve work."
           # Recovery push runs on the host, not in the container. The worktree's
           # origin was rewritten to HTTPS so the in-container worker could auth
           # via GITHUB_TOKEN, but the host has no HTTPS credential helper — that
@@ -2146,7 +2169,7 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
                 --draft \
                 --title "$_stub_title" \
                 --body "$_stub_body" 2>&1); then
-              echo "Opened recovery PR: $_new_pr_url"
+              log_event "Recovery: opened PR $_new_pr_url"
               ACTUAL_BRANCH="$_recover_branch"
               _recovery_pr=true
               if [ "$TASK_SOURCE" = "file" ]; then
@@ -2155,10 +2178,10 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
                   || die "could not mark task ${DISPATCHED_TASK_ID} in-flight in $TASKS_FILE_ABS — recovery PR #${_recovery_pr_num} is pushed and safe; fix the heading before the next run"
               fi
             else
-              echo "Could not open recovery PR: $_new_pr_url"
+              log_event "Recovery: could not open recovery PR: $_new_pr_url"
             fi
           else
-            echo "Could not push $_recover_branch to origin — work is lost."
+            log_event "Recovery: could not push $_recover_branch to origin — work is lost."
           fi
         fi
       fi
@@ -2187,8 +2210,10 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
     fi
     post_iteration_usage "$i" "$ACTUAL_BRANCH" "$REPO_ABS" "$LOG_DIR"
 
+    _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
+    log_event "Iteration $i/$ITERATIONS end: rc=$rc duration=${_iter_duration}s"
+
     if [ "$rc" -ne 0 ]; then
-      echo "Iteration $i exited rc=$rc. Continuing."
       continue
     fi
 
@@ -2202,14 +2227,14 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
       _remaining=""
       _remaining=$(get_task_queue "$REPO_ABS" | jq 'length' 2>/dev/null || true)
       if [ "${_remaining:-}" = "0" ]; then
-        echo "Alucard signaled completion after $i iterations (queue verified empty)."
+        log_event "Run end: alucard signaled completion after $i iterations (queue verified empty)."
         exit 0
       fi
-      echo "Worker promised NO MORE TASKS but queue still has ${_remaining:-unknown} unblocked issue(s) — ignoring (likely a wedged iteration). Continuing."
+      log_event "Worker promised NO MORE TASKS but queue still has ${_remaining:-unknown} unblocked issue(s) — ignoring (likely a wedged iteration). Continuing."
     fi
   done
 
-  echo "Reached max iterations ($ITERATIONS)."
+  log_event "Run end: reached max iterations ($ITERATIONS)."
 }
 
 command_continue() {
