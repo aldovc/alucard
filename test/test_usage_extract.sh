@@ -59,6 +59,19 @@ assert_eq "codex log: exact TSV, cost empty" \
   "$(printf '72745\t15363\t1218798\t0\t1\t')" \
   "$(extract_agent_usage "$CODEX_LOG")"
 
+# ── Test group 2b: codex-cli 0.147+ log carrying cache_write_input_tokens ───
+echo "── codex format, 0.147+ cache-write field ──"
+
+CODEX_CW_LOG="$TMP_ROOT/codex_cw.jsonl"
+cat > "$CODEX_CW_LOG" <<'EOF'
+{"type":"turn.completed","usage":{"input_tokens":10817,"cached_input_tokens":0,"cache_write_input_tokens":10814,"output_tokens":5,"reasoning_output_tokens":0}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution"}}
+EOF
+
+assert_eq "codex 0.147 log: cache-write column populated" \
+  "$(printf '10817\t5\t0\t10814\t1\t')" \
+  "$(extract_agent_usage "$CODEX_CW_LOG")"
+
 # ── Test group 3: codex log summed across multiple turn.completed events ────
 echo "── codex format, multiple turns ──"
 

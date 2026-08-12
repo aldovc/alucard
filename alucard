@@ -354,6 +354,7 @@ scan_agent_errors() {
 # preflight). Kept in one global array so the call sites cannot drift apart
 # on resource limits or lockdown flags, while remaining compatible with Bash 3.2.
 docker_sandbox_args() {
+  # shellcheck disable=SC2054 # commas live inside single flag values (--tmpfs …,size=2g), not between elements
   DOCKER_SANDBOX_ARGS=(
     --network bridge
     --memory 4g --cpus 2
@@ -368,7 +369,10 @@ docker_sandbox_args() {
 }
 
 # Run one agent container and stream its output to a log file.
-# $1 = role tag (container name becomes alucard-<role>)
+# $1 = role tag (container name becomes alucard-<role>-<pid> — the PID suffix
+#      keeps concurrent runs, even against different repos, from colliding on
+#      a fixed name, and stops a crashed run's leftover container from
+#      blocking the next run's `docker run --name`)
 # $2 = log file path (JSONL stream written here via tee)
 # $3 = --max-turns value (Claude only)
 # $4 = --max-budget-usd value (Claude only)
@@ -398,8 +402,11 @@ invoke_agent() {
   local _start_epoch
   _start_epoch=$(date +%s)
 
+  local cname="alucard-${role}-$$"
+  CREATED_CONTAINERS+=("$cname")
+
   local -a _docker_args=(
-    --name "alucard-${role}"
+    --name "$cname"
     "${DOCKER_SANDBOX_ARGS[@]}"
     --env-file "$ENV_FILE"
     -e "HOME=/home/alucard"
@@ -417,8 +424,8 @@ invoke_agent() {
     while [ ! -e "$log_file" ]; do sleep 0.2; done
     tail -F "$log_file" 2>/dev/null \
       | grep --line-buffered -m1 -F 'Shell cwd was reset to /work (deleted)' >/dev/null \
-      && { echo "alucard: detected /work wedge in alucard-${role} — killing container" >&2; \
-           docker kill "alucard-${role}" >/dev/null 2>&1; } || true
+      && { echo "alucard: detected /work wedge in ${cname} — killing container" >&2; \
+           docker kill "$cname" >/dev/null 2>&1; } || true
   ) &
   local _watcher_pid=$!
 
@@ -463,7 +470,7 @@ invoke_agent() {
   # timeout's forwarded SIGTERM can be ignored by the containerized process;
   # --kill-after above forces it dead, but --rm only removes on a clean exit,
   # so a stopped-but-present container can still block the next `--name`.
-  docker rm -f "alucard-${role}" >/dev/null 2>&1 || true
+  docker rm -f "$cname" >/dev/null 2>&1 || true
 
   # Reap the wedge watcher (and its tail/grep children) whether or not it triggered.
   pkill -P "$_watcher_pid" 2>/dev/null || true
@@ -989,9 +996,12 @@ extract_agent_usage() {
       ([$u[].input_tokens        // 0] | add // 0) as $itok |
       ([$u[].cached_input_tokens  // 0] | add // 0) as $cached |
       ([$u[].output_tokens       // 0] | add // 0) as $out |
+      # cache_write_input_tokens first appears in codex-cli 0.147; older logs
+      # lack the field and sum to 0, matching the previous hardcoded column.
+      ([$u[].cache_write_input_tokens // 0] | add // 0) as $cwrite |
       ([ .[] | select(.type == "item.completed" and .item.type == "command_execution") ]
         | length) as $turns |
-      [ ($itok - $cached), $out, $cached, 0, $turns, "" ] | @tsv
+      [ ($itok - $cached), $out, $cached, $cwrite, $turns, "" ] | @tsv
     ' "$logfile" 2>/dev/null
 }
 
@@ -1110,13 +1120,13 @@ post_iteration_usage() {
   while IFS= read -r f; do
     base=$(basename "$f" .jsonl)
     case "$base" in
-      iter-${iter}-fix-*)
+      iter-"${iter}"-fix-*)
         mid="${base#iter-}"; label="ci-fix ${mid/-fix-/.}" ;;
-      iter-${iter}-review-*)
+      iter-"${iter}"-review-*)
         mid="${base#iter-}"; label="review ${mid/-review-/.}" ;;
-      iter-${iter}-feedback-*)
+      iter-"${iter}"-feedback-*)
         mid="${base#iter-}"; label="feedback ${mid/-feedback-/.}" ;;
-      iter-${iter})
+      iter-"${iter}")
         label="worker $iter" ;;
       *)
         continue ;;
@@ -1853,6 +1863,7 @@ toolchain_preflight() {
   fi
 
   docker_sandbox_args
+  CREATED_CONTAINERS+=("alucard-preflight-$$")
 
   set +e
   timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
@@ -1911,11 +1922,19 @@ setup_run_environment() {
   stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
   codex_stream_text="$CODEX_STREAM_TEXT"
   CREATED_WORKTREES=()
+  CREATED_CONTAINERS=()
 
   cleanup() {
-    local wt
+    local wt c
     for wt in "${CREATED_WORKTREES[@]}"; do
       rm -rf "$wt"
+    done
+    # Agent containers are force-removed after each run, so these are usually
+    # gone already — this catches the interrupt case (Ctrl+C mid-agent), where
+    # a still-running container would otherwise keep burning API budget and a
+    # stopped one would squat on its name.
+    for c in "${CREATED_CONTAINERS[@]}"; do
+      docker rm -f "$c" >/dev/null 2>&1 || true
     done
     print_usage_report "$LOG_DIR"
   }

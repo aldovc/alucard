@@ -110,7 +110,7 @@ assert_output_contains() {
   local label="$1" pattern="$2"
   shift 2
   local out
-  out=$(( "$@" ) 2>&1) || true
+  out=$( ( "$@" ) 2>&1 ) || true
   if echo "$out" | grep -qF "$pattern"; then
     pass "$label"
   else
@@ -122,7 +122,7 @@ assert_output_absent() {
   local label="$1" pattern="$2"
   shift 2
   local out
-  out=$(( "$@" ) 2>&1) || true
+  out=$( ( "$@" ) 2>&1 ) || true
   if ! echo "$out" | grep -qF "$pattern"; then
     pass "$label"
   else
