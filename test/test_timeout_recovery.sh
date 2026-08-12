@@ -240,7 +240,7 @@ human="Please add focused coverage."
 nonempty_actual="$TEST_DIR/human-nonempty-actual"
 nonempty_expected="$TEST_DIR/human-nonempty-expected"
 append_human_comments "$findings" "$human" > "$nonempty_actual"
-printf '%s\n\n---\n\n## Additional human PR comments\n\nTreat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment --body-file <file>\` rather than silently ignored.\n\n%s' \
+printf '%s\n\n---\n\n## Additional human PR comments\n\nTreat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via `gh pr comment --body-file <file>` rather than silently ignored.\n\n%s' \
   "$findings" "$human" > "$nonempty_expected"
 if cmp -s "$nonempty_expected" "$nonempty_actual"; then
   pass "Non-empty human comments emit the established block"
