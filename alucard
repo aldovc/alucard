@@ -29,6 +29,21 @@ DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-2}"
 DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-sonnet}"
 DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-haiku}"
 
+# Refresh agent settings after an env file is sourced. This keeps inherited
+# values working while allowing the selected env file to override them.
+refresh_agent_settings() {
+  DEFAULT_WORKER_MAX_TURNS="${ALUCARD_WORKER_MAX_TURNS:-180}"
+  DEFAULT_WORKER_MAX_BUDGET="${ALUCARD_WORKER_MAX_BUDGET:-10}"
+  DEFAULT_CI_FIX_MAX_TURNS="${ALUCARD_CI_FIX_MAX_TURNS:-30}"
+  DEFAULT_CI_FIX_MAX_BUDGET="${ALUCARD_CI_FIX_MAX_BUDGET:-2}"
+  DEFAULT_REVIEWER_MAX_TURNS="${ALUCARD_REVIEWER_MAX_TURNS:-20}"
+  DEFAULT_REVIEWER_MAX_BUDGET="${ALUCARD_REVIEWER_MAX_BUDGET:-2}"
+  DEFAULT_FEEDBACK_MAX_TURNS="${ALUCARD_FEEDBACK_MAX_TURNS:-50}"
+  DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-2}"
+  DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-sonnet}"
+  DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-haiku}"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -184,6 +199,7 @@ load_env_file() {
   # shellcheck disable=SC1090
   source "$env_file"
   set +a
+  refresh_agent_settings
 
   if [ "$require" = "true" ]; then
     [ -n "${GITHUB_TOKEN:-}" ] || die "GITHUB_TOKEN is empty in $env_file"
