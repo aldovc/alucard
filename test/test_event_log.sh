@@ -105,7 +105,7 @@ cat > "$MOCK_BIN/docker" <<'MOCK'
 set -euo pipefail
 case "$1" in
   run)
-    printf '%s\n' '{}'
+    printf '%s\n' "${ALUCARD_TEST_DOCKER_RUN_OUTPUT:-{}}"
     exit "${ALUCARD_TEST_DOCKER_RUN_EXIT:-0}"
     ;;
   rm|kill)
@@ -116,6 +116,10 @@ MOCK
 
 cat > "$MOCK_BIN/jq" <<'MOCK'
 #!/bin/bash
+if [ "${1:-}" = "length" ]; then
+  echo 1
+  exit 0
+fi
 cat
 MOCK
 
@@ -161,6 +165,63 @@ if printf '%s' "$event" | grep -qF "(timeout)"; then
 else
   pass "an ordinary failure rc is not mislabeled as a timeout"
 fi
+
+# ── Test group 4: billing abort closes the active iteration ─────────────────
+
+BILLING_REPO="$TEST_DIR/billing-repo"
+BILLING_REMOTE="$TEST_DIR/billing-remote.git"
+mkdir -p "$BILLING_REPO"
+git -C "$BILLING_REPO" init --initial-branch=main >/dev/null
+git -C "$BILLING_REPO" config user.email test@example.com
+git -C "$BILLING_REPO" config user.name "Alucard Test"
+touch "$BILLING_REPO/README.md"
+git -C "$BILLING_REPO" add README.md
+git -C "$BILLING_REPO" commit -m "Initial commit" >/dev/null
+git init --bare "$BILLING_REMOTE" >/dev/null
+git -C "$BILLING_REPO" remote add origin "$BILLING_REMOTE"
+git -C "$BILLING_REPO" push -u origin main >/dev/null
+
+need_cmd() { :; }
+parse_repo_options() {
+  REPO_ABS="$BILLING_REPO"
+  BASE_BRANCH="main"
+  ITERATIONS=1
+  TIMEOUT_MIN=1
+  IMAGE="alucard-test-image"
+}
+setup_run_environment() {
+  LOG_DIR="$TEST_DIR/billing-logs"
+  WT_ROOT="$TEST_DIR/billing-worktrees"
+  ENV_FILE="$TEST_DIR/alucard.env"
+  CREATED_WORKTREES=()
+  mkdir -p "$LOG_DIR" "$WT_ROOT"
+}
+resolve_task_source() { TASK_SOURCE="github"; }
+get_task_queue() { printf '%s\n' '[{}]'; }
+build_worker_prompt() { FULL_PROMPT="test prompt"; }
+
+export ALUCARD_TEST_DOCKER_RUN_EXIT=7
+export ALUCARD_TEST_DOCKER_RUN_OUTPUT='{"error":"billing_error"}'
+export ALUCARD_WORKER_PROVIDER="claude"
+set +e
+(command_run) >/dev/null 2>&1
+billing_rc=$?
+set -e
+unset ALUCARD_TEST_DOCKER_RUN_EXIT ALUCARD_TEST_DOCKER_RUN_OUTPUT ALUCARD_WORKER_PROVIDER
+
+assert_eq "billing error aborts the run with rc=2" "2" "$billing_rc"
+mapfile -t billing_events < <(cut -f2- "$LOG_DIR/events.log" | grep -E \
+  '^(Iteration 1/1 start|Agent iter-1 end:|Iteration 1/1 end:|Run end: provider returned billing_error)')
+assert_eq "billing abort emits four iteration/run transitions" "4" "${#billing_events[@]}"
+assert_eq "billing abort starts the iteration first" \
+  "Iteration 1/1 start" "${billing_events[0]:-}"
+assert_matches "billing abort records the worker end before cleanup" \
+  '^Agent iter-1 end: rc=7 duration=[0-9]+s$' "${billing_events[1]:-}"
+assert_matches "billing abort closes the iteration with the worker rc" \
+  '^Iteration 1/1 end: rc=7 duration=[0-9]+s$' "${billing_events[2]:-}"
+assert_eq "billing abort records the run end last" \
+  "Run end: provider returned billing_error (credit balance too low) — aborting run." \
+  "${billing_events[3]:-}"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"

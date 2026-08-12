@@ -2042,6 +2042,8 @@ command_run() {
     # the same exhausted account just burns time and leaks stub branches. Bail
     # the whole run on the first sighting so the user can top up and retry.
     if [ -f "$log_file" ] && grep -q '"error":"billing_error"' "$log_file"; then
+      _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
+      log_event "Iteration $i/$ITERATIONS end: rc=$rc duration=${_iter_duration}s"
       log_event "Run end: provider returned billing_error (credit balance too low) — aborting run."
       rm -rf "$WT_HOST"
       exit 2
