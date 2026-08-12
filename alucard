@@ -15,6 +15,20 @@ DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
 DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
 DEFAULT_CACHE_DIR="${ALUCARD_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/alucard}"
 
+# Per-role --max-turns / --max-budget-usd (Claude only) and the Claude
+# model/fallback-model, all overridable so tuning doesn't require editing
+# this script. Codex's equivalent knob is ALUCARD_CODEX_MODEL (see invoke_agent).
+DEFAULT_WORKER_MAX_TURNS="${ALUCARD_WORKER_MAX_TURNS:-180}"
+DEFAULT_WORKER_MAX_BUDGET="${ALUCARD_WORKER_MAX_BUDGET:-10}"
+DEFAULT_CI_FIX_MAX_TURNS="${ALUCARD_CI_FIX_MAX_TURNS:-30}"
+DEFAULT_CI_FIX_MAX_BUDGET="${ALUCARD_CI_FIX_MAX_BUDGET:-2}"
+DEFAULT_REVIEWER_MAX_TURNS="${ALUCARD_REVIEWER_MAX_TURNS:-20}"
+DEFAULT_REVIEWER_MAX_BUDGET="${ALUCARD_REVIEWER_MAX_BUDGET:-2}"
+DEFAULT_FEEDBACK_MAX_TURNS="${ALUCARD_FEEDBACK_MAX_TURNS:-50}"
+DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-2}"
+DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-sonnet}"
+DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-haiku}"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -70,6 +84,17 @@ Environment:
                                Default: ~/.cache/alucard  (XDG_CACHE_HOME honoured)
   ALUCARD_TASKS_FILE           Default tasks file for the local task source
                                (equivalent to passing --tasks).
+  ALUCARD_CLAUDE_MODEL         Claude model for all agent roles. Default: sonnet
+  ALUCARD_CLAUDE_FALLBACK_MODEL
+                               Claude fallback model. Default: haiku
+  ALUCARD_WORKER_MAX_TURNS     Worker --max-turns (Claude only). Default: 180
+  ALUCARD_WORKER_MAX_BUDGET    Worker --max-budget-usd (Claude only). Default: 10
+  ALUCARD_CI_FIX_MAX_TURNS     CI-fix --max-turns (Claude only). Default: 30
+  ALUCARD_CI_FIX_MAX_BUDGET    CI-fix --max-budget-usd (Claude only). Default: 2
+  ALUCARD_REVIEWER_MAX_TURNS   Reviewer --max-turns (Claude only). Default: 20
+  ALUCARD_REVIEWER_MAX_BUDGET  Reviewer --max-budget-usd (Claude only). Default: 2
+  ALUCARD_FEEDBACK_MAX_TURNS   Feedback --max-turns (Claude only). Default: 50
+  ALUCARD_FEEDBACK_MAX_BUDGET  Feedback --max-budget-usd (Claude only). Default: 2
 
 Examples:
   alucard run owner/repo --iterations 1
@@ -355,8 +380,8 @@ invoke_agent() {
         --permission-mode bypassPermissions \
         --max-turns "$max_turns" \
         --max-budget-usd "$max_budget" \
-        --model sonnet \
-        --fallback-model haiku \
+        --model "$DEFAULT_CLAUDE_MODEL" \
+        --fallback-model "$DEFAULT_CLAUDE_FALLBACK_MODEL" \
         --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
         -- \
         "$prompt" \
@@ -1156,7 +1181,7 @@ $(printf '%s' "$feedback_findings" | xml_escape)
   invoke_agent \
     "feedback-${iter}-${cycle}" \
     "$feedback_log" \
-    50 2 \
+    "$DEFAULT_FEEDBACK_MAX_TURNS" "$DEFAULT_FEEDBACK_MAX_BUDGET" \
     "$_feedback_prompt" \
     -v "$wt_feedback:/work:rw" \
     -v "$feedback_out_dir:/work-output:rw" \
@@ -1308,7 +1333,7 @@ $(printf '%s' "$failure_log" | xml_escape)
     invoke_agent \
       "fix-${iter}-${ci_attempt}" \
       "$fix_log" \
-      30 2 \
+      "$DEFAULT_CI_FIX_MAX_TURNS" "$DEFAULT_CI_FIX_MAX_BUDGET" \
       "$_fix_prompt" \
       -v "$wt_fix:/work:rw" \
       -e "ALUCARD_ITER=${iter}-fix-${ci_attempt}"
@@ -1429,7 +1454,7 @@ $(printf '%s' "${blocked_ledger:-None recorded.}" | xml_escape)
     invoke_agent \
       "review-${iter}-${review_cycle}" \
       "$review_log" \
-      20 2 \
+      "$DEFAULT_REVIEWER_MAX_TURNS" "$DEFAULT_REVIEWER_MAX_BUDGET" \
       "$_review_prompt" \
       -v "$wt_review:/work:ro" \
       -v "$review_out_dir:/work-output:rw" \
@@ -1843,7 +1868,7 @@ command_run() {
     invoke_agent \
       "iter-$i" \
       "$log_file" \
-      180 10 \
+      "$DEFAULT_WORKER_MAX_TURNS" "$DEFAULT_WORKER_MAX_BUDGET" \
       "$full_prompt" \
       -v "$WT_HOST:/work:rw" \
       -e "ALUCARD_ITER=$i"
