@@ -14,6 +14,7 @@ DEFAULT_ENV_FILE="${ALUCARD_ENV_FILE:-$TOOL_DIR/alucard.env}"
 DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
 DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
 DEFAULT_CACHE_DIR="${ALUCARD_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/alucard}"
+HARD_KILL_GRACE="30s"
 CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
 
 # Per-role --max-turns / --max-budget-usd (Claude only) and the Claude
@@ -398,7 +399,7 @@ invoke_agent() {
   if [ "$provider" = "codex" ]; then
     local codex_model="${ALUCARD_CODEX_MODEL:-gpt-5.6-terra}"
     # Prompt is fed via process substitution so PIPESTATUS[0] captures docker's exit.
-    timeout "${TIMEOUT_MIN}m" docker run --rm -i \
+    timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm -i \
       "${_docker_args[@]}" \
       codex exec \
         --dangerously-bypass-approvals-and-sandbox \
@@ -412,7 +413,7 @@ invoke_agent() {
       | jq --unbuffered -rj "$codex_stream_text"
     _rc=${PIPESTATUS[0]}
   else
-    timeout "${TIMEOUT_MIN}m" docker run --rm \
+    timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
       "${_docker_args[@]}" \
       claude -p \
         --verbose \
@@ -431,6 +432,11 @@ invoke_agent() {
       | jq --unbuffered -rj "$stream_text"
     _rc=${PIPESTATUS[0]}
   fi
+
+  # timeout's forwarded SIGTERM can be ignored by the containerized process;
+  # --kill-after above forces it dead, but --rm only removes on a clean exit,
+  # so a stopped-but-present container can still block the next `--name`.
+  docker rm -f "alucard-${role}" >/dev/null 2>&1 || true
 
   # Reap the wedge watcher (and its tail/grep children) whether or not it triggered.
   pkill -P "$_watcher_pid" 2>/dev/null || true
@@ -1805,7 +1811,7 @@ toolchain_preflight() {
   fi
 
   set +e
-  timeout "${TIMEOUT_MIN}m" docker run --rm \
+  timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
     --name "alucard-preflight-$$" \
     --network bridge \
     --memory 4g --cpus 2 \
@@ -1825,6 +1831,7 @@ toolchain_preflight() {
   rc=$?
   set -e
 
+  docker rm -f "alucard-preflight-$$" >/dev/null 2>&1 || true
   rm -rf "$preflight_dir" || true
 
   if [ "$rc" -eq 0 ]; then
