@@ -31,6 +31,15 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if printf '%s\n' "$haystack" | grep -qF -- "$needle"; then
+    fail "$label (unexpected '$needle')"
+  else
+    pass "$label"
+  fi
+}
+
 assert_line_after() {
   local label="$1" first="$2" second="$3" trace="$4"
   local first_line second_line
@@ -219,7 +228,7 @@ assert_line_after "Base clone happens after its refspec fetch" \
 findings_file="$TEST_DIR/findings"
 empty_actual="$TEST_DIR/human-empty-actual"
 printf 'Original findings\n\nWith trailing newlines\n\n' > "$findings_file"
-findings=$(cat "$findings_file")
+findings=$'Original findings\n\nWith trailing newlines\n\n'
 append_human_comments "$findings" "" > "$empty_actual"
 if cmp -s "$findings_file" "$empty_actual"; then
   pass "Empty human comments preserve findings byte-for-byte"
