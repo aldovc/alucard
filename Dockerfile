@@ -7,7 +7,7 @@ FROM node:24.14.0-slim
 # push unverified code for the whole run — see the zodiac#40 post-mortem.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl jq ripgrep ca-certificates gnupg openssh-client \
-      build-essential pkg-config \
+      build-essential pkg-config shellcheck \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \

@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ALUCARD="$SCRIPT_DIR/../alucard"
 FIX_BASIC="$SCRIPT_DIR/fixtures/tasks-basic.md"
 FIX_MALFORMED="$SCRIPT_DIR/fixtures/tasks-malformed.md"
+FIX_ISSUE_BLOCKERS="$SCRIPT_DIR/fixtures/tasks-issue-blockers.md"
 
 PASS=0
 FAIL=0
@@ -96,6 +97,47 @@ assert_eq "queue: excludes done, in-flight, human, and blocked tasks" "2" \
 assert_eq "queue: emits id, title, body per task" "body,id,title" \
   "$(echo "$QUEUE" | jq -r '.[0] | keys | join(",")')"
 
+# ── Test group 2b: issue-blocker resolution via a single open-set fetch ─────
+# Fixture has one task blocked by an open issue (#100), one by a closed issue
+# (#200), one by a nonexistent issue (#999), one with no blockers.
+
+assert_exit "is_issue_blocking: number present in open set blocks" 0 \
+  is_issue_blocking 100 '[100,200]' true
+assert_exit "is_issue_blocking: number absent from open set does not block" 1 \
+  is_issue_blocking 999 '[100,200]' true
+assert_exit "is_issue_blocking: fetch failure blocks regardless of the set" 0 \
+  is_issue_blocking 999 '[]' false
+
+GH_CALL_LOG=$(mktemp /tmp/alucard_test_ghcalls.XXXXXX)
+gh() {
+  echo "$*" >> "$GH_CALL_LOG"
+  if [ "$1" = "issue" ] && [ "$2" = "list" ] && [ "$3" = "--state" ] && [ "$4" = "open" ]; then
+    echo '[100]'
+    return 0
+  fi
+  return 1
+}
+
+assert_eq "fetch_open_issue_numbers: returns gh's json array" "[100]" \
+  "$(fetch_open_issue_numbers "$SCRIPT_DIR/..")"
+
+: > "$GH_CALL_LOG"
+QUEUE_IB=$(get_unblocked_local_tasks "$FIX_ISSUE_BLOCKERS" "$SCRIPT_DIR/..")
+assert_eq "issue blockers: open blocks, closed and nonexistent refs don't" "2,3,4" \
+  "$(echo "$QUEUE_IB" | jq -r '[.[].id] | join(",")')"
+assert_eq "issue blockers: exactly one gh call resolves every blocker" "1" \
+  "$(grep -c '^issue list --state open --json number' "$GH_CALL_LOG")"
+rm -f "$GH_CALL_LOG"
+unset -f gh
+
+gh() { return 1; }
+assert_exit "fetch_open_issue_numbers: gh failure returns 1" 1 \
+  fetch_open_issue_numbers "$SCRIPT_DIR/.."
+QUEUE_IB_FAIL=$(get_unblocked_local_tasks "$FIX_ISSUE_BLOCKERS" "$SCRIPT_DIR/..")
+assert_eq "issue blockers: fetch failure blocks every issue-blocked task" "4" \
+  "$(echo "$QUEUE_IB_FAIL" | jq -r '[.[].id] | join(",")')"
+unset -f gh
+
 # ── Test group 3: validate_tasks_file (doctor) ───────────────────────────────
 
 assert_exit "validate: basic fixture passes" 0 validate_tasks_file "$FIX_BASIC"
@@ -183,14 +225,15 @@ assert_exit "dispatch: unknown source dies" 1 get_task_queue "$SCRIPT_DIR/.."
 
 TASK_SOURCE="github"
 BASE_BRANCH="main"
-build_worker_prompt '[{"number":1,"title":"t","body":"b"}]' 'line1
+build_worker_prompt '[{"number":1,"title":"t","body":"b","labels":[{"name":"afk"},{"name":"bug"}]}]' 'line1
 line2' "INSTRUCTIONS"
 EXPECTED_GH='<instructions>INSTRUCTIONS</instructions>
 <base_branch>main</base_branch>
 <commits>line1
 line2</commits>
-<issues>[{"number":1,"title":"t","body":"b"}]</issues>'
-assert_eq "prompt: github mode format is byte-identical" "$EXPECTED_GH" "$FULL_PROMPT"
+<issues>[{"number":1,"title":"t","labels":["afk","bug"]}]</issues>'
+assert_eq "prompt: github mode slims issues to number/title/labels" "$EXPECTED_GH" "$FULL_PROMPT"
+assert_not_contains "prompt: github mode drops issue body" '"body"' "$FULL_PROMPT"
 assert_eq "prompt: github mode leaves no dispatched task id" "" "$DISPATCHED_TASK_ID"
 assert_eq "prompt: github mode leaves TASK_XML empty" "" "$TASK_XML"
 assert_eq "prompt: github mode leaves PARENT_CONTEXT_XML empty" "" "$PARENT_CONTEXT_XML"

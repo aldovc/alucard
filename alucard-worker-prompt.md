@@ -7,7 +7,7 @@ You run inside an autonomous loop. Each iteration: pick ONE issue, complete it e
 These instructions are followed by context sections:
 - `<base_branch>` — the configured base branch name (e.g. `main`)
 - `<commits>` — last 5 commits on the base branch
-- `<issues>` — JSON array of open, unblocked, non-WIP AFK issues (GitHub mode)
+- `<issues>` — JSON array of open, unblocked, non-WIP AFK issues (GitHub mode). Each entry carries only `number`, `title`, and `labels` (name strings) — no body. Fetch the body of the issue you pick with `gh issue view <N> --comments` (see Explore below); do not assume the queue carries it.
 
 In local tasks mode — marked by `<task_source>file</task_source>` — `<issues>` is replaced by:
 - `<parent_context>` — the plan's shared context; implement against its constraints

@@ -15,6 +15,36 @@ DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
 DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
 DEFAULT_CACHE_DIR="${ALUCARD_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/alucard}"
 HARD_KILL_GRACE="30s"
+CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
+
+# Per-role --max-turns / --max-budget-usd (Claude only) and the Claude
+# model/fallback-model, all overridable so tuning doesn't require editing
+# this script. Codex's equivalent knob is ALUCARD_CODEX_MODEL (see invoke_agent).
+DEFAULT_WORKER_MAX_TURNS="${ALUCARD_WORKER_MAX_TURNS:-180}"
+DEFAULT_WORKER_MAX_BUDGET="${ALUCARD_WORKER_MAX_BUDGET:-10}"
+DEFAULT_CI_FIX_MAX_TURNS="${ALUCARD_CI_FIX_MAX_TURNS:-30}"
+DEFAULT_CI_FIX_MAX_BUDGET="${ALUCARD_CI_FIX_MAX_BUDGET:-2}"
+DEFAULT_REVIEWER_MAX_TURNS="${ALUCARD_REVIEWER_MAX_TURNS:-20}"
+DEFAULT_REVIEWER_MAX_BUDGET="${ALUCARD_REVIEWER_MAX_BUDGET:-2}"
+DEFAULT_FEEDBACK_MAX_TURNS="${ALUCARD_FEEDBACK_MAX_TURNS:-50}"
+DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-2}"
+DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-sonnet}"
+DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-haiku}"
+
+# Refresh agent settings after an env file is sourced. This keeps inherited
+# values working while allowing the selected env file to override them.
+refresh_agent_settings() {
+  DEFAULT_WORKER_MAX_TURNS="${ALUCARD_WORKER_MAX_TURNS:-$DEFAULT_WORKER_MAX_TURNS}"
+  DEFAULT_WORKER_MAX_BUDGET="${ALUCARD_WORKER_MAX_BUDGET:-$DEFAULT_WORKER_MAX_BUDGET}"
+  DEFAULT_CI_FIX_MAX_TURNS="${ALUCARD_CI_FIX_MAX_TURNS:-$DEFAULT_CI_FIX_MAX_TURNS}"
+  DEFAULT_CI_FIX_MAX_BUDGET="${ALUCARD_CI_FIX_MAX_BUDGET:-$DEFAULT_CI_FIX_MAX_BUDGET}"
+  DEFAULT_REVIEWER_MAX_TURNS="${ALUCARD_REVIEWER_MAX_TURNS:-$DEFAULT_REVIEWER_MAX_TURNS}"
+  DEFAULT_REVIEWER_MAX_BUDGET="${ALUCARD_REVIEWER_MAX_BUDGET:-$DEFAULT_REVIEWER_MAX_BUDGET}"
+  DEFAULT_FEEDBACK_MAX_TURNS="${ALUCARD_FEEDBACK_MAX_TURNS:-$DEFAULT_FEEDBACK_MAX_TURNS}"
+  DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-$DEFAULT_FEEDBACK_MAX_BUDGET}"
+  DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-$DEFAULT_CLAUDE_MODEL}"
+  DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-$DEFAULT_CLAUDE_FALLBACK_MODEL}"
+}
 
 usage() {
   cat <<'EOF'
@@ -71,6 +101,17 @@ Environment:
                                Default: ~/.cache/alucard  (XDG_CACHE_HOME honoured)
   ALUCARD_TASKS_FILE           Default tasks file for the local task source
                                (equivalent to passing --tasks).
+  ALUCARD_CLAUDE_MODEL         Claude model for all agent roles. Default: sonnet
+  ALUCARD_CLAUDE_FALLBACK_MODEL
+                               Claude fallback model. Default: haiku
+  ALUCARD_WORKER_MAX_TURNS     Worker --max-turns (Claude only). Default: 180
+  ALUCARD_WORKER_MAX_BUDGET    Worker --max-budget-usd (Claude only). Default: 10
+  ALUCARD_CI_FIX_MAX_TURNS     CI-fix --max-turns (Claude only). Default: 30
+  ALUCARD_CI_FIX_MAX_BUDGET    CI-fix --max-budget-usd (Claude only). Default: 2
+  ALUCARD_REVIEWER_MAX_TURNS   Reviewer --max-turns (Claude only). Default: 20
+  ALUCARD_REVIEWER_MAX_BUDGET  Reviewer --max-budget-usd (Claude only). Default: 2
+  ALUCARD_FEEDBACK_MAX_TURNS   Feedback --max-turns (Claude only). Default: 50
+  ALUCARD_FEEDBACK_MAX_BUDGET  Feedback --max-budget-usd (Claude only). Default: 2
 
 Examples:
   alucard run owner/repo --iterations 1
@@ -160,6 +201,7 @@ load_env_file() {
   # shellcheck disable=SC1090
   source "$env_file"
   set +a
+  refresh_agent_settings
 
   if [ "$require" = "true" ]; then
     [ -n "${GITHUB_TOKEN:-}" ] || die "GITHUB_TOKEN is empty in $env_file"
@@ -271,6 +313,30 @@ any_role_uses() {
   return 1
 }
 
+# Scan a completed agent's log for provider-reported errors and print them to
+# stderr, tagged with role and exit code. Confirmed live: every codex run for
+# a week began with a "Model metadata ... not found, defaulting to fallback"
+# item.completed error and nothing surfaced it — operators ran degraded
+# blind. Runs after the container exits, so it covers errors that showed up
+# mid-stream (codex_stream_text already echoes those live) as well as ones
+# only visible in the final claude result line.
+scan_agent_errors() {
+  local role="$1" log_file="$2" provider="$3" rc="$4"
+  [ -f "$log_file" ] || return 0
+  if [ "$provider" = "codex" ]; then
+    jq -r --arg role "$role" --arg rc "$rc" \
+      'select(.type == "item.completed" and .item.type == "error") |
+       "alucard: " + $role + " (rc=" + $rc + ") codex error: " + .item.message' \
+      "$log_file" >&2 2>/dev/null || true
+  else
+    jq -r --arg role "$role" --arg rc "$rc" \
+      'select(.type == "result") | select(.is_error == true or .subtype != "success") |
+       "alucard: " + $role + " (rc=" + $rc + ") claude error (subtype=" + (.subtype // "unknown") + "): " +
+       ((.result // "") | .[0:200])' \
+      "$log_file" >&2 2>/dev/null || true
+  fi
+}
+
 # Run one agent container and stream its output to a log file.
 # $1 = role tag (container name becomes alucard-<role>)
 # $2 = log file path (JSONL stream written here via tee)
@@ -356,8 +422,8 @@ invoke_agent() {
         --permission-mode bypassPermissions \
         --max-turns "$max_turns" \
         --max-budget-usd "$max_budget" \
-        --model sonnet \
-        --fallback-model haiku \
+        --model "$DEFAULT_CLAUDE_MODEL" \
+        --fallback-model "$DEFAULT_CLAUDE_FALLBACK_MODEL" \
         --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
         -- \
         "$prompt" \
@@ -376,6 +442,8 @@ invoke_agent() {
   pkill -P "$_watcher_pid" 2>/dev/null || true
   kill "$_watcher_pid" 2>/dev/null || true
   wait "$_watcher_pid" 2>/dev/null || true
+
+  scan_agent_errors "$role" "$log_file" "$provider" "$_rc"
 
   return "$_rc"
 }
@@ -476,12 +544,46 @@ parse_repo_options() {
   done
 }
 
+# Single gh call resolving every currently-open issue number, used to settle
+# "Blocked by #N" references without one gh call per blocker (the previous
+# N+1 pattern: a `gh issue view` round-trip per reference, per issue, on
+# every queue build). Echoes a JSON array on success. On any gh/network
+# failure echoes "[]" and returns 1 so callers know to block conservatively
+# instead of mistaking "fetch failed" for "no open issues".
+fetch_open_issue_numbers() {
+  local repo_abs="$1"
+  local out
+  out=$(cd "$repo_abs" && gh issue list --state open --json number --limit 1000 \
+        --jq '[.[].number]' 2>/dev/null) || { echo "[]"; return 1; }
+  echo "$out"
+}
+
+# True iff issue number $1 is blocking, given the open-issue-number JSON
+# array $2 and whether that array's fetch succeeded ($3, "true"/"false").
+# A fetch failure blocks unconditionally (conservative, matches the old
+# per-blocker `|| echo "OPEN"` default). On success, a blocker not present
+# in the open set is treated as closed/satisfied — this also covers a
+# reference to a nonexistent issue number, which previously blocked forever
+# under the `|| echo "OPEN"` fallback; a dangling ref is far more likely a
+# typo than an issue that must stay open forever.
+is_issue_blocking() {
+  local num="$1" open_issues="$2" fetch_ok="$3"
+  [ "$fetch_ok" = "true" ] || return 0
+  echo "$open_issues" | jq -e --argjson n "$num" 'any(.[]; . == $n)' >/dev/null
+}
+
 get_unblocked_afk_issues() {
   local repo_abs="$1"
-  local all open_prs issue body blockers blocked state skip num has_pr _gh_repo owner repo
+  local all open_prs issue body blockers blocked skip num has_pr _gh_repo owner repo
+  local open_issues fetch_ok=true
 
   all=$(cd "$repo_abs" && gh issue list --state open --label afk --limit 500 \
         --json number,title,body,labels)
+
+  open_issues="[]"
+  if echo "$all" | jq -e '[.[] | (.body // "") | test("Blocked by #[0-9]+")] | any' >/dev/null; then
+    open_issues=$(fetch_open_issue_numbers "$repo_abs") || fetch_ok=false
+  fi
 
   # Use GitHub's own closing-issue graph so PR detection is never left to LLM
   # output format — GitHub parses the PR body; we just read the result.
@@ -509,8 +611,7 @@ get_unblocked_afk_issues() {
 
     blocked=false
     for b in $blockers; do
-      state=$(cd "$repo_abs" && gh issue view "$b" --json state -q .state 2>/dev/null || echo "OPEN")
-      [ "$state" = "OPEN" ] && { blocked=true; break; }
+      is_issue_blocking "$b" "$open_issues" "$fetch_ok" && { blocked=true; break; }
     done
 
     skip=$(echo "$issue" | jq -r '
@@ -592,7 +693,8 @@ parse_tasks_file() {
 # Emits a JSON array of {id, title, body}.
 get_unblocked_local_tasks() {
   local file="$1" repo_abs="$2"
-  local parsed errors candidates task ref state blocked
+  local parsed errors candidates task ref blocked
+  local open_issues="[]" fetch_ok=true
 
   parsed=$(parse_tasks_file "$file")
   errors=$(echo "$parsed" | jq -r '.errors[]')
@@ -614,13 +716,20 @@ $errors"
     | {id, title, body, issue_blockers: $issue_blockers}
   ')
 
+  # Only pay for the open-issue-number fetch when some candidate actually
+  # has a GitHub-issue blocker — most local-mode queues use task-id
+  # blockers exclusively and should stay fully offline (get_task_queue's
+  # dispatch test relies on this).
+  if [ "$(echo "$candidates" | jq -s '[.[].issue_blockers[]] | length > 0')" = "true" ]; then
+    open_issues=$(fetch_open_issue_numbers "$repo_abs") || fetch_ok=false
+  fi
+
   echo "$candidates" | while IFS= read -r task; do
     [ -n "$task" ] || continue
 
     blocked=false
     for ref in $(echo "$task" | jq -r '.issue_blockers[]'); do
-      state=$(cd "$repo_abs" && gh issue view "$ref" --json state -q .state 2>/dev/null || echo "OPEN")
-      [ "$state" = "OPEN" ] && { blocked=true; break; }
+      is_issue_blocking "$ref" "$open_issues" "$fetch_ok" && { blocked=true; break; }
     done
 
     if [ "$blocked" = false ]; then
@@ -809,6 +918,49 @@ get_task_queue() {
   esac
 }
 
+# Echo one TSV line: input<TAB>output<TAB>cache_read<TAB>cache_write<TAB>turns<TAB>cost
+# for a single agent log. Empty output means the log had no parsable usage.
+#
+# claude logs carry one final `{"type":"result",...}` line; codex logs have
+# no such line, only a stream of `{"type":"turn.completed","usage":{...}}`
+# events (no cost field) plus `{"type":"item.completed",...}` events used
+# here as the closest analog to a turn count. Try claude's cheap tail-20
+# check first; only fall back to a full-file scan for codex's summed form.
+extract_agent_usage() {
+  local logfile="$1"
+  [ -f "$logfile" ] || return 0
+
+  local result_line
+  result_line=$(tail -n 20 "$logfile" | grep '"type":"result"' | tail -1) || true
+
+  if [ -n "$result_line" ]; then
+    printf '%s\n' "$result_line" \
+      | jq -r 'select(.type == "result") |
+          ([ .modelUsage // {} | to_entries[] | .value ] as $m |
+          [
+            ([$m[].inputTokens              // 0] | add // 0),
+            ([$m[].outputTokens             // 0] | add // 0),
+            ([$m[].cacheReadInputTokens     // 0] | add // 0),
+            ([$m[].cacheCreationInputTokens // 0] | add // 0),
+            (.num_turns // 0),
+            (.total_cost_usd // 0)
+          ]) | @tsv' 2>/dev/null
+    return 0
+  fi
+
+  grep -q '"type":"turn.completed"' "$logfile" 2>/dev/null || return 0
+
+  jq -rs '
+      [ .[] | select(.type == "turn.completed") | .usage ] as $u |
+      ([$u[].input_tokens        // 0] | add // 0) as $itok |
+      ([$u[].cached_input_tokens  // 0] | add // 0) as $cached |
+      ([$u[].output_tokens       // 0] | add // 0) as $out |
+      ([ .[] | select(.type == "item.completed" and .item.type == "command_execution") ]
+        | length) as $turns |
+      [ ($itok - $cached), $out, $cached, 0, $turns, "" ] | @tsv
+    ' "$logfile" 2>/dev/null
+}
+
 print_usage_report() {
   local log_dir="$1"
 
@@ -817,7 +969,7 @@ print_usage_report() {
   local -a labels=() inps=() outs=() crs=() cws=() turnss=() costs=()
   local f base label mid
   local total_inp=0 total_out=0 total_cr=0 total_cw=0 total_turns=0
-  local total_cost="0"
+  local total_cost="0" have_cost=0
 
   while IFS= read -r f; do
     base=$(basename "$f" .jsonl)
@@ -837,19 +989,7 @@ print_usage_report() {
     local inp out cr cw turns cost
     # read returns non-zero on empty input; guard with || true so set -e doesn't
     # abort the report when a log has no result line (timeout, Ctrl+C, etc.)
-    IFS=$'\t' read -r inp out cr cw turns cost < <(
-      tail -n 20 "$f" | grep '"type":"result"' | tail -1 \
-        | jq -r 'select(.type == "result") |
-            ([ .modelUsage // {} | to_entries[] | .value ] as $m |
-            [
-              ([$m[].inputTokens            // 0] | add // 0),
-              ([$m[].outputTokens           // 0] | add // 0),
-              ([$m[].cacheReadInputTokens   // 0] | add // 0),
-              ([$m[].cacheCreationInputTokens // 0] | add // 0),
-              (.num_turns // 0),
-              (.total_cost_usd // 0)
-            ]) | @tsv' 2>/dev/null || true
-    ) || true
+    IFS=$'\t' read -r inp out cr cw turns cost < <(extract_agent_usage "$f") || true
 
     [ -z "${inp:-}" ] && continue
 
@@ -866,7 +1006,10 @@ print_usage_report() {
     total_cr=$((total_cr + cr))
     total_cw=$((total_cw + cw))
     total_turns=$((total_turns + turns))
-    total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
+    if [ -n "$cost" ]; then
+      have_cost=1
+      total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
+    fi
   done < <(find "$log_dir" -maxdepth 1 -name '*.jsonl' 2>/dev/null | sort -V)
 
   [ "${#labels[@]}" -eq 0 ] && return 0
@@ -879,17 +1022,29 @@ print_usage_report() {
     "Agent" "Input" "Output" "Cache Read" "Cache Write" "Turns" "Cost"
   printf '%s\n' "$sep"
 
-  local i
+  local i cost_disp
   for i in "${!labels[@]}"; do
+    if [ -n "${costs[$i]}" ]; then
+      cost_disp=$(printf '$%.3f' "${costs[$i]}")
+    else
+      cost_disp="-"
+    fi
     printf '%-22s  %10s  %8s  %12s  %12s  %5s  %8s\n' \
       "${labels[$i]}" "${inps[$i]}" "${outs[$i]}" "${crs[$i]}" "${cws[$i]}" \
-      "${turnss[$i]}" "$(printf '$%.3f' "${costs[$i]}")"
+      "${turnss[$i]}" "$cost_disp"
   done
+
+  local total_cost_disp
+  if [ "$have_cost" -eq 1 ]; then
+    total_cost_disp=$(printf '$%.3f' "$total_cost")
+  else
+    total_cost_disp="-"
+  fi
 
   printf '%s\n' "$sep"
   printf '%-22s  %10s  %8s  %12s  %12s  %5s  %8s\n' \
     "TOTAL" "$total_inp" "$total_out" "$total_cr" "$total_cw" "$total_turns" \
-    "$(printf '$%.3f' "$total_cost")"
+    "$total_cost_disp"
   printf '\n'
 }
 
@@ -915,8 +1070,8 @@ post_iteration_usage() {
 
   local -a rows=()
   local total_inp=0 total_out=0 total_cr=0 total_cw=0 total_turns=0
-  local total_cost="0"
-  local f base label mid inp out cr cw turns cost
+  local total_cost="0" have_cost=0
+  local f base label mid inp out cr cw turns cost cost_disp
 
   while IFS= read -r f; do
     base=$(basename "$f" .jsonl)
@@ -933,29 +1088,24 @@ post_iteration_usage() {
         continue ;;
     esac
 
-    IFS=$'\t' read -r inp out cr cw turns cost < <(
-      tail -n 20 "$f" | grep '"type":"result"' | tail -1 \
-        | jq -r 'select(.type == "result") |
-            ([ .modelUsage // {} | to_entries[] | .value ] as $m |
-            [
-              ([$m[].inputTokens              // 0] | add // 0),
-              ([$m[].outputTokens             // 0] | add // 0),
-              ([$m[].cacheReadInputTokens     // 0] | add // 0),
-              ([$m[].cacheCreationInputTokens // 0] | add // 0),
-              (.num_turns // 0),
-              (.total_cost_usd // 0)
-            ]) | @tsv' 2>/dev/null || true
-    ) || true
+    IFS=$'\t' read -r inp out cr cw turns cost < <(extract_agent_usage "$f") || true
 
     [ -z "${inp:-}" ] && continue
 
-    rows+=("| ${label} | ${inp} | ${out} | ${cr} | ${cw} | ${turns} | \$$(printf '%.3f' "${cost}") |")
+    if [ -n "$cost" ]; then
+      cost_disp="\$$(printf '%.3f' "$cost")"
+      have_cost=1
+      total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
+    else
+      cost_disp="-"
+    fi
+
+    rows+=("| ${label} | ${inp} | ${out} | ${cr} | ${cw} | ${turns} | ${cost_disp} |")
     total_inp=$((total_inp + inp))
     total_out=$((total_out + out))
     total_cr=$((total_cr + cr))
     total_cw=$((total_cw + cw))
     total_turns=$((total_turns + turns))
-    total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
   done < <(
     { find "$log_dir" -maxdepth 1 -name "iter-${iter}.jsonl" 2>/dev/null
       find "$log_dir" -maxdepth 1 -name "iter-${iter}-*.jsonl" 2>/dev/null
@@ -964,13 +1114,20 @@ post_iteration_usage() {
 
   [ "${#rows[@]}" -eq 0 ] && return 0
 
+  local total_cost_disp
+  if [ "$have_cost" -eq 1 ]; then
+    total_cost_disp="\$$(printf '%.3f' "$total_cost")"
+  else
+    total_cost_disp="-"
+  fi
+
   local body
   body="<details><summary>🤖 Alucard token usage (iteration ${iter})</summary>
 
 | Agent | Input | Output | Cache Read | Cache Write | Turns | Cost |
 |-------|------:|-------:|-----------:|------------:|------:|-----:|
 $(printf '%s\n' "${rows[@]}")
-| **TOTAL** | **${total_inp}** | **${total_out}** | **${total_cr}** | **${total_cw}** | **${total_turns}** | **\$$(printf '%.3f' "${total_cost}")** |
+| **TOTAL** | **${total_inp}** | **${total_out}** | **${total_cr}** | **${total_cw}** | **${total_turns}** | **${total_cost_disp}** |
 
 </details>"
 
@@ -1162,7 +1319,7 @@ $(printf '%s' "$feedback_findings" | xml_escape)
   invoke_agent \
     "feedback-${iter}-${cycle}" \
     "$feedback_log" \
-    50 2 \
+    "$DEFAULT_FEEDBACK_MAX_TURNS" "$DEFAULT_FEEDBACK_MAX_BUDGET" \
     "$_feedback_prompt" \
     -v "$wt_feedback:/work:rw" \
     -v "$feedback_out_dir:/work-output:rw" \
@@ -1314,7 +1471,7 @@ $(printf '%s' "$failure_log" | xml_escape)
     invoke_agent \
       "fix-${iter}-${ci_attempt}" \
       "$fix_log" \
-      30 2 \
+      "$DEFAULT_CI_FIX_MAX_TURNS" "$DEFAULT_CI_FIX_MAX_BUDGET" \
       "$_fix_prompt" \
       -v "$wt_fix:/work:rw" \
       -e "ALUCARD_ITER=${iter}-fix-${ci_attempt}"
@@ -1435,7 +1592,7 @@ $(printf '%s' "${blocked_ledger:-None recorded.}" | xml_escape)
     invoke_agent \
       "review-${iter}-${review_cycle}" \
       "$review_log" \
-      20 2 \
+      "$DEFAULT_REVIEWER_MAX_TURNS" "$DEFAULT_REVIEWER_MAX_BUDGET" \
       "$_review_prompt" \
       -v "$wt_review:/work:ro" \
       -v "$review_out_dir:/work-output:rw" \
@@ -1715,7 +1872,7 @@ setup_run_environment() {
   ensure_image "$IMAGE" "$AUTO_BUILD"
 
   stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
-  codex_stream_text='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" else empty end'
+  codex_stream_text="$CODEX_STREAM_TEXT"
   CREATED_WORKTREES=()
 
   cleanup() {
@@ -1756,7 +1913,13 @@ build_worker_prompt() {
     TASK_XML="$_task_esc"
     PARENT_CONTEXT_XML="$_parent_esc"
   else
-    _issues_esc=$(printf '%s' "$queue" | xml_escape)
+    # Slim to number/title/labels only: the worker prompt instructs the
+    # agent to `gh issue view <N> --comments` for the issue it picks, so
+    # shipping every body here pays for it twice on the pick and wastes it
+    # on every issue the agent doesn't pick. Full `queue` (with bodies) is
+    # still what filtering and `alucard queue` use — this trims only what
+    # goes on the wire to the worker.
+    _issues_esc=$(echo "$queue" | jq -c '[.[] | {number, title, labels: [.labels[].name]}]' | xml_escape)
     FULL_PROMPT="<instructions>${instructions}</instructions>
 <base_branch>${BASE_BRANCH}</base_branch>
 <commits>${_commits_esc}</commits>
@@ -1850,7 +2013,7 @@ command_run() {
     invoke_agent \
       "iter-$i" \
       "$log_file" \
-      180 10 \
+      "$DEFAULT_WORKER_MAX_TURNS" "$DEFAULT_WORKER_MAX_BUDGET" \
       "$full_prompt" \
       -v "$WT_HOST:/work:rw" \
       -e "ALUCARD_ITER=$i"
