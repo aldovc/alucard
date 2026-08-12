@@ -470,12 +470,46 @@ parse_repo_options() {
   done
 }
 
+# Single gh call resolving every currently-open issue number, used to settle
+# "Blocked by #N" references without one gh call per blocker (the previous
+# N+1 pattern: a `gh issue view` round-trip per reference, per issue, on
+# every queue build). Echoes a JSON array on success. On any gh/network
+# failure echoes "[]" and returns 1 so callers know to block conservatively
+# instead of mistaking "fetch failed" for "no open issues".
+fetch_open_issue_numbers() {
+  local repo_abs="$1"
+  local out
+  out=$(cd "$repo_abs" && gh issue list --state open --json number --limit 1000 \
+        --jq '[.[].number]' 2>/dev/null) || { echo "[]"; return 1; }
+  echo "$out"
+}
+
+# True iff issue number $1 is blocking, given the open-issue-number JSON
+# array $2 and whether that array's fetch succeeded ($3, "true"/"false").
+# A fetch failure blocks unconditionally (conservative, matches the old
+# per-blocker `|| echo "OPEN"` default). On success, a blocker not present
+# in the open set is treated as closed/satisfied — this also covers a
+# reference to a nonexistent issue number, which previously blocked forever
+# under the `|| echo "OPEN"` fallback; a dangling ref is far more likely a
+# typo than an issue that must stay open forever.
+is_issue_blocking() {
+  local num="$1" open_issues="$2" fetch_ok="$3"
+  [ "$fetch_ok" = "true" ] || return 0
+  echo "$open_issues" | jq -e --argjson n "$num" 'any(.[]; . == $n)' >/dev/null
+}
+
 get_unblocked_afk_issues() {
   local repo_abs="$1"
-  local all open_prs issue body blockers blocked state skip num has_pr _gh_repo owner repo
+  local all open_prs issue body blockers blocked skip num has_pr _gh_repo owner repo
+  local open_issues fetch_ok=true
 
   all=$(cd "$repo_abs" && gh issue list --state open --label afk --limit 500 \
         --json number,title,body,labels)
+
+  open_issues="[]"
+  if echo "$all" | jq -e '[.[] | (.body // "") | test("Blocked by #[0-9]+")] | any' >/dev/null; then
+    open_issues=$(fetch_open_issue_numbers "$repo_abs") || fetch_ok=false
+  fi
 
   # Use GitHub's own closing-issue graph so PR detection is never left to LLM
   # output format — GitHub parses the PR body; we just read the result.
@@ -503,8 +537,7 @@ get_unblocked_afk_issues() {
 
     blocked=false
     for b in $blockers; do
-      state=$(cd "$repo_abs" && gh issue view "$b" --json state -q .state 2>/dev/null || echo "OPEN")
-      [ "$state" = "OPEN" ] && { blocked=true; break; }
+      is_issue_blocking "$b" "$open_issues" "$fetch_ok" && { blocked=true; break; }
     done
 
     skip=$(echo "$issue" | jq -r '
@@ -586,7 +619,8 @@ parse_tasks_file() {
 # Emits a JSON array of {id, title, body}.
 get_unblocked_local_tasks() {
   local file="$1" repo_abs="$2"
-  local parsed errors candidates task ref state blocked
+  local parsed errors candidates task ref blocked
+  local open_issues="[]" fetch_ok=true
 
   parsed=$(parse_tasks_file "$file")
   errors=$(echo "$parsed" | jq -r '.errors[]')
@@ -608,13 +642,20 @@ $errors"
     | {id, title, body, issue_blockers: $issue_blockers}
   ')
 
+  # Only pay for the open-issue-number fetch when some candidate actually
+  # has a GitHub-issue blocker — most local-mode queues use task-id
+  # blockers exclusively and should stay fully offline (get_task_queue's
+  # dispatch test relies on this).
+  if [ "$(echo "$candidates" | jq -s '[.[].issue_blockers[]] | length > 0')" = "true" ]; then
+    open_issues=$(fetch_open_issue_numbers "$repo_abs") || fetch_ok=false
+  fi
+
   echo "$candidates" | while IFS= read -r task; do
     [ -n "$task" ] || continue
 
     blocked=false
     for ref in $(echo "$task" | jq -r '.issue_blockers[]'); do
-      state=$(cd "$repo_abs" && gh issue view "$ref" --json state -q .state 2>/dev/null || echo "OPEN")
-      [ "$state" = "OPEN" ] && { blocked=true; break; }
+      is_issue_blocking "$ref" "$open_issues" "$fetch_ok" && { blocked=true; break; }
     done
 
     if [ "$blocked" = false ]; then
