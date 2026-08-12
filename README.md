@@ -388,6 +388,9 @@ rm -rf .alucard-worktrees/
 
 # Watch a live run
 tail -f "$ALUCARD_HOME"/logs/alucard-*/iter-*.jsonl | jq -r 'select(.type=="assistant").message.content[]?.text // empty'
+
+# Reconstruct an overnight run — one timestamped line per run/iteration/gate transition
+cat "$ALUCARD_HOME"/logs/alucard-*/events.log
 ```
 
 ## Releases
