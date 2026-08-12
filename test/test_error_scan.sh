@@ -56,6 +56,7 @@ cat > "$codex_log" <<'EOF'
 {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"hello"}}
 EOF
 
+out=$(jq --unbuffered -rj "$CODEX_STREAM_TEXT" < "$codex_log")
 assert_contains "live codex stream emits error warning" \
   '⚠ codex error: Model metadata for `gpt-5.6-terra` not found' "$out"
 
