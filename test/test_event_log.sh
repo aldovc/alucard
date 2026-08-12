@@ -170,6 +170,7 @@ fi
 
 BILLING_REPO="$TEST_DIR/billing-repo"
 BILLING_REMOTE="$TEST_DIR/billing-remote.git"
+BILLING_LOG_DIR="$TEST_DIR/billing-logs"
 mkdir -p "$BILLING_REPO"
 git -C "$BILLING_REPO" init --initial-branch=main >/dev/null
 git -C "$BILLING_REPO" config user.email test@example.com
@@ -190,7 +191,7 @@ parse_repo_options() {
   IMAGE="alucard-test-image"
 }
 setup_run_environment() {
-  LOG_DIR="$TEST_DIR/billing-logs"
+  LOG_DIR="$BILLING_LOG_DIR"
   WT_ROOT="$TEST_DIR/billing-worktrees"
   ENV_FILE="$TEST_DIR/alucard.env"
   CREATED_WORKTREES=()
@@ -210,7 +211,7 @@ set -e
 unset ALUCARD_TEST_DOCKER_RUN_EXIT ALUCARD_TEST_DOCKER_RUN_OUTPUT ALUCARD_WORKER_PROVIDER
 
 assert_eq "billing error aborts the run with rc=2" "2" "$billing_rc"
-mapfile -t billing_events < <(cut -f2- "$LOG_DIR/events.log" | grep -E \
+mapfile -t billing_events < <(cut -f2- "$BILLING_LOG_DIR/events.log" | grep -E \
   '^(Iteration 1/1 start|Agent iter-1 end:|Iteration 1/1 end:|Run end: provider returned billing_error)')
 assert_eq "billing abort emits four iteration/run transitions" "4" "${#billing_events[@]}"
 assert_eq "billing abort starts the iteration first" \
