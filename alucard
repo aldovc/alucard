@@ -14,6 +14,7 @@ DEFAULT_ENV_FILE="${ALUCARD_ENV_FILE:-$TOOL_DIR/alucard.env}"
 DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
 DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
 DEFAULT_CACHE_DIR="${ALUCARD_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/alucard}"
+HARD_KILL_GRACE="30s"
 
 usage() {
   cat <<'EOF'
@@ -332,7 +333,7 @@ invoke_agent() {
   if [ "$provider" = "codex" ]; then
     local codex_model="${ALUCARD_CODEX_MODEL:-gpt-5.6-terra}"
     # Prompt is fed via process substitution so PIPESTATUS[0] captures docker's exit.
-    timeout --kill-after 30s "${TIMEOUT_MIN}m" docker run --rm -i \
+    timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm -i \
       "${_docker_args[@]}" \
       codex exec \
         --dangerously-bypass-approvals-and-sandbox \
@@ -346,7 +347,7 @@ invoke_agent() {
       | jq --unbuffered -rj "$codex_stream_text"
     _rc=${PIPESTATUS[0]}
   else
-    timeout --kill-after 30s "${TIMEOUT_MIN}m" docker run --rm \
+    timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
       "${_docker_args[@]}" \
       claude -p \
         --verbose \
@@ -1653,7 +1654,7 @@ toolchain_preflight() {
   fi
 
   set +e
-  timeout --kill-after 30s "${TIMEOUT_MIN}m" docker run --rm \
+  timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
     --name "alucard-preflight-$$" \
     --network bridge \
     --memory 4g --cpus 2 \
