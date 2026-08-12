@@ -350,6 +350,23 @@ scan_agent_errors() {
   fi
 }
 
+# Sandbox flags shared by every container we run (agents and the toolchain
+# preflight). Kept in one global array so the call sites cannot drift apart
+# on resource limits or lockdown flags, while remaining compatible with Bash 3.2.
+docker_sandbox_args() {
+  DOCKER_SANDBOX_ARGS=(
+    --network bridge
+    --memory 4g --cpus 2
+    --read-only
+    --tmpfs /tmp:exec,size=2g
+    --tmpfs "/home/alucard:size=2g,uid=$(id -u),gid=$(id -g)"
+    --ulimit "nofile=8192:8192"
+    --user "$(id -u):$(id -g)"
+    --security-opt no-new-privileges
+    --cap-drop ALL
+  )
+}
+
 # Run one agent container and stream its output to a log file.
 # $1 = role tag (container name becomes alucard-<role>)
 # $2 = log file path (JSONL stream written here via tee)
@@ -376,20 +393,14 @@ invoke_agent() {
   local provider
   provider=$(resolve_provider "$provider_role")
 
+  docker_sandbox_args
+
   local _start_epoch
   _start_epoch=$(date +%s)
 
   local -a _docker_args=(
     --name "alucard-${role}"
-    --network bridge
-    --memory 4g --cpus 2
-    --read-only
-    --tmpfs /tmp:exec,size=2g
-    --tmpfs "/home/alucard:size=2g,uid=$(id -u),gid=$(id -g)"
-    --ulimit "nofile=8192:8192"
-    --user "$(id -u):$(id -g)"
-    --security-opt no-new-privileges
-    --cap-drop ALL
+    "${DOCKER_SANDBOX_ARGS[@]}"
     --env-file "$ENV_FILE"
     -e "HOME=/home/alucard"
     -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig"
@@ -1304,6 +1315,29 @@ command_doctor() {
   [ "$ok" = "true" ] || exit 1
 }
 
+# Fresh-branch clone dance shared by every gate that hands a container a
+# self-contained worktree: wipe $dest, fetch $branch, create/force a local
+# tracking branch so the --local clone below can see it, clone it, then
+# repoint the clone's origin at the real remote URL.
+# $1=branch $2=dest $3=origin_url $4=(optional) "base" for the $BASE_BRANCH
+# case: that branch is normally checked out in $REPO_ABS itself, and `git
+# branch --force` refuses to update the branch currently checked out, so we
+# fetch straight into the remote-tracking ref instead and skip the local
+# branch --force (the caller resets the clone to it afterward).
+# Uses globals: REPO_ABS
+make_agent_clone() {
+  local branch="$1" dest="$2" origin_url="$3" mode="${4:-branch}"
+  rm -rf "$dest"
+  if [ "$mode" = "base" ]; then
+    git -C "$REPO_ABS" fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+  else
+    git -C "$REPO_ABS" fetch origin "$branch"
+    git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
+  fi
+  git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$dest"
+  git -C "$dest" remote set-url origin "$origin_url"
+}
+
 # Run one feedback container against the PR's head branch.
 # $1=iter $2=branch $3=origin_url $4=pr_num $5=feedback_findings $6=cycle
 # Sets: FEEDBACK_BLOCKED — findings the agent could not resolve in-container
@@ -1320,11 +1354,7 @@ run_feedback_once() {
   local feedback_out_dir
   feedback_out_dir=$(mktemp -d /tmp/alucard_feedback.XXXXXX)
   CREATED_WORKTREES+=("$wt_feedback" "$feedback_out_dir")
-  rm -rf "$wt_feedback"
-  git -C "$REPO_ABS" fetch origin "$branch"
-  git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
-  git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_feedback"
-  git -C "$wt_feedback" remote set-url origin "$origin_url"
+  make_agent_clone "$branch" "$wt_feedback" "$origin_url"
 
   feedback_log="$LOG_DIR/iter-${iter}-feedback-${cycle}.jsonl"
 
@@ -1466,12 +1496,7 @@ ci_gate() {
 
     wt_fix="${WT_ROOT}/fix-${iter}-${ci_attempt}"
     CREATED_WORKTREES+=("$wt_fix")
-    rm -rf "$wt_fix"
-    git -C "$REPO_ABS" fetch origin "$branch"
-    # fetch only creates origin/$branch; create a local branch so --local clone can find it
-    git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
-    git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_fix"
-    git -C "$wt_fix" remote set-url origin "$origin_url"
+    make_agent_clone "$branch" "$wt_fix" "$origin_url"
 
     fix_log="$LOG_DIR/iter-${iter}-fix-${ci_attempt}.jsonl"
 
@@ -1511,6 +1536,25 @@ append_task_context() {
   else
     printf '%s' "$prompt"
   fi
+}
+
+# Appends a "## Additional human PR comments" section to $1 (base findings)
+# when $2 (human-authored comments, already formatted) is non-empty; a no-op
+# otherwise. Echoes the combined findings string.
+append_human_comments() {
+  local findings="$1" human="$2"
+  if [ -n "$human" ]; then
+    findings="${findings}
+
+---
+
+## Additional human PR comments
+
+Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment --body-file <file>\` rather than silently ignored.
+
+${human}"
+  fi
+  printf '%s' "$findings"
 }
 
 # Reconcile the formal GitHub review state with the reviewer's decision file.
@@ -1579,11 +1623,7 @@ review_gate() {
     local review_out_dir
     review_out_dir=$(mktemp -d /tmp/alucard_review.XXXXXX)
     CREATED_WORKTREES+=("$wt_review" "$review_out_dir")
-    rm -rf "$wt_review"
-    git -C "$REPO_ABS" fetch origin "$branch"
-    git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
-    git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$wt_review"
-    git -C "$wt_review" remote set-url origin "$origin_url"
+    make_agent_clone "$branch" "$wt_review" "$origin_url"
 
     review_log="$LOG_DIR/iter-${iter}-review-${review_cycle}.jsonl"
 
@@ -1734,18 +1774,7 @@ If the same finding has been repeating, it is probably one no agent in this loop
       gh pr view "$pr_num" --json comments --jq '.comments' 2>/dev/null \
       | jq -r '[.[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
       2>/dev/null || true)
-    feedback_findings="$review_comments"
-    if [ -n "$human_comments" ]; then
-      feedback_findings="${feedback_findings}
-
----
-
-## Additional human PR comments
-
-Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment --body-file <file>\` rather than silently ignored.
-
-${human_comments}"
-    fi
+    feedback_findings=$(append_human_comments "$review_comments" "$human_comments")
 
     run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" "$review_cycle"
 
@@ -1823,18 +1852,12 @@ toolchain_preflight() {
     return 0
   fi
 
+  docker_sandbox_args
+
   set +e
   timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
     --name "alucard-preflight-$$" \
-    --network bridge \
-    --memory 4g --cpus 2 \
-    --read-only \
-    --tmpfs /tmp:exec,size=2g \
-    --tmpfs "/home/alucard:size=2g,uid=$(id -u),gid=$(id -g)" \
-    --ulimit "nofile=8192:8192" \
-    --user "$(id -u):$(id -g)" \
-    --security-opt no-new-privileges \
-    --cap-drop ALL \
+    "${DOCKER_SANDBOX_ARGS[@]}" \
     --env-file "$ENV_FILE" \
     -e "HOME=/home/alucard" \
     -v "$preflight_dir:/work:rw" \
@@ -1971,16 +1994,16 @@ command_run() {
     BRANCH="alucard/iter-${i}-$(date +%s)"
     CREATED_WORKTREES+=("$WT_HOST")
 
-    # Clean up any stale directory from a previous interrupted run.
-    rm -rf "$WT_HOST"
-
     # Clone locally so the container gets a self-contained .git dir.
     # Worktrees leave a .git file pointing to the host path, which the
-    # container cannot resolve.
-    # Explicit refspec so the remote-tracking ref is updated without touching
-    # the local branch (which may be checked out and thus un-forceable).
-    git -C "$REPO_ABS" fetch origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
-    git clone --local --no-tags --single-branch --branch "$BASE_BRANCH" "$REPO_ABS" "$WT_HOST"
+    # container cannot resolve. "base" mode: $BASE_BRANCH is normally
+    # checked out in $REPO_ABS itself, so make_agent_clone fetches into the
+    # remote-tracking ref instead of force-updating a local branch.
+    # Always use HTTPS so the container can authenticate with GITHUB_TOKEN.
+    # Convert git@github.com:owner/repo.git → https://github.com/owner/repo.git
+    _origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
+    _origin_url="${_origin_url/git@github.com:/https://github.com/}"
+    make_agent_clone "$BASE_BRANCH" "$WT_HOST" "$_origin_url" base
     # The local branch may be behind; reset the clone to the exact fetched commit.
     git -C "$WT_HOST" reset --hard "$(git -C "$REPO_ABS" rev-parse "origin/$BASE_BRANCH")"
     # Snapshot the base SHA the worker starts from. The worktree's own
@@ -1990,11 +2013,6 @@ command_run() {
     # never made. Using a pinned base SHA measures only what this iteration
     # added on top of where it started.
     _base_sha="$(git -C "$WT_HOST" rev-parse HEAD)"
-    # Always use HTTPS so the container can authenticate with GITHUB_TOKEN.
-    # Convert git@github.com:owner/repo.git → https://github.com/owner/repo.git
-    _origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
-    _origin_url="${_origin_url/git@github.com:/https://github.com/}"
-    git -C "$WT_HOST" remote set-url origin "$_origin_url"
     git -C "$WT_HOST" checkout -b "$BRANCH"
 
     issues=$(get_task_queue "$REPO_ABS")
@@ -2292,18 +2310,7 @@ command_continue() {
         '[.comments[] | select((.body | startswith("**🤖 Alucard") | not) and .createdAt > $since) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
         2>/dev/null || true)
     fi
-    feedback_findings="$last_bot_cr_body"
-    if [ -n "${human_after:-}" ]; then
-      feedback_findings="${feedback_findings}
-
----
-
-## Additional human PR comments
-
-Treat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment --body-file <file>\` rather than silently ignored.
-
-${human_after}"
-    fi
+    feedback_findings=$(append_human_comments "$last_bot_cr_body" "${human_after:-}")
   else
     local all_human
     all_human=$(echo "$_comments_json" | jq -r \
