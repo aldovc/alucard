@@ -29,6 +29,9 @@ assert_flag_value() {
 TEST_TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TEST_TMPDIR"' EXIT
 
+unset ALUCARD_PROVIDER ALUCARD_WORKER_PROVIDER ALUCARD_CI_FIX_PROVIDER \
+      ALUCARD_REVIEWER_PROVIDER ALUCARD_FEEDBACK_PROVIDER
+
 unset ALUCARD_WORKER_MAX_TURNS ALUCARD_WORKER_MAX_BUDGET \
       ALUCARD_CI_FIX_MAX_TURNS ALUCARD_CI_FIX_MAX_BUDGET \
       ALUCARD_REVIEWER_MAX_TURNS ALUCARD_REVIEWER_MAX_BUDGET \
@@ -64,7 +67,7 @@ invoke_and_capture() {
   ALUCARD_TEST_CAPTURE="$TEST_TMPDIR/${role}.args"
   export ALUCARD_TEST_CAPTURE
   invoke_agent "$role" "$TEST_TMPDIR/${role}.log" "$max_turns" "$max_budget" prompt
-}
+  >/dev/null}
 
 assert_claude_args() {
   local role="$1" max_turns="$2" max_budget="$3" model="$4" fallback_model="$5"
