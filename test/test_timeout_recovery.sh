@@ -92,6 +92,11 @@ MOCK
 cat > "$MOCK_BIN/git" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
+{
+  printf 'git'
+  printf ' %q' "$@"
+  printf '\n'
+} >> "$ALUCARD_TEST_TRACE"
 if [ "$1" = "clone" ]; then
   mkdir -p "${!#}"
 fi
@@ -175,6 +180,64 @@ assert_line_after "Preflight cleanup follows non-zero docker run" \
 assert_contains "Preflight records the docker failure status" \
   "rc=${PREFLIGHT_DOCKER_EXIT}" "$TOOLCHAIN_STATUS"
 
+# ── Test group 3: clone setup and human-comment composition ─────────────────
+
+: > "$TRACE_FILE"
+REPO_ABS="$TEST_DIR/repo-source"
+mkdir -p "$REPO_ABS"
+branch_dest="$TEST_DIR/branch-clone"
+branch_origin="git@github.com:example/target.git"
+make_agent_clone "feature/test" "$branch_dest" "$branch_origin"
+trace=$(cat "$TRACE_FILE")
+assert_contains "Branch clone fetches the worker branch" \
+  "git -C $REPO_ABS fetch origin feature/test" "$trace"
+assert_contains "Branch clone creates its local tracking branch" \
+  "git -C $REPO_ABS branch --force feature/test origin/feature/test" "$trace"
+assert_contains "Branch clone uses the requested branch" \
+  "git clone --local --no-tags --single-branch --branch feature/test $REPO_ABS $branch_dest" "$trace"
+assert_contains "Branch clone restores the real origin URL" \
+  "git -C $branch_dest remote set-url origin $branch_origin" "$trace"
+assert_line_after "Branch clone creates the tracking branch after fetching" \
+  "git -C $REPO_ABS fetch origin feature/test" \
+  "git -C $REPO_ABS branch --force feature/test origin/feature/test" "$trace"
+assert_line_after "Branch clone happens after its tracking branch is created" \
+  "git -C $REPO_ABS branch --force feature/test origin/feature/test" \
+  "git clone --local --no-tags --single-branch --branch feature/test $REPO_ABS $branch_dest" "$trace"
+
+: > "$TRACE_FILE"
+base_dest="$TEST_DIR/base-clone"
+make_agent_clone "main" "$base_dest" "$branch_origin" base
+trace=$(cat "$TRACE_FILE")
+assert_contains "Base clone fetches directly into the remote-tracking ref" \
+  "git -C $REPO_ABS fetch origin +refs/heads/main:refs/remotes/origin/main" "$trace"
+assert_not_contains "Base clone skips a local branch force-update" \
+  "git -C $REPO_ABS branch --force" "$trace"
+assert_line_after "Base clone happens after its refspec fetch" \
+  "git -C $REPO_ABS fetch origin +refs/heads/main:refs/remotes/origin/main" \
+  "git clone --local --no-tags --single-branch --branch main $REPO_ABS $base_dest" "$trace"
+
+findings_file="$TEST_DIR/findings"
+empty_actual="$TEST_DIR/human-empty-actual"
+printf 'Original findings\n\nWith trailing newlines\n\n' > "$findings_file"
+findings=$(cat "$findings_file")
+append_human_comments "$findings" "" > "$empty_actual"
+if cmp -s "$findings_file" "$empty_actual"; then
+  pass "Empty human comments preserve findings byte-for-byte"
+else
+  fail "Empty human comments changed the findings"
+fi
+
+human="Please add focused coverage."
+nonempty_actual="$TEST_DIR/human-nonempty-actual"
+nonempty_expected="$TEST_DIR/human-nonempty-expected"
+append_human_comments "$findings" "$human" > "$nonempty_actual"
+printf '%s\n\n---\n\n## Additional human PR comments\n\nTreat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via \`gh pr comment --body-file <file>\` rather than silently ignored.\n\n%s' \
+  "$findings" "$human" > "$nonempty_expected"
+if cmp -s "$nonempty_expected" "$nonempty_actual"; then
+  pass "Non-empty human comments emit the established block"
+else
+  fail "Non-empty human comments did not emit the established block"
+fi
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
