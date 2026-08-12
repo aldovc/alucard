@@ -78,13 +78,13 @@ EOF
 out=$(scan_agent_errors "iter-3" "$clean_log" "codex" "0" 2>&1)
 assert_empty "clean codex log produces no stderr output" "$out"
 
-# ── claude: a non-success final result line ─────────────────────────────────
-echo "── scan_agent_errors: claude ──"
+# ── claude: subtype error independently reaches stderr ──────────────────────
+echo "── scan_agent_errors: claude subtype error ──"
 
 claude_log="$TMP_ROOT/claude-error.jsonl"
 cat > "$claude_log" <<'EOF'
 {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}
-{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Reached max turns without completing the task."}
+{"type":"result","subtype":"error_max_turns","is_error":false,"result":"Reached max turns without completing the task."}
 EOF
 
 out=$(scan_agent_errors "review-3-1" "$claude_log" "claude" "1" 2>&1)
@@ -93,6 +93,20 @@ assert_contains "claude error result reaches stderr" \
 assert_contains "claude error output is tagged with role" "review-3-1" "$out"
 assert_contains "claude error output is tagged with exit code" "rc=1" "$out"
 assert_contains "claude error output carries the subtype" "error_max_turns" "$out"
+
+# ── claude: is_error independently reaches stderr ──────────────────────────
+echo "── scan_agent_errors: claude is_error ──"
+
+claude_is_error_log="$TMP_ROOT/claude-is-error.jsonl"
+cat > "$claude_is_error_log" <<'EOF'
+{"type":"result","subtype":"success","is_error":true,"result":"Provider marked the result as an error."}
+EOF
+
+out=$(scan_agent_errors "review-3-2" "$claude_is_error_log" "claude" "1" 2>&1)
+assert_contains "claude is_error result reaches stderr" \
+  "Provider marked the result as an error." "$out"
+assert_contains "claude is_error output is tagged with role" "review-3-2" "$out"
+assert_contains "claude is_error output carries the subtype" "success" "$out"
 
 # ── claude: a successful final result line reports nothing ─────────────────
 echo "── scan_agent_errors: claude success ──"
