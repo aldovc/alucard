@@ -57,9 +57,11 @@ trap cleanup EXIT
 cat > "$MOCK_BIN/timeout" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
-printf 'timeout'
-printf ' %q' "$@"
-printf '\n' >> "$ALUCARD_TEST_TRACE"
+{
+  printf 'timeout'
+  printf ' %q' "$@"
+  printf '\n'
+} >> "$ALUCARD_TEST_TRACE"
 if [ "$1" = "--kill-after" ]; then
   shift 2
 fi
@@ -70,9 +72,11 @@ MOCK
 cat > "$MOCK_BIN/docker" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
-printf 'docker'
-printf ' %q' "$@"
-printf '\n' >> "$ALUCARD_TEST_TRACE"
+{
+  printf 'docker'
+  printf ' %q' "$@"
+  printf '\n'
+} >> "$ALUCARD_TEST_TRACE"
 
 case "$1" in
   run)
