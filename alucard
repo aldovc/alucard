@@ -803,6 +803,49 @@ get_task_queue() {
   esac
 }
 
+# Echo one TSV line: input<TAB>output<TAB>cache_read<TAB>cache_write<TAB>turns<TAB>cost
+# for a single agent log. Empty output means the log had no parsable usage.
+#
+# claude logs carry one final `{"type":"result",...}` line; codex logs have
+# no such line, only a stream of `{"type":"turn.completed","usage":{...}}`
+# events (no cost field) plus `{"type":"item.completed",...}` events used
+# here as the closest analog to a turn count. Try claude's cheap tail-20
+# check first; only fall back to a full-file scan for codex's summed form.
+extract_agent_usage() {
+  local logfile="$1"
+  [ -f "$logfile" ] || return 0
+
+  local result_line
+  result_line=$(tail -n 20 "$logfile" | grep '"type":"result"' | tail -1) || true
+
+  if [ -n "$result_line" ]; then
+    printf '%s\n' "$result_line" \
+      | jq -r 'select(.type == "result") |
+          ([ .modelUsage // {} | to_entries[] | .value ] as $m |
+          [
+            ([$m[].inputTokens              // 0] | add // 0),
+            ([$m[].outputTokens             // 0] | add // 0),
+            ([$m[].cacheReadInputTokens     // 0] | add // 0),
+            ([$m[].cacheCreationInputTokens // 0] | add // 0),
+            (.num_turns // 0),
+            (.total_cost_usd // 0)
+          ]) | @tsv' 2>/dev/null
+    return 0
+  fi
+
+  grep -q '"type":"turn.completed"' "$logfile" 2>/dev/null || return 0
+
+  jq -rs '
+      [ .[] | select(.type == "turn.completed") | .usage ] as $u |
+      ([$u[].input_tokens        // 0] | add // 0) as $itok |
+      ([$u[].cached_input_tokens  // 0] | add // 0) as $cached |
+      ([$u[].output_tokens       // 0] | add // 0) as $out |
+      ([ .[] | select(.type == "item.completed" and .item.type == "command_execution") ]
+        | length) as $turns |
+      [ ($itok - $cached), $out, $cached, 0, $turns, "" ] | @tsv
+    ' "$logfile" 2>/dev/null
+}
+
 print_usage_report() {
   local log_dir="$1"
 
@@ -811,7 +854,7 @@ print_usage_report() {
   local -a labels=() inps=() outs=() crs=() cws=() turnss=() costs=()
   local f base label mid
   local total_inp=0 total_out=0 total_cr=0 total_cw=0 total_turns=0
-  local total_cost="0"
+  local total_cost="0" have_cost=0
 
   while IFS= read -r f; do
     base=$(basename "$f" .jsonl)
@@ -831,19 +874,7 @@ print_usage_report() {
     local inp out cr cw turns cost
     # read returns non-zero on empty input; guard with || true so set -e doesn't
     # abort the report when a log has no result line (timeout, Ctrl+C, etc.)
-    IFS=$'\t' read -r inp out cr cw turns cost < <(
-      tail -n 20 "$f" | grep '"type":"result"' | tail -1 \
-        | jq -r 'select(.type == "result") |
-            ([ .modelUsage // {} | to_entries[] | .value ] as $m |
-            [
-              ([$m[].inputTokens            // 0] | add // 0),
-              ([$m[].outputTokens           // 0] | add // 0),
-              ([$m[].cacheReadInputTokens   // 0] | add // 0),
-              ([$m[].cacheCreationInputTokens // 0] | add // 0),
-              (.num_turns // 0),
-              (.total_cost_usd // 0)
-            ]) | @tsv' 2>/dev/null || true
-    ) || true
+    IFS=$'\t' read -r inp out cr cw turns cost < <(extract_agent_usage "$f") || true
 
     [ -z "${inp:-}" ] && continue
 
@@ -860,7 +891,10 @@ print_usage_report() {
     total_cr=$((total_cr + cr))
     total_cw=$((total_cw + cw))
     total_turns=$((total_turns + turns))
-    total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
+    if [ -n "$cost" ]; then
+      have_cost=1
+      total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
+    fi
   done < <(find "$log_dir" -maxdepth 1 -name '*.jsonl' 2>/dev/null | sort -V)
 
   [ "${#labels[@]}" -eq 0 ] && return 0
@@ -873,17 +907,29 @@ print_usage_report() {
     "Agent" "Input" "Output" "Cache Read" "Cache Write" "Turns" "Cost"
   printf '%s\n' "$sep"
 
-  local i
+  local i cost_disp
   for i in "${!labels[@]}"; do
+    if [ -n "${costs[$i]}" ]; then
+      cost_disp=$(printf '$%.3f' "${costs[$i]}")
+    else
+      cost_disp="-"
+    fi
     printf '%-22s  %10s  %8s  %12s  %12s  %5s  %8s\n' \
       "${labels[$i]}" "${inps[$i]}" "${outs[$i]}" "${crs[$i]}" "${cws[$i]}" \
-      "${turnss[$i]}" "$(printf '$%.3f' "${costs[$i]}")"
+      "${turnss[$i]}" "$cost_disp"
   done
+
+  local total_cost_disp
+  if [ "$have_cost" -eq 1 ]; then
+    total_cost_disp=$(printf '$%.3f' "$total_cost")
+  else
+    total_cost_disp="-"
+  fi
 
   printf '%s\n' "$sep"
   printf '%-22s  %10s  %8s  %12s  %12s  %5s  %8s\n' \
     "TOTAL" "$total_inp" "$total_out" "$total_cr" "$total_cw" "$total_turns" \
-    "$(printf '$%.3f' "$total_cost")"
+    "$total_cost_disp"
   printf '\n'
 }
 
@@ -909,8 +955,8 @@ post_iteration_usage() {
 
   local -a rows=()
   local total_inp=0 total_out=0 total_cr=0 total_cw=0 total_turns=0
-  local total_cost="0"
-  local f base label mid inp out cr cw turns cost
+  local total_cost="0" have_cost=0
+  local f base label mid inp out cr cw turns cost cost_disp
 
   while IFS= read -r f; do
     base=$(basename "$f" .jsonl)
@@ -927,29 +973,24 @@ post_iteration_usage() {
         continue ;;
     esac
 
-    IFS=$'\t' read -r inp out cr cw turns cost < <(
-      tail -n 20 "$f" | grep '"type":"result"' | tail -1 \
-        | jq -r 'select(.type == "result") |
-            ([ .modelUsage // {} | to_entries[] | .value ] as $m |
-            [
-              ([$m[].inputTokens              // 0] | add // 0),
-              ([$m[].outputTokens             // 0] | add // 0),
-              ([$m[].cacheReadInputTokens     // 0] | add // 0),
-              ([$m[].cacheCreationInputTokens // 0] | add // 0),
-              (.num_turns // 0),
-              (.total_cost_usd // 0)
-            ]) | @tsv' 2>/dev/null || true
-    ) || true
+    IFS=$'\t' read -r inp out cr cw turns cost < <(extract_agent_usage "$f") || true
 
     [ -z "${inp:-}" ] && continue
 
-    rows+=("| ${label} | ${inp} | ${out} | ${cr} | ${cw} | ${turns} | \$$(printf '%.3f' "${cost}") |")
+    if [ -n "$cost" ]; then
+      cost_disp="\$$(printf '%.3f' "$cost")"
+      have_cost=1
+      total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
+    else
+      cost_disp="-"
+    fi
+
+    rows+=("| ${label} | ${inp} | ${out} | ${cr} | ${cw} | ${turns} | ${cost_disp} |")
     total_inp=$((total_inp + inp))
     total_out=$((total_out + out))
     total_cr=$((total_cr + cr))
     total_cw=$((total_cw + cw))
     total_turns=$((total_turns + turns))
-    total_cost=$(awk "BEGIN { printf \"%.4f\", $total_cost + $cost }")
   done < <(
     { find "$log_dir" -maxdepth 1 -name "iter-${iter}.jsonl" 2>/dev/null
       find "$log_dir" -maxdepth 1 -name "iter-${iter}-*.jsonl" 2>/dev/null
@@ -958,13 +999,20 @@ post_iteration_usage() {
 
   [ "${#rows[@]}" -eq 0 ] && return 0
 
+  local total_cost_disp
+  if [ "$have_cost" -eq 1 ]; then
+    total_cost_disp="\$$(printf '%.3f' "$total_cost")"
+  else
+    total_cost_disp="-"
+  fi
+
   local body
   body="<details><summary>🤖 Alucard token usage (iteration ${iter})</summary>
 
 | Agent | Input | Output | Cache Read | Cache Write | Turns | Cost |
 |-------|------:|-------:|-----------:|------------:|------:|-----:|
 $(printf '%s\n' "${rows[@]}")
-| **TOTAL** | **${total_inp}** | **${total_out}** | **${total_cr}** | **${total_cw}** | **${total_turns}** | **\$$(printf '%.3f' "${total_cost}")** |
+| **TOTAL** | **${total_inp}** | **${total_out}** | **${total_cr}** | **${total_cw}** | **${total_turns}** | **${total_cost_disp}** |
 
 </details>"
 
