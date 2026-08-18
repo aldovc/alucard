@@ -1241,7 +1241,8 @@ command_doctor() {
 
   local _missing_files=false
   for _f in Dockerfile entrypoint.sh \
-             alucard-worker-prompt.md alucard-reviewer-prompt.md \
+             alucard-worker-prompt.md alucard-worker-github-prompt.md \
+             alucard-worker-local-prompt.md alucard-reviewer-prompt.md \
              alucard-ci-fix-prompt.md alucard-feedback-prompt.md; do
     if [ ! -f "$TOOL_DIR/$_f" ]; then
       echo "missing: $TOOL_DIR/$_f"
@@ -2046,7 +2047,15 @@ command_run() {
     fi
 
     commits=$(git -C "$REPO_ABS" log -n 5 --format="%H%n%ad%n%B---" --date=short "origin/$BASE_BRANCH")
-    prompt=$(<"$TOOL_DIR/alucard-worker-prompt.md")
+    # The worker prompt is a mode-agnostic core plus one mode section, so a
+    # run never carries instructions for the source it isn't using.
+    if [ "$TASK_SOURCE" = "file" ]; then
+      prompt="$(<"$TOOL_DIR/alucard-worker-prompt.md")
+$(<"$TOOL_DIR/alucard-worker-local-prompt.md")"
+    else
+      prompt="$(<"$TOOL_DIR/alucard-worker-prompt.md")
+$(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
+    fi
     log_file="$LOG_DIR/iter-${i}.jsonl"
 
     build_worker_prompt "$issues" "$commits" "$prompt"
