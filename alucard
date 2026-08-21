@@ -613,12 +613,12 @@ is_issue_blocking() {
   echo "$open_issues" | jq -e --argjson n "$num" 'any(.[]; . == $n)' >/dev/null
 }
 
-get_unblocked_afk_issues() {
+get_unblocked_tickets() {
   local repo_abs="$1"
   local all open_prs issue body blockers blocked skip num has_pr _gh_repo owner repo
   local open_issues fetch_ok=true
 
-  all=$(cd "$repo_abs" && gh issue list --state open --label afk --limit 500 \
+  all=$(cd "$repo_abs" && gh issue list --state open --label ready-for-agent --limit 500 \
         --json number,title,body,labels)
 
   open_issues="[]"
@@ -954,7 +954,7 @@ get_task_queue() {
   case "$TASK_SOURCE" in
     file)   reconcile_tasks_file "$TASKS_FILE_ABS" "$repo_abs"
             get_unblocked_local_tasks "$TASKS_FILE_ABS" "$repo_abs" ;;
-    github) get_unblocked_afk_issues "$repo_abs" ;;
+    github) get_unblocked_tickets "$repo_abs" ;;
     *)      die "unknown task source: ${TASK_SOURCE:-unset}" ;;
   esac
 }
@@ -2189,7 +2189,7 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
           git -C "$WT_HOST" remote set-url origin "$_host_origin_url"
           if GIT_TERMINAL_PROMPT=0 git -C "$WT_HOST" push -u origin "$_recover_branch" 2>&1; then
             # Closes #N on the first line lets the queue dedup filter
-            # (closingIssuesReferences in get_unblocked_afk_issues) match
+            # (closingIssuesReferences in get_unblocked_tickets) match
             # the issue to this PR so the issue isn't re-picked. The local
             # source uses a Task: line plus the in-flight heading flip below.
             _closes_line=""
