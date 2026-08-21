@@ -1,12 +1,12 @@
 ---
 name: to-tickets
-description: Break a plan, spec, or PRD into independently-grabbable GitHub tickets or a local Alucard tasks file, using tracer-bullet vertical slices. Use when user wants to convert a plan into tickets, create implementation tickets, or break down work into tickets or tasks.
+description: Break a spec into GitHub tickets or a local Alucard tasks file. Use when user wants to convert a spec into tickets, create implementation tickets, or break down work into tickets or tasks.
 disable-model-invocation: true
 ---
 
 # To Tickets
 
-Break a plan into independently-grabbable **tickets** using vertical slices (tracer bullets), labeled and sized so an autonomous worker loop can pick them up. The slicing and quiz flow (steps 1-4) is identical regardless of where the result is published; step 5 picks the target and step 6 publishes to it.
+Break a spec into **tickets**, each small enough for one agent session and complete enough to merge on its own. The drafting and quiz flow (steps 1-4) is identical regardless of where the result is published; step 5 picks the target and step 6 publishes to it.
 
 ## Process
 
@@ -18,42 +18,39 @@ Work from whatever is in the conversation. If the user passes a ticket number or
 
 If you haven't already, explore to understand current state. If the project has a domain glossary, ticket titles and descriptions should use its vocabulary.
 
-### 3. Draft vertical slices
+### 3. Draft tickets
 
-Each ticket is a thin vertical slice cutting through **every layer relevant to that slice** end-to-end, not a horizontal slice of one layer. Which layers apply depends on the slice (schema/API/UI/tests, or just script/test, or just config/docs).
+Each ticket should be complete and mergeable on its own: whatever layers it needs (schema, API, UI, tests, or just a script), not one layer of a larger change.
 
-Each slice is **ready-for-agent** or **ready-for-human**:
+Each ticket is **ready-for-agent** or **ready-for-human**:
 
 - **ready-for-agent** — implementable and mergeable without human interaction. Crisp acceptance criteria, no architectural ambiguity, no design judgement.
 - **ready-for-human** — needs a human. Architectural decision, design review, ambiguous tradeoff, anything where "just pick" isn't safe.
 
 Prefer ready-for-agent. If you find yourself stretching to justify that label, it's ready-for-human. An agent-labeled ticket the worker gets stuck on mid-run is worse than an honest human ticket you handle when you check back.
 
-<vertical-slice-rules>
-- Each slice delivers a narrow but COMPLETE path through every relevant layer
-- A completed slice is demoable or verifiable on its own
-- Prefer many thin slices over few thick ones
-- ready-for-agent slices fit in a single agent session, roughly ≤10 file changes or ≤30 minutes of focused work. If bigger, split.
-</vertical-slice-rules>
+- A finished ticket is demoable or verifiable on its own
+- Prefer many small tickets over few large ones
+- ready-for-agent tickets fit in a single agent session, roughly ≤10 file changes or ≤30 minutes of focused work. If bigger, split.
 
-Give each ticket its **blocking edges**: the other tickets that must complete before it can start. A ticket with no blockers can start immediately.
+Give each ticket its **blockers**: the other tickets that must complete before it can start. A ticket with no blockers can start immediately.
 
 ### 4. Quiz the user
 
-Present as a numbered list. For each slice:
+Present as a numbered list. For each ticket:
 
 - **Title**
 - **Type**: ready-for-agent or ready-for-human
-- **Blocked by**: dependent slice numbers, if any
+- **Blocked by**: dependent ticket numbers, if any
 - **What it delivers**: the end-to-end behaviour this ticket makes work
 
 Ask:
 
 - Granularity right? (too coarse / too fine)
 - Dependencies correct?
-- Any slices to merge or split?
+- Any tickets to merge or split?
 - Labels honest, or are ready-for-agent tickets really ready-for-human in disguise?
-- Do ready-for-agent slices look small enough to finish in one agent session?
+- Do ready-for-agent tickets look small enough to finish in one agent session?
 
 Iterate until approved.
 
@@ -77,7 +74,6 @@ Apply the type label so the worker loop can filter. If `ready-for-agent` or `rea
 gh issue create \
   --title "<title>" \
   --label "<ready-for-agent|ready-for-human>" \
-  --label tracer-bullet \
   --body-file <path>
 ```
 
@@ -118,10 +114,10 @@ Do NOT close or modify any parent ticket beyond adding sub-issue links.
 
 Write or update `.alucard/tasks.md` in the target repo instead of creating GitHub tickets.
 
-- **New file:** create it with the plan summary as the header — the freeform markdown above the first task heading. This block is the parent context, injected verbatim into every worker and reviewer prompt, so put the goal, constraints, and key decisions here instead of repeating them per task.
+- **New file:** create it with the spec summary as the header — the freeform markdown above the first task heading. This block is the parent context, injected verbatim into every worker and reviewer prompt, so put the goal, constraints, and key decisions here instead of repeating them per task.
 - **Existing file:** append new tasks after the existing ones. Treat the existing header as canonical unless the user asks to revise it. Number new tasks continuing from the highest existing id — never reuse or renumber an existing id.
 - Assign each slice a stable id (sequential integers are simplest: `1`, `2`, ...) and write slices in dependency order — file order is queue order, and a task can only be blocked by an id defined earlier in the file.
-- ready-for-agent slices become `## [ ] <id>: <title>`. ready-for-human slices become `## [h] <id>: <title>` — never queued, but recorded in the same file so the whole plan lives in one artifact.
+- ready-for-agent slices become `## [ ] <id>: <title>`. ready-for-human slices become `## [h] <id>: <title>` — never queued, but recorded in the same file so the whole spec lives in one artifact.
 - The body is the same content as the GitHub template minus `## Parent` (state and file membership already encode type): `## What to build`, `## Acceptance criteria`, `## Notes`, plus a bare `Blocked by:` line.
 
 <local-task-template>
@@ -150,4 +146,4 @@ Use `## [h] <id>: <title>` in place of `## [ ] <id>: <title>` for ready-for-huma
 
 Before finishing, re-check the file against the grammar: no duplicate ids, every `Blocked by:` id refers to a task defined earlier in the file, the header isn't empty, every heading matches `## [ >xh] <id>: <title>` exactly. If the `alucard` CLI is available, confirm with `alucard doctor --tasks <target-repo>/.alucard/tasks.md <target-repo>` (or from inside the target repo, `alucard doctor`, which auto-detects the file) — it reports the same problems with line numbers.
 
-Do NOT create GitHub tickets for a plan published locally, and do NOT close or modify any parent ticket.
+Do NOT create GitHub tickets for a spec published locally, and do NOT close or modify any parent ticket.

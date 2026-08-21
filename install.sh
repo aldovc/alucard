@@ -29,14 +29,6 @@ fi
 
 chmod +x "$ALUCARD_HOME/alucard" "$ALUCARD_HOME/entrypoint.sh"
 
-# Refresh operator skills so a stale ~/.claude/skills copy cannot win.
-if [ -d "$ALUCARD_HOME/.claude/skills" ]; then
-  mkdir -p "$HOME/.claude/skills"
-  rm -rf "$HOME/.claude/skills/to-issues"
-  cp -R "$ALUCARD_HOME/.claude/skills/." "$HOME/.claude/skills/"
-  ok "skills refreshed in $HOME/.claude/skills"
-fi
-
 # Symlink CLI into BIN_DIR
 mkdir -p "$BIN_DIR"
 ln -sf "$ALUCARD_HOME/alucard" "$BIN_DIR/alucard"

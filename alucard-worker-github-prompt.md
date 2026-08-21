@@ -16,7 +16,7 @@ Pick ONE ticket. Priority order:
 
 1. Critical bugfixes
 2. Development infrastructure (tests, types, dev scripts) — these unblock everything else
-3. Tracer-bullet feature slices — thin vertical slices through every relevant layer
+3. Feature work that can merge on its own
 4. Polish and quick wins
 5. Refactors
 

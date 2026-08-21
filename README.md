@@ -4,14 +4,13 @@
 
 ## What it is
 
-A containerized agent loop that picks GitHub tickets off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended in the background. Workflow:
+A containerized agent loop that picks GitHub tickets off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended in the background. The queue is labels, not a planning tool. Open issues tagged `ready-for-agent` are work; `ready-for-human` is left for you. How those labels get there is your business.
 
-1. **You (the operator) write a PRD or plan** up front. This is the 80% of the work.
-2. **`/to-tickets` skill** breaks the plan into vertical-slice GitHub tickets, labeled `ready-for-agent` or `ready-for-human`.
-3. **Alucard runs unattended** — pulls the ready-for-agent queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
-4. **CI gate** — after a PR is opened, polls CI and launches a fix agent (up to 3 attempts) if checks fail.
-5. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 10). The loop ends early on `APPROVED` or `BLOCKED` (see [Loop convergence](#loop-convergence)).
-6. **You review PRs when you check back** and merge what's good.
+1. **Tickets exist** on the target repo, labeled `ready-for-agent`. Write them by hand, or use whatever authoring skills you already have (`/to-spec` then `/to-tickets` is one optional path, derived from [mattpocock/skills](https://github.com/mattpocock/skills)).
+2. **Alucard runs unattended** — pulls the ready-for-agent queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
+3. **CI gate** — after a PR is opened, polls CI and launches a fix agent (up to 3 attempts) if checks fail.
+4. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 10). The loop ends early on `APPROVED` or `BLOCKED` (see [Loop convergence](#loop-convergence)).
+5. **You review PRs when you check back** and merge what's good.
 
 Before the first iteration, a **toolchain preflight** checks that the container can actually install the target repo's dependencies (`uv sync` / `npm ci`, detected at the repo root or one level down). The result is printed at startup, saved to `toolchain-preflight.txt` in the log directory, and passed to every reviewer.
 
@@ -23,11 +22,10 @@ Alucard never pushes to main. Each iteration produces an independent PR.
 
 ```mermaid
 flowchart TD
-    A[Operator writes PRD/plan up front] --> B["/to-prd skill<br/>(optional: PRD → GitHub issue)"]
-    B --> C["/to-tickets skill<br/>vertical-slice tickets, labeled ready-for-agent or ready-for-human"]
-    C --> D{Label?}
+    A[Open GitHub tickets] --> D{Label?}
     D -->|ready-for-human| E[Operator handles when they check back]
-    D -->|ready-for-agent| F[ready-for-agent queue on GitHub]
+    D -->|ready-for-agent| F[ready-for-agent queue]
+    D -->|other / none| E
 
     F --> G[alucard run<br/>unattended loop]
     G --> H[Pick next ready-for-agent ticket,<br/>label in-progress]
@@ -54,7 +52,7 @@ flowchart TD
 - **CLI / host orchestrator** (`alucard`) — bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
 - **Container** (Dockerfile + entrypoint) — disposable per agent run. Opinionated personal image: Node 24, git, gh, uv, just, Python 3.12, Claude Code, Codex, shellcheck, and build-essential (native extensions). Extend it with a local image (`alucard build --image …` / `ALUCARD_IMAGE`), not by shrinking the published one. Spun up separately for the main worker, CI fix agents, reviewer agents, and feedback agents.
 - **Agent prompts** — one file per role: `alucard-worker-prompt.md` (main worker — mode-agnostic core, assembled at dispatch with `alucard-worker-github-prompt.md` or `alucard-worker-local-prompt.md` depending on the task source), `alucard-reviewer-prompt.md` (code reviewer), `alucard-ci-fix-prompt.md` (CI failure fixer), `alucard-feedback-prompt.md` (review feedback handler).
-- **Skills** (`/to-prd`, `/to-tickets`) — Claude Code skills used during PRD authoring and ticket breakdown. Vendored under `.claude/skills/` in this repo. `install.sh` refreshes `~/.claude/skills/` from that copy so a stale user-level skill cannot win.
+- **Queue** — GitHub issues labeled `ready-for-agent`, or a [local tasks file](#local-task-source). Authoring skills are not part of the runner.
 
 ## Loop convergence
 
@@ -107,10 +105,7 @@ alucard/
 ├── alucard-feedback-prompt.md   # review-feedback agent instructions
 ├── alucard.env.example          # template for credentials (real one is gitignored)
 ├── test/                        # bash unit tests — `for t in test/*.sh; do bash "$t"; done`
-├── .claude/
-│   └── skills/
-│       ├── to-prd/SKILL.md      # vendored — install.sh refreshes ~/.claude/skills
-│       └── to-tickets/SKILL.md  # vendored — install.sh refreshes ~/.claude/skills
+├── .claude/skills/to-tickets/   # optional authoring helper, not required to run
 └── .gitignore                   # ignores alucard.env and logs/
 ```
 
@@ -122,9 +117,7 @@ target-repo/
 └── (your code)
 ```
 
-Skills live in `~/.claude/skills/` after `install.sh`. Seeding `.claude/skills/` inside the target repo is optional.
-
-Alucard tooling is designed to live in a separate folder so it is reusable across projects. Point the CLI at a target repo with a positional path, `--repo`, or `ALUCARD_TARGET_REPO`.
+Alucard tooling is designed to live in a separate folder so it is reusable across projects. Point the CLI at a target repo with a positional path, `--repo`, or `ALUCARD_TARGET_REPO`. The target repo does not need Alucard skills installed.
 
 ## Local task source
 
@@ -264,7 +257,7 @@ cat >> .gitignore <<'EOF'
 EOF
 
 # Create labels
-for L in ready-for-agent ready-for-human in-progress wip tracer-bullet alucard; do
+for L in ready-for-agent ready-for-human in-progress wip alucard; do
   gh label create "$L" --force
 done
 
@@ -281,12 +274,11 @@ gh api -X PUT "repos/{owner}/{repo}/branches/main/protection" \
 EOF
 ```
 
-### The `/to-prd` and `/to-tickets` skills
+### Authoring tickets (optional)
 
-Both skills are vendored in this repo under `.claude/skills/`. `install.sh` copies them into `~/.claude/skills/` (and removes a leftover `to-issues` directory so it cannot shadow `to-tickets`). `alucard doctor` warns if a copy on disk does not match this repo.
+Alucard never invokes a planning skill. A hand-written `gh issue create --label ready-for-agent` is enough, which is what the smoke test below does.
 
-- `/to-prd` — synthesize the current conversation into a PRD and open it as a GitHub issue.
-- `/to-tickets` — break a PRD or plan into tracer-bullet tickets labeled `ready-for-agent` or `ready-for-human`. Publishes to GitHub by default, or to a [local tasks file](#local-task-source) — it asks which target when both are plausible.
+If you want help writing the spec and breaking it into tickets, `/to-spec` then `/to-tickets` (from [mattpocock/skills](https://github.com/mattpocock/skills), or the copy under `.claude/skills/to-tickets` in this repo) is a suggested path, not a requirement. Use them, ignore them, or use something else. The runner only sees labels.
 
 ### First smoke test
 
@@ -296,7 +288,7 @@ docker pull ghcr.io/aldovc/alucard:latest
 
 # Create one trivial ready-for-agent ticket manually for the test
 cd /path/to/target-repo
-gh issue create --label ready-for-agent --label tracer-bullet \
+gh issue create --label ready-for-agent \
   --title "Add a CHANGELOG.md" \
   --body "## Type
 ready-for-agent
@@ -411,11 +403,11 @@ The push triggers `.github/workflows/docker-publish.yml`, which builds and publi
 
 ## Acknowledgements
 
-The `/to-prd` skill vendored in this repo is sourced from [mattpocock/skills](https://github.com/mattpocock/skills). `/to-tickets` is the Alucard queue skill (ready-for-agent / ready-for-human).
+`/to-spec` and `/to-tickets` are optional authoring helpers, derived from [mattpocock/skills](https://github.com/mattpocock/skills). Alucard does not depend on them.
 
 ## Design references for the setup agent
 
 The full design conversation that produced this is summarized as:
 - **Worker loop** based on the "ralph" pattern (issues-as-queue, agent-as-worker, sentinel-for-termination), hardened to use bash-side queue filtering rather than model-side, PRs not main, worktree isolation per iteration, hard timeouts and budget caps.
-- **Ticket creation** via `/to-tickets` skill that produces vertical tracer-bullet slices, labeled `ready-for-agent` / `ready-for-human`, with size constraints (~10 files / ~30 minutes per agent slice) and explicit blocker tracking via `Blocked by #N` body convention.
+- **Queue** is GitHub issues labeled `ready-for-agent` (blockers via `Blocked by #N`, occupancy via an open PR that mentions `#N`). How tickets are authored is outside the runner.
 - **Containerization** chosen over unprivileged-user-only after weighing the threat model — kernel boundary is the only real defense against `rm -rf /`, and the operational cost is low for a single-machine homelab setup.

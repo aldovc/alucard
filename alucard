@@ -1356,30 +1356,6 @@ command_doctor() {
     fi
   fi
 
-  _check_skill_copy() {
-    local name="$1" dest="$2"
-    local src="$TOOL_DIR/.claude/skills/$name/SKILL.md"
-    [ -f "$src" ] || return 0
-    [ -f "$dest" ] || return 0
-    if cmp -s "$src" "$dest"; then
-      echo "ok: $name skill at $dest"
-    else
-      echo "warn: $name skill at $dest does not match $src"
-    fi
-  }
-  _check_skill_copy to-tickets "$HOME/.claude/skills/to-tickets/SKILL.md"
-  _check_skill_copy to-prd "$HOME/.claude/skills/to-prd/SKILL.md"
-  if [ -f "$HOME/.claude/skills/to-issues/SKILL.md" ]; then
-    echo "warn: stale to-issues skill at $HOME/.claude/skills/to-issues (replaced by to-tickets)"
-  fi
-  if [ -n "${REPO_ABS:-}" ]; then
-    _check_skill_copy to-tickets "$REPO_ABS/.claude/skills/to-tickets/SKILL.md"
-    _check_skill_copy to-prd "$REPO_ABS/.claude/skills/to-prd/SKILL.md"
-    if [ -f "$REPO_ABS/.claude/skills/to-issues/SKILL.md" ]; then
-      echo "warn: stale to-issues skill at $REPO_ABS/.claude/skills/to-issues (replaced by to-tickets)"
-    fi
-  fi
-
   [ "$ok" = "true" ] || exit 1
 }
 
