@@ -613,16 +613,52 @@ is_issue_blocking() {
   echo "$open_issues" | jq -e --argjson n "$num" 'any(.[]; . == $n)' >/dev/null
 }
 
+# Echo blocker issue numbers found in a GitHub ticket body, one per line.
+# Accepts "Blocked by #N" anywhere, and "#N" tokens under a "## Blocked by"
+# heading until the next ## heading. A stale skill emits the heading form;
+# missing it used to dispatch dependents before their blockers existed.
+github_ticket_blockers() {
+  local body="$1"
+  {
+    printf '%s\n' "$body" | grep -oE 'Blocked by #[0-9]+' | grep -oE '[0-9]+' || true
+    printf '%s\n' "$body" | awk '
+      /^##[ \t]+Blocked by([ \t]|$)/ { in_sec=1; next }
+      /^##[ \t]/ { in_sec=0 }
+      in_sec {
+        while (match($0, /#[0-9]+/)) {
+          print substr($0, RSTART+1, RLENGTH-1)
+          $0 = substr($0, RSTART+RLENGTH)
+        }
+      }
+    '
+  } | grep -E '^[0-9]+$' | sort -un || true
+}
+
+# True if an open PR already occupies ticket $2, given GraphQL PR nodes JSON $1.
+# Occupied means GitHub's closing-issue graph links it, or the PR title/body
+# mentions #N (Refs, Part of, a bare #N). Partial Alucard PRs write Refs #N
+# and must not be re-picked.
+open_pr_covers_ticket() {
+  local open_prs="$1" num="$2"
+  echo "$open_prs" | jq -e --argjson n "$num" '
+    any(.[];
+      ((.closingIssuesReferences.nodes // []) | map(.number) | index($n) != null)
+      or ((.title // "") | test("#" + ($n|tostring) + "\\b"))
+      or ((.body // "") | test("#" + ($n|tostring) + "\\b"))
+    )
+  ' >/dev/null
+}
+
 get_unblocked_tickets() {
   local repo_abs="$1"
-  local all open_prs issue body blockers blocked skip num has_pr _gh_repo owner repo
+  local all open_prs issue body blockers blocked skip num _gh_repo owner repo
   local open_issues fetch_ok=true
 
   all=$(cd "$repo_abs" && gh issue list --state open --label ready-for-agent --limit 500 \
         --json number,title,body,labels)
 
   open_issues="[]"
-  if echo "$all" | jq -e '[.[] | (.body // "") | test("Blocked by #[0-9]+")] | any' >/dev/null; then
+  if echo "$all" | jq -e '[.[] | (.body // "") | test("Blocked by #[0-9]+") or test("(^|\\n)##[ \\t]+Blocked by")] | any' >/dev/null; then
     open_issues=$(fetch_open_issue_numbers "$repo_abs") || fetch_ok=false
   fi
 
@@ -637,7 +673,7 @@ get_unblocked_tickets() {
       -f query='query($owner:String!,$repo:String!){
         repository(owner:$owner,name:$repo){
           pullRequests(states:OPEN,first:100){
-            nodes{number,closingIssuesReferences(first:25){nodes{number}}}
+            nodes{number,title,body,closingIssuesReferences(first:25){nodes{number}}}
           }
         }
       }' \
@@ -647,8 +683,7 @@ get_unblocked_tickets() {
 
   echo "$all" | jq -c '.[]' | while read -r issue; do
     body=$(echo "$issue" | jq -r '.body // ""')
-    blockers=$(echo "$body" | grep -oE 'Blocked by #[0-9]+' \
-               | grep -oE '[0-9]+' || true)
+    blockers=$(github_ticket_blockers "$body")
 
     blocked=false
     for b in $blockers; do
@@ -658,12 +693,10 @@ get_unblocked_tickets() {
     skip=$(echo "$issue" | jq -r '
       .labels | map(.name) | any(. == "in-progress" or . == "wip")')
 
-    # Skip if GitHub's own closing-issue graph links an open PR to this issue.
+    # Skip if an open PR already occupies this ticket (Closes graph or a #N mention).
     if [ "$skip" = "false" ]; then
       num=$(echo "$issue" | jq -r '.number')
-      has_pr=$(echo "$open_prs" | jq --argjson n "$num" \
-        '[.[] | select((.closingIssuesReferences.nodes // []) | map(.number) | contains([$n]))] | length')
-      [ "${has_pr:-0}" -gt 0 ] && skip="true"
+      open_pr_covers_ticket "$open_prs" "$num" && skip="true"
     fi
 
     if [ "$blocked" = false ] && [ "$skip" = "false" ]; then
@@ -1320,6 +1353,30 @@ command_doctor() {
         printf '%s\n' "$_tasks_problems" | sed 's/^/  - /'
         ok=false
       fi
+    fi
+  fi
+
+  _check_skill_copy() {
+    local name="$1" dest="$2"
+    local src="$TOOL_DIR/.claude/skills/$name/SKILL.md"
+    [ -f "$src" ] || return 0
+    [ -f "$dest" ] || return 0
+    if cmp -s "$src" "$dest"; then
+      echo "ok: $name skill at $dest"
+    else
+      echo "warn: $name skill at $dest does not match $src"
+    fi
+  }
+  _check_skill_copy to-tickets "$HOME/.claude/skills/to-tickets/SKILL.md"
+  _check_skill_copy to-prd "$HOME/.claude/skills/to-prd/SKILL.md"
+  if [ -f "$HOME/.claude/skills/to-issues/SKILL.md" ]; then
+    echo "warn: stale to-issues skill at $HOME/.claude/skills/to-issues (replaced by to-tickets)"
+  fi
+  if [ -n "${REPO_ABS:-}" ]; then
+    _check_skill_copy to-tickets "$REPO_ABS/.claude/skills/to-tickets/SKILL.md"
+    _check_skill_copy to-prd "$REPO_ABS/.claude/skills/to-prd/SKILL.md"
+    if [ -f "$REPO_ABS/.claude/skills/to-issues/SKILL.md" ]; then
+      echo "warn: stale to-issues skill at $REPO_ABS/.claude/skills/to-issues (replaced by to-tickets)"
     fi
   fi
 

@@ -34,8 +34,8 @@ Then fetch the ticket including comments (`gh issue view <N> --comments`) before
 
 ## Task reference
 
-- Commit messages reference the ticket as `Closes #N` or `Refs #N`.
-- The PR body's first line MUST be `Closes #N` — that is what auto-closes the ticket on merge and what queue deduplication keys on.
+- If every acceptance criterion will be done: the PR body's first line MUST be `Closes #N`. Commit messages can use `Closes #N`. That auto-closes the ticket on merge.
+- If the work is partial: the PR body's first line MUST be `Refs #N`. Do not write `Closes #N`. The queue treats an open PR that mentions `#N` as occupying the ticket, so the next run will not re-pick it.
 
 ## Close out
 
@@ -46,8 +46,8 @@ If every acceptance criterion is genuinely done:
 
 If the task is partial:
 - Comment on the ticket: what's done, what remains, blockers — again via `--body-file` for anything multi-line
-- Remove `in-progress` so the next iteration can resume
-- Still open the PR with the partial work
+- Remove `in-progress`
+- Still open the PR, with `Refs #N` as the first line of the body
 
 ## Mode rules
 

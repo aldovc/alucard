@@ -4,11 +4,11 @@
 
 ## What it is
 
-A containerized agent loop that picks GitHub issues off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended in the background. Workflow:
+A containerized agent loop that picks GitHub tickets off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended in the background. Workflow:
 
 1. **You (the operator) write a PRD or plan** up front. This is the 80% of the work.
-2. **`/to-issues` skill** breaks the plan into vertical-slice GitHub issues, labeled `afk` (autonomous-doable) or `hitl` (needs human).
-3. **Alucard runs unattended** — pulls the AFK queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
+2. **`/to-tickets` skill** breaks the plan into vertical-slice GitHub tickets, labeled `ready-for-agent` or `ready-for-human`.
+3. **Alucard runs unattended** — pulls the ready-for-agent queue, picks one, implements, tests, commits, opens a PR, repeats until queue empty or iteration cap hit.
 4. **CI gate** — after a PR is opened, polls CI and launches a fix agent (up to 3 attempts) if checks fail.
 5. **Review gate** — runs a reviewer agent to evaluate the PR, then a feedback agent to address findings; repeats up to `--max-review-cycles` times (default 10). The loop ends early on `APPROVED` or `BLOCKED` (see [Loop convergence](#loop-convergence)).
 6. **You review PRs when you check back** and merge what's good.
@@ -24,13 +24,13 @@ Alucard never pushes to main. Each iteration produces an independent PR.
 ```mermaid
 flowchart TD
     A[Operator writes PRD/plan up front] --> B["/to-prd skill<br/>(optional: PRD → GitHub issue)"]
-    B --> C["/to-issues skill<br/>vertical-slice issues, labeled afk or hitl"]
+    B --> C["/to-tickets skill<br/>vertical-slice tickets, labeled ready-for-agent or ready-for-human"]
     C --> D{Label?}
-    D -->|hitl| E[Operator handles when they check back]
-    D -->|afk| F[AFK queue on GitHub]
+    D -->|ready-for-human| E[Operator handles when they check back]
+    D -->|ready-for-agent| F[ready-for-agent queue on GitHub]
 
     F --> G[alucard run<br/>unattended loop]
-    G --> H[Pick next AFK issue,<br/>label in-progress]
+    G --> H[Pick next ready-for-agent ticket,<br/>label in-progress]
     H --> I[Spin up isolated container<br/>+ disposable worktree]
     I --> J[Worker agent: implement,<br/>test, commit]
     J --> K[Open PR]
@@ -52,9 +52,9 @@ flowchart TD
 ## Architecture
 
 - **CLI / host orchestrator** (`alucard`) — bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
-- **Container** (Dockerfile + entrypoint) — disposable per agent run. Runs `claude` CLI in headless mode with broad permissions but bounded by kernel-level isolation. Spun up separately for the main worker, CI fix agents, reviewer agents, and feedback agents.
+- **Container** (Dockerfile + entrypoint) — disposable per agent run. Opinionated personal image: Node 24, git, gh, uv, just, Python 3.12, Claude Code, Codex, shellcheck, and build-essential (native extensions). Extend it with a local image (`alucard build --image …` / `ALUCARD_IMAGE`), not by shrinking the published one. Spun up separately for the main worker, CI fix agents, reviewer agents, and feedback agents.
 - **Agent prompts** — one file per role: `alucard-worker-prompt.md` (main worker — mode-agnostic core, assembled at dispatch with `alucard-worker-github-prompt.md` or `alucard-worker-local-prompt.md` depending on the task source), `alucard-reviewer-prompt.md` (code reviewer), `alucard-ci-fix-prompt.md` (CI failure fixer), `alucard-feedback-prompt.md` (review feedback handler).
-- **Skills** (`/to-prd`, `/to-issues`) — Claude Code skills used during PRD authoring and issue breakdown. Vendored under `.claude/skills/` in this repo and copied into each target repo's `.claude/skills/` at setup time so the operator can invoke them while working there.
+- **Skills** (`/to-prd`, `/to-tickets`) — Claude Code skills used during PRD authoring and ticket breakdown. Vendored under `.claude/skills/` in this repo. `install.sh` refreshes `~/.claude/skills/` from that copy so a stale user-level skill cannot win.
 
 ## Loop convergence
 
@@ -97,10 +97,10 @@ Three mechanisms keep the loop converging:
 alucard/
 ├── README.md                    # this file
 ├── alucard                      # CLI
-├── Dockerfile                   # node:24.14.0-slim + git + gh + claude code + alucard user
+├── Dockerfile                   # node:24.14.0-slim + git + gh + uv + just + Python 3.12 + claude/codex + alucard user
 ├── entrypoint.sh                # configures git identity and gh auth at container start
 ├── alucard-worker-prompt.md     # worker agent instructions (mode-agnostic core)
-├── alucard-worker-github-prompt.md  # worker mode section: GitHub issues queue
+├── alucard-worker-github-prompt.md  # worker mode section: GitHub tickets queue
 ├── alucard-worker-local-prompt.md   # worker mode section: local tasks file
 ├── alucard-reviewer-prompt.md   # reviewer agent instructions
 ├── alucard-ci-fix-prompt.md     # CI-fix agent instructions
@@ -109,8 +109,8 @@ alucard/
 ├── test/                        # bash unit tests — `for t in test/*.sh; do bash "$t"; done`
 ├── .claude/
 │   └── skills/
-│       ├── to-prd/SKILL.md      # vendored — copy into target repo
-│       └── to-issues/SKILL.md   # vendored — copy into target repo
+│       ├── to-prd/SKILL.md      # vendored — install.sh refreshes ~/.claude/skills
+│       └── to-tickets/SKILL.md  # vendored — install.sh refreshes ~/.claude/skills
 └── .gitignore                   # ignores alucard.env and logs/
 ```
 
@@ -119,14 +119,10 @@ The target repo (the one Alucard works on) needs:
 ```
 target-repo/
 ├── .gitignore                   # add: .alucard-worktrees/
-├── .claude/
-│   └── skills/
-│       ├── to-prd/
-│       │   └── SKILL.md         # copy from alucard/.claude/skills/to-prd/
-│       └── to-issues/
-│           └── SKILL.md         # copy from alucard/.claude/skills/to-issues/
 └── (your code)
 ```
+
+Skills live in `~/.claude/skills/` after `install.sh`. Seeding `.claude/skills/` inside the target repo is optional.
 
 Alucard tooling is designed to live in a separate folder so it is reusable across projects. Point the CLI at a target repo with a positional path, `--repo`, or `ALUCARD_TARGET_REPO`.
 
@@ -145,7 +141,7 @@ States:
 | `[ ]` | Queued — eligible for the next iteration |
 | `[>]` | PR in flight — the harness appends `(PR #N)` to the title when it dispatches the task |
 | `[x]` | Done |
-| `[h]` | Human task (HITL) — never queued, but kept in the file so the whole plan lives in one artifact |
+| `[h]` | Human task (`ready-for-human`) — never queued, but kept in the file so the whole plan lives in one artifact |
 
 A task can declare dependencies with a bare `Blocked by:` line in its body (comma-separated task ids, or `none`); the harness also honors the legacy `Blocked by #N` GitHub-issue form (an open blocker issue keeps the task blocked). File order is queue order — reprioritizing is moving lines, not relabeling.
 
@@ -181,7 +177,7 @@ Blocked by: none
 Blocked by: 1
 ```
 
-`alucard queue` against this file returns exactly task `1` — task `2` is HITL (never queued) and task `3` stays blocked until task `1` reaches `[x]`.
+`alucard queue` against this file returns exactly task `1` — task `2` is human (never queued) and task `3` stays blocked until task `1` reaches `[x]`.
 
 ### Flags and auto-detection
 
@@ -268,7 +264,7 @@ cat >> .gitignore <<'EOF'
 EOF
 
 # Create labels
-for L in afk hitl in-progress wip tracer-bullet alucard; do
+for L in ready-for-agent ready-for-human in-progress wip tracer-bullet alucard; do
   gh label create "$L" --force
 done
 
@@ -285,18 +281,12 @@ gh api -X PUT "repos/{owner}/{repo}/branches/main/protection" \
 EOF
 ```
 
-### The `/to-prd` and `/to-issues` skills
+### The `/to-prd` and `/to-tickets` skills
 
-Both skills are vendored in this repo under `alucard/.claude/skills/`. Copy them into the target repo:
-
-```bash
-mkdir -p /path/to/target-repo/.claude/skills
-cp -r "$ALUCARD_HOME/.claude/skills/to-prd" /path/to/target-repo/.claude/skills/
-cp -r "$ALUCARD_HOME/.claude/skills/to-issues" /path/to/target-repo/.claude/skills/
-```
+Both skills are vendored in this repo under `.claude/skills/`. `install.sh` copies them into `~/.claude/skills/` (and removes a leftover `to-issues` directory so it cannot shadow `to-tickets`). `alucard doctor` warns if a copy on disk does not match this repo.
 
 - `/to-prd` — synthesize the current conversation into a PRD and open it as a GitHub issue.
-- `/to-issues` — break a PRD or plan into properly-labeled (`afk` / `hitl`) tracer-bullet issues that Alucard can pick up unattended. Publishes to GitHub issues by default, or to a [local tasks file](#local-task-source) — it asks which target when both are plausible.
+- `/to-tickets` — break a PRD or plan into tracer-bullet tickets labeled `ready-for-agent` or `ready-for-human`. Publishes to GitHub by default, or to a [local tasks file](#local-task-source) — it asks which target when both are plausible.
 
 ### First smoke test
 
@@ -304,12 +294,12 @@ cp -r "$ALUCARD_HOME/.claude/skills/to-issues" /path/to/target-repo/.claude/skil
 # Pull the pre-built image (default path)
 docker pull ghcr.io/aldovc/alucard:latest
 
-# Create one trivial AFK issue manually for the test
+# Create one trivial ready-for-agent ticket manually for the test
 cd /path/to/target-repo
-gh issue create --label afk --label tracer-bullet \
+gh issue create --label ready-for-agent --label tracer-bullet \
   --title "Add a CHANGELOG.md" \
   --body "## Type
-AFK
+ready-for-agent
 
 ## What to build
 Create a CHANGELOG.md at repo root with a Keep a Changelog template.
@@ -344,7 +334,7 @@ ALUCARD_IMAGE=myproject/alucard:dev alucard run /path/to/target-repo -n 1 -t 15
 
 These are choices the operator hasn't locked yet — surface them rather than guessing:
 
-1. **Project toolchain in the Dockerfile.** The current Dockerfile has Node + git + gh + claude. If the target repo uses Python/uv/just/Rust/etc., those need to be added or the agent will fail to run `just test`.
+1. **Project toolchain in the Dockerfile.** Decided: keep an opinionated personal image (Node, git, gh, uv, just, Python 3.12, Claude Code, Codex, shellcheck, build-essential). That is enough for the repos this tool actually runs against. A different toolchain is a local image via `alucard build --image …` / `ALUCARD_IMAGE`, not a slimmer public base.
 2. **Branch protection enforcement.** Do you want admin enforcement on, or off so you can hotfix? Default off is fine for solo work.
 3. **Notification on completion.** Currently the loop just exits. You might want a Telegram/Discord ping when the run finishes.
 4. **Concurrent iterations.** Current design is sequential — one container at a time. If you want parallel workers picking different issues, the `in-progress` label coordination needs to handle race conditions (gh API isn't atomic for label-add). Don't add unless asked.
@@ -421,11 +411,11 @@ The push triggers `.github/workflows/docker-publish.yml`, which builds and publi
 
 ## Acknowledgements
 
-The `/to-prd` and `/to-issues` skills vendored in this repo are sourced from [mattpocock/skills](https://github.com/mattpocock/skills).
+The `/to-prd` skill vendored in this repo is sourced from [mattpocock/skills](https://github.com/mattpocock/skills). `/to-tickets` is the Alucard queue skill (ready-for-agent / ready-for-human).
 
 ## Design references for the setup agent
 
 The full design conversation that produced this is summarized as:
 - **Worker loop** based on the "ralph" pattern (issues-as-queue, agent-as-worker, sentinel-for-termination), hardened to use bash-side queue filtering rather than model-side, PRs not main, worktree isolation per iteration, hard timeouts and budget caps.
-- **Issue creation** via `/to-issues` skill that produces vertical tracer-bullet slices, AFK/HITL labeled, with size constraints (~10 files / ~30 minutes per AFK slice) and explicit blocker tracking via `Blocked by #N` body convention.
+- **Ticket creation** via `/to-tickets` skill that produces vertical tracer-bullet slices, labeled `ready-for-agent` / `ready-for-human`, with size constraints (~10 files / ~30 minutes per agent slice) and explicit blocker tracking via `Blocked by #N` body convention.
 - **Containerization** chosen over unprivileged-user-only after weighing the threat model — kernel boundary is the only real defense against `rm -rf /`, and the operational cost is low for a single-machine homelab setup.

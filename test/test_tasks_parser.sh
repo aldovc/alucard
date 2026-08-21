@@ -108,6 +108,47 @@ assert_exit "is_issue_blocking: number absent from open set does not block" 1 \
 assert_exit "is_issue_blocking: fetch failure blocks regardless of the set" 0 \
   is_issue_blocking 999 '[]' false
 
+# ── Test group 2a: github_ticket_blockers + open_pr_covers_ticket ────────────
+
+assert_eq "blockers: Blocked by #N on one line" "12" \
+  "$(github_ticket_blockers 'Blocked by #12')"
+assert_eq "blockers: #N under ## Blocked by heading" "348" \
+  "$(github_ticket_blockers '## Blocked by
+
+- #348
+')"
+assert_eq "blockers: both forms, unique" "12" \
+  "$(github_ticket_blockers 'Blocked by #12
+
+## Blocked by
+
+- #12
+')"
+assert_eq "blockers: None under heading is empty" "" \
+  "$(github_ticket_blockers '## Blocked by
+
+None — can start immediately
+')"
+assert_eq "blockers: #N under ## Notes is ignored" "" \
+  "$(github_ticket_blockers '## Notes
+
+See #99
+')"
+
+PRS_CLOSES='[{"number":1,"title":"x","body":"hello","closingIssuesReferences":{"nodes":[{"number":297}]}}]'
+PRS_REFS='[{"number":2,"title":"x","body":"Refs #297\n\npartial work","closingIssuesReferences":{"nodes":[]}}]'
+PRS_UNRELATED='[{"number":3,"title":"other","body":"Refs #12","closingIssuesReferences":{"nodes":[]}}]'
+PRS_PREFIX='[{"number":4,"title":"x","body":"Refs #2970","closingIssuesReferences":{"nodes":[]}}]'
+
+assert_exit "covers: closingIssuesReferences occupies the ticket" 0 \
+  open_pr_covers_ticket "$PRS_CLOSES" 297
+assert_exit "covers: Refs #N in the body occupies the ticket" 0 \
+  open_pr_covers_ticket "$PRS_REFS" 297
+assert_exit "covers: unrelated Refs does not occupy" 1 \
+  open_pr_covers_ticket "$PRS_UNRELATED" 297
+assert_exit "covers: #2970 does not match #297" 1 \
+  open_pr_covers_ticket "$PRS_PREFIX" 297
+
 GH_CALL_LOG=$(mktemp /tmp/alucard_test_ghcalls.XXXXXX)
 gh() {
   echo "$*" >> "$GH_CALL_LOG"
