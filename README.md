@@ -4,7 +4,7 @@
 
 ## What it is
 
-A containerized agent loop that picks GitHub tickets off a queue, completes them one at a time in isolated git clones, opens PRs, and runs unattended in the background. The queue is labels, not a planning tool. Open issues tagged `ready-for-agent` are work; `ready-for-human` is left for you. How those labels get there is your business.
+A containerized agent loop that picks work off a queue, completes it one item at a time in isolated git clones, opens PRs, and runs unattended. The queue is GitHub issues labeled `ready-for-agent`, or a [local tasks file](#local-task-source). `ready-for-human` is left for you. How work gets onto the queue is your business.
 
 1. **Tickets exist** on the target repo, labeled `ready-for-agent`. Write them by hand, or use whatever authoring skills you already have. `/to-spec` then `/to-tickets` is one optional path, derived from [mattpocock/skills](https://github.com/mattpocock/skills).
 2. **Alucard runs unattended.** It pulls the ready-for-agent queue, picks one, implements, tests, commits, opens a PR, and repeats until the queue is empty or the iteration cap is hit.
@@ -83,9 +83,9 @@ Three mechanisms keep the loop converging:
 2. **Resource caps.** `--memory 4g --cpus 2`. A runaway loop can't OOM the host.
 3. **Disposable worktrees.** Each iteration gets a fresh worktree at `${REPO}/.alucard-worktrees/iter-N`. The orchestrator removes it after each iteration. An `EXIT` trap handles interrupted runs.
 4. **PR-only output.** The agent never pushes to main. Branch protection on main as belt-and-suspenders.
-5. **Credential scoping.** GitHub token is a fine-grained PAT, single repo, 30-day expiry. Anthropic key is a dedicated worker key with a monthly budget cap set in the console.
+5. **Credential scoping.** GitHub token is a fine-grained PAT, single repo, 30-day expiry. Anthropic and OpenAI keys are dedicated worker keys with a monthly budget cap set in the console.
 6. **Pattern blacklist (last line).** `--disallowedTools` removes obvious foot-guns like `rm -rf /*`, `sudo`, `curl | sh`. Pattern-matching is leaky but cheap.
-7. **Hard caps per iteration.** `--max-turns 180`, `--max-budget-usd 5`, `timeout 30m`. Fix, reviewer, and feedback agents use lower caps (`--max-turns 20-30`, `--max-budget-usd 2`).
+7. **Hard caps per iteration.** Worker: `--max-turns 180`, `--max-budget-usd 10`, `timeout 30m`. CI-fix 30/$2, reviewer 20/$2, feedback 50/$2. All except the timeout are overridable via `ALUCARD_*` env vars. See `alucard.env.example`.
 
 **What's still possible.** Credential exfiltration via network, bounded by token scoping. Worst case, an attacker gets push access to one repo for up to 30 days. Recoverable.
 
@@ -185,7 +185,7 @@ Blocked by: 1
 - There is no claim/label step in local mode, and no `in-progress` label. Runs are sequential, so nothing else can grab the same task mid-run. Local task blockers should use task ids (`Blocked by: 1, 2`). Legacy `Blocked by #N` issue blockers still require `gh issue view` access so open GitHub issues can keep tasks blocked.
 - When a PR opens, the harness flips the task's heading from `[ ]` to `[>] … (PR #N)`. One atomic line edit.
 - The PR body's first line is `Task: <id>`, never a GitHub closing keyword. Task ids aren't issue numbers, and a stray `Closes #N` would close an unrelated issue in the target repo.
-- Reconciling a `[>]` task's outcome back into the file (merged → `[x]`, closed unmerged → back to `[ ]` with a pointer to the failed attempt) is not automatic yet. Until it is, flip the heading to `[x]` by hand once you've merged the PR, so anything blocked on that task unblocks on the next run.
+- At queue build, the harness reconciles `[>]` headings against GitHub. Merged PRs flip to `[x]` and keep `(PR #N)`. Closed unmerged PRs flip back to `[ ]` with `(previous attempt: PR #N)`, so the task rejoins the queue. Open PRs are left alone. A `gh` failure leaves the file untouched.
 - `alucard queue` shows exactly what the next iteration would pick up. The file doubles as the morning-after dashboard.
 
 ### Reduced PAT scope
@@ -219,10 +219,13 @@ The rest of this README uses `$ALUCARD_HOME` for the install path (`~/.local/sha
 
 Use it from anywhere:
 
+TARGET_REPO can be a local path, `owner/repo` (cloned into `~/.cache/alucard` on first run), or a GitHub HTTPS URL.
+
 ```bash
 alucard run /path/to/target-repo --iterations 1 --timeout-minutes 10
 alucard queue /path/to/target-repo
 alucard doctor /path/to/target-repo
+alucard continue 174 /path/to/target-repo
 ```
 
 ### Credentials to provision
@@ -246,6 +249,12 @@ cp "$ALUCARD_HOME/alucard.env.example" "$ALUCARD_HOME/alucard.env"
    - console.anthropic.com → API keys → create new key named "alucard-worker"
    - In the workspace settings, set a monthly spend cap (e.g. $50)
    - Paste into `alucard.env` as `ANTHROPIC_API_KEY=`
+   - Default provider is Claude (`ALUCARD_PROVIDER` unset or `claude`).
+
+3. **OpenAI API key**, only if any role uses Codex.
+   - Set `ALUCARD_PROVIDER=codex`, or a per-role override (`ALUCARD_WORKER_PROVIDER`, `ALUCARD_REVIEWER_PROVIDER`, and so on).
+   - Paste into `alucard.env` as `OPENAI_API_KEY=`
+   - Model defaults to `gpt-5.6-terra` via `ALUCARD_CODEX_MODEL`.
 
 ### One-time setup commands in target repo
 
@@ -366,6 +375,9 @@ alucard run /path/to/target-repo --tasks /path/to/target-repo/.alucard/tasks.md 
 # Validate a tasks file (duplicate ids, dangling blockers, malformed headings)
 alucard doctor /path/to/target-repo
 
+# Re-run feedback, CI, and review on a parked PR
+alucard continue 174 /path/to/target-repo
+
 # Manually un-stick an issue if Alucard crashed mid-task
 gh issue edit <N> --remove-label in-progress
 
@@ -399,7 +411,7 @@ The push triggers `.github/workflows/docker-publish.yml`, which builds and publi
 
 `:latest` is also updated on every tag push. It always points to the most recently published image (tag or main push, whichever came last).
 
-**Pinning.** Operators who want reproducible runs can set `ALUCARD_IMAGE=ghcr.io/aldovc/alucard:v0.1.0`. `:latest` stays the default.
+**Pinning.** Operators who want reproducible runs can set `ALUCARD_IMAGE=ghcr.io/aldovc/alucard:v0.2.0`. `:latest` stays the default.
 
 **CLI version.** `alucard version` (or `alucard --version`) prints the version derived from `git describe` against the CLI source directory. On a tagged checkout it shows `v0.1.0`; on a post-tag commit, `v0.1.0-3-gabc1234`; on an untagged tree, the short SHA.
 
