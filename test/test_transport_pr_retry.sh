@@ -38,7 +38,8 @@ PR_MARKER="$TEST_DIR/pr-created"
 TARGET="$TEST_DIR/target"
 REMOTE="$TEST_DIR/remote.git"
 mkdir -p "$MOCK_BIN" "$TARGET/.alucard"
-touch "$TRACE" "$TEST_DIR/alucard.env"
+touch "$TRACE"
+cp "$SCRIPT_DIR/fixtures/credentials.env" "$TEST_DIR/alucard.env"
 
 git init -q --bare "$REMOTE"
 git -C "$TARGET" init -q -b main
