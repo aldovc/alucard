@@ -399,8 +399,11 @@ classify_agent_failure() {
 
   if [ "$provider" = "codex" ]; then
     local _err_msg
-    _err_msg=$(jq -r 'select(.type == "item.completed" and .item.type == "error") | .item.message' \
-      "$log_file" 2>/dev/null | tail -1)
+    if ! _err_msg=$(jq -r 'select(.type == "item.completed" and .item.type == "error") | .item.message' \
+      "$log_file" 2>/dev/null | tail -1); then
+      echo "failed"
+      return 0
+    fi
     if [ -z "$_err_msg" ]; then
       if [ "$rc" -eq 0 ]; then echo "clean"; else echo "failed"; fi
       return 0
@@ -414,7 +417,10 @@ classify_agent_failure() {
   fi
 
   local _result_line
-  _result_line=$(jq -c 'select(.type == "result")' "$log_file" 2>/dev/null | tail -1)
+  if ! _result_line=$(jq -c 'select(.type == "result")' "$log_file" 2>/dev/null | tail -1); then
+    echo "failed"
+    return 0
+  fi
   if [ -z "$_result_line" ]; then
     if [ "$rc" -eq 0 ]; then echo "clean"; else echo "failed"; fi
     return 0

@@ -225,6 +225,23 @@ EOF
 out=$(classify_agent_failure "$codex_transport_log" "codex" "1")
 assert_eq "codex connection-closed error item classifies as transport" "transport" "$out"
 
+codex_truncated_log="$TMP_ROOT/codex-truncated.jsonl"
+cat > "$codex_truncated_log" <<'EOF'
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"connection closed"
+EOF
+classifier_stderr="$TMP_ROOT/classifier-stderr"
+out=$(classify_agent_failure "$codex_truncated_log" "codex" "1" 2>"$classifier_stderr")
+assert_eq "malformed codex JSONL classifies as failed" "failed" "$out"
+assert_empty "malformed codex JSONL produces no classifier stderr" "$(<"$classifier_stderr")"
+
+claude_truncated_log="$TMP_ROOT/claude-truncated.jsonl"
+cat > "$claude_truncated_log" <<'EOF'
+{"type":"result","subtype":"success","is_error":true,"result":"connection closed"
+EOF
+out=$(classify_agent_failure "$claude_truncated_log" "claude" "1" 2>"$classifier_stderr")
+assert_eq "malformed claude JSONL classifies as failed" "failed" "$out"
+assert_empty "malformed claude JSONL produces no classifier stderr" "$(<"$classifier_stderr")"
+
 out=$(classify_agent_failure "$clean_log" "codex" "0")
 assert_eq "a clean codex log with rc=0 classifies as clean" "clean" "$out"
 
