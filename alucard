@@ -1639,14 +1639,16 @@ ci_gate() {
     log_event "CI gate: PR #$pr_num failed (attempt $ci_attempt) — launching fix agent."
 
     failed_run_id=$(cd "$REPO_ABS" && \
-      gh run list --branch "$branch" --json databaseId,conclusion,headSha \
-        --jq --arg sha "${pr_head_sha:-}" \
-        '[.[] | select(.conclusion=="failure" and ($sha == "" or .headSha == $sha))] | .[0].databaseId // empty' \
-        2>/dev/null || true)
+      gh run list --branch "$branch" --json databaseId,conclusion,headSha 2>/dev/null \
+      | jq -r --arg sha "${pr_head_sha:-}" \
+          '[.[] | select(.conclusion=="failure" and ($sha == "" or .headSha == $sha))] | .[0].databaseId // empty' \
+      2>/dev/null || true)
     failure_log=""
     if [ -n "${failed_run_id:-}" ]; then
       failure_log=$(cd "$REPO_ABS" && \
         gh run view "$failed_run_id" --log-failed 2>/dev/null | head -400 || true)
+    else
+      log_event "CI gate: could not resolve a failed run ID for PR #$pr_num (attempt $ci_attempt) — fix agent will get no failure log."
     fi
 
     wt_fix="${WT_ROOT}/fix-${iter}-${ci_attempt}"
