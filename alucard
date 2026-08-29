@@ -30,6 +30,7 @@ DEFAULT_FEEDBACK_MAX_TURNS="${ALUCARD_FEEDBACK_MAX_TURNS:-50}"
 DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-2}"
 DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-sonnet}"
 DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-haiku}"
+DEFAULT_CODEX_MODEL="${ALUCARD_CODEX_MODEL:-gpt-5.6-terra}"
 # Extra attempts after a transport-classified worker failure (connection drop,
 # overload, rate-limit) on the same ticket, before falling through to the
 # existing recovery path. Default: 2 extra attempts (3 total).
@@ -48,6 +49,7 @@ refresh_agent_settings() {
   DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-$DEFAULT_FEEDBACK_MAX_BUDGET}"
   DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-$DEFAULT_CLAUDE_MODEL}"
   DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-$DEFAULT_CLAUDE_FALLBACK_MODEL}"
+  DEFAULT_CODEX_MODEL="${ALUCARD_CODEX_MODEL:-$DEFAULT_CODEX_MODEL}"
   DEFAULT_TRANSPORT_RETRY_ATTEMPTS="${ALUCARD_TRANSPORT_RETRY_ATTEMPTS:-$DEFAULT_TRANSPORT_RETRY_ATTEMPTS}"
 }
 
@@ -109,6 +111,15 @@ Environment:
   ALUCARD_CLAUDE_MODEL         Claude model for all agent roles. Default: sonnet
   ALUCARD_CLAUDE_FALLBACK_MODEL
                                Claude fallback model. Default: haiku
+  ALUCARD_EFFORT               Claude --effort level for all agent roles.
+                               Default: unset (flag omitted).
+  ALUCARD_CODEX_MODEL          Codex model for all agent roles. Default: gpt-5.6-terra
+  ALUCARD_<ROLE>_CLAUDE_MODEL, ALUCARD_<ROLE>_CLAUDE_FALLBACK_MODEL,
+  ALUCARD_<ROLE>_EFFORT, ALUCARD_<ROLE>_CODEX_MODEL
+                               Per-role overrides (ROLE is WORKER, CI_FIX,
+                               REVIEWER, or FEEDBACK), each falling back to
+                               the corresponding global var above, then its
+                               default.
   ALUCARD_WORKER_MAX_TURNS     Worker --max-turns (Claude only). Default: 180
   ALUCARD_WORKER_MAX_BUDGET    Worker --max-budget-usd (Claude only). Default: 10
   ALUCARD_CI_FIX_MAX_TURNS     CI-fix --max-turns (Claude only). Default: 30
@@ -324,6 +335,22 @@ resolve_provider() {
   esac
 }
 
+# Resolves a per-role Claude/Codex agent setting (model, fallback model, or
+# effort level) for a given agent ROLE and setting SUFFIX (e.g. CLAUDE_MODEL).
+# Checks ALUCARD_<ROLE>_<SUFFIX>, falls back to ALUCARD_<SUFFIX>, then DEFAULT.
+# Unlike resolve_provider, this does no validation: model names and effort
+# levels are an open set that must work the day a new one ships, without an
+# alucard release, so an unrecognized value is passed through for the
+# underlying CLI to reject rather than rejected here.
+resolve_agent_setting() {
+  local role="${1:?resolve_agent_setting requires a ROLE argument}"
+  local suffix="${2:?resolve_agent_setting requires a SUFFIX argument}"
+  local default="${3:-}"
+  local role_var="ALUCARD_${role}_${suffix}"
+  local global_var="ALUCARD_${suffix}"
+  echo "${!role_var:-${!global_var:-$default}}"
+}
+
 # Returns 0 if any of the four agent roles resolves to PROVIDER, 1 otherwise.
 any_role_uses() {
   local provider="${1:?any_role_uses requires a PROVIDER argument}"
@@ -532,7 +559,8 @@ invoke_agent() {
 
   local _rc
   if [ "$provider" = "codex" ]; then
-    local codex_model="${ALUCARD_CODEX_MODEL:-gpt-5.6-terra}"
+    local codex_model
+    codex_model=$(resolve_agent_setting "$provider_role" CODEX_MODEL "$DEFAULT_CODEX_MODEL")
     # Prompt is fed via process substitution so PIPESTATUS[0] captures docker's exit.
     timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm -i \
       "${_docker_args[@]}" \
@@ -548,6 +576,14 @@ invoke_agent() {
       | jq --unbuffered -rj "$codex_stream_text"
     _rc=${PIPESTATUS[0]}
   else
+    local claude_model claude_fallback_model claude_effort
+    claude_model=$(resolve_agent_setting "$provider_role" CLAUDE_MODEL "$DEFAULT_CLAUDE_MODEL")
+    claude_fallback_model=$(resolve_agent_setting "$provider_role" CLAUDE_FALLBACK_MODEL "$DEFAULT_CLAUDE_FALLBACK_MODEL")
+    claude_effort=$(resolve_agent_setting "$provider_role" EFFORT "")
+    # --effort is omitted entirely when unset, rather than passed empty, so
+    # leaving ALUCARD_EFFORT and its per-role variants unset changes nothing.
+    local -a _effort_args=()
+    [ -n "$claude_effort" ] && _effort_args=(--effort "$claude_effort")
     timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
       "${_docker_args[@]}" \
       claude -p \
@@ -557,8 +593,9 @@ invoke_agent() {
         --permission-mode bypassPermissions \
         --max-turns "$max_turns" \
         --max-budget-usd "$max_budget" \
-        --model "$DEFAULT_CLAUDE_MODEL" \
-        --fallback-model "$DEFAULT_CLAUDE_FALLBACK_MODEL" \
+        --model "$claude_model" \
+        --fallback-model "$claude_fallback_model" \
+        "${_effort_args[@]}" \
         --disallowedTools "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)" \
         -- \
         "$prompt" \

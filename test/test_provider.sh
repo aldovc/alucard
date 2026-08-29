@@ -115,6 +115,38 @@ export ALUCARD_WORKER_PROVIDER=invalid
 assert_exit "any_role_uses exits non-zero when a role has an invalid provider" 1 any_role_uses claude
 unset ALUCARD_WORKER_PROVIDER
 
+# ── Test group 7: resolve_agent_setting (per-role model/effort resolver) ────
+
+unset ALUCARD_CLAUDE_MODEL ALUCARD_WORKER_CLAUDE_MODEL ALUCARD_CI_FIX_CLAUDE_MODEL
+
+assert_eq "resolve_agent_setting: default applies when both unset" \
+  "sonnet" "$(resolve_agent_setting WORKER CLAUDE_MODEL sonnet)"
+
+export ALUCARD_CLAUDE_MODEL=opus
+assert_eq "resolve_agent_setting: global applies when per-role is unset" \
+  "opus" "$(resolve_agent_setting WORKER CLAUDE_MODEL sonnet)"
+
+export ALUCARD_WORKER_CLAUDE_MODEL=worker-opus
+assert_eq "resolve_agent_setting: per-role wins over global" \
+  "worker-opus" "$(resolve_agent_setting WORKER CLAUDE_MODEL sonnet)"
+assert_eq "resolve_agent_setting: a value set for one role does not leak into another" \
+  "opus" "$(resolve_agent_setting CI_FIX CLAUDE_MODEL sonnet)"
+
+unset ALUCARD_CLAUDE_MODEL ALUCARD_WORKER_CLAUDE_MODEL ALUCARD_CI_FIX_CLAUDE_MODEL
+
+# Effort has no non-empty default: leaving both unset must resolve to empty,
+# so invoke_agent can tell "not requested" apart from "requested as ''".
+unset ALUCARD_EFFORT ALUCARD_WORKER_EFFORT
+assert_eq "resolve_agent_setting: effort resolves empty when unset (flag omitted upstream)" \
+  "" "$(resolve_agent_setting WORKER EFFORT "")"
+
+export ALUCARD_WORKER_EFFORT=high
+assert_eq "resolve_agent_setting: per-role effort applies" \
+  "high" "$(resolve_agent_setting WORKER EFFORT "")"
+assert_eq "resolve_agent_setting: per-role effort does not leak to another role" \
+  "" "$(resolve_agent_setting CI_FIX EFFORT "")"
+unset ALUCARD_WORKER_EFFORT
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

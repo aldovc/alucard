@@ -26,6 +26,15 @@ assert_flag_value() {
   assert_eq "$label" "$expected" "$actual"
 }
 
+assert_flag_absent() {
+  local label="$1" flag="$2" file="$3"
+  if grep -qxF -- "$flag" "$file"; then
+    fail "$label (expected '$flag' to be absent, found it in argv)"
+  else
+    pass "$label"
+  fi
+}
+
 TEST_TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TEST_TMPDIR"' EXIT
 
@@ -37,7 +46,13 @@ unset ALUCARD_WORKER_MAX_TURNS ALUCARD_WORKER_MAX_BUDGET \
       ALUCARD_REVIEWER_MAX_TURNS ALUCARD_REVIEWER_MAX_BUDGET \
       ALUCARD_FEEDBACK_MAX_TURNS ALUCARD_FEEDBACK_MAX_BUDGET \
       ALUCARD_CLAUDE_MODEL ALUCARD_CLAUDE_FALLBACK_MODEL \
-      ALUCARD_TRANSPORT_RETRY_ATTEMPTS
+      ALUCARD_TRANSPORT_RETRY_ATTEMPTS \
+      ALUCARD_EFFORT ALUCARD_CODEX_MODEL
+
+for role in WORKER CI_FIX REVIEWER FEEDBACK; do
+  unset "ALUCARD_${role}_CLAUDE_MODEL" "ALUCARD_${role}_CLAUDE_FALLBACK_MODEL" \
+        "ALUCARD_${role}_EFFORT" "ALUCARD_${role}_CODEX_MODEL"
+done
 
 # Source alucard to load helper functions without running main.
 # The BASH_SOURCE guard in alucard prevents main from executing when sourced.
@@ -62,6 +77,7 @@ TIMEOUT_MIN=1
 ENV_FILE="$SETTINGS_ENV"
 IMAGE="test-image"
 stream_text='.event.delta.text'
+codex_stream_text='.'
 
 invoke_and_capture() {
   local role="$1" max_turns="$2" max_budget="$3"
@@ -83,22 +99,43 @@ assert_claude_args() {
 
 invoke_and_capture iter-default "$DEFAULT_WORKER_MAX_TURNS" "$DEFAULT_WORKER_MAX_BUDGET"
 assert_claude_args iter-default 180 10 sonnet haiku
+assert_flag_absent "iter-default omits --effort when unset" --effort "$TEST_TMPDIR/iter-default.args"
 
-# ── Test group 2: selected env-file overrides reach all Claude roles ─────────
+# ── Test group 2: selected env-file overrides reach all Claude roles,        ─
+#    per-role overrides win over the global, and a value set for one role   ─
+#    does not leak into another (the fixture sets ALUCARD_WORKER_CLAUDE_MODEL,
+#    ALUCARD_WORKER_CLAUDE_FALLBACK_MODEL, and ALUCARD_WORKER_EFFORT — only
+#    the WORKER role should see them).
 
 load_env_file "$SETTINGS_ENV" true
 
 invoke_and_capture iter-override "$DEFAULT_WORKER_MAX_TURNS" "$DEFAULT_WORKER_MAX_BUDGET"
-assert_claude_args iter-override 181 11 opus sonnet
+assert_claude_args iter-override 181 11 worker-opus worker-sonnet
+assert_flag_value "iter-override uses its per-role effort" --effort high "$TEST_TMPDIR/iter-override.args"
 
 invoke_and_capture fix-override "$DEFAULT_CI_FIX_MAX_TURNS" "$DEFAULT_CI_FIX_MAX_BUDGET"
 assert_claude_args fix-override 31 3 opus sonnet
+assert_flag_absent "fix-override does not inherit WORKER's per-role effort" --effort "$TEST_TMPDIR/fix-override.args"
 
 invoke_and_capture review-override "$DEFAULT_REVIEWER_MAX_TURNS" "$DEFAULT_REVIEWER_MAX_BUDGET"
 assert_claude_args review-override 21 4 opus sonnet
+assert_flag_absent "review-override does not inherit WORKER's per-role effort" --effort "$TEST_TMPDIR/review-override.args"
 
 invoke_and_capture feedback-override "$DEFAULT_FEEDBACK_MAX_TURNS" "$DEFAULT_FEEDBACK_MAX_BUDGET"
 assert_claude_args feedback-override 51 5 opus sonnet
+assert_flag_absent "feedback-override does not inherit WORKER's per-role effort" --effort "$TEST_TMPDIR/feedback-override.args"
+
+# ── Test group 2b: per-role Codex model override, isolated to its role ──────
+
+ALUCARD_CI_FIX_PROVIDER=codex
+invoke_and_capture fix-codex "$DEFAULT_CI_FIX_MAX_TURNS" "$DEFAULT_CI_FIX_MAX_BUDGET"
+assert_flag_value "fix-codex uses its per-role Codex model" -m ci-fix-codex-model "$TEST_TMPDIR/fix-codex.args"
+unset ALUCARD_CI_FIX_PROVIDER
+
+ALUCARD_REVIEWER_PROVIDER=codex
+invoke_and_capture review-codex "$DEFAULT_REVIEWER_MAX_TURNS" "$DEFAULT_REVIEWER_MAX_BUDGET"
+assert_flag_value "review-codex falls back to the global-default Codex model" -m gpt-5.6-terra "$TEST_TMPDIR/review-codex.args"
+unset ALUCARD_REVIEWER_PROVIDER
 
 # ── Test group 3: transport retry attempts are validated before arithmetic ───
 
