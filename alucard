@@ -1083,6 +1083,14 @@ resolve_task_source() {
 # (reconcile_tasks_file), the PR linkage line ("Closes #N" / "Task: <id>"),
 # prior notes, and the usage-report destination — everything else is
 # source-blind.
+# Print the number of the open PR for a branch, if one exists.
+find_open_pr_for_branch() {
+  local repo_abs="$1" branch="$2"
+  cd "$repo_abs" && \
+    gh pr list --head "$branch" --state open --json number \
+      --jq '.[0].number // empty' 2>/dev/null || true
+}
+
 get_task_queue() {
   local repo_abs="$1"
   case "$TASK_SOURCE" in
@@ -2266,6 +2274,14 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
       if [ "$_worker_class" != "transport" ] || [ "$_attempt" -eq "$_total_worker_attempts" ]; then
         break
       fi
+      # A worker can create its PR and lose the provider connection while
+      # reporting the result. Preserve that branch and let the normal PR-found
+      # path below run instead of launching a duplicate attempt.
+      _transport_pr=$(find_open_pr_for_branch "$REPO_ABS" "$BRANCH")
+      if [ -n "${_transport_pr:-}" ]; then
+        log_event "PR found after transport failure: #$_transport_pr on $BRANCH; skipping retry."
+        break
+      fi
       log_event "Iteration $i: transport failure on attempt $_attempt — retrying with a fresh worktree."
     done
 
@@ -2276,9 +2292,7 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
     ACTUAL_BRANCH="$BRANCH"
     _pr_found=false
     _iter_pr_num=""
-    _harness_pr=$(cd "$REPO_ABS" && \
-      gh pr list --head "$BRANCH" --state open --json number \
-        --jq '.[0].number // empty' 2>/dev/null || true)
+    _harness_pr=$(find_open_pr_for_branch "$REPO_ABS" "$BRANCH")
     if [ -n "${_harness_pr:-}" ]; then
       _pr_found=true
       _iter_pr_num="$_harness_pr"
