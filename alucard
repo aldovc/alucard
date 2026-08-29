@@ -398,12 +398,13 @@ classify_agent_failure() {
   local _transport_pattern='connection closed|network error|overloaded|rate.?limit|gateway|reset by peer|econnreset|timed out waiting|api error'
 
   if [ "$provider" = "codex" ]; then
-    local _err_msg
-    if ! _err_msg=$(jq -r 'select(.type == "item.completed" and .item.type == "error") | .item.message' \
-      "$log_file" 2>/dev/null | tail -1); then
+    local _err_msg _err_msgs
+    if ! _err_msgs=$(jq -r 'select(.type == "item.completed" and .item.type == "error") | .item.message' \
+      "$log_file" 2>/dev/null); then
       echo "failed"
       return 0
     fi
+    _err_msg="${_err_msgs##*$'\n'}"
     if [ -z "$_err_msg" ]; then
       if [ "$rc" -eq 0 ]; then echo "clean"; else echo "failed"; fi
       return 0
@@ -416,11 +417,12 @@ classify_agent_failure() {
     return 0
   fi
 
-  local _result_line
-  if ! _result_line=$(jq -c 'select(.type == "result")' "$log_file" 2>/dev/null | tail -1); then
+  local _result_line _result_lines
+  if ! _result_lines=$(jq -c 'select(.type == "result")' "$log_file" 2>/dev/null); then
     echo "failed"
     return 0
   fi
+  _result_line="${_result_lines##*$'\n'}"
   if [ -z "$_result_line" ]; then
     if [ "$rc" -eq 0 ]; then echo "clean"; else echo "failed"; fi
     return 0
