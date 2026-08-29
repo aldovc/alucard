@@ -439,16 +439,16 @@ classify_agent_failure() {
     return 0
   fi
 
-  if [ "$_subtype" = "success" ] && [ "$_is_error" != "true" ] && [ "$rc" -eq 0 ]; then
-    echo "clean"
-    return 0
-  fi
-
   # api_error_status is an HTTP status the provider reported, not text a
   # worker wrote -- 429/5xx is transport regardless of what .result says.
   case "$_api_error_status" in
     429 | 5[0-9][0-9]) echo "transport"; return 0 ;;
   esac
+
+  if [ "$_subtype" = "success" ] && [ "$_is_error" != "true" ] && [ "$rc" -eq 0 ]; then
+    echo "clean"
+    return 0
+  fi
 
   # A success subtype paired with an error flag is a contradictory provider
   # result record, so retry it even if the provider changes its error wording.

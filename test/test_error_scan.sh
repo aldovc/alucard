@@ -234,6 +234,14 @@ EOF
 out=$(classify_agent_failure "$claude_http_status_log" "claude" "1")
 assert_eq "api_error_status 429 classifies as transport regardless of result text" "transport" "$out"
 
+claude_clean_http_status_log="$TMP_ROOT/claude-clean-http-status.jsonl"
+cat > "$claude_clean_http_status_log" <<'EOF'
+{"type":"result","subtype":"success","is_error":false,"api_error_status":429,"result":"Completed successfully."}
+EOF
+
+out=$(classify_agent_failure "$claude_clean_http_status_log" "claude" "0")
+assert_eq "api_error_status 429 overrides a clean-looking result" "transport" "$out"
+
 claude_5xx_status_log="$TMP_ROOT/claude-5xx-status.jsonl"
 cat > "$claude_5xx_status_log" <<'EOF'
 {"type":"result","subtype":"error","is_error":true,"api_error_status":503,"result":"Service unavailable."}
