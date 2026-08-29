@@ -4,7 +4,7 @@
 set -euo pipefail
 
 API_KEY="${XAI_API_KEY:-}"
-MODEL="${1:-grok-4.3}"
+MODEL="${1:-grok-4.6}"
 BASE_URL="https://api.x.ai/v1"
 
 if [[ -z "$API_KEY" ]]; then

@@ -33,7 +33,7 @@ RUN uv python install 3.12 \
 # codex pin must stay recent enough to carry metadata for ALUCARD_CODEX_MODEL —
 # 0.142.5 predated gpt-5.6-terra and every codex container ran on degraded
 # fallback metadata (surfaced by the error-scan work in PR #44).
-RUN npm install -g @anthropic-ai/claude-code@2.1.198 @openai/codex@0.147.0
+RUN npm install -g @anthropic-ai/claude-code@2.1.250 @openai/codex@0.150.1
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
