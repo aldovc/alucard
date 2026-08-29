@@ -212,7 +212,51 @@ cat > "$claude_unrecognized_log" <<'EOF'
 EOF
 
 out=$(classify_agent_failure "$claude_unrecognized_log" "claude" "1")
-assert_eq "a non-zero exit with an unrecognized result classifies as failed" "failed" "$out"
+assert_eq "a contradictory Claude result record classifies as transport regardless of result text" "transport" "$out"
+
+# ── #62: a worker's own summary must not be misread as a transport drop ────
+echo "── classify_agent_failure: worker prose vs. real transport signals ──"
+
+claude_self_describing_log="$TMP_ROOT/claude-self-describing.jsonl"
+cat > "$claude_self_describing_log" <<'EOF'
+{"type":"result","subtype":"success","is_error":false,"result":"Implemented classify_agent_failure. Transport failures (connection closed, overloaded, rate limit) now retry with a fresh worktree instead of burning the ticket. All 290 tests pass."}
+EOF
+
+out=$(classify_agent_failure "$claude_self_describing_log" "claude" "1")
+assert_eq "a normal completion whose prose mentions transport words is not misread as transport" \
+  "failed" "$out"
+
+claude_http_status_log="$TMP_ROOT/claude-http-status.jsonl"
+cat > "$claude_http_status_log" <<'EOF'
+{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"Too many requests."}
+EOF
+
+out=$(classify_agent_failure "$claude_http_status_log" "claude" "1")
+assert_eq "api_error_status 429 classifies as transport regardless of result text" "transport" "$out"
+
+claude_clean_http_status_log="$TMP_ROOT/claude-clean-http-status.jsonl"
+cat > "$claude_clean_http_status_log" <<'EOF'
+{"type":"result","subtype":"success","is_error":false,"api_error_status":429,"result":"Completed successfully."}
+EOF
+
+out=$(classify_agent_failure "$claude_clean_http_status_log" "claude" "0")
+assert_eq "api_error_status 429 overrides a clean-looking result" "transport" "$out"
+
+claude_5xx_status_log="$TMP_ROOT/claude-5xx-status.jsonl"
+cat > "$claude_5xx_status_log" <<'EOF'
+{"type":"result","subtype":"error","is_error":true,"api_error_status":503,"result":"Service unavailable."}
+EOF
+
+out=$(classify_agent_failure "$claude_5xx_status_log" "claude" "1")
+assert_eq "api_error_status 503 classifies as transport regardless of result text" "transport" "$out"
+
+claude_incident_log="$TMP_ROOT/claude-incident.jsonl"
+cat > "$claude_incident_log" <<'EOF'
+{"type":"result","subtype":"success","is_error":true,"api_error_status":null,"result":"API Error: Connection closed mid-response. The response above may be incomplete."}
+EOF
+
+out=$(classify_agent_failure "$claude_incident_log" "claude" "1")
+assert_eq "the #58 incident record still classifies as transport" "transport" "$out"
 
 out=$(classify_agent_failure "$codex_log" "codex" "1")
 assert_eq "codex error item (fallback metadata) classifies as failed" "failed" "$out"
