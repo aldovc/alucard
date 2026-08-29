@@ -102,12 +102,19 @@ assert_claude_args feedback-override 51 5 opus sonnet
 
 # ── Test group 3: transport retry attempts are validated before arithmetic ───
 
-assert_eq "transport retries add one initial attempt" "4" "$(transport_retry_total_attempts 3)"
-assert_eq "zero transport retries keeps the initial attempt" "1" "$(transport_retry_total_attempts 0)"
+ALUCARD_TRANSPORT_RETRY_ATTEMPTS=3
+refresh_agent_settings
+assert_eq "transport retry override adds one initial attempt" "4" "$(transport_retry_total_attempts "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS")"
+
+ALUCARD_TRANSPORT_RETRY_ATTEMPTS=0
+refresh_agent_settings
+assert_eq "zero transport retry override keeps the initial attempt" "1" "$(transport_retry_total_attempts "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS")"
 
 assert_invalid_transport_retries() {
   local label="$1" value="$2" output
-  if output=$(transport_retry_total_attempts "$value" 2>&1); then
+  ALUCARD_TRANSPORT_RETRY_ATTEMPTS="$value"
+  refresh_agent_settings
+  if output=$(transport_retry_total_attempts "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS" 2>&1); then
     fail "$label (expected validation failure, got '$output')"
   elif [[ "$output" == *"ALUCARD_TRANSPORT_RETRY_ATTEMPTS must be a non-negative integer"* ]]; then
     pass "$label"
