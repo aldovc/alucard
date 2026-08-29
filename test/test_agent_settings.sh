@@ -36,7 +36,8 @@ unset ALUCARD_WORKER_MAX_TURNS ALUCARD_WORKER_MAX_BUDGET \
       ALUCARD_CI_FIX_MAX_TURNS ALUCARD_CI_FIX_MAX_BUDGET \
       ALUCARD_REVIEWER_MAX_TURNS ALUCARD_REVIEWER_MAX_BUDGET \
       ALUCARD_FEEDBACK_MAX_TURNS ALUCARD_FEEDBACK_MAX_BUDGET \
-      ALUCARD_CLAUDE_MODEL ALUCARD_CLAUDE_FALLBACK_MODEL
+      ALUCARD_CLAUDE_MODEL ALUCARD_CLAUDE_FALLBACK_MODEL \
+      ALUCARD_TRANSPORT_RETRY_ATTEMPTS
 
 # Source alucard to load helper functions without running main.
 # The BASH_SOURCE guard in alucard prevents main from executing when sourced.
@@ -98,6 +99,25 @@ assert_claude_args review-override 21 4 opus sonnet
 
 invoke_and_capture feedback-override "$DEFAULT_FEEDBACK_MAX_TURNS" "$DEFAULT_FEEDBACK_MAX_BUDGET"
 assert_claude_args feedback-override 51 5 opus sonnet
+
+# ── Test group 3: transport retry attempts are validated before arithmetic ───
+
+assert_eq "transport retries add one initial attempt" "4" "$(transport_retry_total_attempts 3)"
+assert_eq "zero transport retries keeps the initial attempt" "1" "$(transport_retry_total_attempts 0)"
+
+assert_invalid_transport_retries() {
+  local label="$1" value="$2" output
+  if output=$(transport_retry_total_attempts "$value" 2>&1); then
+    fail "$label (expected validation failure, got '$output')"
+  elif [[ "$output" == *"ALUCARD_TRANSPORT_RETRY_ATTEMPTS must be a non-negative integer"* ]]; then
+    pass "$label"
+  else
+    fail "$label (unexpected error '$output')"
+  fi
+}
+
+assert_invalid_transport_retries "negative transport retries are rejected" "-1"
+assert_invalid_transport_retries "malformed transport retries are rejected" "two"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
