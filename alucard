@@ -30,6 +30,10 @@ DEFAULT_FEEDBACK_MAX_TURNS="${ALUCARD_FEEDBACK_MAX_TURNS:-50}"
 DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-2}"
 DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-sonnet}"
 DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-haiku}"
+# Extra attempts after a transport-classified worker failure (connection drop,
+# overload, rate-limit) on the same ticket, before falling through to the
+# existing recovery path. Default: 2 extra attempts (3 total).
+DEFAULT_TRANSPORT_RETRY_ATTEMPTS="${ALUCARD_TRANSPORT_RETRY_ATTEMPTS:-2}"
 
 # Refresh agent settings after an env file is sourced. This keeps inherited
 # values working while allowing the selected env file to override them.
@@ -44,6 +48,7 @@ refresh_agent_settings() {
   DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-$DEFAULT_FEEDBACK_MAX_BUDGET}"
   DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-$DEFAULT_CLAUDE_MODEL}"
   DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-$DEFAULT_CLAUDE_FALLBACK_MODEL}"
+  DEFAULT_TRANSPORT_RETRY_ATTEMPTS="${ALUCARD_TRANSPORT_RETRY_ATTEMPTS:-$DEFAULT_TRANSPORT_RETRY_ATTEMPTS}"
 }
 
 usage() {
@@ -112,6 +117,10 @@ Environment:
   ALUCARD_REVIEWER_MAX_BUDGET  Reviewer --max-budget-usd (Claude only). Default: 2
   ALUCARD_FEEDBACK_MAX_TURNS   Feedback --max-turns (Claude only). Default: 50
   ALUCARD_FEEDBACK_MAX_BUDGET  Feedback --max-budget-usd (Claude only). Default: 2
+  ALUCARD_TRANSPORT_RETRY_ATTEMPTS
+                               Extra attempts after a transport-classified worker
+                               failure, same ticket, fresh worktree each time.
+                               Default: 2 (3 total attempts).
 
 Examples:
   alucard run owner/repo --iterations 1
@@ -348,6 +357,98 @@ scan_agent_errors() {
        ((.result // "") | .[0:200])' \
       "$log_file" >&2 2>/dev/null || true
   fi
+}
+
+# Classify a completed worker's outcome from its log, provider, and exit
+# code, echoing exactly one class word to stdout: clean, transport,
+# exhausted, wedged, or failed. Pure — no side effects, no stderr, no
+# repository access. A sibling of scan_agent_errors (which reports errors)
+# rather than an extension of it, so that helper isn't overloaded with a
+# return-a-value contract on top of its reporting job.
+#
+# Classification order is fixed and matters: the wedge marker is checked
+# first because the wedge detector's `docker kill` produces the same
+# kill-signal exit code (137) that a hard --kill-after timeout does: a
+# wedge must never be misread as a wall-clock timeout. Timeout exit codes
+# are checked next. Only then does the provider result record get parsed —
+# a Claude max-turns result arrives with a non-zero exit code that is not
+# one of the timeout codes, so exit code alone cannot separate "the harness
+# killed it" from "the model just stopped", and the record's subtype/result
+# text is the only reliable signal for that case.
+classify_agent_failure() {
+  local log_file="$1" provider="$2" rc="$3"
+
+  if [ -f "$log_file" ] && grep -q -F 'Shell cwd was reset to /work (deleted)' "$log_file"; then
+    echo "wedged"
+    return 0
+  fi
+
+  case "$rc" in
+    124|137) echo "exhausted"; return 0 ;;
+  esac
+
+  if [ ! -f "$log_file" ]; then
+    if [ "$rc" -eq 0 ]; then echo "clean"; else echo "failed"; fi
+    return 0
+  fi
+
+  # Transport failures carry no information about the task: a dropped
+  # connection, a generic API error, or a provider overload/rate-limit/
+  # gateway response. Matched against provider-reported error text.
+  local _transport_pattern='connection closed|network error|overloaded|rate.?limit|gateway|reset by peer|econnreset|timed out waiting|api error'
+
+  if [ "$provider" = "codex" ]; then
+    local _err_msg _err_msgs
+    if ! _err_msgs=$(jq -r 'select(.type == "item.completed" and .item.type == "error") | .item.message' \
+      "$log_file" 2>/dev/null); then
+      echo "failed"
+      return 0
+    fi
+    _err_msg="${_err_msgs##*$'\n'}"
+    if [ -z "$_err_msg" ]; then
+      if [ "$rc" -eq 0 ]; then echo "clean"; else echo "failed"; fi
+      return 0
+    fi
+    if echo "$_err_msg" | grep -qiE "$_transport_pattern"; then
+      echo "transport"
+    else
+      echo "failed"
+    fi
+    return 0
+  fi
+
+  local _result_line _result_lines
+  if ! _result_lines=$(jq -c 'select(.type == "result")' "$log_file" 2>/dev/null); then
+    echo "failed"
+    return 0
+  fi
+  _result_line="${_result_lines##*$'\n'}"
+  if [ -z "$_result_line" ]; then
+    if [ "$rc" -eq 0 ]; then echo "clean"; else echo "failed"; fi
+    return 0
+  fi
+
+  local _subtype _is_error _result_text
+  _subtype=$(echo "$_result_line" | jq -r '.subtype // "unknown"')
+  _is_error=$(echo "$_result_line" | jq -r '.is_error // false')
+  _result_text=$(echo "$_result_line" | jq -r '.result // ""')
+
+  if [ "$_subtype" = "error_max_turns" ]; then
+    echo "exhausted"
+    return 0
+  fi
+
+  if [ "$_subtype" = "success" ] && [ "$_is_error" != "true" ] && [ "$rc" -eq 0 ]; then
+    echo "clean"
+    return 0
+  fi
+
+  if echo "$_result_text" | grep -qiE "$_transport_pattern"; then
+    echo "transport"
+    return 0
+  fi
+
+  echo "failed"
 }
 
 # Sandbox flags shared by every container we run (agents and the toolchain
@@ -982,6 +1083,14 @@ resolve_task_source() {
 # (reconcile_tasks_file), the PR linkage line ("Closes #N" / "Task: <id>"),
 # prior notes, and the usage-report destination — everything else is
 # source-blind.
+# Print the number of the open PR for a branch, if one exists.
+find_open_pr_for_branch() {
+  local repo_abs="$1" branch="$2"
+  cd "$repo_abs" && \
+    gh pr list --head "$branch" --state open --json number \
+      --jq '.[0].number // empty' 2>/dev/null || true
+}
+
 get_task_queue() {
   local repo_abs="$1"
   case "$TASK_SOURCE" in
@@ -1159,6 +1268,8 @@ post_iteration_usage() {
         mid="${base#iter-}"; label="review ${mid/-review-/.}" ;;
       iter-"${iter}"-feedback-*)
         mid="${base#iter-}"; label="feedback ${mid/-feedback-/.}" ;;
+      iter-"${iter}"-attempt-*)
+        label="worker attempt ${base##*-attempt-}" ;;
       iter-"${iter}")
         label="worker $iter" ;;
       *)
@@ -2108,27 +2219,71 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
           --jq '[.[].number]' 2>/dev/null || echo '[]')
     fi
 
-    set +e
-    invoke_agent \
-      "iter-$i" \
-      "$log_file" \
-      "$DEFAULT_WORKER_MAX_TURNS" "$DEFAULT_WORKER_MAX_BUDGET" \
-      "$full_prompt" \
-      -v "$WT_HOST:/work:rw" \
-      -e "ALUCARD_ITER=$i"
-    rc=$?
-    set -e
-
-    # Provider billing failure is terminal — re-running 20 iterations against
-    # the same exhausted account just burns time and leaks stub branches. Bail
-    # the whole run on the first sighting so the user can top up and retry.
-    if [ -f "$log_file" ] && grep -q '"error":"billing_error"' "$log_file"; then
-      _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
-      log_event "Iteration $i/$ITERATIONS end: rc=$rc duration=${_iter_duration}s"
-      log_event "Run end: provider returned billing_error (credit balance too low) — aborting run."
-      rm -rf "$WT_HOST"
-      exit 2
+    _worker_provider=$(resolve_provider WORKER)
+    if ! is_uint "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS"; then
+      echo "Error: ALUCARD_TRANSPORT_RETRY_ATTEMPTS must be a non-negative integer; got '$DEFAULT_TRANSPORT_RETRY_ATTEMPTS'." >&2
+      exit 1
     fi
+    _total_worker_attempts=$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))
+    _worker_class="failed"
+    for ((_attempt=1; _attempt<=_total_worker_attempts; _attempt++)); do
+      if [ "$_attempt" -gt 1 ]; then
+        # A transport drop typically lands during orientation, and handing a
+        # fresh worker someone else's half-written diff is worse than
+        # starting over — the superseded attempt's partial commits are
+        # discarded along with its worktree.
+        rm -rf "$WT_HOST" || true
+        WT_HOST="${WT_ROOT}/iter-${i}-${_attempt}"
+        BRANCH="alucard/iter-${i}-$(date +%s)-${_attempt}"
+        CREATED_WORKTREES+=("$WT_HOST")
+        make_agent_clone "$BASE_BRANCH" "$WT_HOST" "$_origin_url" base
+        git -C "$WT_HOST" reset --hard "$(git -C "$REPO_ABS" rev-parse "origin/$BASE_BRANCH")"
+        _base_sha="$(git -C "$WT_HOST" rev-parse HEAD)"
+        git -C "$WT_HOST" checkout -b "$BRANCH"
+        log_file="$LOG_DIR/iter-${i}-attempt-${_attempt}.jsonl"
+      fi
+
+      set +e
+      invoke_agent \
+        "iter-$i" \
+        "$log_file" \
+        "$DEFAULT_WORKER_MAX_TURNS" "$DEFAULT_WORKER_MAX_BUDGET" \
+        "$full_prompt" \
+        -v "$WT_HOST:/work:rw" \
+        -e "ALUCARD_ITER=$i"
+      rc=$?
+      set -e
+
+      # Provider billing failure is terminal — re-running 20 iterations against
+      # the same exhausted account just burns time and leaks stub branches. Bail
+      # the whole run on the first sighting so the user can top up and retry.
+      # Stays ahead of retry classification: a billing error looks like a
+      # transport failure and would otherwise be retried into a longer, more
+      # expensive silence.
+      if [ -f "$log_file" ] && grep -q '"error":"billing_error"' "$log_file"; then
+        _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
+        log_event "Iteration $i/$ITERATIONS end: rc=$rc duration=${_iter_duration}s"
+        log_event "Run end: provider returned billing_error (credit balance too low) — aborting run."
+        rm -rf "$WT_HOST"
+        exit 2
+      fi
+
+      _worker_class=$(classify_agent_failure "$log_file" "$_worker_provider" "$rc")
+      log_event "Iteration $i attempt $_attempt/$_total_worker_attempts: rc=$rc class=$_worker_class"
+
+      if [ "$_worker_class" != "transport" ] || [ "$_attempt" -eq "$_total_worker_attempts" ]; then
+        break
+      fi
+      # A worker can create its PR and lose the provider connection while
+      # reporting the result. Preserve that branch and let the normal PR-found
+      # path below run instead of launching a duplicate attempt.
+      _transport_pr=$(find_open_pr_for_branch "$REPO_ABS" "$BRANCH")
+      if [ -n "${_transport_pr:-}" ]; then
+        log_event "PR found after transport failure: #$_transport_pr on $BRANCH; skipping retry."
+        break
+      fi
+      log_event "Iteration $i: transport failure on attempt $_attempt — retrying with a fresh worktree."
+    done
 
     # Worker should push to $BRANCH, but may misbehave and push to a custom
     # branch (e.g. integration branch). If head-branch lookup finds no PR,
@@ -2137,9 +2292,7 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
     ACTUAL_BRANCH="$BRANCH"
     _pr_found=false
     _iter_pr_num=""
-    _harness_pr=$(cd "$REPO_ABS" && \
-      gh pr list --head "$BRANCH" --state open --json number \
-        --jq '.[0].number // empty' 2>/dev/null || true)
+    _harness_pr=$(find_open_pr_for_branch "$REPO_ABS" "$BRANCH")
     if [ -n "${_harness_pr:-}" ]; then
       _pr_found=true
       _iter_pr_num="$_harness_pr"
@@ -2190,6 +2343,12 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
       fi
 
       if [ -d "$WT_HOST/.git" ]; then
+        # Commits the worker itself made, captured before the harness's own
+        # recovery commit below — this is the figure the transport PR gate
+        # needs, distinct from _commits_ahead (used for the push decision),
+        # which also counts the harness's own commit once it's made.
+        _worker_commits_ahead=$(git -C "$WT_HOST" rev-list --count \
+          "${_base_sha}..HEAD" 2>/dev/null || echo 0)
         # Stage and commit any uncommitted changes — work-in-progress would
         # otherwise die with the worktree.
         if [ -n "$(git -C "$WT_HOST" status --porcelain 2>/dev/null)" ]; then
@@ -2207,7 +2366,12 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
         # since REPO_ABS was first cloned.
         _commits_ahead=$(git -C "$WT_HOST" rev-list --count \
           "${_base_sha}..HEAD" 2>/dev/null || echo 0)
-        if [ "$_commits_ahead" -gt 0 ]; then
+        # A final transport failure can occur before the worker changes the
+        # worktree. Push that otherwise-identical branch too: it is the
+        # discoverable recovery handle, even though it deliberately gets no
+        # recovery PR below.
+        if [ "$_commits_ahead" -gt 0 ] || \
+           { [ "$_worker_class" = "transport" ] && [ "$_worker_commits_ahead" -eq 0 ]; }; then
           _recover_branch=$(git -C "$WT_HOST" rev-parse --abbrev-ref HEAD \
             2>/dev/null || echo "$BRANCH")
           log_event "Recovery: worker rc=$rc left $_commits_ahead commit(s) on $_recover_branch — pushing to preserve work."
@@ -2221,43 +2385,52 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
           _host_origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
           git -C "$WT_HOST" remote set-url origin "$_host_origin_url"
           if GIT_TERMINAL_PROMPT=0 git -C "$WT_HOST" push -u origin "$_recover_branch" 2>&1; then
-            # Closes #N on the first line lets the queue dedup filter
-            # (closingIssuesReferences in get_unblocked_tickets) match
-            # the issue to this PR so the issue isn't re-picked. The local
-            # source uses a Task: line plus the in-flight heading flip below.
-            _closes_line=""
-            if [ "$TASK_SOURCE" = "file" ]; then
-              _closes_line="Task: ${DISPATCHED_TASK_ID}"
+            # A transport drop that produced zero worker commits gets no PR:
+            # opening one would occupy the ticket (the queue's open-PR filter
+            # matches any PR that so much as mentions #N) over a network blip
+            # instead of a real attempt. The branch above is still pushed, so
+            # nothing is lost — just not attributed to this ticket.
+            if [ "$_worker_class" = "transport" ] && [ "$_worker_commits_ahead" -eq 0 ]; then
+              log_event "Recovery: transport failure with no worker commits — branch $_recover_branch preserved, no PR opened, ticket left in queue."
             else
-              for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
-                _closes_line="Closes #${_n}"
-                break
-              done
-            fi
-            _stub_body="${_closes_line}
+              # Closes #N on the first line lets the queue dedup filter
+              # (closingIssuesReferences in get_unblocked_tickets) match
+              # the issue to this PR so the issue isn't re-picked. The local
+              # source uses a Task: line plus the in-flight heading flip below.
+              _closes_line=""
+              if [ "$TASK_SOURCE" = "file" ]; then
+                _closes_line="Task: ${DISPATCHED_TASK_ID}"
+              else
+                for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
+                  _closes_line="Closes #${_n}"
+                  break
+                done
+              fi
+              _stub_body="${_closes_line}
 
 **🤖 Alucard recovery PR** — worker exited rc=${rc} before opening a PR. Its commits have been pushed here so the work isn't lost.
 
 Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or close this PR if the work isn't salvageable."
-            _stub_title="wip: alucard recovery — iter ${i} (worker killed rc=${rc})"
-            if _new_pr_url=$(cd "$REPO_ABS" && \
-              gh pr create \
-                --head "$_recover_branch" \
-                --base "$BASE_BRANCH" \
-                --label alucard \
-                --draft \
-                --title "$_stub_title" \
-                --body "$_stub_body" 2>&1); then
-              log_event "Recovery: opened PR $_new_pr_url"
-              ACTUAL_BRANCH="$_recover_branch"
-              _recovery_pr=true
-              if [ "$TASK_SOURCE" = "file" ]; then
-                _recovery_pr_num="${_new_pr_url##*/}"
-                mark_task_in_flight "$TASKS_FILE_ABS" "$DISPATCHED_TASK_ID" "$_recovery_pr_num" \
-                  || die "could not mark task ${DISPATCHED_TASK_ID} in-flight in $TASKS_FILE_ABS — recovery PR #${_recovery_pr_num} is pushed and safe; fix the heading before the next run"
+              _stub_title="wip: alucard recovery — iter ${i} (worker killed rc=${rc})"
+              if _new_pr_url=$(cd "$REPO_ABS" && \
+                gh pr create \
+                  --head "$_recover_branch" \
+                  --base "$BASE_BRANCH" \
+                  --label alucard \
+                  --draft \
+                  --title "$_stub_title" \
+                  --body "$_stub_body" 2>&1); then
+                log_event "Recovery: opened PR $_new_pr_url"
+                ACTUAL_BRANCH="$_recover_branch"
+                _recovery_pr=true
+                if [ "$TASK_SOURCE" = "file" ]; then
+                  _recovery_pr_num="${_new_pr_url##*/}"
+                  mark_task_in_flight "$TASKS_FILE_ABS" "$DISPATCHED_TASK_ID" "$_recovery_pr_num" \
+                    || die "could not mark task ${DISPATCHED_TASK_ID} in-flight in $TASKS_FILE_ABS — recovery PR #${_recovery_pr_num} is pushed and safe; fix the heading before the next run"
+                fi
+              else
+                log_event "Recovery: could not open recovery PR: $_new_pr_url"
               fi
-            else
-              log_event "Recovery: could not open recovery PR: $_new_pr_url"
             fi
           else
             log_event "Recovery: could not push $_recover_branch to origin — work is lost."

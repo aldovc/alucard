@@ -36,7 +36,8 @@ unset ALUCARD_WORKER_MAX_TURNS ALUCARD_WORKER_MAX_BUDGET \
       ALUCARD_CI_FIX_MAX_TURNS ALUCARD_CI_FIX_MAX_BUDGET \
       ALUCARD_REVIEWER_MAX_TURNS ALUCARD_REVIEWER_MAX_BUDGET \
       ALUCARD_FEEDBACK_MAX_TURNS ALUCARD_FEEDBACK_MAX_BUDGET \
-      ALUCARD_CLAUDE_MODEL ALUCARD_CLAUDE_FALLBACK_MODEL
+      ALUCARD_CLAUDE_MODEL ALUCARD_CLAUDE_FALLBACK_MODEL \
+      ALUCARD_TRANSPORT_RETRY_ATTEMPTS
 
 # Source alucard to load helper functions without running main.
 # The BASH_SOURCE guard in alucard prevents main from executing when sourced.
@@ -98,6 +99,35 @@ assert_claude_args review-override 21 4 opus sonnet
 
 invoke_and_capture feedback-override "$DEFAULT_FEEDBACK_MAX_TURNS" "$DEFAULT_FEEDBACK_MAX_BUDGET"
 assert_claude_args feedback-override 51 5 opus sonnet
+
+# ── Test group 3: transport retry attempts are validated before arithmetic ───
+
+ALUCARD_TRANSPORT_RETRY_ATTEMPTS=3
+refresh_agent_settings
+assert_eq "transport retry override is a non-negative integer" "true" "$(is_uint "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS" && echo true || echo false)"
+assert_eq "transport retry override adds one initial attempt" "4" "$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))"
+
+ALUCARD_TRANSPORT_RETRY_ATTEMPTS=0
+refresh_agent_settings
+assert_eq "zero transport retry override keeps the initial attempt" "1" "$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))"
+
+ALUCARD_TRANSPORT_RETRY_ATTEMPTS=08
+refresh_agent_settings
+assert_eq "leading-zero transport retry override remains decimal" "9" "$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))"
+
+assert_invalid_transport_retries() {
+  local label="$1" value="$2"
+  ALUCARD_TRANSPORT_RETRY_ATTEMPTS="$value"
+  refresh_agent_settings
+  if is_uint "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS"; then
+    fail "$label (expected validation failure)"
+  else
+    pass "$label"
+  fi
+}
+
+assert_invalid_transport_retries "negative transport retries are rejected" "-1"
+assert_invalid_transport_retries "malformed transport retries are rejected" "two"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
