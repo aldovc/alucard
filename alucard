@@ -428,10 +428,11 @@ classify_agent_failure() {
     return 0
   fi
 
-  local _subtype _is_error _result_text
+  local _subtype _is_error _result_text _api_error_status
   _subtype=$(echo "$_result_line" | jq -r '.subtype // "unknown"')
   _is_error=$(echo "$_result_line" | jq -r '.is_error // false')
   _result_text=$(echo "$_result_line" | jq -r '.result // ""')
+  _api_error_status=$(echo "$_result_line" | jq -r '.api_error_status // empty')
 
   if [ "$_subtype" = "error_max_turns" ]; then
     echo "exhausted"
@@ -443,7 +444,20 @@ classify_agent_failure() {
     return 0
   fi
 
-  if echo "$_result_text" | grep -qiE "$_transport_pattern"; then
+  # api_error_status is an HTTP status the provider reported, not text a
+  # worker wrote -- 429/5xx is transport regardless of what .result says.
+  case "$_api_error_status" in
+    429 | 5[0-9][0-9]) echo "transport"; return 0 ;;
+  esac
+
+  # .result is the same field a successful worker writes its own task
+  # summary into, so the regex is only trustworthy when is_error marks the
+  # text as provider-authored rather than model prose that happens to
+  # mention "rate limit" or "connection closed" while describing real work
+  # (see #62). Anchoring to the start of the text further narrows the
+  # match: a real API error leads with "API Error: ...", free-form prose
+  # almost never does.
+  if [ "$_is_error" = "true" ] && echo "$_result_text" | grep -qiE "^($_transport_pattern)"; then
     echo "transport"
     return 0
   fi
