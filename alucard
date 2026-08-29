@@ -51,20 +51,6 @@ refresh_agent_settings() {
   DEFAULT_TRANSPORT_RETRY_ATTEMPTS="${ALUCARD_TRANSPORT_RETRY_ATTEMPTS:-$DEFAULT_TRANSPORT_RETRY_ATTEMPTS}"
 }
 
-# Print the total worker attempts (initial attempt plus configured retries).
-# Keeping validation beside the arithmetic prevents shell expressions in an
-# environment setting from changing control flow under `set -u`.
-transport_retry_total_attempts() {
-  local retry_attempts="$1"
-
-  if ! [[ "$retry_attempts" =~ ^[0-9]+$ ]]; then
-    echo "Error: ALUCARD_TRANSPORT_RETRY_ATTEMPTS must be a non-negative integer; got '$retry_attempts'." >&2
-    return 1
-  fi
-
-  printf '%d\n' "$(( retry_attempts + 1 ))"
-}
-
 usage() {
   cat <<'EOF'
 Usage:
@@ -2218,9 +2204,11 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
     fi
 
     _worker_provider=$(resolve_provider WORKER)
-    if ! _total_worker_attempts=$(transport_retry_total_attempts "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS"); then
+    if ! is_uint "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS"; then
+      echo "Error: ALUCARD_TRANSPORT_RETRY_ATTEMPTS must be a non-negative integer; got '$DEFAULT_TRANSPORT_RETRY_ATTEMPTS'." >&2
       exit 1
     fi
+    _total_worker_attempts=$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))
     _worker_class="failed"
     for ((_attempt=1; _attempt<=_total_worker_attempts; _attempt++)); do
       if [ "$_attempt" -gt 1 ]; then

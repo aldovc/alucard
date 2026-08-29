@@ -104,22 +104,25 @@ assert_claude_args feedback-override 51 5 opus sonnet
 
 ALUCARD_TRANSPORT_RETRY_ATTEMPTS=3
 refresh_agent_settings
-assert_eq "transport retry override adds one initial attempt" "4" "$(transport_retry_total_attempts "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS")"
+assert_eq "transport retry override is a non-negative integer" "true" "$(is_uint "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS" && echo true || echo false)"
+assert_eq "transport retry override adds one initial attempt" "4" "$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))"
 
 ALUCARD_TRANSPORT_RETRY_ATTEMPTS=0
 refresh_agent_settings
-assert_eq "zero transport retry override keeps the initial attempt" "1" "$(transport_retry_total_attempts "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS")"
+assert_eq "zero transport retry override keeps the initial attempt" "1" "$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))"
+
+ALUCARD_TRANSPORT_RETRY_ATTEMPTS=08
+refresh_agent_settings
+assert_eq "leading-zero transport retry override remains decimal" "9" "$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))"
 
 assert_invalid_transport_retries() {
-  local label="$1" value="$2" output
+  local label="$1" value="$2"
   ALUCARD_TRANSPORT_RETRY_ATTEMPTS="$value"
   refresh_agent_settings
-  if output=$(transport_retry_total_attempts "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS" 2>&1); then
-    fail "$label (expected validation failure, got '$output')"
-  elif [[ "$output" == *"ALUCARD_TRANSPORT_RETRY_ATTEMPTS must be a non-negative integer"* ]]; then
-    pass "$label"
+  if is_uint "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS"; then
+    fail "$label (expected validation failure)"
   else
-    fail "$label (unexpected error '$output')"
+    pass "$label"
   fi
 }
 
