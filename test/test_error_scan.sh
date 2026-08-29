@@ -212,7 +212,7 @@ cat > "$claude_unrecognized_log" <<'EOF'
 EOF
 
 out=$(classify_agent_failure "$claude_unrecognized_log" "claude" "1")
-assert_eq "a non-zero exit with an unrecognized result classifies as failed" "failed" "$out"
+assert_eq "a contradictory Claude result record classifies as transport regardless of result text" "transport" "$out"
 
 # ── #62: a worker's own summary must not be misread as a transport drop ────
 echo "── classify_agent_failure: worker prose vs. real transport signals ──"
@@ -233,6 +233,14 @@ EOF
 
 out=$(classify_agent_failure "$claude_http_status_log" "claude" "1")
 assert_eq "api_error_status 429 classifies as transport regardless of result text" "transport" "$out"
+
+claude_5xx_status_log="$TMP_ROOT/claude-5xx-status.jsonl"
+cat > "$claude_5xx_status_log" <<'EOF'
+{"type":"result","subtype":"error","is_error":true,"api_error_status":503,"result":"Service unavailable."}
+EOF
+
+out=$(classify_agent_failure "$claude_5xx_status_log" "claude" "1")
+assert_eq "api_error_status 503 classifies as transport regardless of result text" "transport" "$out"
 
 claude_incident_log="$TMP_ROOT/claude-incident.jsonl"
 cat > "$claude_incident_log" <<'EOF'

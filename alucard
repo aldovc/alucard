@@ -450,6 +450,13 @@ classify_agent_failure() {
     429 | 5[0-9][0-9]) echo "transport"; return 0 ;;
   esac
 
+  # A success subtype paired with an error flag is a contradictory provider
+  # result record, so retry it even if the provider changes its error wording.
+  if [ "$_subtype" = "success" ] && [ "$_is_error" = "true" ]; then
+    echo "transport"
+    return 0
+  fi
+
   # .result is the same field a successful worker writes its own task
   # summary into, so the regex is only trustworthy when is_error marks the
   # text as provider-authored rather than model prose that happens to
