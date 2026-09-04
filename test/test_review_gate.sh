@@ -263,6 +263,77 @@ empty_hash=$(build_inputs_hash "$empty_dir") || _rc=$?
 assert_eq "missing build inputs is not fatal" "0" "$_rc"
 assert_eq "missing build inputs still yields a digest" "64" "${#empty_hash}"
 
+# ── Test group 4: no_verdict_reason ──────────────────────────────────────────
+# A review cycle that ends with no verdict means the PR was never reviewed.
+# The reason line is what the operator reads on the PR the next morning, so
+# each failure class has to name a different next action.
+echo ""
+echo "── no_verdict_reason ──"
+
+TIMEOUT_MIN=30
+
+assert_contains "exhausted names the caps to raise" \
+  "ALUCARD_REVIEWER_MAX_TURNS" "$(no_verdict_reason exhausted 1)"
+assert_contains "exhausted quotes the configured timeout" \
+  "30m" "$(no_verdict_reason exhausted 1)"
+
+assert_contains "transport says retries were spent" \
+  "every attempt" "$(no_verdict_reason transport 1)"
+assert_contains "transport points at alucard continue" \
+  "alucard continue" "$(no_verdict_reason transport 1)"
+
+assert_contains "wedged names the container wedge" \
+  "wedged" "$(no_verdict_reason wedged 137)"
+
+# The fallback must carry the exit code — it is the only signal left when the
+# class is just "the model stopped".
+assert_contains "failed fallback carries the rc" \
+  "rc=7" "$(no_verdict_reason failed 7)"
+assert_contains "failed fallback names the decision file" \
+  ".alucard-review" "$(no_verdict_reason failed 7)"
+
+# Every class must be distinguishable from every other — a shared string here
+# is the bug this helper exists to prevent.
+_reasons=$(for c in exhausted transport wedged failed; do no_verdict_reason "$c" 1; echo; done)
+assert_eq "each failure class yields a distinct reason" \
+  "4" "$(printf '%s' "$_reasons" | sort -u | wc -l | tr -d ' ')"
+
+# ── Test group 5: transport_attempt_budget ───────────────────────────────────
+# `alucard continue` reaches the review gate without ever running the worker
+# loop, so this validation has to live in the helper, not at that call site.
+echo ""
+echo "── transport_attempt_budget ──"
+
+DEFAULT_TRANSPORT_RETRY_ATTEMPTS=2
+assert_eq "2 retries means 3 attempts" "3" "$(transport_attempt_budget)"
+
+DEFAULT_TRANSPORT_RETRY_ATTEMPTS=0
+assert_eq "0 retries means a single attempt" "1" "$(transport_attempt_budget)"
+
+# Leading zeros must not be read as octal.
+DEFAULT_TRANSPORT_RETRY_ATTEMPTS=08
+assert_eq "leading zeros are decimal, not octal" "9" "$(transport_attempt_budget)"
+
+DEFAULT_TRANSPORT_RETRY_ATTEMPTS=abc
+_budget_rc=0
+_budget_err=$( (transport_attempt_budget) 2>&1 ) || _budget_rc=$?
+if [ "$_budget_rc" -ne 0 ]; then
+  pass "a non-numeric override is fatal"
+else
+  fail "a non-numeric override is fatal (got '$_budget_err')"
+fi
+assert_contains "the fatal message names the variable" \
+  "ALUCARD_TRANSPORT_RETRY_ATTEMPTS" "$_budget_err"
+
+DEFAULT_TRANSPORT_RETRY_ATTEMPTS=-1
+_budget_rc=0
+(transport_attempt_budget) >/dev/null 2>&1 || _budget_rc=$?
+if [ "$_budget_rc" -ne 0 ]; then
+  pass "a negative override is fatal"
+else
+  fail "a negative override is fatal"
+fi
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
