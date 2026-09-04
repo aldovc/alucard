@@ -24,7 +24,7 @@ DEFAULT_WORKER_MAX_TURNS="${ALUCARD_WORKER_MAX_TURNS:-180}"
 DEFAULT_WORKER_MAX_BUDGET="${ALUCARD_WORKER_MAX_BUDGET:-10}"
 DEFAULT_CI_FIX_MAX_TURNS="${ALUCARD_CI_FIX_MAX_TURNS:-30}"
 DEFAULT_CI_FIX_MAX_BUDGET="${ALUCARD_CI_FIX_MAX_BUDGET:-2}"
-DEFAULT_REVIEWER_MAX_TURNS="${ALUCARD_REVIEWER_MAX_TURNS:-20}"
+DEFAULT_REVIEWER_MAX_TURNS="${ALUCARD_REVIEWER_MAX_TURNS:-45}"
 DEFAULT_REVIEWER_MAX_BUDGET="${ALUCARD_REVIEWER_MAX_BUDGET:-2}"
 DEFAULT_FEEDBACK_MAX_TURNS="${ALUCARD_FEEDBACK_MAX_TURNS:-50}"
 DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-2}"
@@ -124,7 +124,7 @@ Environment:
   ALUCARD_WORKER_MAX_BUDGET    Worker --max-budget-usd (Claude only). Default: 10
   ALUCARD_CI_FIX_MAX_TURNS     CI-fix --max-turns (Claude only). Default: 30
   ALUCARD_CI_FIX_MAX_BUDGET    CI-fix --max-budget-usd (Claude only). Default: 2
-  ALUCARD_REVIEWER_MAX_TURNS   Reviewer --max-turns (Claude only). Default: 20
+  ALUCARD_REVIEWER_MAX_TURNS   Reviewer --max-turns (Claude only). Default: 45
   ALUCARD_REVIEWER_MAX_BUDGET  Reviewer --max-budget-usd (Claude only). Default: 2
   ALUCARD_FEEDBACK_MAX_TURNS   Feedback --max-turns (Claude only). Default: 50
   ALUCARD_FEEDBACK_MAX_BUDGET  Feedback --max-budget-usd (Claude only). Default: 2
@@ -166,6 +166,16 @@ need_cmd() {
 
 is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+# Total attempts a retryable role gets: one initial run plus the configured
+# transport retries. Validated on every call rather than once at startup
+# because `alucard continue` enters the review gate without going through the
+# run loop, and a typo'd override must not reach the arithmetic below.
+transport_attempt_budget() {
+  is_uint "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS" \
+    || die "ALUCARD_TRANSPORT_RETRY_ATTEMPTS must be a non-negative integer; got '$DEFAULT_TRANSPORT_RETRY_ATTEMPTS'"
+  printf '%s' "$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))"
 }
 
 xml_escape() {
@@ -1798,6 +1808,32 @@ resolve_review_verdict() {
   esac
 }
 
+# Explain why a review cycle produced no verdict, given the failure class from
+# classify_agent_failure. The distinction matters to the operator reading the
+# PR the next morning: "the reviewer ran out of turns" is a harness cap to
+# raise, "the reviewer declined to decide" is a prompt problem, and the two
+# used to render as the same bland "no review posted" line.
+#
+# $1 = failure class, $2 = agent exit code
+# Echoes a one-line reason.
+no_verdict_reason() {
+  local class="$1" rc="$2"
+  case "$class" in
+    exhausted)
+      printf 'The reviewer hit a harness cap (max turns, budget, or the %sm timeout) before recording a verdict. Raise `ALUCARD_REVIEWER_MAX_TURNS` / `ALUCARD_REVIEWER_MAX_BUDGET` if this repeats.' "${TIMEOUT_MIN:-?}"
+      ;;
+    transport)
+      printf 'The reviewer lost its provider connection on every attempt. Nothing was reviewed; re-run `alucard continue` for this PR.'
+      ;;
+    wedged)
+      printf 'The reviewer container wedged (its working directory went away) and was killed. Nothing was reviewed.'
+      ;;
+    *)
+      printf 'The reviewer exited (rc=%s) without recording a verdict in `.alucard-review` and without posting a formal review.' "$rc"
+      ;;
+  esac
+}
+
 # Run reviewer then feedback agents on the open PR, up to MAX_REVIEW_CYCLES times.
 # $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
 # $4 = task XML (file mode only, empty in github mode)
@@ -1834,14 +1870,6 @@ review_gate() {
   for review_cycle in $(seq 1 "$MAX_REVIEW_CYCLES"); do
     echo "Review cycle $review_cycle/$MAX_REVIEW_CYCLES — running reviewer agent..."
 
-    wt_review="${WT_ROOT}/review-${iter}-${review_cycle}"
-    local review_out_dir
-    review_out_dir=$(mktemp -d /tmp/alucard_review.XXXXXX)
-    CREATED_WORKTREES+=("$wt_review" "$review_out_dir")
-    make_agent_clone "$branch" "$wt_review" "$origin_url"
-
-    review_log="$LOG_DIR/iter-${iter}-review-${review_cycle}.jsonl"
-
     local _review_prompt
     _review_prompt="<instructions>
 $(<"$TOOL_DIR/alucard-reviewer-prompt.md")
@@ -1856,30 +1884,62 @@ $(printf '%s' "${blocked_ledger:-None recorded.}" | xml_escape)
 </known_blockers>"
     _review_prompt=$(append_task_context "$_review_prompt" "$task_xml" "$parent_context_xml")
 
-    set +e
-    invoke_agent \
-      "review-${iter}-${review_cycle}" \
-      "$review_log" \
-      "$DEFAULT_REVIEWER_MAX_TURNS" "$DEFAULT_REVIEWER_MAX_BUDGET" \
-      "$_review_prompt" \
-      -v "$wt_review:/work:ro" \
-      -v "$review_out_dir:/work-output:rw" \
-      -e "ALUCARD_ITER=${iter}-review-${review_cycle}"
-    review_rc=$?
-    set -e
+    # A transport drop tells us nothing about the PR, so it gets the same
+    # fresh-attempt treatment the worker gets rather than burning a review
+    # cycle. Every other class breaks out after one attempt: re-running an
+    # exhausted reviewer against the same turn cap just spends the cap again.
+    local _review_provider _total_review_attempts _review_attempt
+    local _review_class="failed" _review_file_state="" _review_file_body=""
+    _review_provider=$(resolve_provider REVIEWER)
+    _total_review_attempts=$(transport_attempt_budget)
 
-    echo ""
+    for ((_review_attempt=1; _review_attempt<=_total_review_attempts; _review_attempt++)); do
+      wt_review="${WT_ROOT}/review-${iter}-${review_cycle}-${_review_attempt}"
+      local review_out_dir
+      review_out_dir=$(mktemp -d /tmp/alucard_review.XXXXXX)
+      CREATED_WORKTREES+=("$wt_review" "$review_out_dir")
+      make_agent_clone "$branch" "$wt_review" "$origin_url"
 
-    # Read reviewer output files (written to the separate rw output dir).
-    local _review_file_state="" _review_file_body=""
-    if [ -f "$review_out_dir/.alucard-review" ]; then
-      _review_file_state=$(tr -d '[:space:]' < "$review_out_dir/.alucard-review")
-    fi
-    if [ -f "$review_out_dir/.alucard-review-body" ]; then
-      _review_file_body=$(< "$review_out_dir/.alucard-review-body")
-    fi
+      # First attempt keeps the unsuffixed name so the usage table's label for
+      # the common case is unchanged; retries get a suffix, as the worker's do.
+      review_log="$LOG_DIR/iter-${iter}-review-${review_cycle}.jsonl"
+      [ "$_review_attempt" -gt 1 ] \
+        && review_log="$LOG_DIR/iter-${iter}-review-${review_cycle}-attempt-${_review_attempt}.jsonl"
 
-    rm -rf "$wt_review" "$review_out_dir" || true
+      set +e
+      invoke_agent \
+        "review-${iter}-${review_cycle}" \
+        "$review_log" \
+        "$DEFAULT_REVIEWER_MAX_TURNS" "$DEFAULT_REVIEWER_MAX_BUDGET" \
+        "$_review_prompt" \
+        -v "$wt_review:/work:ro" \
+        -v "$review_out_dir:/work-output:rw" \
+        -e "ALUCARD_ITER=${iter}-review-${review_cycle}"
+      review_rc=$?
+      set -e
+
+      echo ""
+
+      # Read reviewer output files (written to the separate rw output dir).
+      _review_file_state="" _review_file_body=""
+      if [ -f "$review_out_dir/.alucard-review" ]; then
+        _review_file_state=$(tr -d '[:space:]' < "$review_out_dir/.alucard-review")
+      fi
+      if [ -f "$review_out_dir/.alucard-review-body" ]; then
+        _review_file_body=$(< "$review_out_dir/.alucard-review-body")
+      fi
+
+      rm -rf "$wt_review" "$review_out_dir" || true
+
+      _review_class=$(classify_agent_failure "$review_log" "$_review_provider" "$review_rc")
+      log_event "Review gate: cycle $review_cycle attempt $_review_attempt/$_total_review_attempts: rc=$review_rc class=$_review_class"
+
+      # A reviewer that recorded its verdict before the connection dropped has
+      # already done the work — take it rather than paying for it twice.
+      [ -n "$_review_file_state" ] && break
+      [ "$_review_class" != "transport" ] && break
+      log_event "Review gate: transport failure on attempt $_review_attempt — retrying reviewer."
+    done
 
     review_state=$(cd "$REPO_ABS" && \
       gh pr view "$pr_num" --json reviews \
@@ -1945,11 +2005,18 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
       return 0
     fi
 
+    # No verdict means this PR was never reviewed. Returning quietly leaves it
+    # looking like every gate passed, so it is labelled for a human the same
+    # way a BLOCKED or cycle-exhausted PR is.
     if [ -z "$review_state" ]; then
-      log_event "Review gate: reviewer did not post a review (rc=$review_rc) — skipping."
+      log_event "Review gate: no verdict on PR #$pr_num (rc=$review_rc class=$_review_class) — flagging for human."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: no review posted** (rc=${review_rc})" \
-        2>/dev/null || true
+        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: no review posted — needs human** (rc=${review_rc}, class=${_review_class})
+
+$(no_verdict_reason "$_review_class" "$review_rc")
+
+**This PR has not been reviewed.** Nothing below this gate ran for it." 2>/dev/null || true
+      cd "$REPO_ABS" && gh pr edit "$pr_num" --add-label "needs-human" 2>/dev/null || true
       return 0
     fi
 
@@ -2280,11 +2347,7 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
     fi
 
     _worker_provider=$(resolve_provider WORKER)
-    if ! is_uint "$DEFAULT_TRANSPORT_RETRY_ATTEMPTS"; then
-      echo "Error: ALUCARD_TRANSPORT_RETRY_ATTEMPTS must be a non-negative integer; got '$DEFAULT_TRANSPORT_RETRY_ATTEMPTS'." >&2
-      exit 1
-    fi
-    _total_worker_attempts=$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))
+    _total_worker_attempts=$(transport_attempt_budget)
     _worker_class="failed"
     for ((_attempt=1; _attempt<=_total_worker_attempts; _attempt++)); do
       if [ "$_attempt" -gt 1 ]; then

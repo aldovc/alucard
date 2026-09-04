@@ -56,7 +56,7 @@ flowchart TD
 
 ## Loop convergence
 
-The review gate can end four ways:
+The review gate can end five ways:
 
 | Verdict | What it means | What happens |
 |---|---|---|
@@ -64,8 +64,11 @@ The review gate can end four ways:
 | `CHANGES_REQUESTED` | Merge-blocking issues **a feedback agent can fix in the container**. | Feedback agent runs, then the next cycle. |
 | `BLOCKED` | Code work is done; merge is gated on something no agent can do, a human-only acceptance criterion, a live deploy, a credential the container does not hold. | Loop ends, PR labeled `needs-human`, reviewer's reasoning posted. |
 | *(cycles exhausted)* | The loop hit `--max-review-cycles`. | PR left open for manual review. |
+| *(no verdict)* | The reviewer produced neither a formal review nor a `.alucard-review` file — it ran out of turns or budget, wedged, or lost its connection on every attempt. | Loop ends, PR labeled `needs-human`, with the failure class and what to raise. A transport drop is retried first (`ALUCARD_TRANSPORT_RETRY_ATTEMPTS`). |
 
 Without `BLOCKED`, the loop had only two ends: approval or exhaustion. A finding no agent could act on was re-reported until the budget ran out. [zodiac#40](https://github.com/aldovc/zodiac/pull/40) is the failure mode this fixes. 25 review cycles across 4 runs, ~20 of them re-reporting the same "trigger the Cloud Scheduler job manually and attach production evidence" finding into a container with no `gcloud`. Zero approvals. The feedback agent eventually drifted into rewriting unrelated production logic, because that was the only thing it *could* change.
+
+A no-verdict cycle used to `return 0` after a one-line "no review posted (rc=N)" comment, so a PR that was never reviewed looked the same as one that passed every gate — [zodiac#122](https://github.com/aldovc/zodiac/pull/122) hit this when the reviewer exhausted its 20-turn cap mid-orientation. It is now labeled `needs-human` like any other outcome a human has to pick up, and the reviewer's turn cap defaults to 45.
 
 Three mechanisms keep the loop converging:
 
@@ -85,7 +88,7 @@ Three mechanisms keep the loop converging:
 4. **PR-only output.** The agent never pushes to main. Branch protection on main as belt-and-suspenders.
 5. **Credential scoping.** GitHub token is a fine-grained PAT, single repo, 30-day expiry. Anthropic and OpenAI keys are dedicated worker keys with a monthly budget cap set in the console.
 6. **Pattern blacklist (last line).** `--disallowedTools` removes obvious foot-guns like `rm -rf /*`, `sudo`, `curl | sh`. Pattern-matching is leaky but cheap.
-7. **Hard caps per iteration.** Worker: `--max-turns 180`, `--max-budget-usd 10`, `timeout 30m`. CI-fix 30/$2, reviewer 20/$2, feedback 50/$2. All except the timeout are overridable via `ALUCARD_*` env vars. See `alucard.env.example`.
+7. **Hard caps per iteration.** Worker: `--max-turns 180`, `--max-budget-usd 10`, `timeout 30m`. CI-fix 30/$2, reviewer 45/$2, feedback 50/$2. All except the timeout are overridable via `ALUCARD_*` env vars. See `alucard.env.example`.
 
 **What's still possible.** Credential exfiltration via network, bounded by token scoping. Worst case, an attacker gets push access to one repo for up to 30 days. Recoverable.
 
