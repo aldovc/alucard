@@ -282,9 +282,34 @@ BUILD_INPUTS_LABEL="alucard.build-inputs"
 
 # Build the image, stamping it with the hash of its build inputs. The label is
 # image config, not a layer, so it updates even when every layer is cached.
+#
+# Retagging :latest orphans the previous image as a dangling ~1.6GB layer set,
+# so a rebuild also drops its own predecessor. Three conditions guard the
+# delete, because "the tag moved" is not by itself proof the old image is
+# garbage: the build must have succeeded (a failed build must never leave the
+# host with no image at all), the ID must actually have changed (a fully cached
+# rebuild reuses it), and the old ID must carry no remaining tags (another tag
+# pointing at it means someone wants it kept). A running container can still
+# hold the image, so the removal itself is advisory.
 build_image() {
   local image="$1" hash="$2"
-  docker build --label "${BUILD_INPUTS_LABEL}=${hash}" -t "$image" "$TOOL_DIR"
+  local _prev_id _new_id _prev_tags
+
+  _prev_id=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)
+
+  docker build --label "${BUILD_INPUTS_LABEL}=${hash}" -t "$image" "$TOOL_DIR" || return $?
+
+  [ -n "$_prev_id" ] || return 0
+  _new_id=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)
+  [ -n "$_new_id" ] && [ "$_new_id" != "$_prev_id" ] || return 0
+
+  _prev_tags=$(docker image inspect -f '{{len .RepoTags}}' "$_prev_id" 2>/dev/null || echo 1)
+  if [ "$_prev_tags" = "0" ]; then
+    echo "Removing superseded image ${_prev_id:7:12}..."
+    docker rmi "$_prev_id" >/dev/null 2>&1 \
+      || echo "Warning: could not remove superseded image ${_prev_id:7:12} (a container may still hold it)." >&2
+  fi
+  return 0
 }
 
 ensure_image() {
@@ -1417,7 +1442,10 @@ command_build() {
   done
 
   need_cmd docker
-  docker build -t "$IMAGE" "$TOOL_DIR"
+  # Must go through build_image, not a bare `docker build`: an unstamped image
+  # defeats the staleness check in ensure_image, which then warns the image
+  # "predates this check" or rebuilds what was just built.
+  build_image "$IMAGE" "$(build_inputs_hash "$TOOL_DIR")"
 }
 
 command_version() {

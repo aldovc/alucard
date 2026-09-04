@@ -90,6 +90,8 @@ Three mechanisms keep the loop converging:
 6. **Pattern blacklist (last line).** `--disallowedTools` removes obvious foot-guns like `rm -rf /*`, `sudo`, `curl | sh`. Pattern-matching is leaky but cheap.
 7. **Hard caps per iteration.** Worker: `--max-turns 180`, `--max-budget-usd 10`, `timeout 30m`. CI-fix 30/$2, reviewer 45/$2, feedback 50/$2. All except the timeout are overridable via `ALUCARD_*` env vars. See `alucard.env.example`.
 
+The image is stamped with a `alucard.build-inputs` label — a digest of `Dockerfile` + `entrypoint.sh`. Every run compares it and rebuilds when it drifts, so a Dockerfile fix cannot sit inert behind a cached tag. A rebuild also removes the image it supersedes, which would otherwise be orphaned as ~1.6GB of dangling layers; the old image is kept if another tag still points at it, if the rebuild was fully cached (same image ID), or if the build failed.
+
 **What's still possible.** Credential exfiltration via network, bounded by token scoping. Worst case, an attacker gets push access to one repo for up to 30 days. Recoverable.
 
 ## File layout
@@ -360,7 +362,7 @@ These are choices the operator hasn't locked yet. Surface them rather than guess
 # Pull the latest pre-built image
 docker pull ghcr.io/aldovc/alucard:latest
 
-# Build a local custom image
+# Build a local custom image (stamps the staleness label, drops the image it supersedes)
 alucard build
 
 # Run unattended (20 iterations max, 30 min each) — uses ghcr.io/aldovc/alucard:latest by default
