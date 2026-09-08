@@ -140,6 +140,31 @@ observed heads, and independent pass/fail output are preserved under
 `logs/pilot-arm1-20260908-446/` (gitignored, 2.5 MB at capture), not only in /tmp.
 The original isolated checkouts remain at `/tmp/alucard-pilot-446.8CmoPW`.
 
+### Selected next task: family-brain #460
+
+`feat(finance): receipt ingest correctness`. Chosen because its implementation
+must touch several sites of the same defect class, which is the one thing this
+pair could not test. Site inventory taken from the current tree, not the issue
+text (the issue's line references were checked and are accurate):
+
+| Class | Sites | Where |
+|---|---:|---|
+| Unmatched query does not exclude non-`processed` rows | 3 | `finance/receipts/repository_psql.py` `SQL_COUNT_UNMATCHED:74`, `SQL_LIST_UNMATCHED_RECEIPTS:122`, `SQL_LIST_UNMATCHED_IN_RANGE:131` — reached from `household_observer.py`, `matcher.py`, `service.py` |
+| Write is not idempotent under retry | 2 | `repository_psql.py` `create_receipt_items:230`, `update_receipt_extraction:291` |
+| Synchronous Pillow decode on an async path | 2 | `receipts/service.py` `_resize_image:27`, and the new pre-extraction downscale |
+
+All sites sit in files the change must touch, so a sweeping reviewer can report
+them without leaving the PR's scope — which the previous task could not offer.
+Three independent classes also means a failed sweep on one is still observable
+against the other two.
+
+**#447 was rejected, with evidence.** Its class — a tool's `content` asserting
+requested rather than applied identity — has exactly one site in the codebase:
+`home_routines_edit.py:351`. Every sibling write tool (bookstack books, shelves,
+chapters and pages, tasks, calendar, `home_entities`) already names the applied
+result. A sweep there would correctly find nothing to consolidate, so the task
+cannot test the instruction either way.
+
 Treat this as a successful operational pilot with unequal quality outcomes.
 Before expanding, incorporate the final-CI-head and visible-cost caveats into the
 procedure. Then select one further real, multi-site task where consolidation can
