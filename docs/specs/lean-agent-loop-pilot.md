@@ -77,20 +77,27 @@ cd ~/aldovc/alucard
 SWEEP_BRANCH=feat/lean-loop-step-2
 PRE_SWEEP=e8df226            # last commit before the class-sweep section
 
-# Generate the control arm from the sweep HEAD, so the two differ in one file.
-git branch -f pilot/arm1-control "$SWEEP_BRANCH"
+# Capture the sweep SHA once. Everything below pins to it, so a commit landing
+# mid-pilot cannot move an arm underneath the comparison.
+SWEEP_SHA=$(git rev-parse "$SWEEP_BRANCH")
+
+# Detached, at that SHA. `git worktree add <path> <branch>` fails when the
+# branch is already checked out somewhere — which it is, in this very
+# repository — so the branch name cannot be used here.
+git worktree add --detach "$PILOT/sweep-tool" "$SWEEP_SHA"
+
+# Generate the control arm from the same SHA, so the two differ in one file.
+git branch -f pilot/arm1-control "$SWEEP_SHA"
 git worktree add "$PILOT/control-tool" pilot/arm1-control
 git -C "$PILOT/control-tool" checkout "$PRE_SWEEP" -- alucard-reviewer-prompt.md
 git -C "$PILOT/control-tool" commit -qm "pilot(control): reviewer prompt without the class-sweep section"
-
-git worktree add "$PILOT/sweep-tool" "$SWEEP_BRANCH"
 
 # alucard.env is gitignored, so neither checkout has one; pass it explicitly.
 ENVFILE=~/aldovc/alucard/alucard.env
 IMAGE=ghcr.io/aldovc/alucard:latest
 
 # Must print exactly one path. Anything else and the arms are not comparable.
-git -C "$PILOT/control-tool" diff --name-only HEAD "$SWEEP_BRANCH"
+git -C "$PILOT/control-tool" diff --name-only HEAD "$SWEEP_SHA"
 
 # Both checkouts must be clean; a dirty tree makes the recorded prompt digest
 # describe something that is not in any commit.
@@ -132,9 +139,28 @@ TASK=ha-cover                        # repeat this block per task
   --env-file "$ENVFILE" --image "$IMAGE" \
   --iterations 1 --timeout-minutes 30 --max-review-cycles 0
 
-SEED_PR=$(gh pr list --repo aldovc/family-brain --state open --label alucard \
-  --json number --jq '.[0].number')
-W=$(gh pr view "$SEED_PR" --repo aldovc/family-brain --json headRefOid --jq .headRefOid)
+# Resolve the seed from *this run's own records*, never from a repository-wide
+# PR query: if the seed run failed or found no eligible task, the newest open
+# `alucard`-labelled PR is somebody else's work, and the fork and close below
+# would then operate on it.
+SEED_MEAS="$PILOT/seed/$TASK"/alucard-*/measurements.jsonl
+SEED_PR=$(jq -rs '[.[]|select(.record=="stage" and .stage=="worker")]|.[0].pr // empty' $SEED_MEAS)
+W=$(jq -rs '[.[]|select(.record=="stage" and .stage=="worker")]|.[0].head_sha // empty' $SEED_MEAS)
+SEED_CI=$(jq -rs '[.[]|select(.record=="iteration")]|.[0].ci_result // empty' $SEED_MEAS)
+
+[ -n "$SEED_PR" ] || { echo "STOP: seed run for $TASK produced no PR"; exit 1; }
+[ "$SEED_CI" = "green" ] || { echo "STOP: seed PR #$SEED_PR CI is '${SEED_CI:-unknown}'"; exit 1; }
+
+# Cross-check against GitHub: the branch must be this run's, and the head must
+# still be what the run recorded.
+SEED_BRANCH=$(gh pr view "$SEED_PR" --repo aldovc/family-brain --json headRefName --jq .headRefName)
+SEED_HEAD=$(gh pr view "$SEED_PR" --repo aldovc/family-brain --json headRefOid --jq .headRefOid)
+case "$SEED_BRANCH" in
+  alucard/iter-*) ;;
+  *) echo "STOP: seed PR #$SEED_PR is on '$SEED_BRANCH', not an alucard branch"; exit 1 ;;
+esac
+[ "$SEED_HEAD" = "$W" ] || { echo "STOP: seed PR #$SEED_PR head moved since the run"; exit 1; }
+
 gh pr view "$SEED_PR" --repo aldovc/family-brain --json body --jq .body > "$PILOT/$TASK-body.md"
 
 # ── 2. Fork the identical worker head into both arms ─────────────────────────
@@ -153,17 +179,34 @@ done
 gh pr close "$SEED_PR" --repo aldovc/family-brain
 
 # ── 3. Review loops, one per arm, sequentially ───────────────────────────────
+# The head is checked *immediately before* each arm starts, while it is still
+# expected to equal W. Checking afterwards would fail on every successful arm,
+# because feedback commits necessarily move the head. Both the verified initial
+# head and the final head are recorded for the comparison below.
 while IFS=$'\t' read -r task arm pr w; do
   [ "$task" = "$TASK" ] || continue
+
+  before=$(gh pr view "$pr" --repo aldovc/family-brain --json headRefOid --jq .headRefOid)
+  if [ "$before" != "$w" ]; then
+    echo "SKIP: $task/$arm PR#$pr starts at $before, not the shared head $w"
+    continue
+  fi
+
   "$PILOT/$arm-tool/alucard" continue "$pr" "$REPO" \
     --logs-root "$PILOT/$arm/logs" \
     --env-file "$ENVFILE" --image "$IMAGE" \
     --timeout-minutes 30 --max-review-cycles 10
+
+  after=$(gh pr view "$pr" --repo aldovc/family-brain --json headRefOid --jq .headRefOid)
+  printf '%s\t%s\t%s\t%s\t%s\n' "$task" "$arm" "$pr" "$w" "$after" \
+    >> "$PILOT/observed.tsv"
 done < "$PILOT/mapping.tsv"
 ```
 
-`mapping.tsv` is the pairing record — task, arm, PR, worker head. The result
-recipes below need it, because paired PRs have different numbers.
+`mapping.tsv` is the pairing record — task, arm, PR, shared worker head.
+`observed.tsv` adds the final head each arm reached, and is what the result
+recipes below read: paired PRs have different numbers, and the additions each
+arm made have to be measured from `W`, not from the PR's base.
 
 ## Check the pairing before judging anything
 
@@ -176,11 +219,13 @@ the pairs directly.
 awk -F'\t' '{k=$1; if (h[k] != "" && h[k] != $4) print "MISMATCH: " k; h[k]=$4}' \
   "$PILOT/mapping.tsv"
 
-# And the PRs must still be at that head — nothing rebased or force-pushed.
-while IFS=$'\t' read -r task arm pr w; do
-  now=$(gh pr view "$pr" --repo aldovc/family-brain --json headRefOid --jq .headRefOid)
-  case "$now" in "$w") ;; *) echo "MOVED: $task/$arm PR#$pr" ;; esac
-done < "$PILOT/mapping.tsv"
+# The start-of-arm head check already happened inline, immediately before each
+# `continue`, and an arm that failed it was skipped rather than recorded. So the
+# check here is simply that every planned arm actually ran. Re-querying heads now
+# would fail on every successful arm, since feedback commits move them.
+comm -13 <(cut -f1,2 "$PILOT/observed.tsv" | sort) \
+         <(cut -f1,2 "$PILOT/mapping.tsv" | sort) \
+  | sed 's/^/DID NOT RUN: /'
 
 # Belt and braces: no run should have seen its base move underneath it.
 jq -r 'select(.record=="stage" and .base_drifted==true)
@@ -216,18 +261,35 @@ done | awk -F'\t' 'NR==FNR{task[$3]=$1; head[$3]=$4; next}
   | sort -k1,1 -k2,2 \
   | column -t -N TASK,ARM,PR,WORKER_HEAD,CYCLES,SECONDS,INVOCATIONS,REVIEWS,VERDICT
 
-# Final diff per PR — how much the review loop added on top of the shared head.
-for arm in control sweep; do
-  jq -rs --arg arm "$arm" '[.[]|select(.record=="stage")]
-    | group_by(.pr)[] | (sort_by(.ts) | last) as $f
-    | [$arm, $f.pr, $f.stage, $f.cycle,
-       $f.from_base.tests.added, $f.from_base.impl.added, $f.from_base.added]
-    | @tsv' "$PILOT/$arm/logs"/*/measurements.jsonl
-done | awk -F'\t' 'NR==FNR{task[$3]=$1; next} {print task[$2]"\t"$0}' \
-    "$PILOT/mapping.tsv" - \
+# What each arm's review loop added on top of the shared worker head.
+#
+# This walks observed.tsv and diffs W..final directly, rather than reading stage
+# records, for two reasons. Stage records are written only when something moves
+# the head, so an arm that approved on cycle 1 with no edits produces none at
+# all and would vanish from the table — yet "changed nothing" is exactly the
+# result worth seeing. And `from_base` in a stage record is measured from the
+# PR's base, which includes the whole seed implementation; the question here is
+# what the *review loop* added above W.
+#
+# Sourcing the harness reuses measure_diff_json, so these numbers are bucketed
+# by the same rules as the artifact rather than by a second copy of them.
+source "$PILOT/sweep-tool/alucard"
+
+while IFS=$'\t' read -r task arm pr w final; do
+  git -C "$REPO" fetch -q origin "pilot/$task-$arm" 2>/dev/null || true
+  measure_diff_json "$REPO" "$w" "$final" \
+    | jq -r --arg t "$task" --arg a "$arm" --arg p "$pr" \
+        'if .unavailable then [$t,$a,$p,"UNAVAILABLE",.reason,"",""]
+         else [$t,$a,$p,(.tests.added|tostring),(.impl.added|tostring),
+               (.confdoc.added|tostring),(.added|tostring)] end
+         | @tsv'
+done < "$PILOT/observed.tsv" \
   | sort -k1,1 -k2,2 \
-  | column -t -N TASK,ARM,PR,LAST_STAGE,CYCLE,TESTS,IMPL,TOTAL
+  | column -t -N TASK,ARM,PR,TESTS,IMPL,CONFDOC,TOTAL_ABOVE_W
 ```
+
+A row of zeros is a real and interesting result: it means that arm's reviewer
+approved without requesting a change. Do not read it as missing data.
 
 `COST` is omitted because the reviewer runs on codex, which reports none; the
 `cost_complete` column in the first table says `partial` for exactly that
@@ -263,11 +325,11 @@ support a percentage claim or generalise to all work.
 
 ## Recording
 
-Save the two tables, `mapping.tsv`, and a short verdict beside this file as
+Save the two tables, `mapping.tsv`, `observed.tsv`, and a short verdict as
 `lean-agent-loop-pilot-arm1-results.md`, linking PR numbers and log directories.
-Note anything that broke a pairing — a mismatched worker head, a moved PR head,
-a drifted base, an image mismatch — because a broken pairing is worth knowing
-about and cheap to miss.
+Note anything that broke a pairing — a mismatched worker head, an arm that was
+skipped because its PR did not start at `W`, a drifted base, an image mismatch —
+because a broken pairing is worth knowing about and cheap to miss.
 
 ## Cleanup
 
