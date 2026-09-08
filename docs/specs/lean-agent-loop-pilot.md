@@ -145,16 +145,26 @@ TASK=ha-cover                        # repeat this block per task
 # would then operate on it.
 SEED_MEAS="$PILOT/seed/$TASK"/alucard-*/measurements.jsonl
 SEED_PR=$(jq -rs '[.[]|select(.record=="stage" and .stage=="worker")]|.[0].pr // empty' $SEED_MEAS)
-W=$(jq -rs '[.[]|select(.record=="stage" and .stage=="worker")]|.[0].head_sha // empty' $SEED_MEAS)
 SEED_CI=$(jq -rs '[.[]|select(.record=="iteration")]|.[0].ci_result // empty' $SEED_MEAS)
+
+# W is the *last* recorded stage head, not the worker's. When the seed's CI
+# fails, the CI-fix agent commits on top and the worker head is no longer what
+# either arm should review; the head that went green is. With no CI repair the
+# two coincide, which is why this held on the first live task without proving
+# the CI-fix case.
+W=$(jq -rs '[.[]|select(.record=="stage")]|sort_by(.ts)|last|.head_sha // empty' $SEED_MEAS)
 
 [ -n "$SEED_PR" ] || { echo "STOP: seed run for $TASK produced no PR"; exit 1; }
 [ "$SEED_CI" = "green" ] || { echo "STOP: seed PR #$SEED_PR CI is '${SEED_CI:-unknown}'"; exit 1; }
 
 # Cross-check against GitHub: the branch must be this run's, and the head must
-# still be what the run recorded.
+# still be what the run recorded. This is the guard that catches a W taken from
+# the wrong stage — it stops rather than forking from a stale head.
+#
+# Read the head with `git ls-remote` rather than `gh pr view --json headRefOid`:
+# gh 2.45.0 rejects some of these *RefOid fields, and git does not care.
 SEED_BRANCH=$(gh pr view "$SEED_PR" --repo aldovc/family-brain --json headRefName --jq .headRefName)
-SEED_HEAD=$(gh pr view "$SEED_PR" --repo aldovc/family-brain --json headRefOid --jq .headRefOid)
+SEED_HEAD=$(git -C "$REPO" ls-remote origin "refs/heads/$SEED_BRANCH" | cut -f1)
 case "$SEED_BRANCH" in
   alucard/iter-*) ;;
   *) echo "STOP: seed PR #$SEED_PR is on '$SEED_BRANCH', not an alucard branch"; exit 1 ;;
@@ -186,7 +196,7 @@ gh pr close "$SEED_PR" --repo aldovc/family-brain
 while IFS=$'\t' read -r task arm pr w; do
   [ "$task" = "$TASK" ] || continue
 
-  before=$(gh pr view "$pr" --repo aldovc/family-brain --json headRefOid --jq .headRefOid)
+  before=$(git -C "$REPO" ls-remote origin "refs/heads/pilot/$task-$arm" | cut -f1)
   if [ "$before" != "$w" ]; then
     echo "SKIP: $task/$arm PR#$pr starts at $before, not the shared head $w"
     continue
@@ -197,7 +207,7 @@ while IFS=$'\t' read -r task arm pr w; do
     --env-file "$ENVFILE" --image "$IMAGE" \
     --timeout-minutes 30 --max-review-cycles 10
 
-  after=$(gh pr view "$pr" --repo aldovc/family-brain --json headRefOid --jq .headRefOid)
+  after=$(git -C "$REPO" ls-remote origin "refs/heads/pilot/$task-$arm" | cut -f1)
   printf '%s\t%s\t%s\t%s\t%s\n' "$task" "$arm" "$pr" "$w" "$after" \
     >> "$PILOT/observed.tsv"
 done < "$PILOT/mapping.tsv"
@@ -252,14 +262,15 @@ for arm in control sweep; do
         ([.[]|.roles|to_entries[]|.value.invocations]|add),
         ([.[]|.roles.review.invocations // 0]|add),
         (.[-1].review_verdict),
-        (if ([.[].cost_complete]|all) then "known" else "partial" end) ]
+        (if ([.[].cost_complete]|all) then "known" else "partial" end),
+        "\([.[].costed_invocations]|add)/\([.[].total_invocations]|add)" ]
     | @tsv' "$PILOT/$arm/logs"/*/measurements.jsonl
 done | awk -F'\t' 'NR==FNR{task[$3]=$1; head[$3]=$4; next}
-    {printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-       task[$2], $1, $2, substr(head[$2],1,8), $3, $4, $5, $6, $7}' \
+    {printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+       task[$2], $1, $2, substr(head[$2],1,8), $3, $4, $5, $6, $7, $8, $9}' \
     "$PILOT/mapping.tsv" - \
   | sort -k1,1 -k2,2 \
-  | column -t -N TASK,ARM,PR,WORKER_HEAD,CYCLES,SECONDS,INVOCATIONS,REVIEWS,VERDICT
+  | column -t -N TASK,ARM,PR,WORKER_HEAD,CYCLES,SECONDS,INVOCATIONS,REVIEWS,VERDICT,COST,COSTED
 
 # What each arm's review loop added on top of the shared worker head.
 #
@@ -291,13 +302,34 @@ done < "$PILOT/observed.tsv" \
 A row of zeros is a real and interesting result: it means that arm's reviewer
 approved without requesting a change. Do not read it as missing data.
 
-`COST` is omitted because the reviewer runs on codex, which reports none; the
-`cost_complete` column in the first table says `partial` for exactly that
-reason, which is the honest label rather than a defect.
+`COST` reads `partial` whenever any invocation reported none, which is every run
+with a codex reviewer, and `COSTED` gives the ratio behind it — `0/1` means no
+figure at all, `1/3` means the total is a lower bound. Both must be printed:
+computing completeness and then dropping it from the table is how a partial
+total gets read as a whole one.
 
 ## Judging it
 
-The arm targets cycles, not lines. Read in this order.
+The arm was *designed* to target cycles. The first live pair did something else:
+sweep found a real invariant defect that control approved, then spent an extra
+cycle and 62 lines fixing it. That is a quality gain at higher cost, and it is a
+legitimate outcome — see `lean-agent-loop-pilot-arm1-results.md`.
+
+So there are three shapes of result, not two:
+
+- **Fewer cycles, same findings, same diff** — the efficiency win the arm was
+  built for.
+- **More cycles, more lines, a defect the control arm missed** — a quality win.
+  Worth keeping, but it is not a savings claim and must never be reported as one.
+- **Flat totals, same findings** — the instruction reorganised the work without
+  reducing it. A real result; record it as one.
+
+**A one-cycle approval is not a win until you know what it missed.** That is the
+trap this pilot walked into and caught: on the raw numbers control looked
+strictly better — one cycle, no added lines, less wall time — and it was the
+worse outcome. Never score an arm on cycles before step 1 below.
+
+Read in this order.
 
 1. **Acceptance and coverage first.** Did each task's acceptance criteria stay
    met, and is the failure coverage the control arm ended up with still present
@@ -308,6 +340,11 @@ The arm targets cycles, not lines. Read in this order.
    whole reason for the shared-worker design. Judge each arm's later findings
    against the revisions its own feedback agent made, since the two diverge as
    soon as the first feedback commit lands.
+
+   Where the arms disagree about whether something is a defect at all, settle it
+   independently rather than by reading the reviews: check out the seed head,
+   apply the disputed test, and confirm it fails there and passes with the fix.
+   That is what turned the first pair's disagreement into evidence.
 3. **Cycles per task.** The number the arm is meant to move.
 4. **Totals, not per-cycle figures.** Sweeping makes each cycle search more, so
    per-invocation reviewer cost should be expected to *rise*. The arm wins only
@@ -315,7 +352,16 @@ The arm targets cycles, not lines. Read in this order.
 5. **Did any finding sprawl past the PR?** The predicted way this backfires is a
    reviewer reading "find every instance" as licence to audit the surrounding
    system. Check for findings naming files outside the diff, and for feedback
-   agents that could not act on a finding.
+   agents that could not act on a finding. An expanded file set is not automatic
+   evidence of sprawl: the first pair's sweep arm touched an extra file to move a
+   helper and avoid a circular import, which is a direct dependency of the fix,
+   not an unrelated audit.
+
+**Consolidation cannot be observed on a single-site task.** The first pair's
+sweep arm raised one finding at one helper, so it tested the procedure and the
+reviewer's judgement but said nothing about the behaviour the instruction
+actually changes. Choose at least one task whose defect class plausibly has
+several sites before drawing any conclusion about consolidation.
 
 Flat totals mean the instruction reorganised the work without reducing it. That
 is a real result and should be recorded as one.

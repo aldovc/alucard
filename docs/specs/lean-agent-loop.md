@@ -373,6 +373,19 @@ invocations and their tool output per iteration — so this is checkable rather
 than assumed. If totals come out flat, the honest reading is that the
 instruction reorganised the work without reducing it.
 
+**First live pair, 2026-09-08 (family-brain #446).** It produced a shape this
+spec did not anticipate: the sweep arm found an invariant defect the control arm
+approved, and paid an extra cycle and 62 lines to fix it. Better coverage, no
+efficiency saving — independently verified, in that the added regression fails
+on the seed head and passes with the fix. Two consequences for judging. A
+one-cycle approval must never be scored as a win before checking what it missed:
+on the raw numbers the control arm looked strictly better and was the worse
+outcome. And a quality gain must never be reported as a savings claim. That pair
+also could not test consolidation at all, because the sweep arm raised one
+finding at one site; a multi-site task is needed before the instruction's actual
+mechanism has been measured. Full write-up in
+`lean-agent-loop-pilot-arm1-results.md`.
+
 For each pair, inspect acceptance completion and retained failure coverage first,
 then unnecessary abstractions/tests/docs, reviewer-induced growth, repeated reads,
 review cycles, total tokens/cost where known, and wall time. The maintainer's
