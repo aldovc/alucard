@@ -142,21 +142,34 @@ The original isolated checkouts remain at `/tmp/alucard-pilot-446.8CmoPW`.
 
 ### Selected next task: family-brain #460
 
-`feat(finance): receipt ingest correctness`. Chosen because its implementation
-must touch several sites of the same defect class, which is the one thing this
-pair could not test. Site inventory taken from the current tree, not the issue
-text (the issue's line references were checked and are accurate):
+`feat(finance): receipt ingest correctness`. Chosen because one required change
+has to land in several places at once, which is the opportunity this pair never
+offered. Inventory taken from the current tree (the issue's line references were
+checked and are accurate):
 
-| Class | Sites | Where |
+| Required change | Places it must land | Where |
 |---|---:|---|
-| Unmatched query does not exclude non-`processed` rows | 3 | `finance/receipts/repository_psql.py` `SQL_COUNT_UNMATCHED:74`, `SQL_LIST_UNMATCHED_RECEIPTS:122`, `SQL_LIST_UNMATCHED_IN_RANGE:131` — reached from `household_observer.py`, `matcher.py`, `service.py` |
-| Write is not idempotent under retry | 2 | `repository_psql.py` `create_receipt_items:230`, `update_receipt_extraction:291` |
-| Synchronous Pillow decode on an async path | 2 | `receipts/service.py` `_resize_image:27`, and the new pre-extraction downscale |
+| Exclude non-`processed` rows from the unmatched queries | 3 | `finance/receipts/repository_psql.py` `SQL_COUNT_UNMATCHED:74`, `SQL_LIST_UNMATCHED_RECEIPTS:122`, `SQL_LIST_UNMATCHED_IN_RANGE:131` — reached from `household_observer.py`, `matcher.py`, `service.py` |
+| Make `create_receipt_items` idempotent | 1 | `repository_psql.py:230`, a bare insert loop |
+| Move the Pillow decode off the event loop | 1 | `receipts/service.py` `_resize_image:27`, called once at `:114` |
 
-All sites sit in files the change must touch, so a sweeping reviewer can report
-them without leaving the PR's scope — which the previous task could not offer.
-Three independent classes also means a failed sweep on one is still observable
-against the other two.
+**Only the first is multi-site**, and an earlier version of this table overstated
+the other two. `update_receipt_extraction:291` is a single unconditional
+`UPDATE` and is already idempotent — the issue lists it as the desired end
+state, not a second defect. The pre-extraction downscale is work to be added,
+not an existing second Pillow site. Both were verified in the tree.
+
+So the case for #460 rests on the three unmatched queries alone: they take the
+same new filter, they sit in one file the change must touch, and a worker can
+plausibly update one and miss the others.
+
+**This is an opportunity, not a prediction.** The inventory says where a repeated
+defect *could* appear; whether one survives into the seed is unknown until the
+seed exists. Check it after seeding — see the runbook's consolidation
+precondition — and if the worker filtered all three queries, the pair is
+**inconclusive** for consolidation. That is not a failed sweep: a reviewer that
+finds nothing to consolidate because nothing repeats has behaved correctly, and
+scoring it as a failure would punish the arm for the worker's competence.
 
 **#447 was rejected, with evidence.** Its class — a tool's `content` asserting
 requested rather than applied identity — has exactly one site in the codebase:

@@ -173,6 +173,18 @@ esac
 
 gh pr view "$SEED_PR" --repo aldovc/family-brain --json body --jq .body > "$PILOT/$TASK-body.md"
 
+# ── Consolidation precondition, for a task chosen to test sweeping ───────────
+# The instruction only does anything when the seed leaves the *same* defect at
+# more than one site. A task can be picked for having several places that need
+# one change and still produce a seed that gets them all right. Read the seed
+# diff now, before either arm runs, and write down which repeated defects
+# survive. If none do, the pair is inconclusive for consolidation — record that
+# and either pick another task or run it knowing what it can and cannot show.
+git -C "$REPO" diff "$(git -C "$REPO" merge-base origin/main "$W")" "$W" \
+  > "$PILOT/$TASK-seed.diff"
+echo "Inspect $PILOT/$TASK-seed.diff and record surviving repeated defects before running the arms."
+
+
 # ── 2. Fork the identical worker head into both arms ─────────────────────────
 # No `alucard` label: `continue` takes an explicit PR number, and leaving the
 # label off keeps these PRs out of any fallback lookup.
@@ -357,11 +369,21 @@ Read in this order.
    helper and avoid a circular import, which is a direct dependency of the fix,
    not an unrelated audit.
 
-**Consolidation cannot be observed on a single-site task.** The first pair's
-sweep arm raised one finding at one helper, so it tested the procedure and the
-reviewer's judgement but said nothing about the behaviour the instruction
-actually changes. Choose at least one task whose defect class plausibly has
-several sites before drawing any conclusion about consolidation.
+**Consolidation cannot be observed unless the seed repeats a defect.** The first
+pair's sweep arm raised one finding at one helper, so it tested the procedure and
+the reviewer's judgement but said nothing about the behaviour the instruction
+actually changes.
+
+Choosing a task with several places needing one change is necessary but not
+sufficient: the seed worker may get them all right, and then there is nothing to
+consolidate. That case is **inconclusive**, and must be recorded as a fourth
+outcome distinct from the three above — not as a failed sweep. A reviewer that
+finds nothing to consolidate because nothing repeats has behaved correctly, and
+scoring it as a failure would punish the arm for the worker's competence.
+
+This is why the seed diff is read before either arm runs. Deciding afterwards
+whether repeated defects "were really there" invites reading the answer back out
+of the arms' behaviour, which is the comparison itself.
 
 Flat totals mean the instruction reorganised the work without reducing it. That
 is a real result and should be recorded as one.
