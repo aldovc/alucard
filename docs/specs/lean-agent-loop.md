@@ -1,6 +1,13 @@
 # Lean implementation and efficient context in Alucard
 
-Status: draft for implementation. Date: 2026-09-08.
+Status: step 1 complete, step 2 in progress. Date: 2026-09-08,
+revised 2026-09-08 against the baseline audit.
+
+Step 1 landed in PR #69: `lean-agent-loop-baseline.md` beside this file, and
+the measurement artifact section 3 asks for. **Read the baseline report before
+acting on anything below** — it retired two items this spec used to contain,
+added one it did not, and changed which role the policy work should weight.
+Sections revised against it are marked *(revised)*.
 
 ## Problem and outcome
 
@@ -25,11 +32,20 @@ A local comparison of `HEAD~20` with `HEAD` on 2026-09-08 found these net change
 The window is 20 first-parent commits per repository, not a shared time period.
 Tests were classified by path; other files include code, configuration, and docs.
 
-| Repository and observed HEAD | Test lines | Other lines |
-| --- | ---: | ---: |
-| family-brain, `93435e2` | +5,925 | +5,803 |
-| zodiac, `e13ecfd` | +2,013 | +1,248 |
-| home-cluster, `d84e788` | +355 | +4,007 |
+Both endpoints are pinned. `HEAD~20` slides as commits land, so a table naming
+only the newer SHA stops describing the same window the day after it is written
+— zodiac's HEAD had already moved off `e13ecfd` by the time the baseline audit
+recomputed this.
+
+| Repository | Window (`base..head`) | Test lines | Other lines |
+| --- | --- | ---: | ---: |
+| family-brain | `93435e2~20..93435e2` | +5,925 | +5,803 |
+| zodiac | `e13ecfd~20..e13ecfd` | +2,013 | +1,248 |
+| home-cluster | `d84e788~20..d84e788` | +355 | +4,007 |
+
+The baseline audit reproduced these within classification noise, and treats the
+home-cluster test figure as +266 rather than +355 — the difference is which
+paths count as tests, not a different measurement.
 
 Growth alone does not prove waste or attribute it to Alucard. For example,
 family-brain's cover-control tests protect a meaningful distinction between
@@ -59,7 +75,7 @@ platform, persistent repository index, line-count quota, or automatic cleanup of
 existing code. Do not weaken tests to obtain a smaller diff. No Portal dependency
 or new model integration is required for this iteration.
 
-## 1. Establish a small evidence baseline
+## 1. Establish a small evidence baseline *(complete — see the baseline report)*
 
 Inspect approximately five recent Alucard PRs per target repository. Include large
 additions, unexpectedly large fixes, and straightforward changes for comparison.
@@ -78,13 +94,24 @@ Unknown shell commands remain unclassified; do not build a shell parser to infer
 all reads. Output bytes or characters are proxies, not billed token counts.
 Record whether the baseline supports the proposed prompt changes before coding.
 
-## 2. Align engineering policy across roles
+## 2. Align engineering policy across roles *(revised)*
 
 Add one short `alucard-engineering-policy.md` fragment, assembled inside the
-trusted instructions for worker, reviewer, feedback, and CI-fix invocations.
-Keep permissions, role responsibilities, verification and output contracts in
-their role prompts. Remove conflicting policy copies instead of appending another
+trusted instructions for worker, reviewer, and feedback invocations. Keep
+permissions, role responsibilities, verification and output contracts in their
+role prompts. Remove conflicting policy copies instead of appending another
 checklist. Include the fragment in `doctor`'s required files.
+
+**Not CI-fix.** `alucard-ci-fix-prompt.md` already says "Edit only the files
+needed to fix the failing checks" and "Do not touch code unrelated to the CI
+failure", which is a tighter guard than this fragment provides. Adding shared
+simplicity guidance there can only loosen it.
+
+**Weight the worker half.** The baseline attributes 89% of Alucard's lines to
+the worker's first pass and 11% to review revisions, so the worker-side edits
+below are the part of this section that can change a diff. The reviewer-side
+edits are worth making — they remove a demonstrated class of merge-blocking
+noise — but should not be expected to shrink anything.
 
 The shared policy must express these decisions:
 
@@ -99,15 +126,15 @@ The shared policy must express these decisions:
 - Meet every requested acceptance criterion. Stop when the change is complete
   and adequately verified; speculative improvements are outside the task.
 
-### Worker and CI-fix behavior
+### Worker and CI-fix behavior *(revised)*
 
 The worker checks existing implementation and coverage before adding either.
 For testable changes, retain red/green verification where useful, but replace
 "repeat per criterion" with coverage of changed behavior and distinct failure
 modes. An existing test that already covers a criterion counts.
 
-CI-fix stays focused on the actual failure and its cause. Shared simplicity
-guidance must not invite unrelated refactoring or changes to passing tests.
+CI-fix keeps its own prompt unchanged and does not receive the shared fragment,
+for the reason given above.
 
 ### Tests
 
@@ -125,7 +152,7 @@ Retain coverage for materially distinct entry points, permissions, races, cleanu
 data loss, and other meaningful boundary conditions. A larger test diff can be
 correct when the behavior warrants it.
 
-### Reviewer and feedback behavior
+### Reviewer and feedback behavior *(revised)*
 
 A merge-blocking request for more structure or tests must name the concrete
 failure, violated contract, or material maintenance problem and the smallest
@@ -133,12 +160,57 @@ adequate remedy. Blanket rules about two copies, inline literals, or possible
 polymorphism must no longer mandate changes.
 
 The reviewer may identify unnecessary additions, but should not create repeated
-cycles around equivalent design preferences. Optional simplifications are clearly
-non-blocking and excluded from actionable findings sent to feedback. Feedback
-does not implement optional suggestions automatically or expand the scope after
-resolving a finding. Human instructions and existing blocker handling still apply.
+cycles around equivalent design preferences. Feedback does not implement optional
+suggestions automatically or expand the scope after resolving a finding. Human
+instructions and existing blocker handling still apply.
 
-## 3. Measure changes through the loop
+**Cut: excluding optional simplifications from findings sent to feedback.** The
+leak is real in code — `alucard:1618` passes the whole review body, `Out of
+scope (follow-up)` section included, into `<review_findings>` — but no
+family-brain review in the audited window emitted such a section alongside
+CHANGES_REQUESTED, and the one that did (zodiac #150) accompanied a BLOCKED
+verdict, so no feedback agent ever saw it. There is nothing here to fix yet.
+
+### Sweep a finding's class before reporting it *(new)*
+
+This is not in the original spec and is the change the baseline argues for
+hardest. Cycle count, not line count, is the dominant avoidable cost: PR #427
+spent six review cycles and PR #444 six more, each cycle reporting one instance
+of a single issue class and then handing back for a fix. On #427 the class was
+untrusted strings reaching model-facing content — found first in the provider
+error, then the requested effect name, then the area-derived `entity_id`. On
+#444 it was holes in one automation-action allowlist. Every finding was real;
+they simply arrived one at a time.
+
+The reviewer must, on finding an issue, look for every other instance of the
+same class in the diff and the files it touches, and report them as one finding
+with all its sites. A cycle that reports one site of a class it has not swept is
+the failure mode this addresses.
+
+**The sweep is bounded by the existing scope rule, not an exception to it.**
+`alucard-reviewer-prompt.md` already defines a finding as in scope when its fix
+lands in a file the PR touches or directly breaks, and already tells the
+reviewer not to hunt further afield in late cycles. Sweeping a class means
+looking harder inside that boundary, never widening it — a class instance in a
+pre-existing file the diff merely reads through stays an out-of-scope
+follow-up. This is the obvious way the change could backfire: a reviewer that
+reads "find every instance" as licence to audit the surrounding system would
+trade six cycles for one enormous unactionable finding. The pilot must check
+for that specifically, by confirming the consolidated findings are the same
+ones the serial version eventually raised.
+
+Cost of not doing it, on #427 alone: four review and four feedback invocations,
+2.4 MB of tool output, and about 13 minutes of agent wall time, plus four CI
+waits. This is the first pilot arm — it is one paragraph, it is isolated enough
+to attribute, and it does not interact with the policy fragment.
+
+## 3. Measure changes through the loop *(implemented, PR #69)*
+
+Built as `logs/alucard-*/measurements.jsonl`; `README.md` documents the record
+shapes and `test/test_measurements.sh`, `test_measurement_gates.sh` and
+`test_measurement_run_loop.sh` cover them. The requirements below stand as
+written — each one that follows is there because building the baseline by hand
+hit the failure it describes. The section is kept for the record.
 
 Use existing JSONL logs, usage extraction, event timing, and pinned base SHA.
 Add a small local measurement artifact, with an explicit format version, recording
@@ -162,12 +234,31 @@ Measurement failures are logged but do not fail or alter an otherwise valid run.
 This instrumentation needs no dashboard or per-file token accounting. Sampled
 tool-read analysis can remain an offline audit until it demonstrates value.
 
-## 4. Experiment with bounded orientation reuse
+## 4. Experiment with bounded orientation reuse *(revised)*
 
 Implement context reuse after the policy pilot, only if baseline logs show enough
 repeated exploration to justify it. Keep it independently switchable and off by
 default during the policy comparison; use one experiment setting, not multiple
 intensity levels. Missing or invalid orientation falls back to ordinary reading.
+
+The baseline shows the repeated reading is real but concentrated differently
+than this section assumes. Per invocation, the heaviest reader is the *feedback*
+agent (414 KB, against 199 KB for the worker that wrote the code), and the most
+repetitive is the reviewer across cycles of one PR. Both are later roles, so the
+mechanism below still fits — but the record's contents should be chosen for them
+rather than for a generic successor:
+
+- Verification commands and toolchain layout. One audited worker spent five
+  commands establishing whether the repo builds through `Justfile`,
+  `backend/justfile`, `uv`, or `poetry`.
+- Entry points into hub files. `agent_tools.py` (6,239 lines) appeared in 82
+  tool calls across the eleven review and feedback invocations for one PR.
+- Static repository documentation. `CONVENTIONS.md` was opened by 18 separate
+  invocations in a single run and cannot change while that run is in flight.
+  This is the cheapest item on the list.
+
+Re-reading the diff is not a target: the reviewer needs the current diff every
+cycle and already reads it in narrow ranges rather than whole files.
 
 Have the worker produce an optional, compact navigation record in a separate
 output mount. It identifies relevant source entry points, reusable helpers,
@@ -197,13 +288,30 @@ operate without it; cross-run discovery and persistence are deferred. Separate
 metadata output must not relax the reviewer's read-only checkout or permitted
 output contract. Retry attempts cannot inherit another attempt's stale record.
 
-## Delivery order and acceptance
+## Delivery order and acceptance *(revised)*
 
-1. Baseline audit and stage/usage measurement, retaining current behavior.
-2. Shared policy and aligned role prompts; run the first pilot.
-3. Bounded orientation reuse if repeated-reading evidence warrants it; run the
-   second pilot with policy held constant.
-4. Record findings and refine or remove changes that do not help.
+1. ~~Baseline audit and stage/usage measurement~~ — done, PR #69.
+2. Reviewer class-sweep instruction; run the first pilot on it alone.
+3. Shared policy and aligned role prompts, worker-weighted; run the second
+   pilot with the class-sweep instruction held constant.
+4. Bounded orientation reuse if repeated-reading evidence warrants it; run a
+   third pilot with the earlier changes held constant.
+5. Record findings and refine or remove changes that do not help.
+
+Steps 2 and 3 were one step in the original order. They are split because they
+are separately attributable and act on different costs — the class-sweep
+instruction on review cycles, the policy fragment on worker-authored lines —
+and running them together would make an already-noisy three-task comparison
+uninterpretable. Step 4 is unchanged but is now the *least* supported of the
+three: see the standing item below, which the baseline ranks above it.
+
+### Standing item, outside this spec's sections
+
+Zodiac needs headless-Chromium shared libraries in the container image. Eight of
+the fifteen audited zodiac PRs needed a human the next morning purely to capture
+browser evidence the sandbox could not produce, and that is the entire measured
+review cost in that repository. It is a Dockerfile change, not a prompt
+experiment, and the baseline ranks it above section 4.
 
 Implementation acceptance requires both task sources and existing providers to
 receive the shared policy once, with correct role contracts and escaped untrusted
@@ -215,26 +323,47 @@ Avoid tests that assert every sentence of prompt prose.
 Use the repository's existing Bash tests and ShellCheck commands from CI. Static
 checks establish harness behavior; model behavior requires the pilot below.
 
-## Pilot runs and iteration
+## Pilot runs and iteration *(revised)*
 
-Use two small rounds spanning family-brain, zodiac, and home-cluster. Select one
-bounded task per repository: one behavior change involving existing helpers, one
-test-heavy application change, and one configuration/docs change. Select actual
-tasks after the baseline audit; avoid inventing features just to benchmark them.
+Use small rounds spanning family-brain and zodiac. Select one bounded task per
+arm per repository: one behavior change involving existing helpers, one
+test-heavy application change, and one configuration/docs change. Avoid
+inventing features just to benchmark them.
 
-For the first round, compare the current prompts with the revised policy on each
-selected task, using separate checkouts of the same starting commit. Pin model,
-effort, limits, image, task content, and relevant repository instructions. Use
-isolated task queues and distinct branches so one arm cannot claim, close, or
-consume the other's task. Historical runs provide context but are not equivalent
-to a paired baseline. Keep validation PRs unmerged and avoid deployments or live
-infrastructure changes as part of the experiment.
+**Drop home-cluster from the paired pilot.** Seven Alucard PRs exist across its
+whole history and one has run logs; that cannot support a comparison. Use a
+configuration/docs task in zodiac or family-brain for the third slot instead.
 
-If the second round tests orientation reuse, compare policy-only with
-policy-plus-orientation using the same paired setup. If reuse is not justified,
-use that round to validate a refined policy or repeat a noisy comparison. Keep
-all failures and retries in the results. Three paired tasks are an exploratory
-pilot, not enough to promise a percentage improvement or generalize to all work.
+**Which repository can test which arm.** Family-brain is the only one that can
+test the class-sweep instruction: its reviewer raised 36 findings over 13 PRs
+and ran six cycles twice. Zodiac's reviewer settled all fifteen audited PRs on
+cycle 1 and contributed zero post-worker lines, which makes it useless for a
+reviewer-side arm and ideal for a worker-side one — with review-driven growth at
+zero, any change in test volume is attributable to the worker policy alone.
+
+Family-brain's `control_home_device` domain extensions (the #402/#403/#427
+shape) are the right behaviour-change slot: bounded, they exercise the trust
+boundary that generates most real findings, and four comparable historical runs
+exist to sanity-check against.
+
+For each round, compare the current prompts with the revised ones on each
+selected task, using separate checkouts of the same starting commit, and change
+exactly one arm at a time. Pin model, effort, limits, image, task content, and
+relevant repository instructions. Use isolated task queues and distinct branches
+so one arm cannot claim, close, or consume the other's task. Historical runs
+provide context but are not equivalent to a paired baseline. Keep validation PRs
+unmerged and avoid deployments or live infrastructure changes as part of the
+experiment.
+
+Keep all failures and retries in the results. Three paired tasks are an
+exploratory pilot, not enough to promise a percentage improvement or generalize
+to all work.
+
+**What the first round is measuring.** The class-sweep arm should move review
+cycles per PR, and through them tool output, invocation count, and wall time —
+not line count. Judge it on cycles and on whether the findings it consolidates
+are the same findings the serial version eventually found. A round where the
+diff is unchanged and the cycle count halves is a success.
 
 For each pair, inspect acceptance completion and retained failure coverage first,
 then unnecessary abstractions/tests/docs, reviewer-induced growth, repeated reads,
