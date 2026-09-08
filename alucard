@@ -581,6 +581,11 @@ invoke_agent() {
   local provider
   provider=$(resolve_provider "$provider_role")
 
+  # Archive what this role was actually told, before the container runs. A
+  # pilot comparison has to show the prompt each arm dispatched, not the one
+  # the file happens to hold when the results are read.
+  measure_archive_prompt "$role" "$prompt"
+
   docker_sandbox_args
 
   local _start_epoch
@@ -1240,6 +1245,409 @@ extract_agent_usage() {
     ' "$logfile" 2>/dev/null
 }
 
+
+# ── Stage measurement ───────────────────────────────────────────────────────
+# Appends $LOG_DIR/measurements.jsonl, one JSON object per record, each tagged
+# with "format" so a reader can tell an old run's shape from a new one. Bump
+# MEASURE_FORMAT on any breaking field change; never reuse a field name for a
+# different meaning.
+#
+# Everything below is best-effort by contract. A measurement failure must not
+# fail, alter, or slow an otherwise valid run, so each entry point returns 0
+# unconditionally and reports trouble to events.log instead. Nothing here is
+# read back by the loop — it exists for offline comparison of pilot runs.
+MEASURE_FORMAT=1
+
+# Cross-gate measurement state. ci_gate and review_gate run as separate
+# functions but record stages on the same iteration, so the pinned base, the
+# previous stage's head, and the gate outcomes live here rather than being
+# threaded through four signatures.
+MEASURE_BASE_SHA=""
+MEASURE_PREV_SHA=""
+MEASURE_CI_RESULT=""
+MEASURE_VERDICT=""
+MEASURE_CYCLES=0
+# How MEASURE_BASE_SHA was arrived at: "pinned" (the run that opened the PR
+# recorded it), "prior-run" (recovered from an earlier run's records),
+# "merge-base" (recomputed fork point), or "current-base" (the base branch as
+# it stands now, which may have advanced). Only the first two are exact.
+MEASURE_BASELINE_SOURCE="pinned"
+
+# Stable identity for the repository under test: "owner/name" from the origin
+# remote, falling back to the directory name. Needed because PR numbers are
+# repository-local while $LOG_ROOT holds every repository's runs — matching a
+# stored base by PR number alone reads another repository's records.
+# Not the repo path: the same repository appears as both a working copy and a
+# cached clone depending on the run mode.
+measure_repo_id() {
+  local dir="${1:-}" url=""
+  [ -n "$dir" ] || { printf '%s' "unknown"; return 0; }
+  url=$(git -C "$dir" remote get-url origin 2>/dev/null) || url=""
+  if [ -n "$url" ]; then
+    url="${url%.git}"
+    url="${url%/}"
+    url="${url#*://}"          # https://host/owner/name → host/owner/name
+    url="${url#*@}"            # git@host:owner/name     → host:owner/name
+    url="${url#*:}"            # host:owner/name         → owner/name
+    case "$url" in
+      # Last two segments: "owner/name" for any remote form, and a stable
+      # "<parent>/<name>" for a filesystem remote.
+      */*/*) printf '%s/%s' "$(basename "$(dirname "$url")")" "$(basename "$url")" ;;
+      */*)   printf '%s' "$url" ;;
+      *)     printf '%s' "$(basename "$dir")" ;;
+    esac
+    return 0
+  fi
+  printf '%s' "$(basename "$dir")"
+  return 0
+}
+
+measure_emit() {
+  [ -n "${LOG_DIR:-}" ] && [ -d "$LOG_DIR" ] || return 0
+  if ! printf '%s\n' "$1" >> "$LOG_DIR/measurements.jsonl" 2>/dev/null; then
+    log_event "Measurement: append to measurements.jsonl failed — continuing."
+  fi
+  return 0
+}
+
+# Split `git diff --numstat --find-renames` on stdin into the four buckets the
+# audit needs, and echo them as a JSON object alongside the raw path list.
+#
+# Paths are kept so a later reader can reclassify without re-running anything;
+# the buckets here are heuristics and have already been wrong once (a repo that
+# keeps fixtures outside tests/). Binary files report "-" for both counts and
+# are counted as files only — a checked-in screenshot must never arrive as
+# thousands of added lines.
+measure_classify() {
+  awk '
+    function bucket(p) {
+      # No bare `spec/` here: zodiac keeps requirements in docs/spec/, and
+      # matching that directory silently books every acceptance-criteria edit
+      # as test growth. Colocated .spec.tsx files are still caught below.
+      if (p ~ /(^|\/)(tests?|__tests__)\// || p ~ /\.(test|spec)\.[tj]sx?$/ ||
+          p ~ /(^|\/)test_[^\/]*\.(py|sh)$/) return "tests"
+      if (p ~ /(package-lock\.json|uv\.lock|poetry\.lock|yarn\.lock|Cargo\.lock|go\.sum)$/ ||
+          p ~ /(^|\/)(dist|build|node_modules|vendor)\//) return "generated"
+      if (p ~ /^docs\// || p ~ /\.(md|json|ya?ml|toml|sql|css|ini|cfg|properties|gradle|xml)$/) return "confdoc"
+      return "impl"
+    }
+    function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+    function tally(a, d, p,   b) {
+      b = bucket(p)
+      if (a == "-" || d == "-") { binary++; bin[b]++ }
+      else { add[b] += a; del[b] += d; adds += a; dels += d }
+      files++
+      paths = paths (paths == "" ? "" : ",") "\"" esc(p) "\""
+    }
+    BEGIN { FS = "\t"; state = 0 }
+    # Input is `--numstat -z` with NULs turned into newlines. A rename is
+    # emitted as "adds<TAB>dels<TAB>" with an empty third field, followed by
+    # the old path and then the new path as their own records. Parsing the
+    # human-readable "src/{old => new}/name.py" form instead loses the shared
+    # prefix, which corrupts both the retained path and its bucket.
+    state == 1 { state = 2; next }                  # old path, not recorded
+    state == 2 { renames++; tally(pa, pd, $0); state = 0; next }
+    {
+      if (NF < 3) next
+      if ($3 == "") { pa = $1; pd = $2; state = 1; next }
+      tally($1, $2, $3)
+    }
+    END {
+      printf "{"
+      printf "\"files\":%d,\"binary_files\":%d,\"renames\":%d,", files+0, binary+0, renames+0
+      printf "\"added\":%d,\"deleted\":%d,", adds+0, dels+0
+      n = split("tests impl confdoc generated", k, " ")
+      for (i = 1; i <= n; i++)
+        printf "\"%s\":{\"added\":%d,\"deleted\":%d,\"binary_files\":%d},", \
+          k[i], add[k[i]]+0, del[k[i]]+0, bin[k[i]]+0
+      printf "\"paths\":[%s]}", paths
+    }
+  '
+}
+
+# Diff stats between two commits in REPO_DIR, as the JSON object above.
+# An unresolvable ref yields an empty-diff object rather than a hole in the
+# record — the reader can spot it by files:0 against two different SHAs.
+# Echoes the JSON object above, or an {"unavailable":true,...} marker when the
+# diff could not be taken. Never echoes zero-growth statistics for a diff that
+# did not run: an empty diff and a failed one look identical in the numbers and
+# a reader would take the failure for a stage that changed nothing.
+measure_unavailable_json() {
+  jq -cn --arg reason "$1" --arg from "${2:-}" --arg to "${3:-}" \
+    '{unavailable:true, reason:$reason, from:$from, to:$to}' 2>/dev/null \
+    || printf '{"unavailable":true,"reason":"unknown"}'
+}
+
+measure_diff_json() {
+  local repo_dir="$1" a="$2" b="$3" tmp rc
+
+  if [ -z "$a" ] || [ -z "$b" ]; then
+    measure_unavailable_json "missing ref" "$a" "$b"
+    return 0
+  fi
+
+  # NUL-delimited output cannot survive a bash variable — command substitution
+  # discards NUL bytes — so the diff goes through a temp file.
+  tmp=$(mktemp "${TMPDIR:-/tmp}/alucard_diff.XXXXXX" 2>/dev/null) || {
+    measure_unavailable_json "mktemp failed" "$a" "$b"
+    return 0
+  }
+  rc=0
+  # `|| rc=$?` is load-bearing, not defensive habit: callers can be running
+  # under `set -e` (ci_gate re-enables it right before recording a stage), and
+  # an unresolvable ref would otherwise take the run down from inside a
+  # measurement.
+  git -C "$repo_dir" diff --numstat --find-renames -z "$a" "$b" >"$tmp" 2>/dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$tmp"
+    measure_unavailable_json "git diff exited $rc" "$a" "$b"
+    return 0
+  fi
+  tr '\0' '\n' < "$tmp" | measure_classify
+  rm -f "$tmp"
+  return 0
+}
+
+# One record per stage that can move the branch head: the worker's first push
+# and every CI-fix or feedback commit after it.
+#
+# Every stage is measured against the pinned base SHA, never against the
+# previous stage. Successive diffs must not be summed and called final growth:
+# a later stage that reverts an earlier one would otherwise add to the total
+# instead of cancelling. The from_prev block is recorded separately, for
+# attributing a single stage's work, and is the only place a delta appears.
+measure_stage() {
+  local iter="$1" pr="${2:-}" stage="$3" cycle="${4:-0}" repo_dir="$5" base_sha="$6" \
+        prev_sha="${7:-}" branch="${8:-}"
+  [ -n "${LOG_DIR:-}" ] && [ -d "$LOG_DIR" ] || return 0
+  [ -d "$repo_dir" ] || { log_event "Measurement: no repo dir for stage $stage — skipped."; return 0; }
+
+  local head parents merge from_base from_prev drifted origin_now
+  # Agent worktrees are disposed as soon as their role finishes, so most
+  # stages can only be measured from the pushed branch. Fetch it rather than
+  # trusting a local ref that may never have been updated.
+  if [ -n "$branch" ]; then
+    if ! git -C "$repo_dir" fetch --quiet origin "$branch" 2>/dev/null; then
+      log_event "Measurement: could not fetch $branch for stage $stage — skipped."
+      return 0
+    fi
+    head=$(git -C "$repo_dir" rev-parse FETCH_HEAD 2>/dev/null) || head=""
+  else
+    head=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null) || head=""
+  fi
+  if [ -z "$head" ]; then
+    log_event "Measurement: could not resolve head for stage $stage — skipped."
+    return 0
+  fi
+  parents=$(git -C "$repo_dir" rev-list --parents -n 1 "$head" 2>/dev/null | wc -w) || parents=0
+  merge=false
+  [ "${parents:-0}" -gt 2 ] && merge=true
+
+  from_base=$(measure_diff_json "$repo_dir" "$base_sha" "$head") || from_base=""
+  [ -n "$from_base" ] || from_base='{}'
+  from_prev='{}'
+  if [ -n "$prev_sha" ] && [ "$prev_sha" != "$head" ]; then
+    from_prev=$(measure_diff_json "$repo_dir" "$prev_sha" "$head") || from_prev=""
+    [ -n "$from_prev" ] || from_prev='{}'
+  fi
+
+  # The pinned base can go stale under a long run: someone merges to the base
+  # branch while the iteration is mid-flight. Flag it so a reader can tell
+  # integration churn from agent-authored change instead of guessing.
+  # Both globals are set by the run loop, but measure_stage is also reachable
+  # from `continue` and from tests that exercise a single gate, so neither can
+  # be assumed present: an unset name under `set -u` would take the whole run
+  # down from inside a best-effort measurement.
+  drifted=false
+  if [ -n "${REPO_ABS:-}" ] && [ -n "${BASE_BRANCH:-}" ] && [ -n "$base_sha" ]; then
+    origin_now=$(git -C "$REPO_ABS" rev-parse "origin/${BASE_BRANCH}" 2>/dev/null || echo "")
+    [ -n "$origin_now" ] && [ "$origin_now" != "$base_sha" ] && drifted=true
+  fi
+
+  measure_emit "$(jq -cn \
+    --argjson format "$MEASURE_FORMAT" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg iter "$iter" --arg pr "$pr" --arg stage "$stage" \
+    --argjson cycle "${cycle:-0}" \
+    --arg repo_id "$(measure_repo_id "${REPO_ABS:-$repo_dir}")" \
+    --arg base "$base_sha" --arg prev "$prev_sha" --arg head "$head" \
+    --argjson merge "$merge" --argjson drifted "$drifted" \
+    --arg baseline_source "${MEASURE_BASELINE_SOURCE:-pinned}" \
+    --argjson from_base "$from_base" --argjson from_prev "$from_prev" \
+    '{format:$format, record:"stage", ts:$ts, repo_id:$repo_id, iter:$iter, pr:$pr, stage:$stage,
+      cycle:$cycle, base_sha:$base, prev_sha:$prev, head_sha:$head,
+      is_merge:$merge, base_drifted:$drifted, baseline_source:$baseline_source,
+      from_base:$from_base, from_prev:$from_prev}' 2>/dev/null)" || true
+  MEASURE_PREV_SHA="$head"
+  return 0
+}
+
+# Identity of everything that could change an outcome between two pilot runs:
+# the harness revision, the exact prompt text, the image, and the per-role
+# provider/model/effort settings. Without this a comparison cannot claim the
+# arms differed only in the variable under test.
+measure_run_start() {
+  local repo_dir="$1" task_source="$2"
+  [ -n "${LOG_DIR:-}" ] && [ -d "$LOG_DIR" ] || return 0
+
+  local rev dirty digest image_id roles role
+  rev=$(git -C "$TOOL_DIR" rev-parse HEAD 2>/dev/null || echo "")
+  dirty=false
+  git -C "$TOOL_DIR" diff --quiet HEAD -- 2>/dev/null || dirty=true
+  # One digest over every prompt the roles are assembled from, so an edited
+  # prompt cannot be mistaken for the same arm at a different time.
+  digest=$(cat "$TOOL_DIR"/alucard-*-prompt.md 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1) || digest=""
+  image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || echo "")
+
+  roles='{}'
+  for role in WORKER CI_FIX REVIEWER FEEDBACK; do
+    roles=$(printf '%s' "$roles" | jq -c \
+      --arg r "$role" \
+      --arg p "$(resolve_provider "$role" 2>/dev/null || echo unknown)" \
+      --arg m "$(resolve_agent_setting "$role" CLAUDE_MODEL "$DEFAULT_CLAUDE_MODEL")" \
+      --arg cm "$(resolve_agent_setting "$role" CODEX_MODEL "$DEFAULT_CODEX_MODEL")" \
+      --arg e "$(resolve_agent_setting "$role" EFFORT "")" \
+      '. + {($r): {provider:$p, claude_model:$m, codex_model:$cm, effort:$e}}' 2>/dev/null) || roles='{}'
+  done
+
+  measure_emit "$(jq -cn \
+    --argjson format "$MEASURE_FORMAT" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg repo "$repo_dir" --arg repo_id "$(measure_repo_id "$repo_dir")" \
+    --arg base_branch "$BASE_BRANCH" \
+    --arg task_source "$task_source" \
+    --arg rev "$rev" --argjson dirty "$dirty" --arg digest "$digest" \
+    --arg image "$IMAGE" --arg image_id "$image_id" \
+    --argjson roles "$roles" \
+    '{format:$format, record:"run", ts:$ts, repo:$repo, repo_id:$repo_id, base_branch:$base_branch,
+      task_source:$task_source, alucard_rev:$rev, alucard_dirty:$dirty,
+      prompt_digest:$digest, image:$image, image_id:$image_id, roles:$roles}' 2>/dev/null)" || true
+  return 0
+}
+
+# Closing record for one iteration: outcome, gate results, and tokens by role
+# and cache category, summed over every attempt.
+#
+# Retries and superseded attempts are counted, not discarded — all effort spent
+# reaching the merged diff belongs in the total. A role whose provider reports
+# no cost contributes null, never 0: the reader must be able to tell "free"
+# from "unknown", and codex reports no cost at all.
+measure_iteration() {
+  local iter="$1" pr="${2:-}" rc="${3:-}" duration="${4:-0}" \
+        ci="${5:-}" verdict="${6:-}" cycles="${7:-0}" base_sha="${8:-}"
+  [ -n "${LOG_DIR:-}" ] && [ -d "$LOG_DIR" ] || return 0
+
+  local roles='{}' f base role inp out cr cw turns cost
+  local invocations=0 costs_known=0 cost_complete=false
+  for f in "$LOG_DIR"/iter-"${iter}"*.jsonl; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f" .jsonl)
+    case "$base" in
+      *review*)   role=review   ;;
+      *feedback*) role=feedback ;;
+      *fix*)      role=cifix    ;;
+      *)          role=worker   ;;
+    esac
+    # Count the invocation before parsing it. An agent killed by a timeout or
+    # a transport drop leaves a log with no final usage record, and skipping it
+    # here hid exactly the attempts most likely to be missing one — the total
+    # then described the invocations that succeeded, while claiming to describe
+    # the run.
+    invocations=$((invocations + 1))
+    IFS=$'\t' read -r inp out cr cw turns cost < <(extract_agent_usage "$f" || true) || true
+    local usage_known=true
+    [ -n "${inp:-}" ] || usage_known=false
+    # Completeness means every invocation reported a cost. Any missing one
+    # makes the total a lower bound, and a partial total labelled complete is
+    # worse than no total: codex reports no cost at all, so a run mixing
+    # providers would otherwise present the worker's spend as the whole bill.
+    if [ "$usage_known" = true ] && [ -n "${cost:-}" ]; then
+      costs_known=$((costs_known + 1))
+    fi
+    roles=$(printf '%s' "$roles" | jq -c \
+      --arg r "$role" \
+      --argjson i "${inp:-0}" --argjson o "${out:-0}" \
+      --argjson cr "${cr:-0}" --argjson cw "${cw:-0}" \
+      --argjson t "${turns:-0}" \
+      --argjson c "${cost:-null}" \
+      --argjson known "$usage_known" \
+      '.[$r] = ((.[$r] // {invocations:0, usage_missing:0, input:0, output:0, cache_read:0, cache_write:0, turns:0, cost:null})
+        | .invocations += 1
+        | if $known then
+            .input += $i | .output += $o
+            | .cache_read += $cr | .cache_write += $cw | .turns += $t
+            | .cost = (if $c == null then .cost else ((.cost // 0) + $c) end)
+          else .usage_missing += 1 end)' 2>/dev/null) || roles='{}'
+    unset inp out cr cw turns cost usage_known
+  done
+  # costs_known only counts invocations whose usage parsed *and* carried a
+  # cost, so an unparseable log makes the run incomplete on its own.
+  [ "$invocations" -gt 0 ] && [ "$costs_known" -eq "$invocations" ] && cost_complete=true
+
+  measure_emit "$(jq -cn \
+    --argjson format "$MEASURE_FORMAT" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg iter "$iter" --arg pr "$pr" --arg base "$base_sha" \
+    --arg baseline_source "${MEASURE_BASELINE_SOURCE:-pinned}" \
+    --arg rc "$rc" --argjson duration "${duration:-0}" \
+    --arg ci "$ci" --arg verdict "$verdict" --argjson cycles "${cycles:-0}" \
+    --argjson cost_complete "$cost_complete" \
+    --argjson costed_invocations "$costs_known" \
+    --argjson total_invocations "$invocations" \
+    --argjson roles "$roles" \
+    '{format:$format, record:"iteration", ts:$ts, iter:$iter, pr:$pr,
+      base_sha:$base, baseline_source:$baseline_source,
+      rc:$rc, duration_s:$duration, ci_result:$ci,
+      review_verdict:$verdict, review_cycles:$cycles,
+      cost_complete:$cost_complete,
+      costed_invocations:$costed_invocations, total_invocations:$total_invocations,
+      roles:$roles}' 2>/dev/null)" || true
+  return 0
+}
+
+# Echoes the base SHA an earlier run pinned for PR $1, if any run's records
+# still hold it. A `continue` run must not re-derive the base from the PR's
+# current baseRefOid: the base branch advances as other PRs merge, and
+# comparing against today's base books unrelated base-branch change as this
+# PR's growth.
+# Echoes "<base_sha><TAB><baseline_source>" for the earliest stage recorded
+# against REPO_ID and PR, or nothing. The stored provenance comes back with the
+# SHA: a base an earlier run recomputed as a merge base does not become exact
+# by being read out of a file, and labelling it so would hide an approximation
+# behind a second-hand record. Records without a repo_id predate this field and
+# are ignored rather than matched on PR alone.
+measure_prior_base_for_pr() {
+  local repo_id="$1" pr="$2" f hit
+  [ -n "$repo_id" ] && [ -n "$pr" ] || return 0
+  [ -n "${LOG_ROOT:-}" ] && [ -d "$LOG_ROOT" ] || return 0
+  # Oldest first, so the base belongs to the run that opened the PR.
+  for f in $(ls -1d "$LOG_ROOT"/*/measurements.jsonl 2>/dev/null | sort); do
+    hit=$(jq -r --arg pr "$pr" --arg repo "$repo_id" \
+      'select(.record == "stage" and .pr == $pr and (.repo_id // "") == $repo
+              and (.base_sha // "") != "")
+       | "\(.base_sha)\t\(.baseline_source // "pinned")"' "$f" 2>/dev/null | head -1) || hit=""
+    if [ -n "$hit" ]; then
+      printf '%s' "$hit"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Keep the exact prompt text a role was dispatched with, so a comparison can
+# show what the arm actually said rather than what the current file says.
+# Local only: these carry task bodies and repository context, and are never
+# posted to GitHub. Credentials never reach a prompt — they are passed to the
+# container as environment — so nothing here needs redaction.
+measure_archive_prompt() {
+  local name="$1" text="$2"
+  [ -n "${LOG_DIR:-}" ] && [ -d "$LOG_DIR" ] || return 0
+  mkdir -p "$LOG_DIR/prompts" 2>/dev/null || return 0
+  printf '%s\n' "$text" > "$LOG_DIR/prompts/${name}.txt" 2>/dev/null || \
+    log_event "Measurement: could not archive prompt for ${name} — continuing."
+  return 0
+}
+
 print_usage_report() {
   local log_dir="$1"
 
@@ -1724,11 +2132,13 @@ ci_gate() {
 
     if [ "$ci_rc" -eq 0 ]; then
       log_event "CI gate: PR #$pr_num green — ready for review."
+      MEASURE_CI_RESULT="green"
       return 0
     fi
 
     if [ "$ci_attempt" -eq 3 ]; then
       log_event "CI gate: PR #$pr_num still failing after 3 fix attempts — left open for manual review."
+      MEASURE_CI_RESULT="failed"
       return 0
     fi
 
@@ -1775,6 +2185,8 @@ $(printf '%s' "$failure_log" | xml_escape)
 
     echo ""
     rm -rf "$wt_fix" || true
+    measure_stage "$iter" "$pr_num" cifix "$ci_attempt" \
+      "$REPO_ABS" "$MEASURE_BASE_SHA" "$MEASURE_PREV_SHA" "$branch"
   done
 }
 
@@ -2007,6 +2419,12 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
       log_event "Review gate: using reviewer decision file, verdict=$review_state"
     fi
 
+    # Outside the conditional above: that branch only fires when the decision
+    # file overrides GitHub, so recording there left every ordinary formal
+    # review with an empty verdict and zero cycles.
+    MEASURE_VERDICT="$review_state"
+    MEASURE_CYCLES="$review_cycle"
+
     if [ "$review_state" = "APPROVED" ]; then
       log_event "Review gate: PR #$pr_num approved — ready to merge."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
@@ -2087,6 +2505,8 @@ If the same finding has been repeating, it is probably one no agent in this loop
     feedback_findings=$(append_human_comments "$review_comments" "$human_comments")
 
     run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" "$review_cycle"
+    measure_stage "$iter" "$pr_num" feedback "$review_cycle" \
+      "$REPO_ABS" "$MEASURE_BASE_SHA" "$MEASURE_PREV_SHA" "$branch"
 
     # Record what the feedback agent could not act on, so the next reviewer is
     # told not to re-report it instead of rediscovering it every cycle. Posted
@@ -2302,6 +2722,7 @@ command_run() {
   local _task_source_desc="$TASK_SOURCE"
   [ "$TASK_SOURCE" = "file" ] && _task_source_desc="file ($TASKS_FILE_ABS)"
   log_event "Run start: repo=$REPO_ABS task_source=$_task_source_desc image=$IMAGE"
+  measure_run_start "$REPO_ABS" "$_task_source_desc"
   local final_result='select(.type == "result").result // empty'
 
   for ((i=1; i<=ITERATIONS; i++)); do
@@ -2464,6 +2885,20 @@ $(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
     fi
     _recovery_pr=false
 
+    # Pin the measurement chain to this iteration's base. Every later stage is
+    # compared against it, so a mid-run base change is visible as drift rather
+    # than silently folded into the agent's diff.
+    MEASURE_BASE_SHA="$_base_sha"
+    MEASURE_PREV_SHA="$_base_sha"
+    MEASURE_BASELINE_SOURCE="pinned"
+    MEASURE_CI_RESULT=""
+    MEASURE_VERDICT=""
+    MEASURE_CYCLES=0
+    if [ "$_pr_found" = true ]; then
+      measure_stage "$i" "$_iter_pr_num" worker 0 \
+        "$REPO_ABS" "$_base_sha" "$_base_sha" "$ACTUAL_BRANCH"
+    fi
+
     # Local source: mark the dispatched task in-flight so the next iteration
     # skips it while the PR is open. This is the local analog of GitHub's
     # closing-issues dedup. A miss means the heading was edited mid-run —
@@ -2615,6 +3050,8 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
 
     _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
     log_event "Iteration $i/$ITERATIONS end: rc=$rc duration=${_iter_duration}s"
+    measure_iteration "$i" "$_iter_pr_num" "$rc" "$_iter_duration" \
+      "$MEASURE_CI_RESULT" "$MEASURE_VERDICT" "$MEASURE_CYCLES" "$MEASURE_BASE_SHA"
 
     if [ "$rc" -ne 0 ]; then
       continue
@@ -2706,14 +3143,66 @@ command_continue() {
     fi
   fi
 
+  # A `continue` run keeps growing a PR some earlier run already measured —
+  # PR #444's review rounds landed here, not in the iteration that opened it —
+  # so both runs' records have to describe the same diff. That needs the base
+  # the *original* run pinned, in this order of preference:
+  #   1. the base an earlier run recorded for this PR (exact),
+  #   2. the merge base of the PR head and the base branch (the fork point,
+  #      exact unless the branch has had the base merged into it),
+  #   3. the base branch as it stands now (inexact, and labelled as such —
+  #      it advances as other PRs merge, so growth measured against it can
+  #      include changes this PR never made).
+  measure_run_start "$REPO_ABS" "continue"
+
+  local _continue_start_epoch _pr_head
+  _continue_start_epoch=$(date +%s)
+  _pr_head=$(cd "$REPO_ABS" && \
+    gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")
+
+  local _prior _prior_source
+  _prior=$(measure_prior_base_for_pr "$(measure_repo_id "$REPO_ABS")" "$pr_num")
+  MEASURE_BASE_SHA="${_prior%%$'\t'*}"
+  _prior_source="${_prior##*$'\t'}"
+  if [ -n "$MEASURE_BASE_SHA" ]; then
+    # A base the opening run pinned is exact; one it had already approximated
+    # keeps that approximation's label rather than being promoted.
+    if [ "$_prior_source" = "pinned" ]; then
+      MEASURE_BASELINE_SOURCE="prior-run"
+    else
+      MEASURE_BASELINE_SOURCE="$_prior_source"
+    fi
+  fi
+  if [ -z "$MEASURE_BASE_SHA" ] && [ -n "$_pr_head" ]; then
+    git -C "$REPO_ABS" fetch --quiet origin "$branch" 2>/dev/null || true
+    MEASURE_BASE_SHA=$(git -C "$REPO_ABS" merge-base \
+      "origin/${BASE_BRANCH}" "$_pr_head" 2>/dev/null || echo "")
+    MEASURE_BASELINE_SOURCE="merge-base"
+  fi
+  if [ -z "$MEASURE_BASE_SHA" ]; then
+    MEASURE_BASE_SHA=$(cd "$REPO_ABS" && \
+      gh pr view "$pr_num" --json baseRefOid --jq '.baseRefOid' 2>/dev/null || echo "")
+    MEASURE_BASELINE_SOURCE="current-base"
+    log_event "Measurement: no pinned base for PR #$pr_num — comparing against the current base branch."
+  fi
+
+  MEASURE_PREV_SHA="${_pr_head:-$MEASURE_BASE_SHA}"
+  MEASURE_CI_RESULT=""
+  MEASURE_VERDICT=""
+  MEASURE_CYCLES=0
+
   if [ -n "${feedback_findings:-}" ]; then
     run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" 1
+    measure_stage "$iter" "$pr_num" feedback 1 \
+      "$REPO_ABS" "$MEASURE_BASE_SHA" "$MEASURE_PREV_SHA" "$branch"
   else
     echo "No actionable comments on PR #$pr_num — skipping feedback; running gates only."
   fi
   ci_gate "$iter" "$branch" "$origin_url"
   review_gate "$iter" "$branch" "$origin_url"
   post_iteration_usage "$iter" "$branch" "$REPO_ABS" "$LOG_DIR"
+  measure_iteration "$iter" "$pr_num" 0 "$(( $(date +%s) - _continue_start_epoch ))" \
+    "$MEASURE_CI_RESULT" "$MEASURE_VERDICT" "$MEASURE_CYCLES" "$MEASURE_BASE_SHA"
 }
 
 main() {
