@@ -365,6 +365,14 @@ not line count. Judge it on cycles and on whether the findings it consolidates
 are the same findings the serial version eventually found. A round where the
 diff is unchanged and the cycle count halves is a success.
 
+Watch the counterweight: sweeping makes each cycle do more searching, so
+per-invocation reviewer cost should be expected to rise. The arm only wins if
+cycles fall faster than per-cycle cost climbs, which is a comparison of totals,
+not of either figure alone. `measurements.jsonl` records both — reviewer
+invocations and their tool output per iteration — so this is checkable rather
+than assumed. If totals come out flat, the honest reading is that the
+instruction reorganised the work without reducing it.
+
 For each pair, inspect acceptance completion and retained failure coverage first,
 then unnecessary abstractions/tests/docs, reviewer-induced growth, repeated reads,
 review cycles, total tokens/cost where known, and wall time. The maintainer's
