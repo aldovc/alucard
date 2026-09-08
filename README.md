@@ -394,7 +394,48 @@ tail -f "$ALUCARD_HOME"/logs/alucard-*/iter-*.jsonl | jq -r 'select(.type=="assi
 
 # Reconstruct an overnight run — one timestamped line per run/iteration/gate transition
 cat "$ALUCARD_HOME"/logs/alucard-*/events.log
+
+# Compare two runs — one JSON record per run, per stage, and per iteration
+jq -r 'select(.record=="stage")
+       | "\(.iter) \(.stage)/\(.cycle)  +\(.from_base.added) since base"' \
+  "$ALUCARD_HOME"/logs/alucard-*/measurements.jsonl
 ```
+
+### measurements.jsonl
+
+Written beside `events.log` for offline comparison of runs; nothing in the loop
+reads it back, and a measurement that fails is logged and skipped rather than
+allowed to affect the run.
+
+- `record: "run"` — the harness revision, prompt digest, image ID, and per-role
+  provider/model settings. Two runs claiming to differ in one variable can be
+  checked against this.
+- `record: "stage"` — one per head-moving stage (`worker`, `cifix`, `feedback`).
+  `from_base` is measured against the iteration's pinned base SHA and `from_prev`
+  against the previous stage, split into `tests` / `impl` / `confdoc` /
+  `generated` with the changed paths kept so the buckets can be corrected
+  without re-running. Binary files are counted as files, never as lines, and
+  renames keep their full destination path. A diff that could not be taken is
+  `{"unavailable": true, "reason": …}` rather than zero statistics — an empty
+  diff and a failed one are otherwise indistinguishable. `base_drifted` flags a
+  base branch that moved mid-run; `baseline_source` says how the base was
+  arrived at (`pinned` and `prior-run` are exact, `merge-base` is the
+  recomputed fork point, `current-base` is today's base branch and inexact).
+  A base reused from an earlier run keeps that run's provenance rather than
+  being promoted to exact. `repo_id` is `owner/name` from the origin remote —
+  PR numbers are repository-local and every repository's runs share one logs
+  directory, so records are matched on both.
+- `record: "iteration"` — CI result, review verdict and cycle count, elapsed
+  time, and tokens by role and cache category. `cost` is `null` for a provider
+  that reports none (codex): unknown, not zero. `cost_complete` is true only
+  when *every* invocation reported a cost; `costed_invocations` and
+  `total_invocations` show the split, so a partial total is never read as the
+  whole bill. An invocation whose log has no parseable usage — a worker killed
+  by a timeout or a transport drop — is still counted, and shows up as
+  `usage_missing` on its role.
+
+Dispatched role prompts are archived under `logs/alucard-*/prompts/`. Both are
+local only — neither is posted to GitHub.
 
 ## Releases
 
