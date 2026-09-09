@@ -171,7 +171,7 @@ family-brain review in the audited window emitted such a section alongside
 CHANGES_REQUESTED, and the one that did (zodiac #150) accompanied a BLOCKED
 verdict, so no feedback agent ever saw it. There is nothing here to fix yet.
 
-### Sweep a finding's class before reporting it *(new)*
+### Two recurring classes, as mechanical checks *(revised after two pilots)*
 
 This is not in the original spec and is the change the baseline argues for
 hardest. Cycle count, not line count, is the dominant avoidable cost: PR #427
@@ -182,27 +182,46 @@ error, then the requested effect name, then the area-derived `entity_id`. On
 #444 it was holes in one automation-action allowlist. Every finding was real;
 they simply arrived one at a time.
 
-The reviewer must, on finding an issue, look for every other instance of the
-same class in the diff and the files it touches, and report them as one finding
-with all its sites. A cycle that reports one site of a class it has not swept is
-the failure mode this addresses.
+This shipped first as a paragraph of prose telling the reviewer to look for
+every other instance of a class before writing the finding up. It is no longer
+in the prompt. Two entries in **Mechanical checks** replace it, one per class
+above: enumerate every value the diff interpolates into model-facing output and
+name each one's source, and enumerate every shape a new guard's input can take
+and check the guard inspects each. Both say to report their sites as a single
+finding.
 
-**The sweep is bounded by the existing scope rule, not an exception to it.**
+Why the swap, in one line: the second pilot pair ran the instruction with its
+worked examples removed — they had to be, because one of them *is* #427 — and
+the reviewer holding it approved a head that still failed an independent probe
+for this very class, in three cycles against the control's seven. The
+instruction without concrete classes did not produce sweeping. The examples
+were the part
+naming classes, so the classes are now the artefact and the prose is gone. See
+[the second pair](lean-agent-loop-pilot-arm1-427.md); the hypothesis that
+examples were the whole effect is recorded there and is not established.
+
+**Both checks are bounded by the existing scope rule, not an exception to it.**
 `alucard-reviewer-prompt.md` already defines a finding as in scope when its fix
 lands in a file the PR touches or directly breaks, and already tells the
-reviewer not to hunt further afield in late cycles. Sweeping a class means
-looking harder inside that boundary, never widening it — a class instance in a
+reviewer not to hunt further afield in late cycles. Enumerating a class's sites
+means looking harder inside that boundary, never widening it — an instance in a
 pre-existing file the diff merely reads through stays an out-of-scope
 follow-up. This is the obvious way the change could backfire: a reviewer that
 reads "find every instance" as licence to audit the surrounding system would
-trade six cycles for one enormous unactionable finding. The pilot must check
-for that specifically, by confirming the consolidated findings are the same
-ones the serial version eventually raised.
+trade six cycles for one enormous unactionable finding. Neither pilot arm did
+that — the second pair's sweep arm stayed inside the PR and its extra file was
+a test module — but the checks are narrower than the prose was, so the risk is
+smaller rather than gone.
 
 Cost of not doing it, on #427 alone: four review and four feedback invocations,
 2.4 MB of tool output, and about 13 minutes of agent wall time, plus four CI
-waits. This is the first pilot arm — it is one paragraph, it is isolated enough
-to attribute, and it does not interact with the policy fragment.
+waits. Replaying that head under the current tool reproduced the habit exactly —
+the control arm found the class in four separate cycles, its own incomplete fix
+included.
+
+Two checks are cheaper to judge than the paragraph was. Each names a class, so
+each can be tested on its own against a seed known to contain it, without a
+paired run and without a seed that has to supply repetition by luck.
 
 ## 3. Measure changes through the loop *(implemented, PR #69)*
 
@@ -291,16 +310,19 @@ output contract. Retry attempts cannot inherit another attempt's stale record.
 ## Delivery order and acceptance *(revised)*
 
 1. ~~Baseline audit and stage/usage measurement~~ — done, PR #69.
-2. Reviewer class-sweep instruction; run the first pilot on it alone.
+2. ~~Reviewer class-sweep instruction; run the first pilot on it alone~~ — run,
+   two pairs, and the instruction is withdrawn in favour of two mechanical
+   checks. See [pair one](lean-agent-loop-pilot-arm1-results.md) and
+   [pair two](lean-agent-loop-pilot-arm1-427.md).
 3. Shared policy and aligned role prompts, worker-weighted; run the second
-   pilot with the class-sweep instruction held constant.
+   pilot with the two mechanical checks held constant.
 4. Bounded orientation reuse if repeated-reading evidence warrants it; run a
    third pilot with the earlier changes held constant.
 5. Record findings and refine or remove changes that do not help.
 
 Steps 2 and 3 were one step in the original order. They are split because they
-are separately attributable and act on different costs — the class-sweep
-instruction on review cycles, the policy fragment on worker-authored lines —
+are separately attributable and act on different costs — the reviewer-side
+change on review cycles, the policy fragment on worker-authored lines —
 and running them together would make an already-noisy three-task comparison
 uninterpretable. Step 4 is unchanged but is now the *least* supported of the
 three: see the standing item below, which the baseline ranks above it.
@@ -364,6 +386,14 @@ cycles per PR, and through them tool output, invocation count, and wall time —
 not line count. Judge it on cycles and on whether the findings it consolidates
 are the same findings the serial version eventually found. A round where the
 diff is unchanged and the cycle count halves is a success.
+
+**What it actually measured.** Two pairs, opposite directions, one stochastic
+run each. Pair one: the sweep arm caught a defect the control missed and spent
+an extra cycle and 62 lines fixing it — quality up, cost up. Pair two: the sweep
+arm approved in three cycles against seven, for a third of the cost, on a head
+that still failed an independent probe for the class it was supposed to sweep —
+cost down, quality down. Cycle count moved in both, in opposite directions. The
+prediction below held in neither, and the arm was withdrawn rather than tuned.
 
 Watch the counterweight: sweeping makes each cycle do more searching, so
 per-invocation reviewer cost should be expected to rise. The arm only wins if

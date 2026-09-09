@@ -58,22 +58,14 @@ Out-of-scope problems can be real and still not belong here. Name them in a shor
 
 This matters most in late cycles. When the in-scope findings are exhausted, the honest verdict is APPROVED (or BLOCKED) — not a hunt for something further afield to request. A review loop that pushes an implementer into rewriting production logic unrelated to the PR's stated purpose, with no ability to run the tests, does more damage than the bug it was chasing.
 
-## Sweep a finding's class before you report it
-
-When you find a defect, look for every other instance of the same *kind* of defect before you write it up, and report them as one finding that lists every site. Reporting the first instance and stopping is the single most expensive habit in this loop.
-
-Two real review loops on this repository show why. One PR spent five cycles on one class — an untrusted string reaching model-facing tool output unescaped — because each cycle found a single site and stopped: first the provider's error message, then the requested value echoed back in an error, then an entity ID that came from an external catalog. Another spent five cycles inside one file whose validator enumerated a subset of the input surface it was meant to cover: a domain missing from an allowlist, an action shape carrying neither key the allowlist tested, a metadata field the guard never inspected, a selector the validator ignored. Every finding in both loops was correct and worth making. They simply arrived one at a time, and each one cost a full review, a feedback agent, and a CI run.
-
-Generalise before you search. "This `entity_id` is interpolated unescaped" is a site; "untrusted values reach model-facing content unescaped" is the class. "This allowlist is missing `cover`" is a site; "this guard checks a subset of the shapes its input can take" is the class. Once you can name the class, `rg` for its other sites across the diff and the files the diff touches.
-
-**This narrows where you look; it does not widen your scope.** Every site you find is still subject to **Stay inside the PR's scope** above: a sibling instance in a file the diff merely reads through is an out-of-scope follow-up, not a finding. Sweeping means reading the touched files harder, never auditing the surrounding system. One sprawling finding that reaches past the PR is a worse outcome than the cycles it was meant to save, because no feedback agent can act on it.
-
 ## Mechanical checks — run these first
 
 Fast, high-yield, and able to catch deploy-breaking bugs that green CI hides. Do them before the judgment-based review below. `/work` is read-only but readable — use `rg` against the checkout.
 
 - **Phantom imports.** For every new `import X` / `from X import Y` the diff adds from an *internal* module, grep the target module for the definition of each symbol. A symbol that is imported, referenced, and patched in tests but never defined is an `ImportError` at module load — every route through that module 500s on deploy, yet patch-based tests stay green. Flag any symbol whose definition you cannot locate as **High severity**.
 - **Patch-based test smell.** When a test `patch()`es a symbol at its import site (e.g. `patch("app.module.some_factory")`), confirm the real symbol exists at that path. Such tests pass even when the underlying module would fail to import, so a passing suite is not evidence the symbol exists — verify it directly.
+- **Untrusted text in model-facing output.** For every string the diff builds that reaches a tool result's `content` or `raw`, or any other value returned to the model, list each interpolated expression and name where its value comes from. Flag every one sourced outside this process: a provider's response or exception text, an identifier read from an external catalog, a caller-supplied value echoed back in an error. These are instruction-injection sites and they arrive in batches — one new error path routinely holds three or four. Report them as **one finding listing every site**. **High severity** for provider exception text or an external identifier, **Medium** for a caller's own value echoed back.
+- **Guards that cover only some shapes of their input.** For every validator, allowlist or guard the diff adds or widens, enumerate the shapes its input can actually take — every domain, action, key, selector and type the schema or signature permits — and check the guard inspects each. Flag every shape it does not. A guard written against the shapes its author had in mind passes its author's tests and fails on the rest, and the gaps come in batches. Report them as **one finding listing every unhandled shape**, at the severity the worst one earns.
 
 ## Engineering standards checklist
 
@@ -134,8 +126,8 @@ GitHub may block self-review when the bot identity is also the PR author — in 
 For CHANGES_REQUESTED, list each finding as:
 
 - **Severity**: High / Medium / Low
-- **Location**: `file:line` — when a swept class has several sites, list every one of them here, each on its own line. Do not split one class across several findings, and do not drop sites to keep the list short.
-- **Problem**: what is wrong and why it blocks merge. For a swept class, state the class once and then what goes wrong at each site.
+- **Location**: `file:line` — when one cause has several sites, list every one of them here, each on its own line. Do not split them across several findings, and do not drop sites to keep the list short.
+- **Problem**: what is wrong and why it blocks merge. When several sites share one cause, state it once and then what goes wrong at each.
 - **Expected fix**: what a feedback agent must do to resolve it, using only the tools the container has. Cover every site listed.
 
 For BLOCKED, list each remaining gate the same way, but say plainly in **Expected fix** what the *human* must do and why no agent can. Do not restate items already in `<known_blockers>` — reference them.
