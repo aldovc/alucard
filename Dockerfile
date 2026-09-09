@@ -35,6 +35,26 @@ RUN uv python install 3.12 \
 # fallback metadata (surfaced by the error-scan work in PR #44).
 RUN npm install -g @anthropic-ai/claude-code@2.1.250 @openai/codex@0.150.1
 
+# Headless Chromium, for repositories whose verification is a screenshot. Eight
+# of fifteen audited zodiac PRs needed a human the next morning over this, and
+# it was two faults, not one: the image carried none of Chromium's shared
+# libraries (`libglib-2.0.so.0: cannot open shared object file`), and the copy
+# Playwright downloaded at runtime landed under $HOME, which the sandbox mounts
+# as a noexec tmpfs, so it could not be executed even once it existed (`spawn
+# ... EACCES`). Installing to a system path at build time answers both, for the
+# same reason Python is pinned to /opt above.
+#
+# `playwright-core` goes in globally because zodiac's driver resolves it through
+# `npm root -g`, and the /usr/local/bin/chromium symlink is what its
+# `which chromium` fallback looks for — so neither needs the repo to change.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN npm install -g playwright-core@1.63.0 \
+ && npx --yes playwright@1.63.0 install --with-deps chromium \
+ && ln -s "$(find /opt/ms-playwright -type f -name chrome -path '*chrome-linux*' | sort | head -1)" \
+      /usr/local/bin/chromium \
+ && chmod -R a+rX /opt/ms-playwright \
+ && rm -rf /var/lib/apt/lists/* /root/.npm
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
