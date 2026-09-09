@@ -28,7 +28,7 @@ one file.
 | | control | sweep |
 |---|---|---|
 | PR | [#465](https://github.com/aldovc/family-brain/pull/465) | [#466](https://github.com/aldovc/family-brain/pull/466) |
-| Tool rev | `d4b62c0` (prompt from `e8df226`) | `5b5e66f3` (examples stripped) |
+| Tool rev | `d4b62c0`, tag `pilot/arm1-427-control-tool` | `5b5e66f3`, tag `pilot/arm1-427-sweep-tool` |
 | Shared head | `7d35eac8` | `7d35eac8` |
 | Final head | `8bf11fcc` | `ad4ac324` |
 | Review cycles | **7** | **3** |
@@ -140,11 +140,17 @@ instruction nor the examples describe.
 
 ## Artifacts
 
-Held locally under `logs/` and `.alucard/`, both gitignored, because they quote
-a private repository: the ground truth, the seed diff, the observer probe and
-its output against all three heads, both run logs, each arm's measurements,
-events, raw agent transcripts and dispatched prompts, both tool checkouts and
-the pairing records.
+Each arm's exact tool revision is tagged in this repository —
+`pilot/arm1-427-control-tool` and `pilot/arm1-427-sweep-tool` — so the two
+prompts that produced these results stay recoverable after the pilot worktrees
+were removed. The control tag is the prompt as of `e8df226`, before the
+class-sweep section existed.
+
+Everything that quotes the private target repository is held locally under
+`logs/` and `.alucard/`, both gitignored: the ground truth, the seed diff, the
+observer probe and its output against all three heads, both run logs, each arm's
+measurements, events, raw agent transcripts and dispatched prompts, and the
+pairing records.
 
 Both pairs ran on image `sha256:25b08ef1…`, which `alucard build` removed as
 superseded when headless Chromium was added later the same day. The digest
