@@ -125,6 +125,37 @@ Three tasks, seeded once each. From the baseline audit:
 
 Do not invent features to benchmark. Pick real queued work.
 
+## Seeding from a historical worker head
+
+A fresh seed is a gamble. Two in a row failed to leave a repeated defect behind
+— #446 produced one finding at one site, #460 got all three of its selected
+sites right — and each cost a worker run and an inspection to find that out. A
+merged PR whose review loop is already known to have found one class one site at
+a time is a seed whose repetition is documented rather than hoped for, and
+replaying it costs no worker invocation at all.
+
+The worker head is the PR's first commit when the worker committed once; the
+base is its parent. Replaying #427 this way produced a diff byte-identical to
+the historical one, so the technique is sound. Two mechanics bite:
+
+- **The arms cannot target `main`.** A merged PR's change is already in `main`,
+  squash-merged, along with every fix its review loop produced. A PR against
+  `main` would diff against a tree holding the answers and would almost
+  certainly conflict on merge. Pin a base branch at the historical base instead
+  and open both arms against it.
+- **CI does not fire for a pinned base.** The workflows list `main` alone under
+  `on.pull_request.branches`, so a pull request into `pilot/*` reports no checks
+  and `ci_gate` skips silently. Widen that filter to include `pilot/**` — on the
+  base branch only, never on an arm, or the workflow change joins the diff both
+  reviewers read; and never the `push` filter, so nothing builds off a pilot
+  branch.
+
+**The limit that decides most candidates.** A historical PR is only usable if
+the arm's own prompt does not describe it. See the contamination precondition
+below: for the class-sweep arm, the two PRs with the clearest repeated-class
+loops in the corpus — #427 and #444 — are the prompt's worked examples, which
+rules both out.
+
 ## Running
 
 ```bash
@@ -183,6 +214,15 @@ gh pr view "$SEED_PR" --repo aldovc/family-brain --json body --jq .body > "$PILO
 git -C "$REPO" diff "$(git -C "$REPO" merge-base origin/main "$W")" "$W" \
   > "$PILOT/$TASK-seed.diff"
 echo "Inspect $PILOT/$TASK-seed.diff and record surviving repeated defects before running the arms."
+
+# ── Contamination precondition, for any seed used to test sweeping ───────────
+# The sweep section carries two worked examples, and they are real PRs from this
+# repository: #427's unescaped-untrusted-string loop, three of its sites named
+# outright, and #444's automation-action allowlist loop. Seeding from either
+# hands the sweep arm this seed's answer while the control arm, whose prompt
+# predates the section, gets nothing — so the pair measures the example, not the
+# instruction. Read the examples and rule out any seed they describe.
+sed -n '/^## Sweep a finding.s class/,/^## /p' "$PILOT/sweep-tool/alucard-reviewer-prompt.md"
 
 
 # ── 2. Fork the identical worker head into both arms ─────────────────────────
