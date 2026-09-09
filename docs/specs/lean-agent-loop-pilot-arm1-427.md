@@ -55,31 +55,27 @@ second pair in a row where the cheap-looking arm was the worse one.
 
 ## The defect, written down before either arm reported
 
-Recorded in `logs/pilot-arm1-20260909-427/ground-truth.md` while the control arm
-was still on cycle 1, so that neither arm's behaviour could shape what counted
-as the answer. One class — untrusted text reaching model-facing tool output —
-at four sites, all inside the one function the diff adds, all leaving through
-the same error path:
+Recorded in the run's log directory while the control arm was still on cycle 1,
+so that neither arm's behaviour could shape what counted as the answer. One
+class — untrusted text reaching model-facing tool output — at four sites, all
+inside the one function the diff adds, all leaving through the same error path.
+Three distinct sources: an external service's error text, an identifier read
+from that service's catalog, and the caller's own input echoed back.
 
-1. the provider's exception text,
-2. an area-derived `entity_id`,
-3. the same identifier on the no-effects path,
-4. the caller's requested effect name, echoed back alongside the list read from
-   Home Assistant.
+The sites themselves are recorded with the run artifacts rather than here, since
+the target repository is private.
 
 ## What each arm did with it
 
-The control arm found the class four separate times, one site per cycle:
-provider error (cycle 1), the effect list (cycle 2), the requested effect
-(cycle 3), the effect list again because its own fix was incomplete (cycle 4).
-Exactly the habit the instruction exists to break, reproduced under the current
-tool revision rather than inferred from August's logs.
+The control arm found the class four separate times, one site per cycle, its
+fourth finding being that its own earlier fix had been incomplete. Exactly the
+habit the instruction exists to break, reproduced under the current tool
+revision rather than inferred from August's logs.
 
 The sweep arm raised four findings in cycle 1 — matching what the control arm
-took until cycle 6 to accumulate — and then approved on cycle 3. But it treated
-the effect list as a *type-safety* problem, added
-`all(isinstance(item, str) for item in effect_list)`, and left the interpolation
-in place. It never raised the echoed effect name at all.
+took until cycle 6 to accumulate — and then approved on cycle 3. But it read one
+of the sites as a type-safety problem, fixed it as one, and left the underlying
+interpolation in place. It never raised a third site at all.
 
 So it was broader per cycle and still did not sweep the class. Reporting more
 findings at once is not the same behaviour as enumerating one class's sites,
@@ -87,10 +83,9 @@ and this pair separates them cleanly.
 
 ## Settled independently, not by reading the reviews
 
-An observer-only probe (`logs/pilot-arm1-20260909-427/test_injection_probe.py`)
-sends an instruction-shaped string through both paths and asserts it does not
-reach `content` or `raw`. It is not part of either arm. Run in the pinned image
-against three heads:
+An observer-only probe, kept with the run artifacts, sends an instruction-shaped
+string through both paths and asserts it never reaches model-facing output. It
+is not part of either arm. Run in the pinned image against three heads:
 
 | Head | Result |
 |---|---|
@@ -101,12 +96,11 @@ against three heads:
 The sweep arm's final head is no better than the seed on this class. Its CI is
 green and its reviewer approved it.
 
-The control arm's fix is not a token escape either: it logs the provider
-exception server-side, returns a fixed message, drops the echoed effect name,
-and adds a bounded allowlist for effect names with a stated rationale. It then
-noticed in cycle 5 that the model prompt still promised a list the code no
-longer returns, and corrected the prompt. That coherence is what the extra
-cycles and the extra 173 lines bought.
+The control arm's fix is not a token escape either: it moves the untrusted text
+out of model-facing output entirely, adds a bounded allowlist with a stated
+rationale, and then notices in cycle 5 that a prompt elsewhere still promised
+behaviour the code no longer had, and corrects it. That coherence is what the
+extra cycles and the extra 173 lines bought.
 
 ## Verdict
 
@@ -146,14 +140,11 @@ instruction nor the examples describe.
 
 ## Artifacts
 
-`logs/pilot-arm1-20260909-427/`: `ground-truth.md`, `427-seed.diff`,
-`test_injection_probe.py`, `probe-seed.txt`, `probe-control.txt`,
-`probe-sweep.txt`, `control-run.log`, `sweep-run.log`, and each arm's
-`measurements.jsonl`, events log, raw reviewer/feedback JSONL and dispatched
-prompts.
-
-`.alucard/pilot-427-20260909/`: both tool checkouts, the isolated target clone,
-the validation clone, `setup-manifest.json`, `mapping.tsv`, `observed.tsv`.
+Held locally under `logs/` and `.alucard/`, both gitignored, because they quote
+a private repository: the ground truth, the seed diff, the observer probe and
+its output against all three heads, both run logs, each arm's measurements,
+events, raw agent transcripts and dispatched prompts, both tool checkouts and
+the pairing records.
 
 Both pairs ran on image `sha256:25b08ef1…`, which `alucard build` removed as
 superseded when headless Chromium was added later the same day. The digest

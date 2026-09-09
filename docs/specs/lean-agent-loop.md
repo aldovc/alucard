@@ -48,9 +48,9 @@ home-cluster test figure as +266 rather than +355 — the difference is which
 paths count as tests, not a different measurement.
 
 Growth alone does not prove waste or attribute it to Alucard. For example,
-family-brain's cover-control tests protect a meaningful distinction between
-curtains and garage doors, while home-cluster's recent Audiobookshelf growth is
-mostly manifests and documentation. The audit must inspect requirements and code.
+some of family-brain's tests protect a safety-relevant distinction between two
+device kinds that behave alike but must not be confused, while home-cluster's
+recent growth is mostly service manifests and documentation. The audit must inspect requirements and code.
 
 [Ponytail's rules](https://github.com/DietrichGebert/ponytail/blob/main/skills/ponytail/SKILL.md)
 inform the preference for existing capabilities and present needs, with explicit
@@ -178,7 +178,7 @@ hardest. Cycle count, not line count, is the dominant avoidable cost: PR #427
 spent six review cycles and PR #444 six more, each cycle reporting one instance
 of a single issue class and then handing back for a fix. On #427 the class was
 untrusted strings reaching model-facing content — found first in the provider
-error, then the requested effect name, then the area-derived `entity_id`. On
+error, then a value echoed back to the caller, then an externally sourced identifier. On
 #444 it was holes in one automation-action allowlist. Every finding was real;
 they simply arrived one at a time.
 
@@ -270,9 +270,9 @@ rather than for a generic successor:
 - Verification commands and toolchain layout. One audited worker spent five
   commands establishing whether the repo builds through `Justfile`,
   `backend/justfile`, `uv`, or `poetry`.
-- Entry points into hub files. `agent_tools.py` (6,239 lines) appeared in 82
+- Entry points into hub files. One 6,239-line module appeared in 82
   tool calls across the eleven review and feedback invocations for one PR.
-- Static repository documentation. `CONVENTIONS.md` was opened by 18 separate
+- Static repository documentation. One conventions file was opened by 18 separate
   invocations in a single run and cannot change while that run is in flight.
   This is the cheapest item on the list.
 
@@ -363,7 +363,7 @@ cycle 1 and contributed zero post-worker lines, which makes it useless for a
 reviewer-side arm and ideal for a worker-side one — with review-driven growth at
 zero, any change in test volume is attributable to the worker policy alone.
 
-Family-brain's `control_home_device` domain extensions (the #402/#403/#427
+Family-brain's device-control domain extensions (the #402/#403/#427
 shape) are the right behaviour-change slot: bounded, they exercise the trust
 boundary that generates most real findings, and four comparable historical runs
 exist to sanity-check against.

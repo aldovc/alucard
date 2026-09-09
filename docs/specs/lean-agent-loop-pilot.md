@@ -114,8 +114,8 @@ git -C "$PILOT/sweep-tool"   rev-parse HEAD
 
 Three tasks, seeded once each. From the baseline audit:
 
-1. **Behaviour change on existing helpers** — family-brain, a
-   `control_home_device` domain extension in the #402/#403/#427 shape. The slot
+1. **Behaviour change on existing helpers** — family-brain, a device-control
+   domain extension in the #402/#403/#427 shape. The slot
    that matters most: it exercises the trust boundary that produced most real
    findings, and it is where the six-cycle loops happened.
 2. **Test-heavy application change** — family-brain. Zodiac cannot test this

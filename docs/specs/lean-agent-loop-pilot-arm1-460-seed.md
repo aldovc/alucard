@@ -25,42 +25,39 @@ remains open. No findings were posted to GitHub or injected into agent prompts.
   succeeded at that exact head. No CI-fix commits or reviewer invocations.
 - Upstream main and seed branch were rechecked after inspection: neither moved.
 
-All locations below are in `backend/src/family_brain/finance/receipts/repository_psql.py`
-at the frozen head.
+All three locations are in one query module at the frozen head. The exact
+queries and line numbers are recorded with the run artifacts rather than here,
+since the target repository is private.
 
-| Query | Predicate line | Surviving omission |
-|---|---:|---|
-| SQL_COUNT_UNMATCHED | 81 | None |
-| SQL_LIST_UNMATCHED_RECEIPTS | 143 | None |
-| SQL_LIST_UNMATCHED_IN_RANGE | 152 | None |
+| Selected site | Surviving omission |
+|---|---|
+| Query 1 of 3 | None |
+| Query 2 of 3 | None |
+| Query 3 of 3 | None |
 
-Each has `WHERE transaction_id IS NULL AND status = 'processed'`.
-The three observer checks passed against the actual imported SQL constants.
+Each carries the required predicate.
+The three observer checks passed against the actual imported query constants.
 These are structural predicate checks, not PostgreSQL integration tests.
-The migration also defaults existing rows to processed and constrains the four
-status values. It was inspected, not applied to a live database.
+The accompanying migration was inspected, not applied to a live database.
 
 ## Separate acceptance gaps, not multi-site evidence
 
-Both observations are in the same provider-error handler in
-`backend/src/family_brain/finance/receipts/service.py:156`.
+Both observations are in the same provider-error handler, a few lines apart.
 
-1. **Provider failure is recorded but swallowed (line 160).** The extractor now
-   raises, but the service catches the provider error and returns a failed
-   receipt. An isolated RateLimitError probe confirms failed status was recorded
-   yet the original exception never reached the caller. This conflicts with the
-   issue's requested raise-through behavior. Existing service tests explicitly
-   expect a normal return, so passing tests do not resolve that contract gap.
-   This does not request implementing the later job queue.
-2. **Secondary storage failure prevents recording the extraction failure
-   (line 159).** The handler uploads an image before calling
-   `mark_receipt_failed`. If that upload raises, the status remains processing
-   and no failed-record call occurs. The independent probe reproduces exactly
+1. **A provider failure is recorded but then swallowed.** The service catches
+   the error and returns a normal result, so the original exception never
+   reaches the caller. An isolated probe confirms it. This conflicts with the
+   raise-through behaviour the issue asked for. Existing tests expect the normal
+   return, so a passing suite does not resolve the contract gap.
+2. **A secondary failure inside the handler prevents the first one being
+   recorded at all.** The handler performs a second, fallible step before
+   writing the failure down. If that step raises, the record is never written
+   and the row is left mid-flight. The independent probe reproduces exactly
    that outcome.
 
 Observer-only probes: **3 passed, 2 failed**, exit 1, for the reasons above.
-The seed's existing three receipt test modules passed independently in the same
-container: **26 passed**. The worker reported a full-suite result of
+The seed's three existing test modules for the touched area passed
+independently in the same container: **26 passed**. The worker reported a full-suite result of
 2,558 passed / 4 skipped; GitHub's lint-and-test job independently succeeded.
 
 The two failing scenarios are not two repeated implementation sites. Do not
@@ -92,16 +89,16 @@ persistent from the start, not copied out of /tmp after completion.
 
 ## Evidence and next decision
 
-[Machine-readable assessment](lean-agent-loop-pilot-arm1-460.json).
+The machine-readable assessment is kept with the run artifacts under `logs/`,
+not here: it lists the private repository's changed files verbatim.
 
 Persistent, gitignored artifacts: `logs/pilot-arm1-20260909-460/`:
 
 - `seed/alucard-20260909-094923/`: measurements, events, raw worker JSONL,
   exact dispatched prompt, dependency preflight.
-- `receipt-460-seed.diff`: full frozen seed diff.
-- `source-issue.json`, `receipt-460-tasks.md`, `setup-manifest.json`.
-- `test_pilot_seed_contract.py`, `seed-contract-probe.txt`,
-  `existing-receipt-tests.txt`.
+- the full frozen seed diff, the source issue, the local task file and the
+  setup manifest.
+- the observer probe, its output, and the existing-test output.
 
 Persistent isolated checkouts: `.alucard/pilot-460-20260909/`.
 Image:

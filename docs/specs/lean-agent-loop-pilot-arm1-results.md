@@ -133,7 +133,7 @@ GitHub Actions independently confirmed success at the measured heads:
 ## Evidence and next decision
 
 Machine-readable measurements and pairing:
-[lean-agent-loop-pilot-arm1-446.json](lean-agent-loop-pilot-arm1-446.json).
+the machine-readable assessment kept with the run artifacts under `logs/`.
 
 Raw JSONL, exact dispatched prompts, events, task/body snapshots, mapping,
 observed heads, and independent pass/fail output are preserved under
@@ -142,22 +142,22 @@ The original isolated checkouts remain at `/tmp/alucard-pilot-446.8CmoPW`.
 
 ### Selected next task: family-brain #460
 
-`feat(finance): receipt ingest correctness`. Chosen because one required change
+an ingest-correctness task. Chosen because one required change
 has to land in several places at once, which is the opportunity this pair never
 offered. Inventory taken from the current tree (the issue's line references were
 checked and are accurate):
 
 | Required change | Places it must land | Where |
 |---|---:|---|
-| Exclude non-`processed` rows from the unmatched queries | 3 | `finance/receipts/repository_psql.py` `SQL_COUNT_UNMATCHED:74`, `SQL_LIST_UNMATCHED_RECEIPTS:122`, `SQL_LIST_UNMATCHED_IN_RANGE:131` — reached from `household_observer.py`, `matcher.py`, `service.py` |
-| Make `create_receipt_items` idempotent | 1 | `repository_psql.py:230`, a bare insert loop |
-| Move the Pillow decode off the event loop | 1 | `receipts/service.py` `_resize_image:27`, called once at `:114` |
+| Add one status predicate to the unmatched queries | 3 | three query constants in one module |
+| Make an insert path idempotent | 1 | one bare insert loop in the same module |
+| Move an image decode off the event loop | 1 | one helper, one call site |
 
 **Only the first is multi-site**, and an earlier version of this table overstated
-the other two. `update_receipt_extraction:291` is a single unconditional
+the other two. The second candidate is a single unconditional
 `UPDATE` and is already idempotent — the issue lists it as the desired end
 state, not a second defect. The pre-extraction downscale is work to be added,
-not an existing second Pillow site. Both were verified in the tree.
+not an existing second site for it. Both were verified in the tree.
 
 So the case for #460 rests on the three unmatched queries alone: they take the
 same new filter, they sit in one file the change must touch, and a worker can

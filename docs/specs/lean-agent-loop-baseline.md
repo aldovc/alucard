@@ -31,7 +31,7 @@ were read line by line.
 
 - **home-cluster is not a usable sample.** Seven Alucard PRs exist across its whole
   history, four in the recent listing, one of those closed unmerged, and only #29 has
-  run logs. Its `HEAD~20` growth is Audiobookshelf manifests and docs written
+  run logs. Its `HEAD~20` growth is service manifests and docs written
   outside Alucard. Nothing in this report about reviewer or worker behaviour is
   supported by home-cluster evidence.
 - **Costs are partial.** Worker invocations run on the claude provider and report
@@ -160,7 +160,7 @@ buys a restructuring commit. That is the maintainer's call, not a policy target.
 PR #427 is the clearest case. Six review cycles, five feedback rounds. The findings
 were not scope creep — each cycle found a genuinely new instance of one class,
 untrusted strings reaching model-facing content, in a new place: first the provider
-error, then the requested effect name, then the area-derived `entity_id`. The
+error, then a value echoed back to the caller, then an externally sourced identifier. The
 reviewer looked in one place per cycle.
 
 What that cost, for one PR:
@@ -195,12 +195,12 @@ in code the worker just wrote.
 
 ## Finding 4 — repeated reading is real, concentrated in hub files
 
-For PR #427, `backend/src/family_brain/conversations/agent_tools.py` (6,239 lines at
+For PR #427, the repository's largest hub module (6,239 lines at
 the time) appeared 21 times in the worker's tool inputs and 82 times across the 11
 review and feedback invocations. The reviewer is already disciplined about it — it
 reads named ranges (`sed -n '1380,1540p'`), not whole files — but it re-derives
 which ranges to read on every cycle, alongside a fresh `gh pr view`, `gh pr diff`, and
-`docs/agents/backend/CONVENTIONS.md` read each time.
+a static conventions document read each time.
 
 Worker orientation is also measurable: bytes of tool output consumed before the first
 `Edit`/`Write` were 61%, 70%, 82%, 69%, 68%, 81%, and 37% of each run's total across
@@ -229,8 +229,8 @@ and 19 by eight or more. Zodiac averages 1.41 and has nothing above four. The ga
 is review cycles: zodiac approves on cycle 1, family-brain does not.
 
 The worst offenders are all in `alucard-20260828-194928`, the run that produced
-#427, #428, and #429: `agent_tools.py` opened by 23 separate invocations,
-`docs/agents/backend/CONVENTIONS.md` by 18, `agent_loop.py` by 16. CONVENTIONS.md
+#427, #428, and #429: the hub module opened by 23 separate invocations, the
+conventions document by 18, its sibling entry-point module by 16. The conventions doc
 is the cheapest possible win — it is a static repo document that cannot change
 during a run, and 18 agents each spent a read establishing what the previous one
 already knew.
@@ -239,10 +239,10 @@ already knew.
 
 | # | Location / PR | Protects | Unnecessary part | Proposed change | Verification to retain | Class | Confidence |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `backend/tests/unit/conversations/test_agent_tools_control_home_device.py::test_effect_fields_publish_turn_on_only_guidance` (family-brain #427) | Model is not told `rgb_color`/`effect` work on `turn_off` | Exact-substring assertions against the schema description *and* the `## Home` system prompt prose | Assert the schema exposes both properties; drop the prompt-prose substring match | `test_rejects_rgb_color_for_non_turn_on_light_actions`, `test_rejects_effect_for_non_turn_on_light_actions` already cover the behaviour | safe to simplify | high |
-| 2 | `agent_tools.py` RGB constants (family-brain #427, commit `4025cfb9`) | Schema bounds and runtime validation agreeing | Making a Low-severity literal-extraction a merge blocker | Keep the constants; stop letting this class block merge | existing rgb range tests | policy target, not a code change | high |
+| 1 | A prompt-guidance assertion in the touched test module (family-brain #427) | Model is not told two optional fields are rejected on some actions | Exact-substring assertions against the schema description *and* the `## Home` system prompt prose | Assert the schema exposes both properties; drop the prompt-prose substring match | `test_rejects_rgb_color_for_non_turn_on_light_actions`, `test_rejects_effect_for_non_turn_on_light_actions` already cover the behaviour | safe to simplify | high |
+| 2 | Numeric bound constants in the hub module (family-brain #427) | Schema bounds and runtime validation agreeing | Making a Low-severity literal-extraction a merge blocker | Keep the constants; stop letting this class block merge | existing rgb range tests | policy target, not a code change | high |
 | 3 | Deferred-import comment finding (family-brain #401) | Nothing at runtime | Requiring a comment naming the circular import | Drop as a blocking rule | none needed | policy target | high |
-| 4 | `test_rejects_rgb_color_wrong_length` / `..._component_out_of_range` (family-brain #427) | Malformed RGB rejected before the provider call | Two tests asserting the same message through the same branch | Parameterize into one | same assertions | safe to simplify | medium |
+| 4 | Two malformed-input rejection tests (family-brain #427) | Bad input rejected before the provider call | Two tests asserting the same message through the same branch | Parameterize into one | same assertions | safe to simplify | medium |
 | 5 | Complexity-churn commits (family-brain #427, #444) | ruff `C90` gate | Nothing — repo-chosen lint | No change | — | justified complexity | high |
 | 6 | `docs/verification/pr<N>/` READMEs + screenshots (zodiac #143, #145, #146, #147, #150, #153) | Visual acceptance criteria the maintainer set | Nothing agent-side; 12–44 lines plus binaries per PR accumulate in-repo | No change without a maintainer decision on retention | — | requires a product decision | high |
 | 7 | family-brain #445 (+195% growth) | Stale README env var, untested JSONB decode path, retired config fields still live in the catalog | Nothing | No change — largest relative growth in the sample was fully justified | all three added tests | justified complexity | high |
@@ -280,7 +280,7 @@ Five things the audit learned are encoded as behaviour rather than intention:
   The bucket heuristics are guesses and were already wrong once: the first version
   classified zodiac's `docs/spec/` requirements as tests. Renames are read from
   git's NUL-delimited output rather than its display notation, because
-  `backend/tests/{unit => integration}/helper.py` parsed as display text loses the
+  a `{unit => integration}` rename path parsed as display text loses the
   prefix and books a moved test as implementation.
 - **A diff that could not be taken says so.** An unresolvable ref returns
   `{"unavailable": true, "reason": …}`, never `files:0, added:0`, which would read
@@ -349,8 +349,8 @@ worker that wrote the code), and the most repetitive reader is the reviewer acro
 cycles of the same PR. Both are later roles, so the mechanism fits — but the record's
 contents should be chosen for them: verification commands and toolchain layout
 (the #427 worker burned five commands finding the build tool), and entry points into
-hub files like the 6,239-line `agent_tools.py`. The single clearest candidate is
-static repo documentation: `CONVENTIONS.md` was opened by 18 separate invocations in
+hub files like that 6,239-line module. The single clearest candidate is
+static repo documentation: one conventions file was opened by 18 separate invocations in
 one run and cannot change while that run is in flight. Keep it behind its flag and
 behind the policy pilot, as the spec says.
 
@@ -377,7 +377,7 @@ this role *weakens* an adequate guard. Consider excluding CI-fix from the fragme
 
 The spec asks for one behaviour change on existing helpers, one test-heavy
 application change, and one configuration/docs change, chosen after this audit.
-family-brain's `control_home_device` domain extensions (the #402/#403/#427 shape) are
+family-brain's device-control domain extensions (the #402/#403/#427 shape) are
 the right behaviour-change slot: they are bounded, they exercise the trust boundary
 that generates most real findings, and there are four comparable historical runs to
 sanity-check against. Zodiac supplies the test-heavy slot, and its silent
