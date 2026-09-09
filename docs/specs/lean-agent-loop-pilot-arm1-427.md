@@ -138,9 +138,11 @@ instruction nor the examples describe.
 - Merge #465 or #466. Both are pilot artifacts on a pinned base.
 - Read the 7→3 cycle drop as a saving. It is a saving only if the work skipped
   did not need doing, and the probe shows it did.
-- Carry this result over to the prompt on `feat/lean-loop-step-2`. That prompt
-  still has the examples, and this pair says the examples may be the whole
-  effect.
+- Read this as a verdict on the paragraph *with* its examples. It was run
+  without them, and this pair is the reason the paragraph is gone from
+  `alucard`'s reviewer prompt altogether — replaced by two
+  mechanical checks in `a90cccf`. Whether the examples alone would have worked
+  is still untested.
 
 ## Artifacts
 
