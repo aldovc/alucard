@@ -16,10 +16,10 @@ Read the task's full body, acceptance criteria, and any prior-attempt notes befo
 ## Implement (red → green → refactor)
 
 For testable work:
-- **RED** — failing test capturing one acceptance criterion
+- **RED** — failing test capturing behaviour the task changes
 - **GREEN** — minimal code to pass
 - **REFACTOR** — clean up while green
-- Repeat per criterion
+- Repeat until the changed behaviour and its distinct failure modes are covered
 
 For non-testable work (config, scripts, docs), skip the test loop but still work in small verifiable steps.
 
@@ -69,13 +69,10 @@ Before running lint and tests, read your own diff and check for each of the foll
 - Each function stays in its layer: routers route, services process, clients talk to external APIs.
 - Nothing in the implementation exists only to satisfy a test or pass acceptance criteria by patching around the real problem.
 
-**Reusability and DRY**
-- No logic block appears in two places. If it does, extract it.
-- Any `import` inside a function body has a comment naming the circular-import it avoids.
-
-**Magic values**
-- Every numeric or string literal that carries domain meaning is a named constant.
+**Reuse and configuration**
+- You are reusing an existing helper rather than re-implementing what it does.
 - No external service URL is an inline string in a function body.
+- Any `import` inside a function body has a comment naming the circular-import it avoids.
 
 **Anti-patterns**
 - Each function's responsibility can be stated in one sentence. If it cannot, split it.

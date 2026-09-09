@@ -84,17 +84,11 @@ Flag any of the following as **CHANGES_REQUESTED**. These are not style preferen
 - **Layer crossing**: a router must not download files; a domain model must not make HTTP calls; a service must not format user-facing strings. Each layer has a contract — flag crossings regardless of whether they "work."
 - **Workarounds dressed as solutions**: if the implementation patches around a constraint (test monkey-patching, skipping validation, hardcoding a value to pass a test) rather than solving it properly, flag it. Shortcuts that exist only to satisfy acceptance criteria are bugs deferred.
 
-### Reusability and DRY
-- **Duplicated logic**: if the same behaviour (URL construction, error handling, response formatting) appears in two or more places, flag it. The fix is extraction, not tolerance.
+### Reusability
 - **Deferred imports without justification**: `import` inside a function body hides dependencies. Flag unless a comment names the specific circular-import being avoided.
-
-### Magic values
-- **Magic numbers**: unnamed numeric literals that carry domain meaning (thresholds, limits, timeouts, status codes) must be named constants.
-- **Magic strings**: hardcoded external URLs, status strings, or message templates embedded in logic must be constants or config — not inline literals.
 
 ### Anti-patterns
 - **God function**: a single function that downloads, classifies, routes, and dispatches is doing four jobs. Flag functions whose responsibilities cannot be stated in one sentence.
-- **Stringly-typed dispatch**: using raw strings or untyped values to branch on behaviour where an enum or polymorphism would make invalid states unrepresentable.
 - **Swallowed exceptions**: bare `except Exception: pass` or logging without re-raise (unless the fallback behaviour is explicit and intentional) hides bugs. Flag any exception handler that does not either recover deliberately or propagate.
 
 ## Verdict
