@@ -1321,7 +1321,7 @@ measure_emit() {
 measure_classify() {
   awk '
     function bucket(p) {
-      # No bare `spec/` here: zodiac keeps requirements in docs/spec/, and
+      # No bare `spec/` here: some repos keep requirements in docs/spec/, and
       # matching that directory silently books every acceptance-criteria edit
       # as test growth. Colocated .spec.tsx files are still caught below.
       if (p ~ /(^|\/)(tests?|__tests__)\// || p ~ /\.(test|spec)\.[tj]sx?$/ ||
