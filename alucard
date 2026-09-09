@@ -2084,6 +2084,7 @@ $(compose_role_prompt alucard-feedback-prompt.md)
 <review_findings>
 $(printf '%s' "$feedback_findings" | xml_escape)
 </review_findings>"
+  _feedback_prompt=$(append_review_policy "$_feedback_prompt" "$(read_review_policy "$REPO_ABS")")
 
   set +e
   invoke_agent \
@@ -2281,6 +2282,44 @@ compose_role_prompt() {
   fi
 }
 
+# A target repository may ship its own REVIEW.md: extra review passes, a
+# severity threshold, findings it does not want raised. Without this the
+# reviewer only ever reads alucard's prompt, so a repo that tightens its policy
+# changes nothing about how it gets reviewed.
+#
+# Capped rather than unbounded — this goes into every review and feedback
+# invocation of every cycle. Oversized files are truncated with a marker rather
+# than dropped: a repo that outgrows the cap should still get most of its
+# policy, and the agent should be able to see that it was cut.
+REVIEW_POLICY_MAX_BYTES="${REVIEW_POLICY_MAX_BYTES:-16384}"
+
+read_review_policy() {
+  local policy_file="$1/REVIEW.md" size
+  [ -f "$policy_file" ] || return 0
+  size=$(wc -c < "$policy_file" 2>/dev/null) || return 0
+  if [ "$size" -gt "$REVIEW_POLICY_MAX_BYTES" ]; then
+    head -c "$REVIEW_POLICY_MAX_BYTES" "$policy_file"
+    printf '\n\n[alucard: truncated at %s of %s bytes]\n' \
+      "$REVIEW_POLICY_MAX_BYTES" "$size"
+  else
+    cat "$policy_file"
+  fi
+}
+
+# Appends <review_policy> to a prompt when the target repo ships one. A no-op
+# otherwise, so a repo without REVIEW.md gets exactly the prompt it got before.
+# The content is repo-authored and therefore untrusted in the same sense as a
+# PR body — both role prompts say what it may and may not change.
+append_review_policy() {
+  local prompt="$1" policy="$2"
+  if [ -n "$policy" ]; then
+    printf '%s\n<review_policy>\n%s\n</review_policy>' \
+      "$prompt" "$(printf '%s' "$policy" | xml_escape)"
+  else
+    printf '%s' "$prompt"
+  fi
+}
+
 # Appends <task>/<parent_context> to a reviewer prompt when local-mode task
 # context is available (task_xml non-empty); a no-op in github mode, where
 # the reviewer prompt's own fallback instructs it to `gh issue view` instead.
@@ -2398,6 +2437,12 @@ review_gate() {
     log_event "Blocked-ledger loaded from PR #$pr_num."
   fi
 
+  local _review_policy
+  _review_policy=$(read_review_policy "$REPO_ABS")
+  if [ -n "$_review_policy" ]; then
+    log_event "Review gate: using $REPO_ABS/REVIEW.md as the repo's review policy."
+  fi
+
   for review_cycle in $(seq 1 "$MAX_REVIEW_CYCLES"); do
     echo "Review cycle $review_cycle/$MAX_REVIEW_CYCLES — running reviewer agent..."
 
@@ -2414,6 +2459,7 @@ $(printf '%s' "${TOOLCHAIN_STATUS:-Unknown — no preflight result available.}" 
 $(printf '%s' "${blocked_ledger:-None recorded.}" | xml_escape)
 </known_blockers>"
     _review_prompt=$(append_task_context "$_review_prompt" "$task_xml" "$parent_context_xml")
+    _review_prompt=$(append_review_policy "$_review_prompt" "$_review_policy")
 
     # A transport drop tells us nothing about the PR, so it gets the same
     # fresh-attempt treatment the worker gets rather than burning a review
