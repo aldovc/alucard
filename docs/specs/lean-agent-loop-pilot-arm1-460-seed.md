@@ -12,8 +12,8 @@ of the PR: there are separately reproduced acceptance gaps below.
 
 Seed: [family-brain #464](https://github.com/aldovc/family-brain/pull/464),
 implementing [issue #460](https://github.com/aldovc/family-brain/issues/460).
-The PR remains open, unmerged, and without formal reviews. Source issue #460
-remains open. No findings were posted to GitHub or injected into agent prompts.
+No findings from this assessment were posted to GitHub or injected into agent
+prompts; the PR was corrected and merged independently. See the outcome below.
 
 ## Frozen seed and selected sites
 
@@ -106,7 +106,22 @@ Image:
 Seed command used one iteration, 30-minute timeout, zero review cycles,
 `--no-build`, and the original gitignored env file.
 
-Do not spend paired-review runs on this seed to claim consolidation. The next
-decision is how to correct/review #464 normally and which separate seed can
-supply genuine repeated defects for the experiment. No further task, fix,
-review arm, deployment, merge, or cleanup was performed.
+Do not spend paired-review runs on this seed to claim consolidation. No review
+arm, fix or deployment was performed from this assessment.
+
+## Outcome
+
+#464 was corrected and merged on 2026-09-09 without input from this document.
+Re-running the same observer probe against merged `main` gives **4 passed,
+1 failed**, against 3/2 on the frozen seed:
+
+- The secondary-failure gap is **closed**. The failure is now recorded before
+  the fallible step that used to be able to prevent it.
+- The swallowed-provider-exception gap is **still present**. The failure is
+  recorded and a normal result is returned, so the original exception never
+  reaches the caller.
+
+Whether that second one is a defect is a product decision rather than a
+measurement. Issue #460 asked for raise-through; the merged behaviour records
+and returns. Returning may well be the better choice for the calling surface —
+but the issue still says otherwise, and it is still open.
