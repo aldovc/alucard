@@ -1,0 +1,234 @@
+{
+  "status": "seed-inspected; no review arms started",
+  "assessed_date": "2026-09-09",
+  "task": "aldovc/family-brain#460",
+  "seed_pr": 464,
+  "seed_head": "1ed3fb30fe509a2b2a9102c8398f34a95b1ae2f3",
+  "base": "93435e2687665a9cf64084a14a670c6e064c6d90",
+  "ci_run": "https://github.com/aldovc/family-brain/actions/runs/34297514373",
+  "consolidation": {
+    "outcome": "inconclusive",
+    "selected_sites": [
+      {
+        "name": "SQL_COUNT_UNMATCHED",
+        "line": 81,
+        "filter_present": true
+      },
+      {
+        "name": "SQL_LIST_UNMATCHED_RECEIPTS",
+        "line": 143,
+        "filter_present": true
+      },
+      {
+        "name": "SQL_LIST_UNMATCHED_IN_RANGE",
+        "line": 152,
+        "filter_present": true
+      }
+    ],
+    "surviving_repeated_omissions": [],
+    "other_repeated_defects_identified": [],
+    "qualification": "Bounded seed diff inspection; not proof that the PR has no other defects."
+  },
+  "other_findings": [
+    {
+      "id": "F1",
+      "location": "backend/src/family_brain/finance/receipts/service.py:156",
+      "problem": "Provider exception is swallowed after recording failed status, contrary to the requested raise-through behavior.",
+      "probe": "test_provider_failure_is_recorded_and_propagates",
+      "result": "fails: original RateLimitError not propagated"
+    },
+    {
+      "id": "F2",
+      "location": "backend/src/family_brain/finance/receipts/service.py:159",
+      "problem": "Upload failure in the provider-error handler prevents recording failed status and original extraction error.",
+      "probe": "test_provider_failure_is_recorded_even_when_image_upload_fails",
+      "result": "fails: receipt status remains processing"
+    }
+  ],
+  "probe_summary": {
+    "passed": 3,
+    "failed": 2,
+    "exit_code": 1,
+    "query_checks": "structural checks on actual query constants, not a live PostgreSQL test",
+    "findings_sites": "Both failures belong to one shared service error handler; they do not establish a multi-site defect."
+  },
+  "previous_attempt": {
+    "branch": "alucard/iter-1-1788872996",
+    "status": "interrupted; temporary files and usage logs lost",
+    "pushed_branch_or_pr_found": false,
+    "cost": null,
+    "usage": null
+  },
+  "cost": {
+    "completed_seed_usd": 3.841773800000001,
+    "completed_seed_cost_complete": true,
+    "overall_experiment_cost_complete": false,
+    "reason": "The interrupted prior attempt's usage is unavailable."
+  },
+  "artifacts": "logs/pilot-arm1-20260909-460/",
+  "measurements": [
+    {
+      "format": 1,
+      "record": "run",
+      "ts": "2026-09-09T00:49:26Z",
+      "repo": "/home/aldo/aldovc/alucard/.alucard/pilot-460-20260909/target",
+      "repo_id": "aldovc/family-brain",
+      "base_branch": "main",
+      "task_source": "file (/home/aldo/aldovc/alucard/.alucard/pilot-460-20260909/receipt-460-tasks.md)",
+      "alucard_rev": "ae25183e7d62dfe5801bcf9606ecfb911ff7e567",
+      "alucard_dirty": false,
+      "prompt_digest": "07e2c3820f424d3474e128fa7d0b8759de03ea28ddb373452eb6a75ddea3afd3",
+      "image": "sha256:25b08ef1db6542136839ecc5b35069b903a642f3d74c3928106f479020866261",
+      "image_id": "sha256:25b08ef1db6542136839ecc5b35069b903a642f3d74c3928106f479020866261",
+      "roles": {
+        "WORKER": {
+          "provider": "claude",
+          "claude_model": "sonnet",
+          "codex_model": "gpt-5.6-terra",
+          "effort": ""
+        },
+        "CI_FIX": {
+          "provider": "codex",
+          "claude_model": "sonnet",
+          "codex_model": "gpt-5.6-terra",
+          "effort": ""
+        },
+        "REVIEWER": {
+          "provider": "codex",
+          "claude_model": "sonnet",
+          "codex_model": "gpt-5.6-terra",
+          "effort": ""
+        },
+        "FEEDBACK": {
+          "provider": "claude",
+          "claude_model": "sonnet",
+          "codex_model": "gpt-5.6-terra",
+          "effort": ""
+        }
+      }
+    },
+    {
+      "format": 1,
+      "record": "stage",
+      "ts": "2026-09-09T01:02:16Z",
+      "repo_id": "aldovc/family-brain",
+      "iter": "1",
+      "pr": "464",
+      "stage": "worker",
+      "cycle": 0,
+      "base_sha": "93435e2687665a9cf64084a14a670c6e064c6d90",
+      "prev_sha": "93435e2687665a9cf64084a14a670c6e064c6d90",
+      "head_sha": "1ed3fb30fe509a2b2a9102c8398f34a95b1ae2f3",
+      "is_merge": false,
+      "base_drifted": false,
+      "baseline_source": "pinned",
+      "from_base": {
+        "files": 10,
+        "binary_files": 0,
+        "renames": 0,
+        "added": 473,
+        "deleted": 107,
+        "tests": {
+          "added": 269,
+          "deleted": 21,
+          "binary_files": 0
+        },
+        "impl": {
+          "added": 187,
+          "deleted": 86,
+          "binary_files": 0
+        },
+        "confdoc": {
+          "added": 17,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "generated": {
+          "added": 0,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "paths": [
+          "backend/migrations/20260909120000_finance_receipts_status.down.sql",
+          "backend/migrations/20260909120000_finance_receipts_status.up.sql",
+          "backend/src/family_brain/bot/router.py",
+          "backend/src/family_brain/finance/receipts/domain.py",
+          "backend/src/family_brain/finance/receipts/extractor.py",
+          "backend/src/family_brain/finance/receipts/repository_psql.py",
+          "backend/src/family_brain/finance/receipts/service.py",
+          "backend/tests/unit/test_receipt_extractor.py",
+          "backend/tests/unit/test_receipt_image_processing.py",
+          "backend/tests/unit/test_receipt_service.py"
+        ]
+      },
+      "from_prev": {
+        "files": 10,
+        "binary_files": 0,
+        "renames": 0,
+        "added": 473,
+        "deleted": 107,
+        "tests": {
+          "added": 269,
+          "deleted": 21,
+          "binary_files": 0
+        },
+        "impl": {
+          "added": 187,
+          "deleted": 86,
+          "binary_files": 0
+        },
+        "confdoc": {
+          "added": 17,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "generated": {
+          "added": 0,
+          "deleted": 0,
+          "binary_files": 0
+        },
+        "paths": [
+          "backend/migrations/20260909120000_finance_receipts_status.down.sql",
+          "backend/migrations/20260909120000_finance_receipts_status.up.sql",
+          "backend/src/family_brain/bot/router.py",
+          "backend/src/family_brain/finance/receipts/domain.py",
+          "backend/src/family_brain/finance/receipts/extractor.py",
+          "backend/src/family_brain/finance/receipts/repository_psql.py",
+          "backend/src/family_brain/finance/receipts/service.py",
+          "backend/tests/unit/test_receipt_extractor.py",
+          "backend/tests/unit/test_receipt_image_processing.py",
+          "backend/tests/unit/test_receipt_service.py"
+        ]
+      }
+    },
+    {
+      "format": 1,
+      "record": "iteration",
+      "ts": "2026-09-09T01:03:24Z",
+      "iter": "1",
+      "pr": "464",
+      "base_sha": "93435e2687665a9cf64084a14a670c6e064c6d90",
+      "baseline_source": "pinned",
+      "rc": "0",
+      "duration_s": 838,
+      "ci_result": "green",
+      "review_verdict": "",
+      "review_cycles": 0,
+      "cost_complete": true,
+      "costed_invocations": 1,
+      "total_invocations": 1,
+      "roles": {
+        "worker": {
+          "invocations": 1,
+          "usage_missing": 0,
+          "input": 9641,
+          "output": 69225,
+          "cache_read": 13236054,
+          "cache_write": 197024,
+          "turns": 117,
+          "cost": 3.841773800000001
+        }
+      }
+    }
+  ]
+}
