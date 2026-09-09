@@ -331,25 +331,25 @@ mkdir -p "$LOG_ROOT/alucard-20260101-000000" "$LOG_ROOT/alucard-20260102-000000"
 
 # PR numbers are repository-local, and every repository's runs share $LOG_ROOT.
 cat > "$LOG_ROOT/alucard-20260101-000000/measurements.jsonl" <<'EOF'
-{"format":1,"record":"stage","repo_id":"aldovc/family-brain","pr":"43","stage":"worker","base_sha":"aaaaaaaaaaaa","baseline_source":"pinned"}
+{"format":1,"record":"stage","repo_id":"example/api","pr":"43","stage":"worker","base_sha":"aaaaaaaaaaaa","baseline_source":"pinned"}
 EOF
 cat > "$LOG_ROOT/alucard-20260102-000000/measurements.jsonl" <<'EOF'
-{"format":1,"record":"stage","repo_id":"aldovc/zodiac","pr":"43","stage":"worker","base_sha":"bbbbbbbbbbbb","baseline_source":"merge-base"}
+{"format":1,"record":"stage","repo_id":"example/web","pr":"43","stage":"worker","base_sha":"bbbbbbbbbbbb","baseline_source":"merge-base"}
 EOF
 
 assert_eq "lookup finds its own repository's base" "aaaaaaaaaaaa" \
-  "$(measure_prior_base_for_pr "aldovc/family-brain" 43 | cut -f1)"
+  "$(measure_prior_base_for_pr "example/api" 43 | cut -f1)"
 assert_eq "lookup does not cross repositories" "bbbbbbbbbbbb" \
-  "$(measure_prior_base_for_pr "aldovc/zodiac" 43 | cut -f1)"
+  "$(measure_prior_base_for_pr "example/web" 43 | cut -f1)"
 assert_eq "an unknown repository finds nothing" "" \
-  "$(measure_prior_base_for_pr "aldovc/home-cluster" 43)"
+  "$(measure_prior_base_for_pr "example/infra" 43)"
 
 # Provenance survives the round trip: an approximated base must not be
 # promoted to exact just because a later run read it out of a file.
 assert_eq "pinned provenance is preserved"     "pinned" \
-  "$(measure_prior_base_for_pr "aldovc/family-brain" 43 | cut -f2)"
+  "$(measure_prior_base_for_pr "example/api" 43 | cut -f2)"
 assert_eq "merge-base provenance is preserved" "merge-base" \
-  "$(measure_prior_base_for_pr "aldovc/zodiac" 43 | cut -f2)"
+  "$(measure_prior_base_for_pr "example/web" 43 | cut -f2)"
 
 # Records written before repo_id existed are ignored, not matched on PR alone.
 mkdir -p "$LOG_ROOT/alucard-20251231-000000"
@@ -357,7 +357,7 @@ cat > "$LOG_ROOT/alucard-20251231-000000/measurements.jsonl" <<'EOF'
 {"format":1,"record":"stage","pr":"99","stage":"worker","base_sha":"cccccccccccc"}
 EOF
 assert_eq "records without a repo id are skipped" "" \
-  "$(measure_prior_base_for_pr "aldovc/family-brain" 99)"
+  "$(measure_prior_base_for_pr "example/api" 99)"
 
 # ── Test group 5c: repository identity is stable across run modes ───────────
 echo "── measure_repo_id ──"
@@ -365,17 +365,17 @@ echo "── measure_repo_id ──"
 IDREPO="$TMP_ROOT/idrepo"
 mkdir -p "$IDREPO"
 git -C "$IDREPO" init -q
-git -C "$IDREPO" remote add origin "https://github.com/aldovc/zodiac.git"
-assert_eq "https remote yields owner/name" "aldovc/zodiac" "$(measure_repo_id "$IDREPO")"
-git -C "$IDREPO" remote set-url origin "git@github.com:aldovc/zodiac.git"
-assert_eq "ssh remote yields the same id"  "aldovc/zodiac" "$(measure_repo_id "$IDREPO")"
+git -C "$IDREPO" remote add origin "https://github.com/example/web.git"
+assert_eq "https remote yields owner/name" "example/web" "$(measure_repo_id "$IDREPO")"
+git -C "$IDREPO" remote set-url origin "git@github.com:example/web.git"
+assert_eq "ssh remote yields the same id"  "example/web" "$(measure_repo_id "$IDREPO")"
 # The same repository is reached through a cached clone in some run modes; the
 # id must not change with the path.
-CACHED="$TMP_ROOT/cache/aldovc/zodiac"
+CACHED="$TMP_ROOT/cache/example/web"
 mkdir -p "$CACHED"
 git -C "$CACHED" init -q
-git -C "$CACHED" remote add origin "https://github.com/aldovc/zodiac.git"
-assert_eq "a cached clone has the same id"  "aldovc/zodiac" "$(measure_repo_id "$CACHED")"
+git -C "$CACHED" remote add origin "https://github.com/example/web.git"
+assert_eq "a cached clone has the same id"  "example/web" "$(measure_repo_id "$CACHED")"
 
 NOREMOTE="$TMP_ROOT/noremote"
 mkdir -p "$NOREMOTE"

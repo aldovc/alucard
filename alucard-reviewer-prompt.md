@@ -64,6 +64,8 @@ Fast, high-yield, and able to catch deploy-breaking bugs that green CI hides. Do
 
 - **Phantom imports.** For every new `import X` / `from X import Y` the diff adds from an *internal* module, grep the target module for the definition of each symbol. A symbol that is imported, referenced, and patched in tests but never defined is an `ImportError` at module load — every route through that module 500s on deploy, yet patch-based tests stay green. Flag any symbol whose definition you cannot locate as **High severity**.
 - **Patch-based test smell.** When a test `patch()`es a symbol at its import site (e.g. `patch("app.module.some_factory")`), confirm the real symbol exists at that path. Such tests pass even when the underlying module would fail to import, so a passing suite is not evidence the symbol exists — verify it directly.
+- **Untrusted text in model-facing output.** For every string the diff builds that reaches a tool result's `content` or `raw`, or any other value returned to the model, list each interpolated expression and name where its value comes from. Flag every one sourced outside this process: a provider's response or exception text, an identifier read from an external catalog, a caller-supplied value echoed back in an error. These are instruction-injection sites and they arrive in batches — one new error path routinely holds three or four. Report them as **one finding listing every site**. **High severity** for provider exception text or an external identifier, **Medium** for a caller's own value echoed back.
+- **Guards that cover only some shapes of their input.** For every validator, allowlist or guard the diff adds or widens, enumerate the shapes its input can actually take — every domain, action, key, selector and type the schema or signature permits — and check the guard inspects each. Flag every shape it does not. A guard written against the shapes its author had in mind passes its author's tests and fails on the rest, and the gaps come in batches. Report them as **one finding listing every unhandled shape**, at the severity the worst one earns.
 
 ## Engineering standards checklist
 
@@ -124,9 +126,9 @@ GitHub may block self-review when the bot identity is also the PR author — in 
 For CHANGES_REQUESTED, list each finding as:
 
 - **Severity**: High / Medium / Low
-- **Location**: `file:line`
-- **Problem**: what is wrong and why it blocks merge
-- **Expected fix**: what a feedback agent must do to resolve it, using only the tools the container has
+- **Location**: `file:line` — when one cause has several sites, list every one of them here, each on its own line. Do not split them across several findings, and do not drop sites to keep the list short.
+- **Problem**: what is wrong and why it blocks merge. When several sites share one cause, state it once and then what goes wrong at each.
+- **Expected fix**: what a feedback agent must do to resolve it, using only the tools the container has. Cover every site listed.
 
 For BLOCKED, list each remaining gate the same way, but say plainly in **Expected fix** what the *human* must do and why no agent can. Do not restate items already in `<known_blockers>` — reference them.
 
