@@ -1416,6 +1416,42 @@ measure_diff_json() {
 # a later stage that reverts an earlier one would otherwise add to the total
 # instead of cancelling. The from_prev block is recorded separately, for
 # attributing a single stage's work, and is the only place a delta appears.
+# Add a label to a PR. `gh pr edit --add-label` resolves the PR through GraphQL,
+# which fails outright on repositories the Projects-classic deprecation touches:
+# it exits non-zero and applies nothing. Every call site used to end in
+# `2>/dev/null || true`, so that failure was invisible and PRs that stopped for
+# a human were never marked as such. The REST endpoint has no such dependency.
+# Labelling is never fatal to a run — but it is no longer silent.
+add_pr_label() {
+  local repo_dir="$1" pr_num="$2" label="$3"
+  if (cd "$repo_dir" && gh api --silent -X POST \
+        "repos/{owner}/{repo}/issues/${pr_num}/labels" \
+        -f "labels[]=${label}" 2>/dev/null); then
+    return 0
+  fi
+  log_event "Could not label PR #$pr_num as '$label'."
+  return 0
+}
+
+# Whether a finished feedback agent should end the review loop: it failed AND
+# left the branch exactly where the reviewer found it. Anything it pushed gives
+# the next cycle new code to judge, and an unreadable SHA ("unknown") is not
+# evidence that nothing happened.
+feedback_stalled() {
+  local rc="${1:-0}" advanced="${2:-unknown}"
+  [ "$rc" -ne 0 ] && [ "$advanced" = "false" ]
+}
+
+# The SHA a branch currently points at on the remote. Agent worktrees are
+# disposed as soon as their role finishes, so a local ref may never have been
+# updated — fetch rather than trust it. Echoes nothing and returns 1 when the
+# branch cannot be fetched or resolved.
+remote_branch_sha() {
+  local repo_dir="$1" branch="$2"
+  git -C "$repo_dir" fetch --quiet origin "$branch" 2>/dev/null || return 1
+  git -C "$repo_dir" rev-parse FETCH_HEAD 2>/dev/null || return 1
+}
+
 measure_stage() {
   local iter="$1" pr="${2:-}" stage="$3" cycle="${4:-0}" repo_dir="$5" base_sha="$6" \
         prev_sha="${7:-}" branch="${8:-}"
@@ -1427,11 +1463,10 @@ measure_stage() {
   # stages can only be measured from the pushed branch. Fetch it rather than
   # trusting a local ref that may never have been updated.
   if [ -n "$branch" ]; then
-    if ! git -C "$repo_dir" fetch --quiet origin "$branch" 2>/dev/null; then
+    head=$(remote_branch_sha "$repo_dir" "$branch") || {
       log_event "Measurement: could not fetch $branch for stage $stage — skipped."
       return 0
-    fi
-    head=$(git -C "$repo_dir" rev-parse FETCH_HEAD 2>/dev/null) || head=""
+    }
   else
     head=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null) || head=""
   fi
@@ -2001,6 +2036,12 @@ make_agent_clone() {
 # $1=iter $2=branch $3=origin_url $4=pr_num $5=feedback_findings $6=cycle
 # Sets: FEEDBACK_BLOCKED — findings the agent could not resolve in-container
 #       (missing credentials/tooling). Empty when everything was actionable.
+#       FEEDBACK_RC — the agent's exit code. Non-zero means it did not finish:
+#       a turn-cap or budget stop leaves whatever it had already pushed and
+#       loses the rest with the worktree.
+#       FEEDBACK_ADVANCED — whether the pushed branch moved while it ran.
+#       "unknown" when the branch SHA could not be read on either side, which
+#       must not be read as "no progress".
 # Uses globals: WT_ROOT REPO_ABS LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
 #               CREATED_WORKTREES stream_text
 run_feedback_once() {
@@ -2008,6 +2049,11 @@ run_feedback_once() {
   local wt_feedback feedback_log
 
   FEEDBACK_BLOCKED=""
+  FEEDBACK_RC=0
+  FEEDBACK_ADVANCED="unknown"
+
+  local _head_before
+  _head_before=$(remote_branch_sha "$REPO_ABS" "$branch") || _head_before=""
 
   wt_feedback="${WT_ROOT}/feedback-${iter}-${cycle}"
   local feedback_out_dir
@@ -2036,9 +2082,24 @@ $(printf '%s' "$feedback_findings" | xml_escape)
     -v "$wt_feedback:/work:rw" \
     -v "$feedback_out_dir:/work-output:rw" \
     -e "ALUCARD_ITER=${iter}-feedback-${cycle}"
+  FEEDBACK_RC=$?
   set -e
 
   echo ""
+
+  local _head_after
+  _head_after=$(remote_branch_sha "$REPO_ABS" "$branch") || _head_after=""
+  if [ -n "$_head_before" ] && [ -n "$_head_after" ]; then
+    if [ "$_head_before" = "$_head_after" ]; then
+      FEEDBACK_ADVANCED=false
+    else
+      FEEDBACK_ADVANCED=true
+    fi
+  fi
+
+  if [ "$FEEDBACK_RC" -ne 0 ]; then
+    log_event "Agent feedback-${iter}-${cycle} failed: rc=$FEEDBACK_RC branch_advanced=$FEEDBACK_ADVANCED"
+  fi
 
   if [ -f "$feedback_out_dir/.alucard-blocked" ]; then
     FEEDBACK_BLOCKED=$(< "$feedback_out_dir/.alucard-blocked")
@@ -2447,7 +2508,7 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
 The remaining merge-blocking work cannot be done inside the harness container. Alucard stopped the review loop here rather than spend the remaining $((MAX_REVIEW_CYCLES - review_cycle)) cycle(s) re-reporting it.
 
 ${review_comments}${_self_review_note}" 2>/dev/null || true
-      cd "$REPO_ABS" && gh pr edit "$pr_num" --add-label "needs-human" 2>/dev/null || true
+      add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
       return 0
     fi
 
@@ -2462,7 +2523,7 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
 $(no_verdict_reason "$_review_class" "$review_rc")
 
 **This PR has not been reviewed.** Nothing below this gate ran for it." 2>/dev/null || true
-      cd "$REPO_ABS" && gh pr edit "$pr_num" --add-label "needs-human" 2>/dev/null || true
+      add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
       return 0
     fi
 
@@ -2484,7 +2545,7 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
 The reviewer still wants changes and the cycle budget is spent, so no feedback agent ran for the findings above. Nothing further is queued for this PR.
 
 If the same finding has been repeating, it is probably one no agent in this loop can act on — the reviewer should have returned BLOCKED, and the prompt may need sharpening. If the findings kept changing, raise \`--max-review-cycles\` or land what is here and open follow-ups." 2>/dev/null || true
-      cd "$REPO_ABS" && gh pr edit "$pr_num" --add-label "needs-human" 2>/dev/null || true
+      add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
       return 0
     fi
 
@@ -2507,6 +2568,35 @@ If the same finding has been repeating, it is probably one no agent in this loop
     run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" "$review_cycle"
     measure_stage "$iter" "$pr_num" feedback "$review_cycle" \
       "$REPO_ABS" "$MEASURE_BASE_SHA" "$MEASURE_PREV_SHA" "$branch"
+
+    # A feedback agent that died without pushing anything leaves the branch at
+    # the commit the reviewer just read. Continuing hands the next cycle the
+    # same code and buys an identical review: one run spent four cycles this
+    # way, re-reviewing one unchanged commit twice, because a turn-capped agent
+    # exits non-zero and nothing here looked. Only the no-progress case ends
+    # the loop — a failed agent that still pushed has given the next reviewer
+    # something new to read, and "unknown" is not evidence of no progress.
+    if feedback_stalled "${FEEDBACK_RC:-0}" "${FEEDBACK_ADVANCED:-unknown}"; then
+      log_event "Review gate: feedback agent failed (rc=$FEEDBACK_RC) without advancing $branch — ending review loop at cycle $review_cycle."
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: feedback agent failed — needs human** (rc=${FEEDBACK_RC})
+
+The feedback agent did not finish and pushed nothing, so this branch is still at the commit the reviewer above read. Alucard stopped rather than spend the remaining $((MAX_REVIEW_CYCLES - review_cycle)) cycle(s) re-reviewing it.
+
+A turn-cap or budget stop is the usual cause. Its work died with the worktree: the agent is told to commit and push before verifying, and one that spends its whole budget exploring never reaches that step. Raising \`ALUCARD_FEEDBACK_MAX_TURNS\`, or narrowing the findings above, is the usual fix." 2>/dev/null || true
+      add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
+      return 0
+    fi
+
+    # It did push something, so the loop continues — but partial work from a
+    # dead agent is worth saying out loud. Silently rolling into the next cycle
+    # is how a half-applied fix reads as a completed one.
+    if [ "${FEEDBACK_RC:-0}" -ne 0 ]; then
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "**🤖 Alucard cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: feedback agent failed after pushing** (rc=${FEEDBACK_RC}, branch advanced=${FEEDBACK_ADVANCED})
+
+The agent did not finish, but it had already pushed. What is on the branch may address only some of the findings above, and anything it had not committed is gone. The next review cycle will judge what actually landed." 2>/dev/null || true
+    fi
 
     # Record what the feedback agent could not act on, so the next reviewer is
     # told not to re-report it instead of rediscovering it every cycle. Posted

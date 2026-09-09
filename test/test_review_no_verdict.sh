@@ -163,7 +163,7 @@ assert_contains "the exhausted class is logged" "class=exhausted" "$EVENTS"
 assert_contains "the no-verdict PR is flagged for a human" \
   "flagging for human" "$EVENTS"
 assert_contains "the PR gets the needs-human label" \
-  "pr edit 77 --add-label needs-human" "$(<"$GH_TRACE")"
+  "issues/77/labels" "$(<"$GH_TRACE")"
 assert_contains "the PR comment says it was never reviewed" \
   "has not been reviewed" "$(<"$GH_TRACE")"
 assert_contains "the comment names the caps to raise" \
@@ -189,7 +189,7 @@ run_continue "" 1
 assert_eq "retries are capped by the configured budget" \
   "2" "$(grep -c '^review launch$' "$TRACE" || true)"
 assert_contains "an unrecoverable transport drop still flags a human" \
-  "pr edit 77 --add-label needs-human" "$(<"$GH_TRACE")"
+  "issues/77/labels" "$(<"$GH_TRACE")"
 assert_contains "the comment tells the operator to re-run continue" \
   "alucard continue" "$(<"$GH_TRACE")"
 
