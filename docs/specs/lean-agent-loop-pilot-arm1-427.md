@@ -152,3 +152,8 @@ prompts.
 
 `.alucard/pilot-427-20260909/`: both tool checkouts, the isolated target clone,
 the validation clone, `setup-manifest.json`, `mapping.tsv`, `observed.tsv`.
+
+Both pairs ran on image `sha256:25b08ef1…`, which `alucard build` removed as
+superseded when headless Chromium was added later the same day. The digest
+stands as provenance; an exact re-run would need that image rebuilt, and the
+conclusions here do not depend on one.
