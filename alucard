@@ -3471,6 +3471,34 @@ command_continue() {
     run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" 1
     measure_stage "$iter" "$pr_num" feedback 1 \
       "$REPO_ABS" "$MEASURE_BASE_SHA" "$MEASURE_PREV_SHA" "$branch"
+
+    # Same stall decision review_gate uses inside its loop. continue runs this
+    # feedback once, outside any cycle, then its gates — so a dead agent that
+    # pushed nothing would still hand ci_gate and review_gate the commit the
+    # last reviewer already read. Stop here instead: comment, label, measure,
+    # and leave the gates unrun. A failed agent that did push keeps going —
+    # the gates have new code to judge — but the partial failure is said out
+    # loud rather than rolling into CI looking finished.
+    if feedback_stalled "${FEEDBACK_RC:-0}" "${FEEDBACK_ADVANCED:-unknown}"; then
+      log_event "continue: feedback agent failed (rc=$FEEDBACK_RC) without advancing $branch — stopping before gates."
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "**🤖 Alucard continue: feedback agent failed — needs human** (rc=${FEEDBACK_RC})
+
+The feedback agent did not finish and pushed nothing, so this branch is still at the commit the previous review already read. Alucard stopped rather than re-run CI and review against it.
+
+A turn-cap or budget stop is the usual cause. Its work died with the worktree: the agent is told to commit and push before verifying, and one that spends its whole budget exploring never reaches that step. Raising \`ALUCARD_FEEDBACK_MAX_TURNS\`, or narrowing the findings above, is the usual fix." 2>/dev/null || true
+      add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
+      post_iteration_usage "$iter" "$branch" "$REPO_ABS" "$LOG_DIR"
+      measure_iteration "$iter" "$pr_num" 0 "$(( $(date +%s) - _continue_start_epoch ))" \
+        "$MEASURE_CI_RESULT" "$MEASURE_VERDICT" "$MEASURE_CYCLES" "$MEASURE_BASE_SHA"
+      return 0
+    fi
+    if [ "${FEEDBACK_RC:-0}" -ne 0 ]; then
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "**🤖 Alucard continue: feedback agent failed after pushing** (rc=${FEEDBACK_RC}, branch advanced=${FEEDBACK_ADVANCED})
+
+The agent did not finish, but it had already pushed. What is on the branch may address only some of the findings above, and anything it had not committed is gone. CI and review will judge what actually landed." 2>/dev/null || true
+    fi
   else
     echo "No actionable comments on PR #$pr_num — skipping feedback; running gates only."
   fi
