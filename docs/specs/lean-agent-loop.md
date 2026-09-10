@@ -1,13 +1,15 @@
 # Lean implementation and efficient context in Alucard
 
-Status: step 1 complete, step 2 in progress. Date: 2026-09-08,
-revised 2026-09-08 against the baseline audit.
+Status: steps 1–3 complete. Date: 2026-09-08, revised 2026-09-10
+against the shipped policy fragment (#73), the mechanical checks, and the
+Size-the-remedy rule (#78).
 
 Step 1 landed in PR #69: `lean-agent-loop-baseline.md` beside this file, and
 the measurement artifact section 3 asks for. **Read the baseline report before
 acting on anything below** — it retired two items this spec used to contain,
 added one it did not, and changed which role the policy work should weight.
-Sections revised against it are marked *(revised)*.
+Sections revised against it are marked *(revised)*; sections that later shipped
+are marked *(complete)* or *(implemented)*.
 
 ## Problem and outcome
 
@@ -94,13 +96,13 @@ Unknown shell commands remain unclassified; do not build a shell parser to infer
 all reads. Output bytes or characters are proxies, not billed token counts.
 Record whether the baseline supports the proposed prompt changes before coding.
 
-## 2. Align engineering policy across roles *(revised)*
+## 2. Align engineering policy across roles *(complete — #73, #78)*
 
-Add one short `alucard-engineering-policy.md` fragment, assembled inside the
-trusted instructions for worker, reviewer, and feedback invocations. Keep
-permissions, role responsibilities, verification and output contracts in their
-role prompts. Remove conflicting policy copies instead of appending another
-checklist. Include the fragment in `doctor`'s required files.
+Shipped as `alucard-engineering-policy.md`, assembled inside the trusted
+instructions for worker, reviewer, and feedback invocations. Keep permissions,
+role responsibilities, verification and output contracts in their role prompts.
+Conflicting policy copies were removed rather than appending another checklist.
+The fragment is in `doctor`'s required files.
 
 **Not CI-fix.** `alucard-ci-fix-prompt.md` already says "Edit only the files
 needed to fix the failing checks" and "Do not touch code unrelated to the CI
@@ -171,7 +173,7 @@ family-brain review in the audited window emitted such a section alongside
 CHANGES_REQUESTED, and the one that did (zodiac #150) accompanied a BLOCKED
 verdict, so no feedback agent ever saw it. There is nothing here to fix yet.
 
-### Two recurring classes, as mechanical checks *(revised after two pilots)*
+### Two recurring classes, as mechanical checks *(complete — after two pilots)*
 
 This is not in the original spec and is the change the baseline argues for
 hardest. Cycle count, not line count, is the dominant avoidable cost: PR #427
@@ -222,6 +224,35 @@ included.
 Two checks are cheaper to judge than the paragraph was. Each names a class, so
 each can be tested on its own against a seed known to contain it, without a
 paired run and without a seed that has to supply repetition by luck.
+
+### Size the remedy *(complete — #78)*
+
+A finding can be real, in scope, and still larger than one agent can land in a
+single pass. The loop had no way to discover that except by spending a cycle on
+it and getting nothing back, then handing the next cycle the same unchanged
+commit. One logged run spent four cycles that way.
+
+The reviewer now sizes the smallest adequate fix before writing a finding. It
+belongs in the findings list only if one agent could land it in one pass: edits
+within files the PR already touches or directly breaks, no new module or layer,
+and no test infrastructure the repository does not already have. Anything larger
+is recorded under a heading of exactly `## Too large for this loop` for a human
+to turn into its own task, and when it is the only thing blocking merge the
+verdict is BLOCKED — which already means "nothing in this loop can act on it".
+The prompt also tells the reviewer to confirm a named pattern actually exists
+before sending an agent to follow it.
+
+**This could not be prompt-only.** The feedback agent is handed the review body
+verbatim, so a new section would have arrived looking like a finding and been
+acted on — the exact failure being fixed. `strip_nonactionable_sections` keeps
+both non-actionable sections (`Out of scope (follow-up)` and
+`Too large for this loop`) off the handoff while leaving them on the PR for the
+operator. The filter is the harness-side half of the rule; without it the prompt
+change would make the loop worse.
+
+Filing oversized findings back to the queue as their own issues is deferred:
+Alucard has no `gh issue create` today, and reviewer-side sizing should be
+enough until oversized findings keep arriving after #78.
 
 ## 3. Measure changes through the loop *(implemented, PR #69)*
 
@@ -307,25 +338,37 @@ operate without it; cross-run discovery and persistence are deferred. Separate
 metadata output must not relax the reviewer's read-only checkout or permitted
 output contract. Retry attempts cannot inherit another attempt's stale record.
 
-## Delivery order and acceptance *(revised)*
+## Delivery order and acceptance *(revised 2026-09-10)*
 
 1. ~~Baseline audit and stage/usage measurement~~ — done, PR #69.
 2. ~~Reviewer class-sweep instruction; run the first pilot on it alone~~ — run,
    two pairs, and the instruction is withdrawn in favour of two mechanical
    checks. See [pair one](lean-agent-loop-pilot-arm1-results.md) and
    [pair two](lean-agent-loop-pilot-arm1-427.md).
-3. Shared policy and aligned role prompts, worker-weighted; run the second
-   pilot with the two mechanical checks held constant.
-4. Bounded orientation reuse if repeated-reading evidence warrants it; run a
-   third pilot with the earlier changes held constant.
+3. ~~Shared policy and aligned role prompts, worker-weighted~~ — done, #73.
+   Size-the-remedy rule and harness-side handoff filter landed as #78.
+   **Do not run a second pilot on the policy fragment.** The two pairs already
+   showed that a one-run-per-arm comparison cannot attribute a prompt change to
+   an outcome; another pair would spend the same budget to relearn that. The
+   policy and sizing rules are verified at the harness level only — the block
+   reaches the right roles, carries the right content, and is stripped from the
+   feedback handoff where it must be — by mutating the change and confirming the
+   test fails. Whether an agent behaves differently for having read them is
+   untested, and that is an accepted limit rather than a gap waiting for another
+   pilot.
+4. Bounded orientation reuse if repeated-reading evidence warrants it. Parked:
+   the baseline's 59%-share-zero-files figure measured reuse *between different
+   tasks*. Within one PR's review cycles the agents share nearly everything —
+   one cycle redid 65–70% of the previous cycle's investigation. If unparked,
+   scope it to same-PR cycles; do not re-run the cross-iteration measurement.
 5. Record findings and refine or remove changes that do not help.
 
 Steps 2 and 3 were one step in the original order. They are split because they
 are separately attributable and act on different costs — the reviewer-side
 change on review cycles, the policy fragment on worker-authored lines —
 and running them together would make an already-noisy three-task comparison
-uninterpretable. Step 4 is unchanged but is now the *least* supported of the
-three: see the standing item below, which the baseline ranks above it.
+uninterpretable. Step 4 is the *least* supported of the three: see the standing
+item below, which the baseline ranks above it, and the parking note on step 4.
 
 ### Standing item, outside this spec's sections
 
