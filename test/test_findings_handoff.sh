@@ -106,6 +106,51 @@ INLINE='## Findings
 out=$(printf '%s' "$INLINE" | strip_nonactionable_sections)
 assert_contains "a prose mention does not trigger stripping" "KEEP-INLINE" "$out"
 
+# Review bodies quote code, and a `##` line inside a fence is not a heading.
+# Both directions were reproduced before this was handled: a fenced example of
+# the heading swallowed every finding after it, and a `##` line inside a
+# deferred section's example resumed output and leaked the rest of it.
+FENCED_HEADING='## Findings
+
+- **Expected fix**: use this shape:
+
+```markdown
+## Too large for this loop
+```
+
+- **Problem**: KEEP-AFTER-FENCE'
+out=$(printf '%s' "$FENCED_HEADING" | strip_nonactionable_sections)
+assert_contains "a fenced heading does not start stripping" "KEEP-AFTER-FENCE" "$out"
+assert_contains 'the fenced example itself survives' '```markdown' "$out"
+
+FENCED_INSIDE='## Findings
+
+KEEP-BEFORE-FENCE
+
+## Too large for this loop
+
+```
+## not a heading
+```
+
+DROP-AFTER-INNER-FENCE'
+out=$(printf '%s' "$FENCED_INSIDE" | strip_nonactionable_sections)
+assert_contains "content before the deferred section survives" "KEEP-BEFORE-FENCE" "$out"
+assert_not_contains "a fenced ## inside a deferred section does not resume it" \
+  "DROP-AFTER-INNER-FENCE" "$out"
+assert_not_contains "and its fenced example stays out too" "not a heading" "$out"
+
+# Tilde fences are markdown too.
+TILDE='## Findings
+
+~~~
+## Too large for this loop
+~~~
+
+KEEP-AFTER-TILDE'
+assert_contains "tilde fences are honoured as well" \
+  "KEEP-AFTER-TILDE" "$(printf '%s' "$TILDE" | strip_nonactionable_sections)"
+
 # ── End to end: the section never reaches the feedback agent ─────────────────
 # The helper being right is not the same as it being wired in. Drive `alucard
 # continue` with a reviewer body that carries both sections and read the

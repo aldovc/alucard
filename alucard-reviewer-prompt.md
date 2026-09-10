@@ -80,7 +80,7 @@ Scope is not the only way a finding can fail to belong here. A finding can be re
 
 Before you write a finding, size its smallest adequate fix. It belongs in your findings list only if one agent could land it in one pass:
 
-- the edits fall in files this PR already touches;
+- the edits stay within the files this PR touches or directly breaks — the same boundary **Stay inside the PR's scope** draws. A one-line fix to a caller this PR broke is small, however untouched that file is;
 - it introduces no new module, layer, or service;
 - it needs no test infrastructure the repository does not already have. **If your expected fix names an existing pattern or helper, confirm it is actually there before naming it.** An agent sent to copy a convention that does not exist will spend its whole budget looking for it.
 

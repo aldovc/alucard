@@ -2374,7 +2374,16 @@ append_task_context() {
 # just do not travel to feedback. Headings are matched literally, which is why
 # the reviewer prompt tells the reviewer to keep them as written.
 strip_nonactionable_sections() {
+  # Fences are tracked because review bodies quote code, and a `##` line inside
+  # one is not a heading. Without this a fenced example of the heading swallows
+  # every finding after it, and a `##` line inside a deferred section's example
+  # resumes output and leaks the rest of that section into the handoff. An
+  # unterminated fence therefore stops all stripping rather than starting it:
+  # leaking a deferred item costs a cycle, silently dropping a merge-blocking
+  # finding costs more.
   awk '
+    /^[[:space:]]*(```|~~~)/ { in_fence = !in_fence; if (!skip) print; next }
+    in_fence { if (!skip) print; next }
     /^##[[:space:]]+(Out of scope \(follow-up\)|Too large for this loop)[[:space:]]*$/ { skip = 1; next }
     /^##[[:space:]]/ { skip = 0 }
     !skip
