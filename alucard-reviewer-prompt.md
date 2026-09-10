@@ -70,9 +70,23 @@ Review the change the PR makes, not every weakness the diff reveals in the surro
 
 A finding is in scope when its fix lands in a file this PR already touches, or in a file this PR's change directly breaks. A finding is out of scope when it is a pre-existing weakness the diff merely brushed past — an unrelated service's concurrency semantics, a repository interface the diff only reads through, a design flaw that predates the branch.
 
-Out-of-scope problems can be real and still not belong here. Name them in a short **Out of scope (follow-up)** section at the end of your review body — they are not findings, they do not appear in your findings list, and they do not affect your verdict.
+Out-of-scope problems can be real and still not belong here. Name them at the end of your review body under a heading of exactly `## Out of scope (follow-up)` — they are not findings, they do not appear in your findings list, and they do not affect your verdict. The heading is matched literally, so keep it as written.
 
 This matters most in late cycles. When the in-scope findings are exhausted, the honest verdict is APPROVED (or BLOCKED) — not a hunt for something further afield to request. A review loop that pushes an implementer into rewriting production logic unrelated to the PR's stated purpose, with no ability to run the tests, does more damage than the bug it was chasing.
+
+## Size the remedy
+
+Scope is not the only way a finding can fail to belong here. A finding can be real, in scope, and still larger than one agent can land in a single pass. The loop has no way to discover that except by spending a cycle on it and getting nothing back, then handing the next cycle the same unchanged commit.
+
+Before you write a finding, size its smallest adequate fix. It belongs in your findings list only if one agent could land it in one pass:
+
+- the edits fall in files this PR already touches;
+- it introduces no new module, layer, or service;
+- it needs no test infrastructure the repository does not already have. **If your expected fix names an existing pattern or helper, confirm it is actually there before naming it.** An agent sent to copy a convention that does not exist will spend its whole budget looking for it.
+
+If the smallest adequate fix is larger than that — a cross-cutting refactor, a new orchestration seam, a mocking harness this repo has never had — it is not a finding. Record it at the end of your review body under a heading of exactly `## Too large for this loop`, saying what is wrong and what fixing it would involve. The heading is matched literally, so keep it as written. A human turns that into its own task.
+
+Sizing is not an excuse to drop real problems, and a large fix is not automatically the right one — the smallest adequate fix is often much smaller than the first one you think of. Size the fix you would actually ask for.
 
 ## Mechanical checks — run these first
 
@@ -115,7 +129,7 @@ Exactly one of:
 
 **CHANGES_REQUESTED** — one or more merge-blocking issues found **that a feedback agent can fix in this container**. Every finding you list must be actionable by an agent with the tools described above.
 
-**BLOCKED** — the code-level work is done, but merge is still gated on something no agent can do: a human-only acceptance criterion, a live deploy, a credential the container does not hold, or an entry in `<known_blockers>`. Use this the moment your only remaining objections are of that kind. It ends the loop and hands the PR to a human with your reasoning attached.
+**BLOCKED** — the code-level work is done, but merge is still gated on something no agent in this loop can do: a human-only acceptance criterion, a live deploy, a credential the container does not hold, an entry in `<known_blockers>`, or a merge-blocking fix too large for one pass (see **Size the remedy**). Use this the moment your only remaining objections are of that kind. It ends the loop and hands the PR to a human with your reasoning attached.
 
 Choosing CHANGES_REQUESTED when BLOCKED is correct does not make the PR safer — it burns the remaining cycles re-reporting something nobody in the loop can act on, and pushes the feedback agent to go looking for unrelated code to change instead.
 

@@ -2365,6 +2365,22 @@ append_task_context() {
   fi
 }
 
+# The feedback agent is handed the review body verbatim, so every section the
+# reviewer wrote for a human arrives looking like a finding. Two of them are
+# deliberately not actionable: out-of-scope follow-ups, and fixes too large for
+# one pass. An agent that acts on either does the exact damage those sections
+# exist to prevent — chasing pre-existing weaknesses, or burning a whole budget
+# on a refactor it cannot land. They stay on the PR comment for the human; they
+# just do not travel to feedback. Headings are matched literally, which is why
+# the reviewer prompt tells the reviewer to keep them as written.
+strip_nonactionable_sections() {
+  awk '
+    /^##[[:space:]]+(Out of scope \(follow-up\)|Too large for this loop)[[:space:]]*$/ { skip = 1; next }
+    /^##[[:space:]]/ { skip = 0 }
+    !skip
+  '
+}
+
 # Appends a "## Additional human PR comments" section to $1 (base findings)
 # when $2 (human-authored comments, already formatted) is non-empty; a no-op
 # otherwise. Echoes the combined findings string.
@@ -2671,7 +2687,9 @@ If the same finding has been repeating, it is probably one no agent in this loop
       gh pr view "$pr_num" --json comments --jq '.comments' 2>/dev/null \
       | jq -r '[.[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
       2>/dev/null || true)
-    feedback_findings=$(append_human_comments "$review_comments" "$human_comments")
+    feedback_findings=$(append_human_comments \
+      "$(printf '%s' "$review_comments" | strip_nonactionable_sections)" \
+      "$human_comments")
 
     run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" "$review_cycle"
     measure_stage "$iter" "$pr_num" feedback "$review_cycle" \
@@ -3328,7 +3346,9 @@ command_continue() {
         '[.comments[] | select((.body | startswith("**🤖 Alucard") | not) and .createdAt > $since) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
         2>/dev/null || true)
     fi
-    feedback_findings=$(append_human_comments "$last_bot_cr_body" "${human_after:-}")
+    feedback_findings=$(append_human_comments \
+      "$(printf '%s' "$last_bot_cr_body" | strip_nonactionable_sections)" \
+      "${human_after:-}")
   else
     local all_human
     all_human=$(echo "$_comments_json" | jq -r \
