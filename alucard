@@ -1909,6 +1909,21 @@ command_queue() {
   get_task_queue "$REPO_ABS"
 }
 
+# Files that must exist in TOOL_DIR for a run to work. `doctor` reports each
+# missing one; the test suite reads this list to check nothing new is shipped
+# without being checked for.
+REQUIRED_TOOL_FILES=(
+  Dockerfile
+  entrypoint.sh
+  alucard-worker-prompt.md
+  alucard-worker-github-prompt.md
+  alucard-worker-local-prompt.md
+  alucard-reviewer-prompt.md
+  alucard-ci-fix-prompt.md
+  alucard-feedback-prompt.md
+  alucard-engineering-policy.md
+)
+
 command_doctor() {
   parse_repo_options "$@"
 
@@ -1923,10 +1938,7 @@ command_doctor() {
   done
 
   local _missing_files=false
-  for _f in Dockerfile entrypoint.sh \
-             alucard-worker-prompt.md alucard-worker-github-prompt.md \
-             alucard-worker-local-prompt.md alucard-reviewer-prompt.md \
-             alucard-ci-fix-prompt.md alucard-feedback-prompt.md; do
+  for _f in "${REQUIRED_TOOL_FILES[@]}"; do
     if [ ! -f "$TOOL_DIR/$_f" ]; then
       echo "missing: $TOOL_DIR/$_f"
       _missing_files=true
@@ -2065,7 +2077,7 @@ run_feedback_once() {
 
   local _feedback_prompt
   _feedback_prompt="<instructions>
-$(<"$TOOL_DIR/alucard-feedback-prompt.md")
+$(compose_role_prompt alucard-feedback-prompt.md)
 </instructions>
 <pr_num>${pr_num}</pr_num>
 <branch>${branch}</branch>
@@ -2251,6 +2263,24 @@ $(printf '%s' "$failure_log" | xml_escape)
   done
 }
 
+# Assembles one role's trusted instructions: the role prompt, then the shared
+# engineering policy, then an optional trailer the role prompt expects to come
+# last (the worker's mode section).
+#
+# CI-fix is deliberately not a caller. Its own prompt already says to edit only
+# the files needed to fix the failing checks and to touch nothing unrelated,
+# which is a tighter guard than this fragment provides — adding shared policy
+# there could only loosen it.
+compose_role_prompt() {
+  local role_file="$1" trailer_file="${2:-}"
+  printf '%s\n\n%s' \
+    "$(<"$TOOL_DIR/$role_file")" \
+    "$(<"$TOOL_DIR/alucard-engineering-policy.md")"
+  if [ -n "$trailer_file" ]; then
+    printf '\n\n%s' "$(<"$TOOL_DIR/$trailer_file")"
+  fi
+}
+
 # Appends <task>/<parent_context> to a reviewer prompt when local-mode task
 # context is available (task_xml non-empty); a no-op in github mode, where
 # the reviewer prompt's own fallback instructs it to `gh issue view` instead.
@@ -2373,7 +2403,7 @@ review_gate() {
 
     local _review_prompt
     _review_prompt="<instructions>
-$(<"$TOOL_DIR/alucard-reviewer-prompt.md")
+$(compose_role_prompt alucard-reviewer-prompt.md)
 </instructions>
 <pr_num>${pr_num}</pr_num>
 <review_cycle>${review_cycle} of ${MAX_REVIEW_CYCLES}</review_cycle>
@@ -2860,11 +2890,9 @@ command_run() {
     # The worker prompt is a mode-agnostic core plus one mode section, so a
     # run never carries instructions for the source it isn't using.
     if [ "$TASK_SOURCE" = "file" ]; then
-      prompt="$(<"$TOOL_DIR/alucard-worker-prompt.md")
-$(<"$TOOL_DIR/alucard-worker-local-prompt.md")"
+      prompt="$(compose_role_prompt alucard-worker-prompt.md alucard-worker-local-prompt.md)"
     else
-      prompt="$(<"$TOOL_DIR/alucard-worker-prompt.md")
-$(<"$TOOL_DIR/alucard-worker-github-prompt.md")"
+      prompt="$(compose_role_prompt alucard-worker-prompt.md alucard-worker-github-prompt.md)"
     fi
     log_file="$LOG_DIR/iter-${i}.jsonl"
 

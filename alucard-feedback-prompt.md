@@ -55,7 +55,6 @@ After fixing each finding, scan only the code you wrote or modified for these vi
 - Any token, API key, or credential passed as a plain `str` parameter across more than one function boundary.
 - Any logic duplicated from an existing helper in the codebase.
 - Any `import` inside a function body without a comment naming the circular import it avoids.
-- Any numeric or string literal with domain meaning that should be a named constant.
 - Any function whose responsibility cannot be stated in one sentence.
 - Any `except` block that swallows an exception without a deliberate fallback or explicit logging.
 - Any layer crossing: routers must not make external API calls; domain models must not format user-facing strings.

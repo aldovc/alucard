@@ -51,7 +51,7 @@ flowchart TD
 
 - **CLI / host orchestrator** (`alucard`). Bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
 - **Container** (Dockerfile + entrypoint). Disposable per agent run. Opinionated personal image: Node 24, git, gh, uv, just, Python 3.12, Claude Code, Codex, shellcheck, and build-essential (native extensions). Extend it with a local image (`alucard build --image …` / `ALUCARD_IMAGE`), not by shrinking the published one. Worker, CI-fix, reviewer, and feedback each get their own container.
-- **Agent prompts.** One file per role: `alucard-worker-prompt.md` (main worker, mode-agnostic core, assembled at dispatch with `alucard-worker-github-prompt.md` or `alucard-worker-local-prompt.md` depending on the task source), `alucard-reviewer-prompt.md` (code reviewer), `alucard-ci-fix-prompt.md` (CI failure fixer), `alucard-feedback-prompt.md` (review feedback handler).
+- **Agent prompts.** One file per role: `alucard-worker-prompt.md` (main worker, mode-agnostic core, assembled at dispatch with `alucard-worker-github-prompt.md` or `alucard-worker-local-prompt.md` depending on the task source), `alucard-reviewer-prompt.md` (code reviewer), `alucard-ci-fix-prompt.md` (CI failure fixer), `alucard-feedback-prompt.md` (review feedback handler). Worker, reviewer, and feedback also get `alucard-engineering-policy.md`, one shared fragment holding the solution, test, and change-request policy those three roles must agree on. CI-fix does not: its own prompt already forbids touching anything outside the failing check, and shared policy could only loosen that.
 - **Queue.** GitHub issues labeled `ready-for-agent`, or a [local tasks file](#local-task-source). Authoring skills are not part of the runner.
 
 ## Loop convergence
@@ -108,6 +108,7 @@ alucard/
 ├── alucard-reviewer-prompt.md   # reviewer agent instructions
 ├── alucard-ci-fix-prompt.md     # CI-fix agent instructions
 ├── alucard-feedback-prompt.md   # review-feedback agent instructions
+├── alucard-engineering-policy.md    # shared policy fragment: worker, reviewer, feedback
 ├── alucard.env.example          # template for credentials (real one is gitignored)
 ├── test/                        # bash unit tests — `for t in test/*.sh; do bash "$t"; done`
 ├── .claude/skills/to-tickets/   # optional authoring helper, not required to run
@@ -392,7 +393,7 @@ rm -rf .alucard-worktrees/
 # Watch a live run
 tail -f "$ALUCARD_HOME"/logs/alucard-*/iter-*.jsonl | jq -r 'select(.type=="assistant").message.content[]?.text // empty'
 
-# Reconstruct an overnight run — one timestamped line per run/iteration/gate transition
+# Reconstruct a finished run — one timestamped line per run/iteration/gate transition
 cat "$ALUCARD_HOME"/logs/alucard-*/events.log
 
 # Compare two runs — one JSON record per run, per stage, and per iteration
