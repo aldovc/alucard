@@ -2365,6 +2365,82 @@ append_task_context() {
   fi
 }
 
+# The feedback agent is handed the review body verbatim, so every section the
+# reviewer wrote for a human arrives looking like a finding. Two of them are
+# deliberately not actionable: out-of-scope follow-ups, and fixes too large for
+# one pass. An agent that acts on either does the exact damage those sections
+# exist to prevent — chasing pre-existing weaknesses, or burning a whole budget
+# on a refactor it cannot land. They stay on the PR comment for the human; they
+# just do not travel to feedback. Headings are matched literally, which is why
+# the reviewer prompt tells the reviewer to keep them as written.
+strip_nonactionable_sections() {
+  # Fences are matched, not merely counted. Review bodies quote markdown, and
+  # the usual way to quote a fence is to wrap it in a longer one — so a `\`\`\``
+  # must not close a `\`\`\`\``, and a backtick run must not close a tilde run.
+  # Getting that wrong drops actionable findings, which is the expensive
+  # direction: a leaked deferred item costs one cycle, a silently deleted
+  # merge-blocking finding costs a merge.
+  #
+  # An opener with no matching closer is treated as ordinary text rather than
+  # as a fence running to end of input. Whether a fence is unterminated is only
+  # knowable at EOF, and the alternative lets one malformed line suppress the
+  # filter for the whole body — or, inside a deferred section, swallow every
+  # heading after it.
+  awk '
+    function fence_run(s,   t, c, n) {
+      t = s
+      sub(/^[[:space:]]+/, "", t)
+      c = substr(t, 1, 1)
+      if (c != "`" && c != "~") return ""
+      n = 0
+      while (substr(t, n + 1, 1) == c) n++
+      if (n < 3) return ""
+      return c n
+    }
+    function closes(s, c, n,   t, m, rest) {
+      t = s
+      sub(/^[[:space:]]+/, "", t)
+      # A line of a different fence character runs zero of this one, so the
+      # length test below rejects it — no separate character check needed.
+      m = 0
+      while (substr(t, m + 1, 1) == c) m++
+      if (m < n) return 0
+      rest = substr(t, m + 1)
+      return (rest ~ /^[[:space:]]*$/)
+    }
+    { line[NR] = $0 }
+    END {
+      i = 1
+      while (i <= NR) {
+        run = fence_run(line[i])
+        if (run != "") {
+          c = substr(run, 1, 1)
+          n = substr(run, 2) + 0
+          j = i + 1
+          while (j <= NR && !closes(line[j], c, n)) j++
+          if (j <= NR) {
+            for (k = i; k <= j; k++) fenced[k] = 1
+            i = j + 1
+            continue
+          }
+        }
+        i++
+      }
+      skip = 0
+      for (i = 1; i <= NR; i++) {
+        if (!fenced[i]) {
+          if (line[i] ~ /^##[[:space:]]+(Out of scope \(follow-up\)|Too large for this loop)[[:space:]]*$/) {
+            skip = 1
+            continue
+          }
+          if (line[i] ~ /^##[[:space:]]/) skip = 0
+        }
+        if (!skip) print line[i]
+      }
+    }
+  '
+}
+
 # Appends a "## Additional human PR comments" section to $1 (base findings)
 # when $2 (human-authored comments, already formatted) is non-empty; a no-op
 # otherwise. Echoes the combined findings string.
@@ -2671,7 +2747,9 @@ If the same finding has been repeating, it is probably one no agent in this loop
       gh pr view "$pr_num" --json comments --jq '.comments' 2>/dev/null \
       | jq -r '[.[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
       2>/dev/null || true)
-    feedback_findings=$(append_human_comments "$review_comments" "$human_comments")
+    feedback_findings=$(append_human_comments \
+      "$(printf '%s' "$review_comments" | strip_nonactionable_sections)" \
+      "$human_comments")
 
     run_feedback_once "$iter" "$branch" "$origin_url" "$pr_num" "$feedback_findings" "$review_cycle"
     measure_stage "$iter" "$pr_num" feedback "$review_cycle" \
@@ -3328,7 +3406,9 @@ command_continue() {
         '[.comments[] | select((.body | startswith("**🤖 Alucard") | not) and .createdAt > $since) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
         2>/dev/null || true)
     fi
-    feedback_findings=$(append_human_comments "$last_bot_cr_body" "${human_after:-}")
+    feedback_findings=$(append_human_comments \
+      "$(printf '%s' "$last_bot_cr_body" | strip_nonactionable_sections)" \
+      "${human_after:-}")
   else
     local all_human
     all_human=$(echo "$_comments_json" | jq -r \
