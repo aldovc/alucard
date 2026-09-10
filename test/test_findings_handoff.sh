@@ -151,6 +151,63 @@ KEEP-AFTER-TILDE'
 assert_contains "tilde fences are honoured as well" \
   "KEEP-AFTER-TILDE" "$(printf '%s' "$TILDE" | strip_nonactionable_sections)"
 
+# Quoting a fence means wrapping it in a longer one, or a different character.
+# A naive toggle closes a four-backtick fence on three, and a tilde fence on
+# backticks — both reproduced, and both deleted the finding that followed.
+LONG_FENCE='## Findings
+
+````markdown
+```
+## Too large for this loop
+````
+
+- **Problem**: KEEP-PAST-LONG-FENCE'
+assert_contains "three backticks do not close a four-backtick fence" \
+  "KEEP-PAST-LONG-FENCE" "$(printf '%s' "$LONG_FENCE" | strip_nonactionable_sections)"
+
+MIXED_FENCE='## Findings
+
+~~~
+```
+## Too large for this loop
+~~~
+
+- **Problem**: KEEP-PAST-TILDE-FENCE'
+assert_contains "backticks do not close a tilde fence" \
+  "KEEP-PAST-TILDE-FENCE" "$(printf '%s' "$MIXED_FENCE" | strip_nonactionable_sections)"
+
+# A closer carries nothing but whitespace, so an info string opens a fence and
+# never closes one.
+INFO_STRING='## Findings
+
+```
+```python
+## Too large for this loop
+```
+
+- **Problem**: KEEP-PAST-INFO-STRING'
+assert_contains "an info string does not close a fence" \
+  "KEEP-PAST-INFO-STRING" "$(printf '%s' "$INFO_STRING" | strip_nonactionable_sections)"
+
+# An opener with no closer is text, not a fence to end of input. Inside a
+# deferred section the alternative swallows every heading after it.
+UNTERMINATED='## Findings
+
+KEEP-BEFORE-UNTERMINATED
+
+## Too large for this loop
+
+```
+never closed
+
+## Expected fix
+
+KEEP-AFTER-UNTERMINATED'
+out=$(printf '%s' "$UNTERMINATED" | strip_nonactionable_sections)
+assert_contains "an unterminated fence does not swallow the rest of the body" \
+  "KEEP-AFTER-UNTERMINATED" "$out"
+assert_not_contains "the deferred section is still stripped" "never closed" "$out"
+
 # ── End to end: the section never reaches the feedback agent ─────────────────
 # The helper being right is not the same as it being wired in. Drive `alucard
 # continue` with a reviewer body that carries both sections and read the
