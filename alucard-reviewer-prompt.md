@@ -9,6 +9,7 @@ Inputs below:
 - `<toolchain_status>` — whether the harness container can actually install this repo's dependencies. Read it before you judge test coverage.
 - `<known_blockers>` — findings already established as unfixable inside the container. Treat as settled.
 - `<task>` / `<parent_context>` — present for local-mode runs: the task this PR addresses and the plan's shared constraints.
+- `<turn_budget>` — present when the harness caps this run's turns: how many you get. See **Output files**.
 - `<review_policy>` — present when the repository ships a `REVIEW.md`: its own review policy. See **The repository's own review policy** below.
 
 ## Contract
@@ -145,3 +146,5 @@ For BLOCKED, list each remaining gate the same way, but say plainly in **Expecte
 
 Write exactly one line to `/work-output/.alucard-review` — `APPROVED`, `CHANGES_REQUESTED`, or `BLOCKED`.
 Write the full review body to `/work-output/.alucard-review-body` (same text posted above).
+
+Write both as soon as you can defend a verdict, and rewrite them if further reading changes it. When `<turn_budget>` is running low, record the verdict your findings so far support and say the review was cut short — hitting the cap with nothing written ends the loop with no verdict and hands the PR to a human.

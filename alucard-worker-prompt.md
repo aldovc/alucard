@@ -7,6 +7,7 @@ You run inside an autonomous loop. Each iteration: complete ONE task end-to-end,
 These instructions are followed by context sections:
 - `<base_branch>` — the configured base branch name (e.g. `main`)
 - `<commits>` — last 5 commits on the base branch
+- `<turn_budget>` — how many turns this iteration gets, when the harness caps them. See **Commit cadence**.
 - the queue context described in the **Mode** section at the end of these instructions. Exactly one mode applies to this run; the Mode section is authoritative for where the task comes from, how to reference it in commits and the PR, and how to close it out.
 
 ## Explore
@@ -26,6 +27,8 @@ For non-testable work (config, scripts, docs), skip the test loop but still work
 ## Commit cadence
 
 Commit in small chunks — every 3–5 file changes, after each cohesive step, before running the full test suite. The harness has worktree-disposal recovery: if your iteration is killed mid-stream by timeout, budget, or a tool failure, any commits already made will be pushed to a draft recovery PR for the next iteration to resume from. **Uncommitted work dies with the worktree.** A single end-of-iteration commit is the worst-case shape — partial progress vanishes if anything goes wrong before then.
+
+`<turn_budget>` is the whole iteration, and hitting it stops you where you stand — no chance to wrap up. As it runs low, bank what is done (commit, push, and say in the PR what is still outstanding) rather than opening a new piece of work. Runs have ended one step past the point where they should have committed.
 
 ## Database migrations
 
