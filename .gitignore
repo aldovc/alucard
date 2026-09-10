@@ -1,4 +1,5 @@
 alucard.env
 logs/
 .claude/settings.local.json
+.claude/worktrees/
 .alucard/
