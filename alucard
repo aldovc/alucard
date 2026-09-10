@@ -2163,17 +2163,29 @@ CI_CHECKS_AVAILABLE=""
 # Poll CI via the Actions run list. Echoes 0 (green/skip) or 1 (failed).
 # $1=pr_num $2=branch $3=pr_head_sha (may be empty)
 # Uses globals: REPO_ABS
+#
+# An empty SHA-filtered set is not "CI has not started yet". The branch may
+# already have runs for older commits, and waiting 45 minutes will not create
+# a run for HEAD. Two empty-HEAD probes (one 30s lag for enqueue) then skip
+# with a distinct log. A truly empty branch still gets a short window, then
+# the same skip-as-green as before. The 2700s deadline is for in-progress
+# runs on the current HEAD only.
+#
+# log_event is redirected to stderr here: this function's stdout is captured
+# as ci_rc and must stay a single integer.
 poll_ci_via_run_list() {
   local pr_num="$1" branch="$2" pr_head_sha="${3:-}"
   local deadline=$(( $(date +%s) + 2700 ))
-  local _found_runs=false
-  local run_json total in_progress failed
+  local empty_head_probes=0 empty_branch_probes=0
+  local empty_head_limit=2 empty_branch_limit=4
+  local run_json branch_runs total in_progress failed
   local result=1
 
   while [ "$(date +%s)" -lt "$deadline" ]; do
     run_json=$(cd "$REPO_ABS" && \
       gh run list --branch "$branch" --json status,conclusion,databaseId,headSha \
         --jq '[.[] | select(.status != "queued")]' 2>/dev/null || echo "[]")
+    branch_runs=$(echo "$run_json" | jq 'length')
     if [ -n "${pr_head_sha:-}" ]; then
       run_json=$(echo "$run_json" | jq --arg sha "$pr_head_sha" '[.[] | select(.headSha == $sha)]')
     fi
@@ -2181,10 +2193,25 @@ poll_ci_via_run_list() {
     in_progress=$(echo "$run_json" | jq '[.[] | select(.status != "completed")] | length')
     failed=$(echo "$run_json" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length')
     if [ "$total" -eq 0 ]; then
+      if [ "$branch_runs" -gt 0 ]; then
+        empty_head_probes=$((empty_head_probes + 1))
+        if [ "$empty_head_probes" -ge "$empty_head_limit" ]; then
+          log_event "CI gate: no run for current HEAD ${pr_head_sha}; older SHAs on this branch did run — skipping." >&2
+          result=0
+          break
+        fi
+        echo "No run for current HEAD yet. Waiting..." >&2
+        sleep 30; continue
+      fi
+      empty_branch_probes=$((empty_branch_probes + 1))
+      if [ "$empty_branch_probes" -ge "$empty_branch_limit" ]; then
+        log_event "CI gate: no CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping." >&2
+        result=0
+        break
+      fi
       echo "No workflow runs found yet — waiting..." >&2
       sleep 30; continue
     fi
-    _found_runs=true
     if [ "$in_progress" -gt 0 ]; then
       echo "Runs still in progress ($in_progress/$total) — waiting..." >&2
       sleep 30; continue
@@ -2196,14 +2223,8 @@ poll_ci_via_run_list() {
     fi
     break
   done
-  # No runs appeared during the entire polling window — token likely also
-  # lacks 'actions' read permission. Skip rather than fire spurious fix agents.
-  if [ "$_found_runs" = "false" ]; then
-    log_event "CI gate: no CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping."
-    result=0
-  fi
-  # Only the status code goes to stdout — progress above is on stderr so
-  # `ci_rc=$(poll_ci_via_run_list …)` stays a single integer.
+  # Only the status code goes to stdout. Progress and skip logs are on stderr
+  # so `ci_rc=$(poll_ci_via_run_list …)` stays a single integer.
   echo "$result"
 }
 
