@@ -552,6 +552,23 @@ docker_sandbox_args() {
   )
 }
 
+# Appends <turn_budget> so the agent can see the wall it is running at. Claude
+# only: --max-turns below is a Claude flag, and codex is invoked without any
+# equivalent, so a codex-backed agent is told nothing rather than told about a
+# cap nobody is enforcing. Runs that could not see the cap spent their last turn
+# mid-action and left uncommitted work behind; the role prompts say what to do
+# with the number.
+append_turn_budget() {
+  local prompt="$1" provider="$2" max_turns="$3"
+  if [ "$provider" = "claude" ] && [ -n "$max_turns" ]; then
+    printf '%s\n<turn_budget>\n%s\n</turn_budget>' \
+      "$prompt" \
+      "This run gets ${max_turns} turns. The harness stops you the moment the cap is reached, wherever you are."
+  else
+    printf '%s' "$prompt"
+  fi
+}
+
 # Run one agent container and stream its output to a log file.
 # $1 = role tag (container name becomes alucard-<role>-<pid> — the PID suffix
 #      keeps concurrent runs, even against different repos, from colliding on
@@ -580,6 +597,11 @@ invoke_agent() {
 
   local provider
   provider=$(resolve_provider "$provider_role")
+
+  # Appended here rather than at the four call sites so every role gets the
+  # number from one place, and before the archive below so the captured prompt
+  # is the one the container actually received.
+  prompt=$(append_turn_budget "$prompt" "$provider" "$max_turns")
 
   # Archive what this role was actually told, before the container runs. A
   # pilot comparison has to show the prompt each arm dispatched, not the one

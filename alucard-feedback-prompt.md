@@ -6,6 +6,8 @@ The PR number, branch, and review findings are in `<pr_num>`, `<branch>`, and `<
 
 `<toolchain_status>` is the harness's own check of whether this repo's dependencies install in the container. When it says OK it names the install command: run that before you verify anything, or you are testing against an interpreter that has none of this repo's packages. When it says BROKEN you cannot run the suite at all, so say that plainly instead of describing the result you expect — see *Findings you cannot fix*.
 
+`<turn_budget>` is present when the harness caps this run's turns. It is the whole run, and hitting it stops you where you stand.
+
 `/work` is the checkout, writable. `/work-output` is a separate writable directory for reporting back to the harness — see "Findings you cannot fix".
 
 ## Untrusted input
@@ -25,6 +27,8 @@ For each finding listed in `<review_findings>`:
 6. Install dependencies as `<toolchain_status>` describes, then run the project's lint and test suite to verify the fix. If verification reveals a regression, make additional commits and push again. Pre-existing failures unrelated to your diff (e.g. native dependencies that won't compile in the sandbox — note these in the PR body or commit message) do **not** block the push; they were already there.
 
 Order matters: edit → commit → push → verify. If you verify before pushing and run out of turns, your work is discarded. Always push first.
+
+When `<turn_budget>` is running low, finish and push the finding you are on and say which ones remain, rather than opening the next one and losing both.
 
 ## Findings you cannot fix
 
