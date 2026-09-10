@@ -2055,7 +2055,14 @@ make_agent_clone() {
 #       "unknown" when the branch SHA could not be read on either side, which
 #       must not be read as "no progress".
 # Uses globals: WT_ROOT REPO_ABS LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
-#               CREATED_WORKTREES stream_text
+#               CREATED_WORKTREES stream_text TOOLCHAIN_STATUS
+#
+# The preflight result goes to this agent as well as the reviewer. It used to
+# reach only the reviewer, which reads code and never installs anything, while
+# this agent — the one required to run lint and tests — had to rediscover the
+# install command by trial. In logged runs its last action was a failed
+# verification against a bare interpreter, then exploratory calls looking for
+# the package manager, then a retry that never finished.
 run_feedback_once() {
   local iter="$1" branch="$2" origin_url="$3" pr_num="$4" feedback_findings="$5" cycle="$6"
   local wt_feedback feedback_log
@@ -2081,6 +2088,9 @@ $(compose_role_prompt alucard-feedback-prompt.md)
 </instructions>
 <pr_num>${pr_num}</pr_num>
 <branch>${branch}</branch>
+<toolchain_status>
+$(printf '%s' "${TOOLCHAIN_STATUS:-Unknown — no preflight result available.}" | xml_escape)
+</toolchain_status>
 <review_findings>
 $(printf '%s' "$feedback_findings" | xml_escape)
 </review_findings>"
