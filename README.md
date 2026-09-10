@@ -250,7 +250,7 @@ cp "$ALUCARD_HOME/alucard.env.example" "$ALUCARD_HOME/alucard.env"
    - Permissions: Contents R/W, Issues R/W, Pull requests R/W, Metadata R
    - Expiry: 30 days
    - Paste into `alucard.env` as `GITHUB_TOKEN=`
-   - Fine-grained PATs cannot access the GitHub GraphQL `statusCheckRollup` field. GitHub has not shipped a "Checks" permission for fine-grained tokens ([known limitation](https://github.com/cli/cli/issues/12597)). Alucard detects this and falls back to polling `gh run list`, which works. If you want the primary `gh pr checks --watch` path, use a classic PAT with `repo` scope instead.
+   - Fine-grained PATs cannot access the GitHub GraphQL `statusCheckRollup` field. GitHub has not shipped a "Checks" permission for fine-grained tokens ([known limitation](https://github.com/cli/cli/issues/12597)) — there is no grant to add. Alucard probes once per run and, when the surface is closed, uses `gh run list` for the rest of the run without retrying the failed call. If you want the primary `gh pr checks --watch` path, use a classic PAT with `repo` scope instead.
    - **Local task source.** Running a repo exclusively off a [local tasks file](#local-task-source) instead of GitHub issues needs only Contents R/W, Pull requests R/W, Metadata R. Drop `Issues R/W` only when local tasks use task-id blockers exclusively. Keep Issues read access for legacy `Blocked by #N` issue blockers.
 
 2. **Anthropic worker API key.**

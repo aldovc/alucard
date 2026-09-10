@@ -2153,10 +2153,64 @@ $(printf '%s' "$feedback_findings" | xml_escape)
   rm -rf "$wt_feedback" "$feedback_out_dir" || true
 }
 
+# Whether `gh pr checks` (GraphQL statusCheckRollup) works for this token.
+# Empty until first observation; "true" or "false" for the rest of the run.
+# Fine-grained PATs have no Checks permission at all — the surface cannot be
+# granted — so a failed probe must not be retried every gate. Classic PATs keep
+# the watch path. Reset in setup_run_environment.
+CI_CHECKS_AVAILABLE=""
+
+# Poll CI via the Actions run list. Echoes 0 (green/skip) or 1 (failed).
+# $1=pr_num $2=branch $3=pr_head_sha (may be empty)
+# Uses globals: REPO_ABS
+poll_ci_via_run_list() {
+  local pr_num="$1" branch="$2" pr_head_sha="${3:-}"
+  local deadline=$(( $(date +%s) + 2700 ))
+  local _found_runs=false
+  local run_json total in_progress failed
+  local result=1
+
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    run_json=$(cd "$REPO_ABS" && \
+      gh run list --branch "$branch" --json status,conclusion,databaseId,headSha \
+        --jq '[.[] | select(.status != "queued")]' 2>/dev/null || echo "[]")
+    if [ -n "${pr_head_sha:-}" ]; then
+      run_json=$(echo "$run_json" | jq --arg sha "$pr_head_sha" '[.[] | select(.headSha == $sha)]')
+    fi
+    total=$(echo "$run_json" | jq 'length')
+    in_progress=$(echo "$run_json" | jq '[.[] | select(.status != "completed")] | length')
+    failed=$(echo "$run_json" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length')
+    if [ "$total" -eq 0 ]; then
+      echo "No workflow runs found yet — waiting..." >&2
+      sleep 30; continue
+    fi
+    _found_runs=true
+    if [ "$in_progress" -gt 0 ]; then
+      echo "Runs still in progress ($in_progress/$total) — waiting..." >&2
+      sleep 30; continue
+    fi
+    if [ "$failed" -gt 0 ]; then
+      result=1
+    else
+      result=0
+    fi
+    break
+  done
+  # No runs appeared during the entire polling window — token likely also
+  # lacks 'actions' read permission. Skip rather than fire spurious fix agents.
+  if [ "$_found_runs" = "false" ]; then
+    log_event "CI gate: no CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping."
+    result=0
+  fi
+  # Only the status code goes to stdout — progress above is on stderr so
+  # `ci_rc=$(poll_ci_via_run_list …)` stays a single integer.
+  echo "$result"
+}
+
 # Run a fresh fix agent on the branch if CI fails after a PR is opened.
 # $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
 # Uses globals: REPO_ABS WT_ROOT LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
-#               CREATED_WORKTREES stream_text
+#               CREATED_WORKTREES stream_text CI_CHECKS_AVAILABLE
 ci_gate() {
   local iter="$1" branch="$2" origin_url="$3"
 
@@ -2175,64 +2229,43 @@ ci_gate() {
     pr_head_sha=$(cd "$REPO_ABS" && \
       gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
     echo "Polling CI (attempt $ci_attempt/3)..."
-    _ci_err_file="$(mktemp /tmp/alucard_ci_err.XXXXXX)"
-    set +e
-    (cd "$REPO_ABS" && timeout 2700 gh pr checks "$pr_num" --watch --interval 30) \
-      2>"$_ci_err_file"
-    ci_rc=$?
-    _ci_err="$(cat "$_ci_err_file" 2>/dev/null || true)"
-    rm -f "$_ci_err_file"
-    [ -n "$_ci_err" ] && echo "$_ci_err" >&2
-    set -e
 
-    # No CI workflows configured (or none triggered for this PR's changed
-    # paths) — treat as a pass. Without this, `gh pr checks --watch` exits 1
-    # with "no checks reported", which falls through to the fix-agent loop
-    # and burns budget trying to repair CI that does not exist.
-    if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "no checks reported"; then
-      log_event "CI gate: no checks configured for PR #$pr_num — skipping."
-      ci_rc=0
-    fi
+    # Prefer `gh pr checks --watch` when the token can reach statusCheckRollup.
+    # Fine-grained PATs cannot — there is no Checks permission to grant — so
+    # after one failed probe the rest of the run goes straight to run list.
+    if [ "${CI_CHECKS_AVAILABLE:-}" = "false" ]; then
+      ci_rc=$(poll_ci_via_run_list "$pr_num" "$branch" "${pr_head_sha:-}")
+    else
+      _ci_err_file="$(mktemp /tmp/alucard_ci_err.XXXXXX)"
+      set +e
+      (cd "$REPO_ABS" && timeout 2700 gh pr checks "$pr_num" --watch --interval 30) \
+        2>"$_ci_err_file"
+      ci_rc=$?
+      _ci_err="$(cat "$_ci_err_file" 2>/dev/null || true)"
+      rm -f "$_ci_err_file"
+      [ -n "$_ci_err" ] && echo "$_ci_err" >&2
+      set -e
 
-    # Token lacks 'checks' read permission — fall back to polling gh run list.
-    if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "Resource not accessible"; then
-      log_event "CI gate: token lacks 'checks' read permission — falling back to gh run list for PR #$pr_num."
-      local deadline=$(( $(date +%s) + 2700 ))
-      ci_rc=1
-      local _found_runs=false
-      while [ "$(date +%s)" -lt "$deadline" ]; do
-        local run_json
-        run_json=$(cd "$REPO_ABS" && \
-          gh run list --branch "$branch" --json status,conclusion,databaseId,headSha \
-            --jq '[.[] | select(.status != "queued")]' 2>/dev/null || echo "[]")
-        if [ -n "${pr_head_sha:-}" ]; then
-          run_json=$(echo "$run_json" | jq --arg sha "$pr_head_sha" '[.[] | select(.headSha == $sha)]')
-        fi
-        local total in_progress failed
-        total=$(echo "$run_json" | jq 'length')
-        in_progress=$(echo "$run_json" | jq '[.[] | select(.status != "completed")] | length')
-        failed=$(echo "$run_json" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length')
-        if [ "$total" -eq 0 ]; then
-          echo "No workflow runs found yet — waiting..."
-          sleep 30; continue
-        fi
-        _found_runs=true
-        if [ "$in_progress" -gt 0 ]; then
-          echo "Runs still in progress ($in_progress/$total) — waiting..."
-          sleep 30; continue
-        fi
-        if [ "$failed" -gt 0 ]; then
-          ci_rc=1
-        else
-          ci_rc=0
-        fi
-        break
-      done
-      # No runs appeared during the entire polling window — token likely also
-      # lacks 'actions' read permission. Skip rather than fire spurious fix agents.
-      if [ "$_found_runs" = "false" ]; then
-        log_event "CI gate: no CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping."
+      # No CI workflows configured (or none triggered for this PR's changed
+      # paths) — treat as a pass. Without this, `gh pr checks --watch` exits 1
+      # with "no checks reported", which falls through to the fix-agent loop
+      # and burns budget trying to repair CI that does not exist.
+      if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "no checks reported"; then
+        log_event "CI gate: no checks configured for PR #$pr_num — skipping."
         ci_rc=0
+        CI_CHECKS_AVAILABLE=true
+      elif [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "Resource not accessible"; then
+        # Token-type limitation (fine-grained PAT), not a missing grant. Probe
+        # once, remember for the run, and stop naming a permission that does
+        # not exist on the settings page.
+        if [ "${CI_CHECKS_AVAILABLE:-}" != "false" ]; then
+          CI_CHECKS_AVAILABLE=false
+          log_event "CI gate: checks API unavailable to this token type (fine-grained PAT) — using gh run list for this run."
+        fi
+        ci_rc=$(poll_ci_via_run_list "$pr_num" "$branch" "${pr_head_sha:-}")
+      else
+        # Any other outcome means the checks surface answered.
+        CI_CHECKS_AVAILABLE=true
       fi
     fi
 
@@ -2919,6 +2952,7 @@ setup_run_environment() {
   codex_stream_text="$CODEX_STREAM_TEXT"
   CREATED_WORKTREES=()
   CREATED_CONTAINERS=()
+  CI_CHECKS_AVAILABLE=""
 
   cleanup() {
     local wt c
