@@ -14,6 +14,15 @@ DEFAULT_ENV_FILE="${ALUCARD_ENV_FILE:-$TOOL_DIR/alucard.env}"
 DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
 DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
 DEFAULT_CACHE_DIR="${ALUCARD_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/alucard}"
+# Shared Playwright browser cache, mounted into every container. Lives under
+# the same cache dir so one ALUCARD_CACHE_DIR still moves everything.
+DEFAULT_BROWSERS_DIR="$DEFAULT_CACHE_DIR/playwright-browsers"
+# Where the image bakes its browsers (Dockerfile). Named here because the
+# preflight seed is the only thing that reads it.
+BAKED_BROWSERS_PATH="/opt/ms-playwright"
+# Cap on the browser download alone, well inside the preflight container's own
+# --timeout. See PLAYWRIGHT_REPO_INSTALL for why it needs its own.
+PLAYWRIGHT_INSTALL_TIMEOUT="8m"
 HARD_KILL_GRACE="30s"
 CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
 
@@ -104,7 +113,8 @@ Continue options:
   --max-review-cycles, --no-build.
 
 Environment:
-  ALUCARD_CACHE_DIR            Where GitHub repos are cached on first run.
+  ALUCARD_CACHE_DIR            Where GitHub repos, and the shared Playwright
+                               browser cache, are kept between runs.
                                Default: ~/.cache/alucard  (XDG_CACHE_HOME honoured)
   ALUCARD_TASKS_FILE           Default tasks file for the local task source
                                (equivalent to passing --tasks).
@@ -550,6 +560,39 @@ docker_sandbox_args() {
     --security-opt no-new-privileges
     --cap-drop ALL
   )
+
+  # Playwright resolves browsers by an internal revision number rather than a
+  # browser version, and every Playwright release pins exactly one revision. The
+  # image bakes the revision *its* Playwright wants, so a target repo pinning any
+  # other version — one patch release of drift is enough — finds nothing it
+  # recognises and downloads a full browser inside the run. Containers are
+  # per-iteration, so that download is paid again on every iteration, CI fix and
+  # feedback cycle (#85).
+  #
+  # Pointing PLAYWRIGHT_BROWSERS_PATH at a host directory makes the download
+  # outlive the container. Revisions live in sibling directories, so repos on
+  # different pins share the cache rather than evicting each other. The image's
+  # /opt/ms-playwright is deliberately left alone: the /usr/local/bin/chromium
+  # symlink points into it, and the cache is seeded from it (toolchain_preflight).
+  #
+  # Empty means no cache, and then this adds nothing and every container behaves
+  # exactly as it did before.
+  # PLAYWRIGHT_SKIP_BROWSER_GC because `playwright install` otherwise deletes
+  # every browser it believes nothing references, and it decides that from link
+  # files pointing at the node_modules that installed them. Preflight's
+  # node_modules is a throwaway clone, so its link is dangling by the next run:
+  # without this, the first repo to install would evict the baked browsers, and
+  # each repo would then evict the last one's — turning a shared cache into a
+  # slower version of the bug. Measured: the baked chromium-1243 disappeared the
+  # first time a repo pinned to 1234 installed. The cost is that obsolete
+  # revisions accumulate; this is a cache, and deleting it is safe.
+  if [ -n "${BROWSERS_CACHE_HOST:-}" ]; then
+    DOCKER_SANDBOX_ARGS+=(
+      -v "$BROWSERS_CACHE_HOST:/opt/alucard-browsers:rw"
+      -e "PLAYWRIGHT_BROWSERS_PATH=/opt/alucard-browsers"
+      -e "PLAYWRIGHT_SKIP_BROWSER_GC=1"
+    )
+  fi
 }
 
 # Appends <turn_budget> so the agent can see the wall it is running at. Claude
@@ -2878,6 +2921,60 @@ detect_dependency_install() {
   return 1
 }
 
+# Two shell fragments the preflight container runs around the dependency
+# install. Kept here rather than in the image because they are harness policy,
+# and because a change to the image forces every user to rebuild and re-pull it.
+#
+# The seed hands the baked browsers over to the cache. Without it a repo pinning
+# the image's own Playwright version would stop finding the browser the image
+# already carries, which would make this whole change a regression for the repos
+# it is not aimed at. tar rather than `cp -a`: the container runs as the
+# invoking user and cannot chown root-owned files, so `cp -a` fails where tar
+# does not try. The marker is written last, so a copy interrupted part-way is
+# retried next run instead of being mistaken for a finished one — and the
+# harness refuses to mount an unmarked cache at all.
+PLAYWRIGHT_CACHE_SEED=$(cat <<'SNIPPET'
+_pw_marker="$PLAYWRIGHT_BROWSERS_PATH/.alucard-seeded"
+if [ "$(cat "$_pw_marker" 2>/dev/null || true)" != "$BAKED_STAMP" ]; then
+  # pipefail: without it a `tar cf` that dies part-way is still reported as
+  # success by the extracting end, and the marker would go down on a torn copy.
+  if (set -o pipefail; (cd "$BAKED_BROWSERS" && tar cf - .) | (cd "$PLAYWRIGHT_BROWSERS_PATH" && tar xf -)); then
+    printf '%s' "$BAKED_STAMP" > "$_pw_marker"
+  else
+    echo "alucard: could not seed the browser cache from the image" >&2
+  fi
+fi
+SNIPPET
+)
+
+# The install runs after dependencies are in place, because that is the one
+# moment the target repo's own node_modules exists on disk — and so the only
+# place that knows which revision the repo's pinned Playwright wants. Asking the
+# repo beats guessing from the image: it self-corrects when the repo bumps
+# Playwright, and a repo without Playwright skips it.
+#
+# `exit 0` because a browser that will not install is not a broken toolchain.
+# Dependencies installing is what TOOLCHAIN_STATUS reports and what the reviewer
+# keys its evidence demands off; the repo falls back to downloading its own
+# browser in-run, exactly as it does today.
+PLAYWRIGHT_REPO_INSTALL=$(cat <<'SNIPPET'
+_pw_fail() { echo "alucard: playwright install failed — this repo will download its browser in-run" >&2; }
+# Its own timeout, well inside the preflight container's. A browser download
+# that hangs, or a link slow enough to run past ${TIMEOUT_MIN}m, would otherwise
+# kill the container and report BROKEN for a repo whose dependencies installed
+# perfectly well — turning a missing optimisation into a false toolchain alarm
+# that tells every agent and the reviewer not to expect test evidence.
+if [ -x node_modules/.bin/playwright ]; then
+  echo "alucard: caching this repo's pinned Playwright browser"
+  timeout "$PW_INSTALL_TIMEOUT" node_modules/.bin/playwright install chromium || _pw_fail
+elif [ -f node_modules/playwright-core/cli.js ]; then
+  echo "alucard: caching this repo's pinned Playwright browser"
+  timeout "$PW_INSTALL_TIMEOUT" node node_modules/playwright-core/cli.js install chromium || _pw_fail
+fi
+exit 0
+SNIPPET
+)
+
 # Verify once, at run start, that the container can actually build the target
 # repo's dependencies. Without this the failure is rediscovered independently
 # by every agent in every cycle — each reporting "lint/tests blocked" — while
@@ -2912,8 +3009,33 @@ toolchain_preflight() {
     return 0
   fi
 
+  # The browser cache is prepared here, and only here, because preflight is the
+  # first and cheapest container of the run: it is already paying a container
+  # start, it already installs the repo's dependencies, and a repo with no
+  # manifest — which returned above — has no Playwright to cache for.
+  BROWSERS_CACHE_HOST=""
+  if mkdir -p "$DEFAULT_BROWSERS_DIR" 2>/dev/null; then
+    BROWSERS_CACHE_HOST="$DEFAULT_BROWSERS_DIR"
+  else
+    log_event "Playwright cache: cannot create $DEFAULT_BROWSERS_DIR — containers keep the image's baked browser."
+  fi
+
   docker_sandbox_args
   CREATED_CONTAINERS+=("alucard-preflight-$$")
+
+  # Seed before the install, not after, so the cache is handed the baked
+  # browsers even on a run whose dependency install fails.
+  local preflight_script="$install_cmd"
+  if [ -n "$BROWSERS_CACHE_HOST" ]; then
+    local baked_stamp
+    baked_stamp=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo unknown)
+    preflight_script="BAKED_BROWSERS=$BAKED_BROWSERS_PATH
+BAKED_STAMP=$baked_stamp
+PW_INSTALL_TIMEOUT=$PLAYWRIGHT_INSTALL_TIMEOUT
+$PLAYWRIGHT_CACHE_SEED
+$install_cmd || exit \$?
+$PLAYWRIGHT_REPO_INSTALL"
+  fi
 
   set +e
   timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
@@ -2924,12 +3046,21 @@ toolchain_preflight() {
     -v "$preflight_dir:/work:rw" \
     -w "/work/${manifest_dir}" \
     "$IMAGE" \
-    bash -lc "$install_cmd" >"$preflight_log" 2>&1
+    bash -lc "$preflight_script" >"$preflight_log" 2>&1
   rc=$?
   set -e
 
   docker rm -f "alucard-preflight-$$" >/dev/null 2>&1 || true
   rm -rf "$preflight_dir" || true
+
+  # Mount the cache into the rest of the run only once it actually holds the
+  # baked browsers. An unseeded cache at PLAYWRIGHT_BROWSERS_PATH would hide
+  # them from every repo that pins the image's own Playwright version, which is
+  # worse than changing nothing at all.
+  if [ -n "$BROWSERS_CACHE_HOST" ] && [ ! -f "$BROWSERS_CACHE_HOST/.alucard-seeded" ]; then
+    log_event "Playwright cache: seeding did not complete — containers keep the image's baked browser."
+    BROWSERS_CACHE_HOST=""
+  fi
 
   if [ "$rc" -eq 0 ]; then
     TOOLCHAIN_STATUS="OK — \`$install_cmd\` completes in the container. Agents can run this repo's lint and test suite; missing test evidence is a real gap."
