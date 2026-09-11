@@ -105,6 +105,51 @@ assert_eq "log with neither format: no output" "" "$(extract_agent_usage "$NOISE
 
 assert_eq "missing log file: no output" "" "$(extract_agent_usage "$TMP_ROOT/does-not-exist.jsonl")"
 
+# ── Test group 5: the posted comment is recognisable as ours ────────────────
+echo "── posted comment prefix ──"
+
+# The human-vs-bot filters key off the body's opening prefix. A usage comment
+# that does not carry it is handed to the feedback agent as human input, and on
+# `continue` it reads as a human replying after the reviewer asked for changes.
+CAPTURE="$TMP_ROOT/comment-body"
+MOCK_BIN="$TMP_ROOT/bin"; mkdir -p "$MOCK_BIN"
+cat > "$MOCK_BIN/gh" <<'MOCK'
+#!/bin/bash
+case "$1 $2" in
+  "pr list") printf '7\n' ;;
+  "pr view") printf '\n' ;;
+  "pr comment"|"issue comment")
+    while [ "$#" -gt 0 ]; do
+      [ "$1" = "--body" ] && { printf '%s' "$2" > "$ALUCARD_TEST_CAPTURE"; break; }
+      shift
+    done ;;
+esac
+exit 0
+MOCK
+chmod +x "$MOCK_BIN/gh"
+
+RUN_DIR="$TMP_ROOT/run"; mkdir -p "$RUN_DIR"
+cp "$CLAUDE_LOG" "$RUN_DIR/iter-1.jsonl"
+PATH="$MOCK_BIN:$PATH" ALUCARD_TEST_CAPTURE="$CAPTURE" \
+  post_iteration_usage 1 some-branch "$TMP_ROOT" "$RUN_DIR" >/dev/null
+
+posted=$(cat "$CAPTURE" 2>/dev/null || true)
+case "$posted" in
+  "$BOT_COMMENT_PREFIX"*) pass "the usage comment opens with the wrapper prefix" ;;
+  *) fail "the usage comment opens with the wrapper prefix (got '${posted:0:40}')" ;;
+esac
+
+excluded=$(jq -nr --arg body "$posted" --arg prefix "$BOT_COMMENT_PREFIX" \
+  '[$body] | map(select(startswith($prefix) | not)) | length')
+assert_eq "so the human-comment filter drops it" "0" "$excluded"
+
+# Nothing may keep its own copy of the marker: that is how the writers and the
+# filters drifted apart last time. Matching the emoji alone is deliberate — a
+# writer that drifts to some other wording is precisely the case a search for
+# the current prefix would miss.
+assert_eq "no comment body spells the marker out for itself" \
+  "1" "$(grep -c '🤖' "$ALUCARD")"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

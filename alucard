@@ -24,6 +24,16 @@ BAKED_BROWSERS_PATH="/opt/ms-playwright"
 # --timeout. See PLAYWRIGHT_REPO_INSTALL for why it needs its own.
 PLAYWRIGHT_INSTALL_TIMEOUT="8m"
 HARD_KILL_GRACE="30s"
+
+# Prefix on every comment the wrapper posts to a PR. This is a protocol string,
+# not decoration: the blocked-findings ledger reload, the human-vs-bot comment
+# filter, and continue's CHANGES_REQUESTED lookup all match on it. Rename it and
+# every comment already sitting on an open PR stops being recognised — the
+# ledger silently empties, and old review cycles start reading as fresh human
+# feedback. Defined once here, written and matched through these two names, and
+# read by the tests from here, so no copy of the string can drift out of step.
+BOT_COMMENT_PREFIX='**🤖 Alucard'
+BOT_LEDGER_MARKER="$BOT_COMMENT_PREFIX blocked findings**"
 CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
 
 # Per-role --max-turns / --max-budget-usd (Claude only) and the Claude
@@ -1911,7 +1921,9 @@ post_iteration_usage() {
   fi
 
   local body
-  body="<details><summary>🤖 Alucard token usage (iteration ${iter})</summary>
+  body="${BOT_COMMENT_PREFIX} token usage (iteration ${iter})**
+
+<details><summary>Per-agent breakdown</summary>
 
 | Agent | Input | Output | Cache Read | Cache Write | Turns | Cost |
 |-------|------:|-------:|-----------:|------------:|------:|-----:|
@@ -2635,8 +2647,9 @@ review_gate() {
   # already established was unfixable in-container.
   local blocked_ledger
   blocked_ledger=$(cd "$REPO_ABS" && \
-    gh pr view "$pr_num" --json comments --jq \
-      '[.comments[] | select(.body | startswith("**🤖 Alucard blocked findings**")) | .body] | join("\n\n")' \
+    gh pr view "$pr_num" --json comments 2>/dev/null \
+    | jq -r --arg marker "$BOT_LEDGER_MARKER" \
+        '[.comments[] | select(.body | startswith($marker)) | .body] | join("\n\n")' \
     2>/dev/null || true)
   if [ -n "$blocked_ledger" ]; then
     log_event "Blocked-ledger loaded from PR #$pr_num."
@@ -2770,7 +2783,7 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
     if [ "$review_state" = "APPROVED" ]; then
       log_event "Review gate: PR #$pr_num approved — ready to merge."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
+        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
 
 ${review_comments}${_self_review_note}" 2>/dev/null || true
       return 0
@@ -2784,7 +2797,7 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
     if [ "$review_state" = "BLOCKED" ]; then
       log_event "Review gate: PR #$pr_num blocked on human action — ending review loop at cycle $review_cycle."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: BLOCKED — needs human**
+        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: BLOCKED — needs human**
 
 The remaining merge-blocking work cannot be done inside the harness container. Alucard stopped the review loop here rather than spend the remaining $((MAX_REVIEW_CYCLES - review_cycle)) cycle(s) re-reporting it.
 
@@ -2799,7 +2812,7 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
     if [ -z "$review_state" ]; then
       log_event "Review gate: no verdict on PR #$pr_num (rc=$review_rc class=$_review_class) — flagging for human."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: no review posted — needs human** (rc=${review_rc}, class=${_review_class})
+        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: no review posted — needs human** (rc=${review_rc}, class=${_review_class})
 
 $(no_verdict_reason "$_review_class" "$review_rc")
 
@@ -2810,7 +2823,7 @@ $(no_verdict_reason "$_review_class" "$review_rc")
 
     # CHANGES_REQUESTED path — post findings for audit before acting on them
     cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-      "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: CHANGES_REQUESTED**
+      "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: CHANGES_REQUESTED**
 
 ${review_comments}${_self_review_note}" 2>/dev/null || true
 
@@ -2821,7 +2834,7 @@ ${review_comments}${_self_review_note}" 2>/dev/null || true
     if [ "$review_cycle" -eq "$MAX_REVIEW_CYCLES" ]; then
       log_event "Review gate: max review cycles ($MAX_REVIEW_CYCLES) reached — PR #$pr_num left open for manual review."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard gave up after ${MAX_REVIEW_CYCLES}/${MAX_REVIEW_CYCLES} review cycles — needs human**
+        "${BOT_COMMENT_PREFIX} gave up after ${MAX_REVIEW_CYCLES}/${MAX_REVIEW_CYCLES} review cycles — needs human**
 
 The reviewer still wants changes and the cycle budget is spent, so no feedback agent ran for the findings above. Nothing further is queued for this PR.
 
@@ -2836,13 +2849,14 @@ If the same finding has been repeating, it is probably one no agent in this loop
     # feedback agent sees the user's questions/asks alongside the reviewer's
     # findings. Note: alucard runs under a human PAT, so author-based filtering
     # would also drop legitimate human comments. Instead, filter by body prefix
-    # — all wrapper-posted comments start with "**🤖 Alucard …**". Reviewer
+    # — all wrapper-posted comments start with "${BOT_COMMENT_PREFIX} …**". Reviewer
     # prompt no longer falls back to `gh pr comment`, so this prefix uniquely
     # identifies bot-self comments going forward.
     local human_comments feedback_findings
     human_comments=$(cd "$REPO_ABS" && \
       gh pr view "$pr_num" --json comments --jq '.comments' 2>/dev/null \
-      | jq -r '[.[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
+      | jq -r --arg prefix "$BOT_COMMENT_PREFIX" \
+          '[.[] | select(.body | startswith($prefix) | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
       2>/dev/null || true)
     feedback_findings=$(append_human_comments \
       "$(printf '%s' "$review_comments" | strip_nonactionable_sections)" \
@@ -2862,7 +2876,7 @@ If the same finding has been repeating, it is probably one no agent in this loop
     if feedback_stalled "${FEEDBACK_RC:-0}" "${FEEDBACK_ADVANCED:-unknown}"; then
       log_event "Review gate: feedback agent failed (rc=$FEEDBACK_RC) without advancing $branch — ending review loop at cycle $review_cycle."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: feedback agent failed — needs human** (rc=${FEEDBACK_RC})
+        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: feedback agent failed — needs human** (rc=${FEEDBACK_RC})
 
 The feedback agent did not finish and pushed nothing, so this branch is still at the commit the reviewer above read. Alucard stopped rather than spend the remaining $((MAX_REVIEW_CYCLES - review_cycle)) cycle(s) re-reviewing it.
 
@@ -2876,7 +2890,7 @@ A turn-cap or budget stop is the usual cause. Its work died with the worktree: t
     # is how a half-applied fix reads as a completed one.
     if [ "${FEEDBACK_RC:-0}" -ne 0 ]; then
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: feedback agent failed after pushing** (rc=${FEEDBACK_RC}, branch advanced=${FEEDBACK_ADVANCED})
+        "${BOT_COMMENT_PREFIX} cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: feedback agent failed after pushing** (rc=${FEEDBACK_RC}, branch advanced=${FEEDBACK_ADVANCED})
 
 The agent did not finish, but it had already pushed. What is on the branch may address only some of the findings above, and anything it had not committed is gone. The next review cycle will judge what actually landed." 2>/dev/null || true
     fi
@@ -2886,7 +2900,7 @@ The agent did not finish, but it had already pushed. What is on the branch may a
     # as a marker comment, which is also how a later run reloads the ledger.
     if [ -n "${FEEDBACK_BLOCKED:-}" ]; then
       local _blocked_body
-      _blocked_body="**🤖 Alucard blocked findings** (cycle ${review_cycle}/${MAX_REVIEW_CYCLES})
+      _blocked_body="${BOT_LEDGER_MARKER} (cycle ${review_cycle}/${MAX_REVIEW_CYCLES})
 
 The feedback agent could not resolve these inside the harness container. Later review cycles are instructed to treat them as known blockers and not re-report them.
 
@@ -3454,7 +3468,7 @@ command_run() {
               fi
               _stub_body="${_closes_line}
 
-**🤖 Alucard recovery PR** — worker exited rc=${rc} before opening a PR. Its commits have been pushed here so the work isn't lost.
+${BOT_COMMENT_PREFIX} recovery PR** — worker exited rc=${rc} before opening a PR. Its commits have been pushed here so the work isn't lost.
 
 Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or close this PR if the work isn't salvageable."
               _stub_title="wip: alucard recovery — iter ${i} (worker killed rc=${rc})"
@@ -3577,19 +3591,20 @@ command_continue() {
   _comments_json=$(cd "$REPO_ABS" && \
     gh pr view "$pr_num" --json comments 2>/dev/null || echo '{"comments":[]}')
 
-  last_bot_cr_body=$(echo "$_comments_json" | jq -r \
-    '.comments | map(select(.body | startswith("**🤖 Alucard") and contains("CHANGES_REQUESTED"))) | last | .body // empty' \
+  last_bot_cr_body=$(echo "$_comments_json" | jq -r --arg prefix "$BOT_COMMENT_PREFIX" \
+    '.comments | map(select(.body | startswith($prefix) and contains("CHANGES_REQUESTED"))) | last | .body // empty' \
     2>/dev/null || true)
   bot_cr_time=$(echo "$_comments_json" | jq -r \
-    '.comments | map(select(.body | startswith("**🤖 Alucard") and contains("CHANGES_REQUESTED"))) | last | .createdAt // empty' \
+    --arg prefix "$BOT_COMMENT_PREFIX" \
+    '.comments | map(select(.body | startswith($prefix) and contains("CHANGES_REQUESTED"))) | last | .createdAt // empty' \
     2>/dev/null || true)
 
   if [ -n "${last_bot_cr_body:-}" ]; then
     human_after=""
     if [ -n "${bot_cr_time:-}" ]; then
       human_after=$(echo "$_comments_json" | jq -r \
-        --arg since "$bot_cr_time" \
-        '[.comments[] | select((.body | startswith("**🤖 Alucard") | not) and .createdAt > $since) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
+        --arg since "$bot_cr_time" --arg prefix "$BOT_COMMENT_PREFIX" \
+        '[.comments[] | select((.body | startswith($prefix) | not) and .createdAt > $since) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
         2>/dev/null || true)
     fi
     feedback_findings=$(append_human_comments \
@@ -3597,8 +3612,8 @@ command_continue() {
       "${human_after:-}")
   else
     local all_human
-    all_human=$(echo "$_comments_json" | jq -r \
-      '[.comments[] | select(.body | startswith("**🤖 Alucard") | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
+    all_human=$(echo "$_comments_json" | jq -r --arg prefix "$BOT_COMMENT_PREFIX" \
+      '[.comments[] | select(.body | startswith($prefix) | not) | "- @\(.author.login) at \(.createdAt):\n\(.body)"] | join("\n\n")' \
       2>/dev/null || true)
     if [ -n "${all_human:-}" ]; then
       feedback_findings="$all_human"
@@ -3668,7 +3683,7 @@ command_continue() {
     if feedback_stalled "${FEEDBACK_RC:-0}" "${FEEDBACK_ADVANCED:-unknown}"; then
       log_event "continue: feedback agent failed (rc=$FEEDBACK_RC) without advancing $branch — stopping before gates."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard continue: feedback agent failed — needs human** (rc=${FEEDBACK_RC})
+        "${BOT_COMMENT_PREFIX} continue: feedback agent failed — needs human** (rc=${FEEDBACK_RC})
 
 The feedback agent did not finish and pushed nothing, so this branch is still at the commit the previous review already read. Alucard stopped rather than re-run CI and review against it.
 
@@ -3681,7 +3696,7 @@ A turn-cap or budget stop is the usual cause. Its work died with the worktree: t
     fi
     if [ "${FEEDBACK_RC:-0}" -ne 0 ]; then
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "**🤖 Alucard continue: feedback agent failed after pushing** (rc=${FEEDBACK_RC}, branch advanced=${FEEDBACK_ADVANCED})
+        "${BOT_COMMENT_PREFIX} continue: feedback agent failed after pushing** (rc=${FEEDBACK_RC}, branch advanced=${FEEDBACK_ADVANCED})
 
 The agent did not finish, but it had already pushed. What is on the branch may address only some of the findings above, and anything it had not committed is gone. CI and review will judge what actually landed." 2>/dev/null || true
     fi
