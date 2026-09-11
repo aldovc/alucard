@@ -341,6 +341,50 @@ ALUCARD_TEST_EXEC_DIR="$REPO_ABS" toolchain_preflight >/dev/null
 assert_contains "a repo without Playwright preflights clean" "OK —" "$TOOLCHAIN_STATUS"
 assert_eq "and nothing pretends to install a browser for it" "" "$(<"$PW_LOG")"
 
+# ── The pin mismatch warning (#85) ───────────────────────────────────────────
+echo ""
+echo "── pin mismatch warning ──"
+
+# The repo's playwright-core says which revision it wants; the image's baked
+# directory says which one it has. Nothing else tells a target repo it is in
+# this case — the image's pin appears nowhere a repo can read.
+pw_core="$WORK/node_modules/playwright-core"
+mkdir -p "$pw_core"
+write_repo_pin() {
+  printf '{"version":"%s"}' "$1" > "$pw_core/package.json"
+  printf '{"browsers":[{"name":"chromium","revision":"%s"}]}' "$2" \
+    > "$pw_core/browsers.json"
+}
+
+DEFAULT_BROWSERS_DIR="$CACHE"
+write_repo_pin "1.62.1" "1234"
+out=$(toolchain_preflight 2>&1)
+assert_contains "a differing pin is reported" "Playwright pin mismatch" "$out"
+assert_contains "it names the version the repo pins" "playwright 1.62.1" "$out"
+assert_contains "it names both revisions" \
+  "wants chromium 1234; the image bakes chromium 1243" "$out"
+assert_contains "with a cache live, it says the cost is paid once" \
+  "one download rather than one per iteration" "$out"
+
+# Without a cache the same mismatch costs a download every iteration, and the
+# advice has to say so rather than reassure.
+DEFAULT_BROWSERS_DIR="$TEST_DIR/not-a-dir/browsers"
+out=$(toolchain_preflight 2>&1)
+assert_contains "with no cache, it says the cost repeats" \
+  "inside every iteration" "$out"
+DEFAULT_BROWSERS_DIR="$CACHE"
+
+# Matching pins are the quiet case. Plenty of repos carry Playwright without
+# ever launching a browser, and a warning they cannot act on is noise.
+write_repo_pin "1.63.0" "1243"
+out=$(toolchain_preflight 2>&1)
+assert_not_contains "a matching pin says nothing" "Playwright pin mismatch" "$out"
+
+rm -rf "$pw_core"
+out=$(toolchain_preflight 2>&1)
+assert_not_contains "a repo without Playwright says nothing" \
+  "Playwright pin mismatch" "$out"
+
 echo ""
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

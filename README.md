@@ -14,6 +14,8 @@ A containerized agent loop that picks work off a queue, completes it one item at
 
 Before the first iteration, a **toolchain preflight** checks that the container can actually install the target repo's dependencies (`uv sync` / `npm ci`, detected at the repo root or one level down). Alucard prints the result at startup, saves it to `toolchain-preflight.txt` in the log directory, and passes it to every reviewer.
 
+Preflight also handles **Playwright browsers**. Every container shares one browser directory on the host, under `~/.cache/alucard/playwright-browsers`, seeded once from the copy baked into the image. Preflight then asks the target repo's own pinned Playwright to install what it wants — that is the one moment the repo's `node_modules` exists, so it is the only place that knows which revision to fetch. Without this a repo pinning a different Playwright version downloads a full browser inside every iteration, because Playwright keys its browsers by an internal revision number and each release pins exactly one. When the repo's pin and the image's disagree, preflight says so; the repo can align its pin to stop carrying a second revision. Deleting the cache directory is safe and is how you prune it.
+
 The build stamps the image with a hash of the `Dockerfile` and `entrypoint.sh` that produced it, and rebuilds automatically when they change. An existing tag is not proof the image is current. A Dockerfile fix sitting inert behind a cached tag is how the toolchain stayed broken for 25 review cycles. `--no-build` warns instead of rebuilding.
 
 Alucard never pushes to main. Each iteration produces an independent PR.

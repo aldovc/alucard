@@ -95,20 +95,30 @@ assert_eq "BLOCKED returns exit 0" "0" "$_rc"
 # ── Test group 2: blocked-findings ledger filter ─────────────────────────────
 echo "── blocked-findings ledger ──"
 
-# Mirrors the jq filter review_gate uses to reload the ledger from the PR.
-ledger_filter='[.comments[] | select(.body | startswith("**🤖 Alucard blocked findings**")) | .body] | join("\n\n")'
+# Pinned deliberately. Changing the prefix is not a rename, it is a protocol
+# break: every comment already sitting on an open PR keeps the old one, and
+# after the change those comments read as human feedback while the blocked
+# ledger comes back empty. This assertion is here to make that decision loud
+# rather than to describe the string.
+assert_eq "the prefix matches what PRs already in flight carry" \
+  '**🤖 Alucard' "$BOT_COMMENT_PREFIX"
 
-comments_json=$(cat <<'JSON'
-{"comments":[
-  {"body":"**🤖 Alucard review cycle 1/10: CHANGES_REQUESTED**\n\nsome finding"},
-  {"body":"**🤖 Alucard blocked findings** (cycle 1/10)\n\n- **Finding**: run the Scheduler job manually\n  **Why it cannot be done here**: `gcloud: command not found` (exit 127)"},
-  {"body":"a human comment asking a question"},
-  {"body":"**🤖 Alucard blocked findings** (cycle 3/10)\n\n- **Finding**: attach a production HTTP 200"}
-]}
-JSON
-)
+# Built from the script's own constants, not a copy of them. A rename that
+# reaches only the writers, or only the filters, has to fail here — that is the
+# whole point: the prefix is a protocol string, and the last time it changed,
+# nothing caught it.
+comments_json=$(jq -nc \
+  --arg prefix "$BOT_COMMENT_PREFIX" \
+  --arg marker "$BOT_LEDGER_MARKER" \
+  '{comments:[
+    {body: ($prefix + " review cycle 1/10: CHANGES_REQUESTED**\n\nsome finding")},
+    {body: ($marker + " (cycle 1/10)\n\n- **Finding**: run the Scheduler job manually\n  **Why it cannot be done here**: `gcloud: command not found` (exit 127)")},
+    {body: "a human comment asking a question"},
+    {body: ($marker + " (cycle 3/10)\n\n- **Finding**: attach a production HTTP 200")}
+  ]}')
 
-ledger=$(printf '%s' "$comments_json" | jq -r "$ledger_filter")
+ledger=$(printf '%s' "$comments_json" | jq -r --arg marker "$BOT_LEDGER_MARKER" \
+  '[.comments[] | select(.body | startswith($marker)) | .body] | join("\n\n")')
 
 assert_contains "ledger picks up the first blocked marker" \
   "gcloud: command not found" "$ledger"
@@ -121,8 +131,8 @@ assert_not_contains "ledger excludes human comments" \
 
 # The human-comment filter feeding the feedback agent must exclude the blocked
 # marker too, or blocked findings would be re-injected as "human" findings.
-human_filter='[.[] | select(.body | startswith("**🤖 Alucard") | not) | .body] | join("\n\n")'
-humans=$(printf '%s' "$comments_json" | jq -r ".comments | $human_filter")
+humans=$(printf '%s' "$comments_json" | jq -r --arg prefix "$BOT_COMMENT_PREFIX" \
+  '[.comments[] | select(.body | startswith($prefix) | not) | .body] | join("\n\n")')
 
 assert_contains "human filter keeps genuine human comments" \
   "a human comment asking a question" "$humans"
@@ -132,7 +142,9 @@ assert_not_contains "human filter excludes review-cycle comments" \
   "some finding" "$humans"
 
 # A PR with no markers yet must yield an empty ledger, not an error.
-empty_ledger=$(printf '%s' '{"comments":[{"body":"nothing to see"}]}' | jq -r "$ledger_filter")
+empty_ledger=$(printf '%s' '{"comments":[{"body":"nothing to see"}]}' \
+  | jq -r --arg marker "$BOT_LEDGER_MARKER" \
+      '[.comments[] | select(.body | startswith($marker)) | .body] | join("\n\n")')
 assert_eq "ledger is empty when no blocked markers exist" "" "$empty_ledger"
 
 # ── Test group 3: detect_dependency_install ──────────────────────────────────
