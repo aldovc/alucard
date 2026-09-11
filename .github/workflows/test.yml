@@ -15,9 +15,11 @@ jobs:
 
       - name: Run test suite
         run: |
+          # </dev/null so a test that reads stdin fails fast instead of
+          # hanging the job until the workflow timeout.
           for t in test/test_*.sh; do
             echo "== $t"
-            bash "$t" || exit 1
+            bash "$t" </dev/null || exit 1
           done
 
       # --severity=warning skips info-level notes (SC2015 `&& … || true` and

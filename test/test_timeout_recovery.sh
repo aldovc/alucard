@@ -1,6 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
+# These tests take no input, and their mocks stand in for tools that read stdin
+# (`jq` with a filter, `cat` in a pipeline). Leaving stdin attached means a mock
+# that falls through to a plain `cat` reads the caller's terminal and the whole
+# suite hangs — invisible under a CI runner, which hands them a stdin that
+# closes, and not invisible at all when someone runs the suite by hand.
+exec </dev/null
+
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ALUCARD="$SCRIPT_DIR/../alucard"
 
@@ -111,9 +118,18 @@ if [ "$1" = "clone" ]; then
 fi
 MOCK
 
+# Reads a trailing file argument the way jq does. Falling through to `cat` with
+# no redirect makes the mock read the caller's stdin instead — scan_agent_errors
+# passes the agent log as an argument, so the whole suite hangs whenever stdin
+# happens to stay open, which is invisible under a CI runner and not under a
+# hand-run.
 cat > "$MOCK_BIN/jq" <<'MOCK'
 #!/bin/bash
-cat
+if [ -f "${!#}" ]; then
+  cat "${!#}"
+else
+  cat
+fi
 MOCK
 
 chmod +x "$MOCK_BIN/timeout" "$MOCK_BIN/docker" "$MOCK_BIN/git" "$MOCK_BIN/jq"
