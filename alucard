@@ -2961,6 +2961,31 @@ fi
 SNIPPET
 )
 
+# Reports a Playwright pin mismatch, which is otherwise silent: nothing tells a
+# target repo that the browser revision it wants is not the one the image baked,
+# and the image's pin appears nowhere a repo can read. Runs after the dependency
+# install because it reads the repo's own playwright-core, and prints a marker
+# line the harness picks back out of the preflight log (#85).
+PLAYWRIGHT_PIN_PROBE=$(cat <<'SNIPPET'
+if [ -f node_modules/playwright-core/browsers.json ]; then
+  _pw_repo_rev=$(jq -r '.browsers[] | select(.name=="chromium") | .revision' \
+    node_modules/playwright-core/browsers.json 2>/dev/null)
+  _pw_repo_ver=$(jq -r '.version // empty' \
+    node_modules/playwright-core/package.json 2>/dev/null)
+  _pw_baked_rev=""
+  for _pw_dir in "$BAKED_BROWSERS"/chromium-*; do
+    [ -d "$_pw_dir" ] || continue
+    _pw_baked_rev="${_pw_dir##*/chromium-}"
+    break
+  done
+  if [ -n "$_pw_repo_rev" ] && [ -n "$_pw_baked_rev" ] \
+     && [ "$_pw_repo_rev" != "$_pw_baked_rev" ]; then
+    echo "alucard-playwright-pin: playwright ${_pw_repo_ver:-unknown} wants chromium ${_pw_repo_rev}; the image bakes chromium ${_pw_baked_rev}"
+  fi
+fi
+SNIPPET
+)
+
 # The install runs after dependencies are in place, because that is the one
 # moment the target repo's own node_modules exists on disk — and so the only
 # place that knows which revision the repo's pinned Playwright wants. Asking the
@@ -2985,7 +3010,6 @@ elif [ -f node_modules/playwright-core/cli.js ]; then
   echo "alucard: caching this repo's pinned Playwright browser"
   timeout "$PW_INSTALL_TIMEOUT" node node_modules/playwright-core/cli.js install chromium || _pw_fail
 fi
-exit 0
 SNIPPET
 )
 
@@ -3037,19 +3061,29 @@ toolchain_preflight() {
   docker_sandbox_args
   CREATED_CONTAINERS+=("alucard-preflight-$$")
 
-  # Seed before the install, not after, so the cache is handed the baked
-  # browsers even on a run whose dependency install fails.
-  local preflight_script="$install_cmd"
+  # Composed in one place so the cached and uncached shapes cannot drift. The
+  # seed goes before the install, not after, so the cache is handed the baked
+  # browsers even on a run whose dependency install fails; the pin probe goes
+  # after it, because it reads the repo's own playwright-core. Neither may
+  # change the exit status — that belongs to the dependency install alone.
+  local baked_stamp preflight_script
+  baked_stamp=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo unknown)
+  preflight_script="BAKED_BROWSERS=$BAKED_BROWSERS_PATH
+"
   if [ -n "$BROWSERS_CACHE_HOST" ]; then
-    local baked_stamp
-    baked_stamp=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo unknown)
-    preflight_script="BAKED_BROWSERS=$BAKED_BROWSERS_PATH
-BAKED_STAMP=$baked_stamp
+    preflight_script="${preflight_script}BAKED_STAMP=$baked_stamp
 PW_INSTALL_TIMEOUT=$PLAYWRIGHT_INSTALL_TIMEOUT
 $PLAYWRIGHT_CACHE_SEED
-$install_cmd || exit \$?
-$PLAYWRIGHT_REPO_INSTALL"
+"
   fi
+  preflight_script="${preflight_script}$install_cmd || exit \$?
+$PLAYWRIGHT_PIN_PROBE
+"
+  if [ -n "$BROWSERS_CACHE_HOST" ]; then
+    preflight_script="${preflight_script}$PLAYWRIGHT_REPO_INSTALL
+"
+  fi
+  preflight_script="${preflight_script}exit 0"
 
   set +e
   timeout --kill-after "$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" docker run --rm \
@@ -3074,6 +3108,20 @@ $PLAYWRIGHT_REPO_INSTALL"
   if [ -n "$BROWSERS_CACHE_HOST" ] && [ ! -f "$BROWSERS_CACHE_HOST/.alucard-seeded" ]; then
     log_event "Playwright cache: seeding did not complete — containers keep the image's baked browser."
     BROWSERS_CACHE_HOST=""
+  fi
+
+  # A mismatch is worth saying out loud even though the cache absorbs most of
+  # its cost: it is the only signal that the repo is carrying a second browser
+  # revision, and the advice differs depending on whether the cache is live.
+  local _pin
+  _pin=$(grep -m1 '^alucard-playwright-pin: ' "$preflight_log" 2>/dev/null || true)
+  if [ -n "$_pin" ]; then
+    _pin="${_pin#alucard-playwright-pin: }"
+    if [ -n "$BROWSERS_CACHE_HOST" ]; then
+      log_event "Playwright pin mismatch: this repo's ${_pin}. The shared cache holds both, so this costs one download rather than one per iteration — align the repo's pin to stop carrying a second revision."
+    else
+      log_event "Playwright pin mismatch: this repo's ${_pin}. There is no shared cache this run, so the repo downloads its own browser inside every iteration — align the repo's pin with the image's."
+    fi
   fi
 
   if [ "$rc" -eq 0 ]; then
