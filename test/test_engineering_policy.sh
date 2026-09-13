@@ -51,17 +51,21 @@ POLICY_MARK="Similar-looking code is not automatically duplication"
 echo "── policy assembly ──"
 
 worker_github=$(compose_role_prompt alucard-worker-prompt.md alucard-worker-github-prompt.md)
+worker_pin=$(compose_role_prompt alucard-worker-prompt.md alucard-worker-github-issue-prompt.md)
 worker_local=$(compose_role_prompt alucard-worker-prompt.md alucard-worker-local-prompt.md)
 reviewer=$(compose_role_prompt alucard-reviewer-prompt.md)
 feedback=$(compose_role_prompt alucard-feedback-prompt.md)
 
 assert_contains "worker (github mode) carries the policy" "$POLICY_MARK" "$worker_github"
+assert_contains "worker (github pin mode) carries the policy" "$POLICY_MARK" "$worker_pin"
 assert_contains "worker (file mode) carries the policy"   "$POLICY_MARK" "$worker_local"
 assert_contains "reviewer carries the policy"             "$POLICY_MARK" "$reviewer"
 assert_contains "feedback carries the policy"             "$POLICY_MARK" "$feedback"
 
 assert_contains "worker (github mode) keeps its mode section" \
   "$(head -1 "$ROOT/alucard-worker-github-prompt.md")" "$worker_github"
+assert_contains "worker (github pin mode) keeps its mode section" \
+  "$(head -1 "$ROOT/alucard-worker-github-issue-prompt.md")" "$worker_pin"
 assert_contains "worker (file mode) keeps its mode section" \
   "$(head -1 "$ROOT/alucard-worker-local-prompt.md")" "$worker_local"
 
@@ -74,6 +78,15 @@ if [ -n "$policy_line" ] && [ -n "$mode_line" ] && [ "$policy_line" -lt "$mode_l
   pass "worker mode section still comes after the policy"
 else
   fail "worker mode section no longer last (policy at '$policy_line', mode at '$mode_line')"
+fi
+
+pin_mode_line=$(printf '%s\n' "$worker_pin" | grep -nF \
+  "$(head -1 "$ROOT/alucard-worker-github-issue-prompt.md")" | head -1 | cut -d: -f1)
+pin_policy_line=$(printf '%s\n' "$worker_pin" | grep -nF "$POLICY_MARK" | head -1 | cut -d: -f1)
+if [ -n "$pin_policy_line" ] && [ -n "$pin_mode_line" ] && [ "$pin_policy_line" -lt "$pin_mode_line" ]; then
+  pass "worker pin mode section still comes after the policy"
+else
+  fail "worker pin mode section no longer last (policy at '$pin_policy_line', mode at '$pin_mode_line')"
 fi
 
 # ── CI-fix is deliberately excluded ──────────────────────────────────────────
@@ -92,6 +105,8 @@ echo "── doctor ──"
 
 assert_contains "doctor's required files include the fragment" \
   "alucard-engineering-policy.md" "$(printf '%s\n' "${REQUIRED_TOOL_FILES[@]}")"
+assert_contains "doctor's required files include the pin mode section" \
+  "alucard-worker-github-issue-prompt.md" "$(printf '%s\n' "${REQUIRED_TOOL_FILES[@]}")"
 
 # ── Superseded copies are gone from the role prompts ─────────────────────────
 echo "── superseded rules removed ──"

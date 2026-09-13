@@ -37,7 +37,7 @@ assert_exit() {
 
 assert_contains() {
   local label="$1" needle="$2" haystack="$3"
-  if printf '%s' "$haystack" | grep -qF "$needle"; then
+  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
     pass "$label"
   else
     fail "$label (output does not contain '$needle')"
@@ -46,11 +46,24 @@ assert_contains() {
 
 assert_not_contains() {
   local label="$1" needle="$2" haystack="$3"
-  if printf '%s' "$haystack" | grep -qF "$needle"; then
+  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
     fail "$label (output unexpectedly contains '$needle')"
   else
     pass "$label"
   fi
+}
+
+# Run COMMAND in a subshell; assert it dies (exit 1) and stderr/stdout contain NEEDLE.
+assert_die_contains() {
+  local label="$1" needle="$2"
+  shift 2
+  local actual_exit=0 err
+  err=$( "$@" 2>&1 ) || actual_exit=$?
+  if [ "$actual_exit" -ne 1 ]; then
+    fail "$label (expected exit 1, got $actual_exit)"
+    return
+  fi
+  assert_contains "$label" "$needle" "$err"
 }
 
 # Source alucard to load helper functions without running main.
@@ -210,30 +223,30 @@ FAKE_REPO=$(mktemp -d /tmp/alucard_test_repo.XXXXXX)
 mkdir -p "$FAKE_REPO/.alucard"
 cp "$FIX_BASIC" "$FAKE_REPO/.alucard/tasks.md"
 
-TASKS_FILE="" TASKS_FILE_FROM_FLAG=false FORCE_GITHUB=false
+TASKS_FILE="" TASKS_FILE_FROM_FLAG=false FORCE_GITHUB=false PIN_ISSUE=""
 resolve_task_source ""
 assert_eq "source: defaults to github with no file and no repo" "github" "$TASK_SOURCE"
 
-TASKS_FILE="" TASKS_FILE_FROM_FLAG=false FORCE_GITHUB=false
+TASKS_FILE="" TASKS_FILE_FROM_FLAG=false FORCE_GITHUB=false PIN_ISSUE=""
 resolve_task_source "$FAKE_REPO"
 assert_eq "source: auto-detects .alucard/tasks.md" "file" "$TASK_SOURCE"
 assert_eq "source: auto-detect resolves the file path" \
   "$FAKE_REPO/.alucard/tasks.md" "$TASKS_FILE_ABS"
 
-TASKS_FILE="$FIX_BASIC" TASKS_FILE_FROM_FLAG=true FORCE_GITHUB=false
+TASKS_FILE="$FIX_BASIC" TASKS_FILE_FROM_FLAG=true FORCE_GITHUB=false PIN_ISSUE=""
 resolve_task_source ""
 assert_eq "source: explicit --tasks wins without a repo" "file" "$TASK_SOURCE"
 assert_eq "source: explicit --tasks resolves to an absolute path" \
   "$FIX_BASIC" "$TASKS_FILE_ABS"
 
-TASKS_FILE="/nonexistent/tasks.md" TASKS_FILE_FROM_FLAG=true FORCE_GITHUB=false
+TASKS_FILE="/nonexistent/tasks.md" TASKS_FILE_FROM_FLAG=true FORCE_GITHUB=false PIN_ISSUE=""
 assert_exit "source: missing explicit tasks file dies" 1 resolve_task_source ""
 
-TASKS_FILE="$FIX_BASIC" TASKS_FILE_FROM_FLAG=true FORCE_GITHUB=true
+TASKS_FILE="$FIX_BASIC" TASKS_FILE_FROM_FLAG=true FORCE_GITHUB=true PIN_ISSUE=""
 assert_exit "source: --tasks with --github dies" 1 resolve_task_source ""
 
 # ALUCARD_TASKS_FILE (env default, not flag) + --github: github wins quietly.
-TASKS_FILE="$FIX_BASIC" TASKS_FILE_FROM_FLAG=false FORCE_GITHUB=true
+TASKS_FILE="$FIX_BASIC" TASKS_FILE_FROM_FLAG=false FORCE_GITHUB=true PIN_ISSUE=""
 resolve_task_source "$FAKE_REPO"
 assert_eq "source: --github overrides env default and auto-detect" "github" "$TASK_SOURCE"
 
@@ -265,6 +278,7 @@ assert_exit "dispatch: unknown source dies" 1 get_task_queue "$SCRIPT_DIR/.."
 # ── Test group 6: build_worker_prompt ────────────────────────────────────────
 
 TASK_SOURCE="github"
+PIN_ISSUE=""
 BASE_BRANCH="main"
 build_worker_prompt '[{"number":1,"title":"t","body":"b","labels":[{"name":"ready-for-agent"},{"name":"bug"}]}]' 'line1
 line2' "INSTRUCTIONS"
@@ -393,6 +407,202 @@ assert_eq "reconcile: gh failure leaves the file untouched (fail safe)" "0" \
 rm -f "$RECONCILE_FILE"
 
 unset -f gh
+
+# ── Test group 9: --issue pin ────────────────────────────────────────────────
+
+parse_repo_options --issue 12 --tasks "$FIX_BASIC"
+assert_exit "pin: --issue plus --tasks dies" 1 resolve_task_source ""
+
+PIN_FAKE=$(mktemp -d /tmp/alucard_test_pin_repo.XXXXXX)
+mkdir -p "$PIN_FAKE/.alucard"
+cp "$FIX_BASIC" "$PIN_FAKE/.alucard/tasks.md"
+parse_repo_options --issue 12
+resolve_task_source "$PIN_FAKE"
+assert_eq "pin: --issue overrides auto-detect of tasks.md" "github" "$TASK_SOURCE"
+rm -rf "$PIN_FAKE"
+
+parse_repo_options --issue 12
+assert_eq "pin: without -n sets ITERATIONS=1" "1" "$ITERATIONS"
+assert_eq "pin: captures issue number" "12" "$PIN_ISSUE"
+
+assert_exit "pin: -n other than 1 dies" 1 parse_repo_options -n 2 --issue 12
+assert_exit "pin: -n 0 with --issue dies" 1 parse_repo_options -n 0 --issue 12
+assert_exit "pin: --issue 0 dies" 1 parse_repo_options --issue 0
+
+parse_repo_options -n 1 --issue 12
+assert_eq "pin: -n 1 --issue is ok" "1" "$ITERATIONS"
+assert_eq "pin: -n 1 keeps PIN_ISSUE" "12" "$PIN_ISSUE"
+
+PIN_FAKE=$(mktemp -d /tmp/alucard_test_pin_repo.XXXXXX)
+mkdir -p "$PIN_FAKE/.alucard"
+cp "$FIX_BASIC" "$PIN_FAKE/.alucard/tasks.md"
+parse_repo_options --issue 12 --github
+resolve_task_source "$PIN_FAKE"
+assert_eq "pin: --issue plus --github resolves to github" "github" "$TASK_SOURCE"
+rm -rf "$PIN_FAKE"
+
+assert_exit "pin: queue rejects --issue" 1 command_queue --issue 12
+assert_exit "pin: doctor rejects --issue" 1 command_doctor --issue 12
+assert_exit "pin: continue rejects --issue" 1 command_continue 1 --issue 12
+
+assert_die_contains "pin: queue --issue names the flag" "--issue is only valid with alucard run" \
+  command_queue --issue 12
+
+MOCK_GH_ISSUE_RC=0
+MOCK_GH_PR_RC=1
+MOCK_GH_ISSUE_JSON='{"number":42,"title":"Open bug","body":"do the thing","labels":[{"name":"in-progress"},{"name":"wip"}],"state":"OPEN"}'
+MOCK_GH_OPEN_ISSUES='[]'
+MOCK_GH_OPEN_ISSUES_RC=0
+MOCK_GH_REPO='aldovc/alucard'
+MOCK_GH_REPO_VIEW_RC=0
+MOCK_GH_GRAPHQL='[]'
+MOCK_GH_GRAPHQL_RC=0
+gh() {
+  if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+    [ "$MOCK_GH_ISSUE_RC" -eq 0 ] || return "$MOCK_GH_ISSUE_RC"
+    printf '%s\n' "$MOCK_GH_ISSUE_JSON"
+    return 0
+  fi
+  if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+    [ "$MOCK_GH_OPEN_ISSUES_RC" -eq 0 ] || return "$MOCK_GH_OPEN_ISSUES_RC"
+    printf '%s\n' "$MOCK_GH_OPEN_ISSUES"
+    return 0
+  fi
+  if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+    return "$MOCK_GH_PR_RC"
+  fi
+  if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+    [ "$MOCK_GH_REPO_VIEW_RC" -eq 0 ] || return "$MOCK_GH_REPO_VIEW_RC"
+    printf '%s\n' "$MOCK_GH_REPO"
+    return 0
+  fi
+  if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+    [ "$MOCK_GH_GRAPHQL_RC" -eq 0 ] || return "$MOCK_GH_GRAPHQL_RC"
+    printf '%s\n' "$MOCK_GH_GRAPHQL"
+    return 0
+  fi
+  return 1
+}
+
+PINNED=$(resolve_pinned_issue "$SCRIPT_DIR/.." 42)
+assert_eq "pin: open issue without ready-for-agent resolves" "42" \
+  "$(echo "$PINNED" | jq -r '.number')"
+assert_eq "pin: title preserved" "Open bug" \
+  "$(echo "$PINNED" | jq -r '.title')"
+assert_eq "pin: body preserved" "do the thing" \
+  "$(echo "$PINNED" | jq -r '.body')"
+assert_eq "pin: labels stay {name:...} objects" "in-progress,wip" \
+  "$(echo "$PINNED" | jq -r '[.labels[].name] | join(",")')"
+assert_eq "pin: in-progress/wip do not block resolve" "false" \
+  "$(echo "$PINNED" | jq 'has("state")')"
+
+MOCK_GH_ISSUE_RC=1
+assert_die_contains "pin: missing issue dies with number" "#42" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+assert_die_contains "pin: missing issue says not found" "not found" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+MOCK_GH_ISSUE_RC=0
+MOCK_GH_ISSUE_JSON='{"number":42,"title":"Done","body":"","labels":[],"state":"CLOSED"}'
+assert_die_contains "pin: closed issue dies with number" "#42" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+assert_die_contains "pin: closed issue says closed" "closed" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+MOCK_GH_ISSUE_JSON='{"number":42,"title":"A PR","body":"","labels":[],"state":"OPEN"}'
+MOCK_GH_PR_RC=0
+assert_die_contains "pin: PR-not-issue dies with number" "#42" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+assert_die_contains "pin: PR-not-issue says pull request" "pull request" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+assert_die_contains "pin: PR-not-issue points at continue" "alucard continue 42" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+MOCK_GH_PR_RC=1
+MOCK_GH_ISSUE_JSON='{"number":42,"title":"Open bug","body":"Blocked by #12","labels":[],"state":"OPEN"}'
+MOCK_GH_OPEN_ISSUES='[12]'
+assert_die_contains "pin: blocked by open #12 dies naming it" "#12" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+MOCK_GH_ISSUE_JSON='{"number":42,"title":"Open bug","body":"## Blocked by\n\n- #12\n","labels":[],"state":"OPEN"}'
+assert_die_contains "pin: heading Blocked by #12 also dies" "#12" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+MOCK_GH_OPEN_ISSUES='[]'
+PINNED=$(resolve_pinned_issue "$SCRIPT_DIR/.." 42)
+assert_eq "pin: closed blocker does not block resolve" "42" \
+  "$(echo "$PINNED" | jq -r '.number')"
+
+MOCK_GH_ISSUE_JSON='{"number":42,"title":"Open bug","body":"do the thing","labels":[],"state":"OPEN"}'
+MOCK_GH_GRAPHQL='[{"number":5,"title":"x","body":"hello","closingIssuesReferences":{"nodes":[{"number":42}]}}]'
+assert_die_contains "pin: occupied via closing-issue graph names the PR" "#5" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+assert_die_contains "pin: occupied via closing-issue graph points at continue" "alucard continue 5" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+MOCK_GH_GRAPHQL='[{"number":8,"title":"x","body":"Refs #42\n\npartial work","closingIssuesReferences":{"nodes":[]}}]'
+assert_die_contains "pin: occupied via Refs #N names the PR" "#8" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+assert_die_contains "pin: occupied via Refs #N points at continue" "alucard continue 8" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+MOCK_GH_ISSUE_JSON='{"number":297,"title":"Open bug","body":"do the thing","labels":[],"state":"OPEN"}'
+MOCK_GH_GRAPHQL='[{"number":3,"title":"other","body":"Refs #12","closingIssuesReferences":{"nodes":[]}}]'
+PINNED=$(resolve_pinned_issue "$SCRIPT_DIR/.." 297)
+assert_eq "pin: unrelated Refs #12 does not occupy 297" "297" \
+  "$(echo "$PINNED" | jq -r '.number')"
+
+MOCK_GH_GRAPHQL='[{"number":4,"title":"x","body":"Refs #2970","closingIssuesReferences":{"nodes":[]}}]'
+PINNED=$(resolve_pinned_issue "$SCRIPT_DIR/.." 297)
+assert_eq "pin: #2970 does not occupy #297" "297" \
+  "$(echo "$PINNED" | jq -r '.number')"
+
+MOCK_GH_ISSUE_JSON='{"number":42,"title":"Open bug","body":"Blocked by #12","labels":[],"state":"OPEN"}'
+MOCK_GH_GRAPHQL='[]'
+MOCK_GH_OPEN_ISSUES_RC=1
+assert_die_contains "pin: open-issue fetch failure while checking blockers is fatal" \
+  "could not list open issues" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+MOCK_GH_OPEN_ISSUES_RC=0
+MOCK_GH_ISSUE_JSON='{"number":42,"title":"Open bug","body":"do the thing","labels":[],"state":"OPEN"}'
+MOCK_GH_GRAPHQL_RC=1
+assert_die_contains "pin: graphql failure while checking occupancy is fatal" \
+  "could not list open pull requests" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+MOCK_GH_GRAPHQL_RC=0
+MOCK_GH_REPO_VIEW_RC=1
+assert_die_contains "pin: gh repo view failure while checking occupancy is fatal" \
+  "could not list open pull requests" \
+  resolve_pinned_issue "$SCRIPT_DIR/.." 42
+
+unset -f gh
+
+TASK_SOURCE="github"
+PIN_ISSUE="7"
+BASE_BRANCH="main"
+build_worker_prompt '[{"number":7,"title":"t","body":"secret-body","labels":[{"name":"in-progress"},{"name":"bug"}]}]' 'line1
+line2' "INSTRUCTIONS"
+EXPECTED_PIN='<instructions>INSTRUCTIONS</instructions>
+<base_branch>main</base_branch>
+<commits>line1
+line2</commits>
+<issue>{"number":7,"title":"t","labels":["in-progress","bug"]}</issue>'
+assert_eq "prompt: pin mode injects slim <issue>" "$EXPECTED_PIN" "$FULL_PROMPT"
+assert_not_contains "prompt: pin mode has no shoppable <issues> list" "<issues>" "$FULL_PROMPT"
+assert_not_contains "prompt: pin mode drops issue body" "secret-body" "$FULL_PROMPT"
+assert_not_contains "prompt: pin mode has no local task id" "<task>" "$FULL_PROMPT"
+assert_eq "prompt: pin mode leaves no dispatched task id" "" "$DISPATCHED_TASK_ID"
+assert_eq "prompt: pin mode leaves TASK_XML empty" "" "$TASK_XML"
+assert_eq "prompt: pin mode leaves PARENT_CONTEXT_XML empty" "" "$PARENT_CONTEXT_XML"
+
+PIN_ISSUE=""
+TASK_SOURCE="github"
+BASE_BRANCH="main"
+build_worker_prompt '[{"number":1,"title":"t","body":"b","labels":[{"name":"ready-for-agent"},{"name":"bug"}]}]' 'line1
+line2' "INSTRUCTIONS"
+assert_eq "prompt: queue github shape unchanged when PIN_ISSUE is empty" "$EXPECTED_GH" "$FULL_PROMPT"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
