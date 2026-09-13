@@ -116,6 +116,9 @@ Run options:
                                .alucard/tasks.md in the target repo.
       --github                 Force the GitHub issue queue even when a local
                                tasks file exists.
+      --issue N                Run exactly one iteration on open GitHub
+                               issue N. Forces the GitHub task source.
+                               Cannot be combined with --tasks.
 
 Continue options:
   <PR_NUM>                     Open PR number to continue (required, positional).
@@ -155,6 +158,7 @@ Environment:
 
 Examples:
   alucard run owner/repo --iterations 1
+  alucard run owner/repo --issue 90
   alucard run /path/to/target-repo --iterations 1 --timeout-minutes 10
   ALUCARD_TARGET_REPO=/path/to/target-repo alucard run -n 20 -t 30
   cd /path/to/target-repo && alucard queue
@@ -770,6 +774,7 @@ parse_repo_options() {
   BASE_BRANCH="$DEFAULT_BASE_BRANCH"
   LOG_ROOT="$DEFAULT_LOG_ROOT"
   ITERATIONS=20
+  ITERATIONS_FROM_FLAG=false
   TIMEOUT_MIN=30
   MAX_REVIEW_CYCLES=10
   AUTO_BUILD=true
@@ -777,6 +782,7 @@ parse_repo_options() {
   TASKS_FILE="${ALUCARD_TASKS_FILE:-}"
   TASKS_FILE_FROM_FLAG=false
   FORCE_GITHUB=false
+  PIN_ISSUE=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -790,6 +796,7 @@ parse_repo_options() {
         [ -n "${2:-}" ] || die "$1 requires a number"
         is_uint "$2" || die "iterations must be a positive integer"
         ITERATIONS="$2"
+        ITERATIONS_FROM_FLAG=true
         shift 2
         ;;
       -t|--timeout-minutes)
@@ -838,6 +845,12 @@ parse_repo_options() {
         FORCE_GITHUB=true
         shift
         ;;
+      --issue)
+        [ -n "${2:-}" ] || die "$1 requires a number"
+        is_uint "$2" && [ "$2" -gt 0 ] || die "--issue requires a positive integer"
+        PIN_ISSUE="$2"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -857,6 +870,14 @@ parse_repo_options() {
         ;;
     esac
   done
+
+  if [ -n "$PIN_ISSUE" ]; then
+    if [ "$ITERATIONS_FROM_FLAG" = "true" ]; then
+      [ "$ITERATIONS" -eq 1 ] || die "--issue runs exactly one iteration"
+    else
+      ITERATIONS=1
+    fi
+  fi
 }
 
 # Single gh call resolving every currently-open issue number, used to settle
@@ -923,9 +944,36 @@ open_pr_covers_ticket() {
   ' >/dev/null
 }
 
+# Open PR nodes for occupancy: number, title, body, and GitHub's closing-issue
+# graph. Echoes the GraphQL nodes JSON array on success. On gh repo view or
+# GraphQL failure returns 1 and prints nothing — pin dies, queue falls back
+# to [] so a blip does not empty the drain.
+fetch_open_pr_nodes() {
+  local repo_abs="$1"
+  local _gh_repo owner repo out
+  _gh_repo=$(cd "$repo_abs" && gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null) \
+    || return 1
+  owner="${_gh_repo%%/*}"
+  repo="${_gh_repo#*/}"
+  [ -n "$owner" ] && [ -n "$repo" ] || return 1
+  # Use GitHub's own closing-issue graph so PR detection is never left to LLM
+  # output format — GitHub parses the PR body; we just read the result.
+  out=$(cd "$repo_abs" && gh api graphql \
+    -f query='query($owner:String!,$repo:String!){
+        repository(owner:$owner,name:$repo){
+          pullRequests(states:OPEN,first:100){
+            nodes{number,title,body,closingIssuesReferences(first:25){nodes{number}}}
+          }
+        }
+      }' \
+    -f owner="$owner" -f repo="$repo" \
+    --jq '.data.repository.pullRequests.nodes' 2>/dev/null) || return 1
+  echo "$out"
+}
+
 get_unblocked_tickets() {
   local repo_abs="$1"
-  local all open_prs issue body blockers blocked skip num _gh_repo owner repo
+  local all open_prs issue body blockers blocked skip num
   local open_issues fetch_ok=true
 
   all=$(cd "$repo_abs" && gh issue list --state open --label ready-for-agent --limit 500 \
@@ -936,24 +984,7 @@ get_unblocked_tickets() {
     open_issues=$(fetch_open_issue_numbers "$repo_abs") || fetch_ok=false
   fi
 
-  # Use GitHub's own closing-issue graph so PR detection is never left to LLM
-  # output format — GitHub parses the PR body; we just read the result.
-  _gh_repo=$(cd "$repo_abs" && gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || true)
-  owner="${_gh_repo%%/*}"
-  repo="${_gh_repo#*/}"
-  open_prs="[]"
-  if [ -n "$owner" ] && [ -n "$repo" ]; then
-    open_prs=$(cd "$repo_abs" && gh api graphql \
-      -f query='query($owner:String!,$repo:String!){
-        repository(owner:$owner,name:$repo){
-          pullRequests(states:OPEN,first:100){
-            nodes{number,title,body,closingIssuesReferences(first:25){nodes{number}}}
-          }
-        }
-      }' \
-      -f owner="$owner" -f repo="$repo" \
-      --jq '.data.repository.pullRequests.nodes' 2>/dev/null || echo "[]")
-  fi
+  open_prs=$(fetch_open_pr_nodes "$repo_abs" || echo "[]")
 
   echo "$all" | jq -c '.[]' | while read -r issue; do
     body=$(echo "$issue" | jq -r '.body // ""')
@@ -1223,14 +1254,19 @@ reconcile_tasks_file() {
 }
 
 # Decide where this invocation's tasks come from. Sets TASK_SOURCE
-# (github|file) and, for file mode, TASKS_FILE_ABS. Precedence: --github
-# beats everything except an explicit --tasks (the combination is an error),
-# then --tasks/ALUCARD_TASKS_FILE, then an auto-detected .alucard/tasks.md in
+# (github|file) and, for file mode, TASKS_FILE_ABS. Precedence: --issue and
+# --github both force GitHub and error with an explicit --tasks; then
+# --tasks/ALUCARD_TASKS_FILE, then an auto-detected .alucard/tasks.md in
 # the target repo, else the GitHub issue queue.
 resolve_task_source() {
   local repo_abs="${1:-}"
   TASK_SOURCE="github"
   TASKS_FILE_ABS=""
+
+  if [ -n "${PIN_ISSUE:-}" ]; then
+    [ "$TASKS_FILE_FROM_FLAG" = "false" ] || die "--tasks and --issue are mutually exclusive"
+    return 0
+  fi
 
   if [ "$FORCE_GITHUB" = "true" ]; then
     [ "$TASKS_FILE_FROM_FLAG" = "false" ] || die "--tasks and --github are mutually exclusive"
@@ -1272,6 +1308,59 @@ get_task_queue() {
     github) get_unblocked_tickets "$repo_abs" ;;
     *)      die "unknown task source: ${TASK_SOURCE:-unset}" ;;
   esac
+}
+
+# Resolve GitHub issue $2 in $1 to a queue-shaped JSON object
+# {number,title,body,labels} (labels as {name:...} arrays). Dies if the
+# issue is missing, closed, a pull request, blocked by an open issue, or
+# occupied by an open PR. A GitHub fetch failure while checking blockers
+# or occupancy is fatal. Does not require ready-for-agent; does not refuse
+# in-progress or wip.
+resolve_pinned_issue() {
+  local repo_abs="$1" num="$2"
+  local issue_json state body blockers open_issues open_prs occupying_pr
+  local open_blocker_names b
+
+  issue_json=$(cd "$repo_abs" && gh issue view "$num" --json number,title,body,labels,state 2>/dev/null) \
+    || die "issue #$num not found in target repo"
+
+  state=$(echo "$issue_json" | jq -r '.state')
+  [ "$state" = "OPEN" ] || die "issue #$num is closed"
+
+  if (cd "$repo_abs" && gh pr view "$num" >/dev/null 2>/dev/null); then
+    die "issue #$num is a pull request; use alucard continue $num"
+  fi
+
+  body=$(echo "$issue_json" | jq -r '.body // ""')
+  blockers=$(github_ticket_blockers "$body")
+  if [ -n "$blockers" ]; then
+    open_issues=$(fetch_open_issue_numbers "$repo_abs") \
+      || die "could not list open issues while checking blockers for #$num"
+    open_blocker_names=""
+    for b in $blockers; do
+      if is_issue_blocking "$b" "$open_issues" true; then
+        open_blocker_names="${open_blocker_names:+$open_blocker_names, }#$b"
+      fi
+    done
+    [ -z "$open_blocker_names" ] || die "issue #$num is blocked by $open_blocker_names"
+  fi
+
+  open_prs=$(fetch_open_pr_nodes "$repo_abs") \
+    || die "could not list open pull requests while checking occupancy for #$num"
+  if open_pr_covers_ticket "$open_prs" "$num"; then
+    occupying_pr=$(echo "$open_prs" | jq -r --argjson n "$num" '
+      first(.[] |
+        select(
+          ((.closingIssuesReferences.nodes // []) | map(.number) | index($n) != null)
+          or ((.title // "") | test("#" + ($n|tostring) + "\\b"))
+          or ((.body // "") | test("#" + ($n|tostring) + "\\b"))
+        ) | .number
+      )
+    ')
+    die "issue #$num is occupied by PR #${occupying_pr}; use alucard continue ${occupying_pr}"
+  fi
+
+  echo "$issue_json" | jq -c '{number, title, body, labels}'
 }
 
 # Echo one TSV line: input<TAB>output<TAB>cache_read<TAB>cache_write<TAB>turns<TAB>cost
@@ -1976,6 +2065,7 @@ command_version() {
 
 command_queue() {
   parse_repo_options "$@"
+  [ -z "${PIN_ISSUE:-}" ] || die "--issue is only valid with alucard run"
   need_cmd git
   need_cmd gh
   need_cmd jq
@@ -1994,6 +2084,7 @@ REQUIRED_TOOL_FILES=(
   entrypoint.sh
   alucard-worker-prompt.md
   alucard-worker-github-prompt.md
+  alucard-worker-github-issue-prompt.md
   alucard-worker-local-prompt.md
   alucard-reviewer-prompt.md
   alucard-ci-fix-prompt.md
@@ -2003,6 +2094,7 @@ REQUIRED_TOOL_FILES=(
 
 command_doctor() {
   parse_repo_options "$@"
+  [ -z "${PIN_ISSUE:-}" ] || die "--issue is only valid with alucard run"
 
   local ok=true
   for cmd in git gh jq docker timeout; do
@@ -3187,14 +3279,15 @@ setup_run_environment() {
   toolchain_preflight
 }
 
-# Build the worker prompt for one iteration. GitHub mode injects the whole
-# queue and the worker picks; file mode injects exactly ONE task — the first
-# eligible in file order — plus the plan's parent context, so bundling and
-# mispicking are structurally impossible. Sets FULL_PROMPT and, in file mode,
+# Build the worker prompt for one iteration. GitHub queue mode injects the
+# whole queue and the worker picks; GitHub pin mode injects exactly one
+# <issue>; file mode injects exactly ONE task — the first eligible in file
+# order — plus the plan's parent context, so bundling and mispicking are
+# structurally impossible. Sets FULL_PROMPT and, in file mode,
 # DISPATCHED_TASK_ID (used for PR linkage and recovery attribution).
 build_worker_prompt() {
   local queue="$1" commits="$2" instructions="$3"
-  local _commits_esc _task _task_esc _parent_esc _issues_esc
+  local _commits_esc _task _task_esc _parent_esc _issues_esc _issue_esc
 
   _commits_esc=$(printf '%s' "$commits" | xml_escape)
   DISPATCHED_TASK_ID=""
@@ -3212,6 +3305,14 @@ build_worker_prompt() {
 <task>${_task_esc}</task>"
     TASK_XML="$_task_esc"
     PARENT_CONTEXT_XML="$_parent_esc"
+  elif [ -n "${PIN_ISSUE:-}" ]; then
+    _issue_esc=$(echo "$queue" | jq -c '.[0] | {number, title, labels: [.labels[].name]}' | xml_escape)
+    FULL_PROMPT="<instructions>${instructions}</instructions>
+<base_branch>${BASE_BRANCH}</base_branch>
+<commits>${_commits_esc}</commits>
+<issue>${_issue_esc}</issue>"
+    TASK_XML=""
+    PARENT_CONTEXT_XML=""
   else
     # Slim to number/title/labels only: the worker prompt instructs the
     # agent to `gh issue view <N> --comments` for the issue it picks, so
@@ -3240,6 +3341,13 @@ command_run() {
 
   [ "$ITERATIONS" -gt 0 ] || die "iterations must be greater than zero"
   [ "$TIMEOUT_MIN" -gt 0 ] || die "timeout must be greater than zero"
+
+  if [ -n "${PIN_ISSUE:-}" ]; then
+    REPO_ABS=$(resolve_repo "$TARGET_REPO")
+    load_env_file "$ENV_FILE" true
+    resolve_task_source "$REPO_ABS"
+    PINNED_ISSUE_JSON=$(resolve_pinned_issue "$REPO_ABS" "$PIN_ISSUE")
+  fi
 
   setup_run_environment
   resolve_task_source "$REPO_ABS"
@@ -3279,15 +3387,20 @@ command_run() {
     _base_sha="$(git -C "$WT_HOST" rev-parse HEAD)"
     git -C "$WT_HOST" checkout -b "$BRANCH"
 
-    issues=$(get_task_queue "$REPO_ABS")
-    count=$(echo "$issues" | jq 'length')
+    # A pin must not take the empty ready-for-agent path (that exits 0).
+    if [ -n "${PIN_ISSUE:-}" ]; then
+      issues=$(printf '%s\n' "$PINNED_ISSUE_JSON" | jq -c '[.]')
+    else
+      issues=$(get_task_queue "$REPO_ABS")
+      count=$(echo "$issues" | jq 'length')
 
-    if [ "$count" -eq 0 ]; then
-      _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
-      log_event "Iteration $i/$ITERATIONS end: rc=0 duration=${_iter_duration}s"
-      log_event "Run end: queue empty — alucard rests after $((i-1)) iterations."
-      rm -rf "$WT_HOST"
-      exit 0
+      if [ "$count" -eq 0 ]; then
+        _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
+        log_event "Iteration $i/$ITERATIONS end: rc=0 duration=${_iter_duration}s"
+        log_event "Run end: queue empty — alucard rests after $((i-1)) iterations."
+        rm -rf "$WT_HOST"
+        exit 0
+      fi
     fi
 
     commits=$(git -C "$REPO_ABS" log -n 5 --format="%H%n%ad%n%B---" --date=short "origin/$BASE_BRANCH")
@@ -3295,6 +3408,8 @@ command_run() {
     # run never carries instructions for the source it isn't using.
     if [ "$TASK_SOURCE" = "file" ]; then
       prompt="$(compose_role_prompt alucard-worker-prompt.md alucard-worker-local-prompt.md)"
+    elif [ -n "${PIN_ISSUE:-}" ]; then
+      prompt="$(compose_role_prompt alucard-worker-prompt.md alucard-worker-github-issue-prompt.md)"
     else
       prompt="$(compose_role_prompt alucard-worker-prompt.md alucard-worker-github-prompt.md)"
     fi
@@ -3304,6 +3419,8 @@ command_run() {
     full_prompt="$FULL_PROMPT"
     if [ "$TASK_SOURCE" = "file" ]; then
       echo "Dispatching task ${DISPATCHED_TASK_ID}: $(echo "$issues" | jq -r '.[0].title')"
+    elif [ -n "${PIN_ISSUE:-}" ]; then
+      echo "Dispatching issue #${PIN_ISSUE}: $(echo "$issues" | jq -r '.[0].title')"
     fi
 
     ITER_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -3606,6 +3723,7 @@ command_continue() {
   shift
 
   parse_repo_options "$@"
+  [ -z "${PIN_ISSUE:-}" ] || die "--issue is only valid with alucard run"
 
   need_cmd git
   need_cmd gh

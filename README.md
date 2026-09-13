@@ -53,7 +53,7 @@ flowchart TD
 
 - **CLI / host orchestrator** (`alucard`). Bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
 - **Container** (Dockerfile + entrypoint). Disposable per agent run. Opinionated personal image: Node 24, git, gh, uv, just, Python 3.12, Claude Code, Codex, shellcheck, and build-essential (native extensions). Extend it with a local image (`alucard build --image …` / `ALUCARD_IMAGE`), not by shrinking the published one. Worker, CI-fix, reviewer, and feedback each get their own container.
-- **Agent prompts.** One file per role: `alucard-worker-prompt.md` (main worker, mode-agnostic core, assembled at dispatch with `alucard-worker-github-prompt.md` or `alucard-worker-local-prompt.md` depending on the task source), `alucard-reviewer-prompt.md` (code reviewer), `alucard-ci-fix-prompt.md` (CI failure fixer), `alucard-feedback-prompt.md` (review feedback handler). Worker, reviewer, and feedback also get `alucard-engineering-policy.md`, one shared fragment holding the solution, test, and change-request policy those three roles must agree on. CI-fix does not: its own prompt already forbids touching anything outside the failing check, and shared policy could only loosen that.
+- **Agent prompts.** One file per role: `alucard-worker-prompt.md` (main worker, mode-agnostic core, assembled at dispatch with `alucard-worker-github-prompt.md`, `alucard-worker-github-issue-prompt.md`, or `alucard-worker-local-prompt.md` depending on the task source), `alucard-reviewer-prompt.md` (code reviewer), `alucard-ci-fix-prompt.md` (CI failure fixer), `alucard-feedback-prompt.md` (review feedback handler). Worker, reviewer, and feedback also get `alucard-engineering-policy.md`, one shared fragment holding the solution, test, and change-request policy those three roles must agree on. CI-fix does not: its own prompt already forbids touching anything outside the failing check, and shared policy could only loosen that.
 - **Repository review policy.** If the target repository has a `REVIEW.md` at its root, it is injected into the reviewer and feedback prompts as `<review_policy>`: extra review passes, a severity threshold, classes of finding the repo does not want raised. It is capped at 16 KB (`REVIEW_POLICY_MAX_BYTES`) and truncated with a marker rather than dropped. It is repo-authored, so it is treated as untrusted: it can refine what gets flagged and how it is graded, but it cannot lift the reviewer's contract, change the verdicts or output format, or instruct an approval. Repositories without the file are unaffected.
 - **Turn budget.** Each role runs under a `--max-turns` cap (`ALUCARD_WORKER_MAX_TURNS` and friends). The number is injected into that role's prompt as `<turn_budget>`, and the role prompts say what to do as it runs low: bank committed work and say what remains, rather than stopping mid-action. `--max-turns` is a Claude flag, so a codex-backed role gets no block — nothing there enforces a cap. Runs that could not see the number all exhausted it without ever signalling, losing whatever was uncommitted.
 - **Queue.** GitHub issues labeled `ready-for-agent`, or a [local tasks file](#local-task-source). Authoring skills are not part of the runner.
@@ -108,6 +108,7 @@ alucard/
 ├── entrypoint.sh                # configures git identity and gh auth at container start
 ├── alucard-worker-prompt.md     # worker agent instructions (mode-agnostic core)
 ├── alucard-worker-github-prompt.md  # worker mode section: GitHub tickets queue
+├── alucard-worker-github-issue-prompt.md  # worker mode section: pinned GitHub issue
 ├── alucard-worker-local-prompt.md   # worker mode section: local tasks file
 ├── alucard-reviewer-prompt.md   # reviewer agent instructions
 ├── alucard-ci-fix-prompt.md     # CI-fix agent instructions
@@ -187,6 +188,7 @@ Blocked by: 1
 - `--tasks PATH` / `ALUCARD_TASKS_FILE` uses this tasks file instead of the GitHub queue.
 - Auto-detect: with neither flag set, `alucard` looks for `.alucard/tasks.md` in the target repo and switches to it automatically.
 - `--github` forces the GitHub issue queue even when a local tasks file is present or configured. Combining `--tasks` and `--github` is an error.
+- `--issue N` runs exactly one iteration on open GitHub issue N and forces the GitHub task source, including when `.alucard/tasks.md` would auto-detect. Combining `--tasks` and `--issue` is an error. `queue`, `doctor`, and `continue` reject `--issue`.
 - `alucard doctor` validates the file structurally (duplicate ids, dangling `Blocked by:` references, empty header, malformed headings) with line numbers, before a run ever starts.
 
 ### Lifecycle / morning-after flow
@@ -375,6 +377,9 @@ alucard run /path/to/target-repo -n 20 -t 30
 
 # Run one iteration to test
 alucard run /path/to/target-repo -n 1 -t 15
+
+# Run one open GitHub issue, then stop
+alucard run /path/to/target-repo --issue 90
 
 # Check what's in the queue right now
 alucard queue /path/to/target-repo
