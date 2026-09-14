@@ -76,7 +76,8 @@ MOCK
 # The worker. Finds its worktree from the -v mount and plays one scenario:
 #   exhausted — one commit, one uncommitted file, then the max-turns result
 #   deferred  — no claim, no changes, a clean exit (it parked the ticket)
-#   failed    — claimed, changed nothing, died
+#   parked_then_pr — parked #480, then opened a PR for #481
+#   failed         — claimed, changed nothing, died
 # Touching the flag file is how the gh mock knows the worker has run, so its
 # label queries can answer differently before and after.
 cat > "$MOCK_BIN/docker" <<'MOCK'
@@ -101,6 +102,13 @@ case "$ALUCARD_TEST_SCENARIO" in
     exit 1 ;;
   deferred)
     printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Parked #480 as ready-for-human; nothing else to pick."}'
+    exit 0 ;;
+  parked_then_pr)
+    printf 'fixed\n' > "$wt/small-fix.txt"
+    git -C "$wt" add -A
+    git -C "$wt" -c user.name=w -c user.email=w@example.invalid commit -qm 'fix: small fix'
+    git -C "$wt" push -qu origin HEAD
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Parked #480, then opened PR #91 for #481."}'
     exit 0 ;;
   failed)
     printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}'
@@ -128,15 +136,25 @@ case "$1 $2" in
         # The worker claims in every scenario but the deferral.
         if $ran && [ "$ALUCARD_TEST_SCENARIO" != deferred ]; then echo "[480]"; else echo "[]"; fi ;;
       *ready-for-agent*)
-        if $ran && [ "$ALUCARD_TEST_SCENARIO" = deferred ]; then
+        if $ran && { [ "$ALUCARD_TEST_SCENARIO" = deferred ] || [ "$ALUCARD_TEST_SCENARIO" = parked_then_pr ]; }; then
           echo "[]"
         elif $has_jq; then
-          echo "[480]"
+          if [ "$ALUCARD_TEST_SCENARIO" = parked_then_pr ]; then echo "[480,481]"; else echo "[480]"; fi
         else
-          echo '[{"number":480,"title":"Queue receipt ingest and web multi-file drop","body":"A big one.","labels":[{"name":"ready-for-agent"}]}]'
+          if [ "$ALUCARD_TEST_SCENARIO" = parked_then_pr ]; then
+            echo '[{"number":480,"title":"Queue receipt ingest and web multi-file drop","body":"A big one.","labels":[{"name":"ready-for-agent"}]},{"number":481,"title":"Small fix","body":"A small one.","labels":[{"name":"ready-for-agent"}]}]'
+          else
+            echo '[{"number":480,"title":"Queue receipt ingest and web multi-file drop","body":"A big one.","labels":[{"name":"ready-for-agent"}]}]'
+          fi
         fi ;;
       *) echo "[]" ;;
     esac ;;
+  "pr list")
+    if $ran && [ "$ALUCARD_TEST_SCENARIO" = parked_then_pr ]; then echo "91"; else echo ""; fi ;;
+  "pr view")
+    if [ "$ALUCARD_TEST_SCENARIO" = parked_then_pr ]; then
+      echo '{"number":91,"title":"fix: small fix","body":"Closes #481"}'
+    fi ;;
   "pr create")
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -284,6 +302,17 @@ assert_contains "and again at the end" "#480 left the queue without a PR" "$EVEN
 assert_line_after "after the queue-empty line" "Needs attention:" "Run end: queue empty" "$EVENTS"
 assert_not_contains "nothing was claimed, so nothing is unclaimed" "issue edit" "$TRACE"
 assert_not_contains "and no PR is opened for it" "pr create" "$TRACE"
+
+# ── A parked ticket followed by a normal PR ──────────────────────────────────
+echo ""
+echo "── parked ticket, then PR ──"
+
+run_scenario parked_then_pr 1
+assert_eq "the run completes after opening the second ticket's PR" "0" "$RC"
+assert_contains "the parked ticket is listed despite the PR" \
+  "#480 left the queue without a PR" "$EVENTS"
+assert_not_contains "the ticket occupied by the new PR is not listed as parked" \
+  "#481 left the queue without a PR" "$EVENTS"
 
 # ── A worker that claimed and produced nothing ───────────────────────────────
 echo ""

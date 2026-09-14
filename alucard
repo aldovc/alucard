@@ -3771,23 +3771,32 @@ command_run() {
         done
       fi
 
-      # A worker that judged its only option too large is told to park it
-      # under ready-for-human rather than attempt it or silently skip it.
-      # That leaves the queue shorter with no PR to show for it, which the
-      # run's last line would otherwise report as a finished queue. Anything
-      # dispatched this iteration that is no longer ready-for-agent is named.
-      if [ "$TASK_SOURCE" = "github" ] && [ -z "${PIN_ISSUE:-}" ]; then
-        _still_ready=$(cd "$REPO_ABS" && \
-          gh issue list --state open --label ready-for-agent --limit 500 --json number \
-            --jq '[.[].number]' 2>/dev/null || true)
-        if [ -n "${_still_ready:-}" ]; then
-          for _n in $(jq -nr \
-              --argjson q "$(echo "$issues" | jq -c '[.[].number]')" \
-              --argjson r "$_still_ready" '($q - $r)[]' 2>/dev/null); do
-            log_event "Worker took #$_n off the queue without a PR (no longer ready-for-agent) — its comments should say why."
-            RUN_ATTENTION+=("#$_n left the queue without a PR — the worker relabeled or closed it; see the ticket's comments")
-          done
-        fi
+    fi
+
+    # A worker can park an oversized ticket, then pick another and open a PR.
+    # Compare the ready-for-agent labels on every GitHub iteration, not only
+    # the no-PR recovery path. If the worker also removed that label from the
+    # ticket its new PR occupies, do not report that ticket as parked.
+    if [ "$TASK_SOURCE" = "github" ] && [ -z "${PIN_ISSUE:-}" ]; then
+      _still_ready=$(cd "$REPO_ABS" && \
+        gh issue list --state open --label ready-for-agent --limit 500 --json number \
+          --jq '[.[].number]' 2>/dev/null || true)
+      _iter_pr_node=""
+      if [ "$_pr_found" = true ]; then
+        _iter_pr_node=$(cd "$REPO_ABS" && \
+          gh pr view "$_iter_pr_num" --json number,title,body \
+            2>/dev/null || true)
+      fi
+      if [ -n "${_still_ready:-}" ]; then
+        for _n in $(jq -nr \
+            --argjson q "$(echo "$issues" | jq -c '[.[].number]')" \
+            --argjson r "$_still_ready" '($q - $r)[]' 2>/dev/null); do
+          if [ -n "$_iter_pr_node" ] && open_pr_covers_ticket "[$_iter_pr_node]" "$_n"; then
+            continue
+          fi
+          log_event "Worker took #$_n off the queue without a PR (no longer ready-for-agent) — its comments should say why."
+          RUN_ATTENTION+=("#$_n left the queue without a PR — the worker relabeled or closed it; see the ticket's comments")
+        done
       fi
     fi
 
