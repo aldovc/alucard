@@ -1,10 +1,8 @@
 #!/bin/bash
 # Covers the toolchain preflight on a repo with more than one dependency
-# manifest: every manifest is found, each is verified in its own directory,
-# the status names each one, and the worker is handed that status. Preflight
-# used to check only the first manifest it found. A worker on a two-manifest
-# repo then spent the last turns of its iteration discovering that the second
-# directory had nothing installed, after preflight had vouched for the first.
+# install root: each ecosystem is found and verified in its own directory,
+# root manifests cover their nested workspace members, the status names each
+# install, and the worker is handed that status.
 set -euo pipefail
 
 # The mocks stand in for tools that read stdin; see test_timeout_recovery.sh.
@@ -90,6 +88,16 @@ assert_eq "a root pyproject is one uv line" $'uv sync\t.' "$(detect_dependency_i
 r=$(mk root-both pyproject.toml package-lock.json)
 assert_eq "a root with both manifests lists uv, then npm" \
   $'uv sync\t.\nnpm ci\t.' "$(detect_dependency_install "$r")"
+
+r=$(mk workspace pyproject.toml backend/pyproject.toml \
+      examples/pyproject.toml frontend/package-lock.json)
+assert_eq "a root manifest covers nested members of its ecosystem" \
+  $'uv sync\t.\nnpm ci\tfrontend' "$(detect_dependency_install "$r")"
+
+r=$(mk npm-workspace package-lock.json examples/package-lock.json \
+      docs/package-lock.json backend/pyproject.toml)
+assert_eq "root npm skips example and docs lockfiles but keeps nested Python" \
+  $'npm ci\t.\nuv sync\tbackend' "$(detect_dependency_install "$r")"
 
 r=$(mk split backend/pyproject.toml frontend/package-lock.json docs/index.md \
       .git/pyproject.toml deep/er/pyproject.toml)
@@ -207,6 +215,11 @@ assert_contains "and names both failures" '`uv sync` in backend/ fails inside th
 assert_contains "with the whole-repo consequence" \
   "cannot run this repo's lint or test suite" "$TOOLCHAIN_STATUS"
 assert_not_contains "and no partial wording" "For the rest of the repo" "$TOOLCHAIN_STATUS"
+
+assert_contains "the feedback prompt treats BROKEN as potentially partial" \
+  'A `BROKEN` status may be partial' "$(<"$SCRIPT_DIR/../alucard-feedback-prompt.md")"
+assert_contains "and requires tests in healthy directories" \
+  "still run tests in healthy directories" "$(<"$SCRIPT_DIR/../alucard-feedback-prompt.md")"
 
 # ── A single root manifest keeps its one container ───────────────────────────
 echo ""

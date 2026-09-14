@@ -3024,24 +3024,32 @@ ${_blocked_body}"
   done
 }
 
-# Detect how to install the target repo's dependencies. Every Python or Node
-# manifest at the repo root or exactly one level down counts: a backend/
-# owning one and a frontend/ owning another is the common layout in these
-# repos, and checking only the first left the second unverified — a worker
-# spent its last turns of an iteration discovering frontend/node_modules did
-# not exist, after preflight had vouched for backend/.
-# $1 = repo root. Echoes one "<install_cmd><TAB><dir>" line per manifest —
+# Detect how to install the target repo's dependencies. A root manifest covers
+# nested manifests from the same ecosystem, as it does for uv and npm
+# workspaces; running those members separately can fail even after the root
+# install succeeded. When an ecosystem has no root manifest, every manifest
+# exactly one level down counts. This still finds a root Python project plus a
+# nested frontend, or the reverse.
+# $1 = repo root. Echoes one "<install_cmd><TAB><dir>" line per install root,
 # root first, then subdirectories in sorted order, uv before npm within a
-# directory — and returns 1 when there is none.
+# directory, and returns 1 when there is none.
 detect_dependency_install() {
-  local root="$1" found=false dir
-  if [ -f "$root/pyproject.toml" ]; then printf 'uv sync\t.\n'; found=true; fi
-  if [ -f "$root/package-lock.json" ]; then printf 'npm ci\t.\n'; found=true; fi
+  local root="$1" found=false dir root_py=false root_npm=false
+  if [ -f "$root/pyproject.toml" ]; then
+    printf 'uv sync\t.\n'; found=true; root_py=true
+  fi
+  if [ -f "$root/package-lock.json" ]; then
+    printf 'npm ci\t.\n'; found=true; root_npm=true
+  fi
   # sort keeps the order deterministic across filesystems.
   while IFS= read -r dir; do
     [ -n "$dir" ] || continue
-    if [ -f "$root/$dir/pyproject.toml" ]; then printf 'uv sync\t%s\n' "$dir"; found=true; fi
-    if [ -f "$root/$dir/package-lock.json" ]; then printf 'npm ci\t%s\n' "$dir"; found=true; fi
+    if [ "$root_py" = false ] && [ -f "$root/$dir/pyproject.toml" ]; then
+      printf 'uv sync\t%s\n' "$dir"; found=true
+    fi
+    if [ "$root_npm" = false ] && [ -f "$root/$dir/package-lock.json" ]; then
+      printf 'npm ci\t%s\n' "$dir"; found=true
+    fi
   done < <(cd "$root" && find . -mindepth 2 -maxdepth 2 \
              \( -name pyproject.toml -o -name package-lock.json \) \
              -not -path './.git/*' 2>/dev/null \

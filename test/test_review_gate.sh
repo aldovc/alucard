@@ -179,11 +179,24 @@ repo=$(mk_repo npm-nested "web/package-lock.json")
 assert_eq "nested package-lock.json -> npm ci at web" \
   "npm ci	web" "$(detect_dependency_install "$repo" || true)"
 
-# Every manifest is listed, the root's first, so a monorepo's top-level
-# project and its subdirectory projects are all preflighted.
+# A root manifest covers nested manifests from the same ecosystem. This avoids
+# syncing a uv workspace member separately after the root already covered it.
 repo=$(mk_repo py-both "pyproject.toml" "backend/pyproject.toml")
-assert_eq "root manifest listed before nested" \
+assert_eq "root Python manifest wins over nested Python manifest" \
+  "uv sync	." "$(detect_dependency_install "$repo" || true)"
+
+# Root precedence is per ecosystem, not global: a nested frontend still needs
+# its own install when the root only covers Python.
+repo=$(mk_repo py-root-npm-nested "pyproject.toml" "backend/pyproject.toml" \
+  "frontend/package-lock.json")
+assert_eq "root Python still includes nested Node" \
   "uv sync	.
+npm ci	frontend" "$(detect_dependency_install "$repo" || true)"
+
+repo=$(mk_repo npm-root-py-nested "package-lock.json" \
+  "examples/package-lock.json" "docs/package-lock.json" "backend/pyproject.toml")
+assert_eq "root Node skips examples and docs lockfiles but includes nested Python" \
+  "npm ci	.
 uv sync	backend" "$(detect_dependency_install "$repo" || true)"
 
 # A Python directory and a Node directory are both listed, by directory.
