@@ -179,21 +179,24 @@ repo=$(mk_repo npm-nested "web/package-lock.json")
 assert_eq "nested package-lock.json -> npm ci at web" \
   "npm ci	web" "$(detect_dependency_install "$repo" || true)"
 
-# Root manifest wins over a nested one so a monorepo's top-level project is
-# preflighted rather than an arbitrary subdirectory.
+# Every manifest is listed, the root's first, so a monorepo's top-level
+# project and its subdirectory projects are all preflighted.
 repo=$(mk_repo py-both "pyproject.toml" "backend/pyproject.toml")
-assert_eq "root manifest wins over nested" \
-  "uv sync	." "$(detect_dependency_install "$repo" || true)"
+assert_eq "root manifest listed before nested" \
+  "uv sync	.
+uv sync	backend" "$(detect_dependency_install "$repo" || true)"
 
-# Python is checked before Node when a repo has both.
+# A Python directory and a Node directory are both listed, by directory.
 repo=$(mk_repo mixed "backend/pyproject.toml" "web/package-lock.json")
-assert_eq "python manifest checked before node" \
-  "uv sync	backend" "$(detect_dependency_install "$repo" || true)"
+assert_eq "python and node manifests both listed" \
+  "uv sync	backend
+npm ci	web" "$(detect_dependency_install "$repo" || true)"
 
-# Deterministic pick when several nested manifests exist.
+# Deterministic order when several nested manifests exist.
 repo=$(mk_repo py-multi "svc-b/pyproject.toml" "svc-a/pyproject.toml")
-assert_eq "multiple nested manifests pick deterministically" \
-  "uv sync	svc-a" "$(detect_dependency_install "$repo" || true)"
+assert_eq "multiple nested manifests are listed in sorted order" \
+  "uv sync	svc-a
+uv sync	svc-b" "$(detect_dependency_install "$repo" || true)"
 
 repo=$(mk_repo none "README.md")
 _rc=0

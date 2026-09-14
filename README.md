@@ -12,7 +12,7 @@ A containerized agent loop that picks work off a queue, completes it one item at
 4. **Review gate.** A reviewer agent evaluates the PR, then a feedback agent addresses findings, repeating up to `--max-review-cycles` times (default 10). The loop ends early on `APPROVED` or `BLOCKED`. See [Loop convergence](#loop-convergence).
 5. **You review PRs when you check back** and merge what's good.
 
-Before the first iteration, a **toolchain preflight** checks that the container can actually install the target repo's dependencies (`uv sync` / `npm ci`, detected at the repo root or one level down). Alucard prints the result at startup, saves it to `toolchain-preflight.txt` in the log directory, and passes it to every reviewer.
+Before the first iteration, a **toolchain preflight** checks that the container can actually install the target repo's dependencies: every `pyproject.toml` (`uv sync`) and `package-lock.json` (`npm ci`) at the repo root or one level down, each verified in its own directory. Alucard prints the result at startup, saves it to `toolchain-preflight.txt` in the log directory, and hands it to every worker, reviewer, and feedback agent, naming each install and where it belongs.
 
 Preflight also handles **Playwright browsers**. Every container shares one browser directory on the host, under `~/.cache/alucard/playwright-browsers`, seeded once from the copy baked into the image. Preflight then asks the target repo's own pinned Playwright to install what it wants — that is the one moment the repo's `node_modules` exists, so it is the only place that knows which revision to fetch. Without this a repo pinning a different Playwright version downloads a full browser inside every iteration, because Playwright keys its browsers by an internal revision number and each release pins exactly one. When the repo's pin and the image's disagree, preflight says so; the repo can align its pin to stop carrying a second revision. Deleting the cache directory is safe and is how you prune it.
 
@@ -78,7 +78,7 @@ Three mechanisms keep the loop converging:
 
 - **Blocked-findings ledger.** When the feedback agent hits a finding it cannot action, it writes `/work-output/.alucard-blocked` instead of posting a "blocked" comment. The harness posts that once as a `**🤖 Alucard blocked findings**` marker comment and feeds it to every later reviewer as `<known_blockers>`. Reviewers are told not to re-report those. The harness reloads the ledger from the PR at the start of each run, so a re-run does not rediscover it.
 - **Reviewers read the conversation.** Each reviewer reads prior cycles' findings and the feedback agent's replies before judging, so they don't raise a finding that's already fixed or already recorded as blocked, just at a new line number.
-- **Toolchain status.** Reviewers are told whether the container can install dependencies at all. When it cannot, they review the tests as written but do not demand test *output* no agent on the PR could produce.
+- **Toolchain status.** Every agent is told which dependency installs work in the container and in which directory. Workers and feedback agents run them before verifying; reviewers, when an install fails, review the tests as written but do not demand test *output* no agent on the PR could produce.
 
 ## When the worker stops without a PR
 

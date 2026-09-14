@@ -286,6 +286,9 @@ EXPECTED_GH='<instructions>INSTRUCTIONS</instructions>
 <base_branch>main</base_branch>
 <commits>line1
 line2</commits>
+<toolchain_status>
+Unknown — no preflight result available.
+</toolchain_status>
 <issues>[{"number":1,"title":"t","labels":["ready-for-agent","bug"]}]</issues>'
 assert_eq "prompt: github mode slims issues to number/title/labels" "$EXPECTED_GH" "$FULL_PROMPT"
 assert_not_contains "prompt: github mode drops issue body" '"body"' "$FULL_PROMPT"
@@ -588,6 +591,9 @@ EXPECTED_PIN='<instructions>INSTRUCTIONS</instructions>
 <base_branch>main</base_branch>
 <commits>line1
 line2</commits>
+<toolchain_status>
+Unknown — no preflight result available.
+</toolchain_status>
 <issue>{"number":7,"title":"t","labels":["in-progress","bug"]}</issue>'
 assert_eq "prompt: pin mode injects slim <issue>" "$EXPECTED_PIN" "$FULL_PROMPT"
 assert_not_contains "prompt: pin mode has no shoppable <issues> list" "<issues>" "$FULL_PROMPT"
