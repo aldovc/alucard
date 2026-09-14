@@ -80,6 +80,14 @@ Three mechanisms keep the loop converging:
 - **Reviewers read the conversation.** Each reviewer reads prior cycles' findings and the feedback agent's replies before judging, so they don't raise a finding that's already fixed or already recorded as blocked, just at a new line number.
 - **Toolchain status.** Reviewers are told whether the container can install dependencies at all. When it cannot, they review the tests as written but do not demand test *output* no agent on the PR could produce.
 
+## When the worker stops without a PR
+
+A worker that runs out of turns, hits the iteration timeout, wedges, or fails before `gh pr create` leaves a worktree the harness is about to delete. Recovery commits whatever is there, pushes the branch, and opens a draft PR titled `wip: alucard recovery`, labeled `needs-human`. Its body says what the branch is (unverified, possibly mid-edit) and what each next step does.
+
+That PR is the only thing holding the ticket. The worker's `in-progress` label comes off, the PR body says `Refs #N` rather than `Closes #N`, and the ticket gets a comment pointing at the PR. The morning-after decision is one action: finish the branch on the PR, or close the PR and the ticket rejoins the queue on the next run. `alucard continue <PR>` runs the CI and review gates on the branch as it stands; it does not resume implementation.
+
+The last lines of a run list everything it parked this way. "Run end: queue empty" is followed by a "Needs attention" list whenever the queue is empty because a recovery PR holds a ticket, or because the worker took one off the queue. In GitHub queue mode a worker that judges a ticket too large for one iteration comments a proposed split on it and moves it from `ready-for-agent` to `ready-for-human` rather than attempting it. Before that rule, two iterations in a row judged the same ticket too large, picked something else, and kept the judgment in their logs; the third had nothing else to pick, attempted it, and exhausted its budget with nothing committed.
+
 ## Threat model and safety design
 
 **The risk.** `claude` runs in `bypassPermissions` mode, no prompts, full tool access, so the agent doesn't get stuck mid-run on a missing tool permission. Without isolation, a confused or prompt-injected agent could `rm -rf` your home directory or exfiltrate credentials.

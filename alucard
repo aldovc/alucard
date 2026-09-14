@@ -184,6 +184,21 @@ log_event() {
   printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >> "$LOG_DIR/events.log"
 }
 
+# Every way a run ends goes through here, so the last line of a run cannot
+# read "queue empty" over a ticket that is only out of the queue because an
+# unfinished recovery PR holds it. Whatever the loop parked for a human —
+# recovery PRs, tickets the worker took off the queue — is listed right after.
+# RUN_ATTENTION is the run loop's list; it is empty on most runs.
+log_run_end() {
+  log_event "Run end: $1"
+  [ "${#RUN_ATTENTION[@]}" -gt 0 ] || return 0
+  log_event "Needs attention: ${#RUN_ATTENTION[@]} item(s) this run left for a human — the queue may be empty because of them, not because the work is done."
+  local _a
+  for _a in "${RUN_ATTENTION[@]}"; do
+    log_event "  - $_a"
+  done
+}
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
@@ -3279,6 +3294,58 @@ setup_run_environment() {
   toolchain_preflight
 }
 
+# One sentence for the class classify_agent_failure gave a stopped worker, for
+# the texts a human reads the morning after. The class word stays in the log
+# lines; this is what goes into PR bodies and ticket comments.
+describe_worker_stop() {
+  case "$1" in
+    exhausted) echo "ran out of turns or hit its time limit" ;;
+    wedged)    echo "wedged its shell (every tool call failed after /work went missing)" ;;
+    transport) echo "lost its provider connection" ;;
+    *)         echo "failed" ;;
+  esac
+}
+
+# Body of the draft PR that holds a stopped worker's branch. It says what the
+# branch is — unverified, possibly mid-edit — and what each next step actually
+# does. The previous stub sent people to `alucard continue` as if it resumed
+# the work; it runs the CI and review gates on what is there, nothing more.
+# $1 = reference line ("Refs #N", "Task: <id>", or empty when the worker's
+#      claim could not be attributed), $2 = failure class, $3 = worker rc,
+#      $4 = commits the worker itself made, $5 = task source (github|file)
+recovery_pr_body() {
+  local ref_line="$1" class="$2" rc="$3" commits="$4" source="$5"
+  local finish handback
+  if [ "$source" = "file" ]; then
+    finish="the harness flips the task to \`[x]\` when this PR merges."
+    handback="close this PR and the task flips back to \`[ ]\` at the next queue build, with this attempt noted in its heading."
+  else
+    finish="when every acceptance criterion is met, change the \`Refs\` line above to \`Closes\` so the ticket closes on merge."
+    handback="close this PR and the ticket rejoins the queue on the next run — its \`in-progress\` label is already off, and this attempt is noted in its comments."
+  fi
+  printf '%s' "${ref_line:+$ref_line
+
+}${BOT_COMMENT_PREFIX} recovery PR** — the worker $(describe_worker_stop "$class") (rc=${rc}) before opening a PR. Its ${commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.
+
+This is not a finished change. What each next step does:
+
+- **Finish it here** — ${finish}
+- **Hand it back** — ${handback}
+- **\`alucard continue <PR_NUM>\`** runs the CI and review gates on what is here. It does not resume implementation."
+}
+
+# The comment a stopped worker's ticket gets, so the attempt is where the next
+# worker looks — the prompts say to read the ticket's comments, and a PR's
+# cross-reference is not a comment.
+# $1 = recovery PR number, $2 = failure class, $3 = worker rc,
+# $4 = commits the worker itself made
+recovery_ticket_comment() {
+  local pr_num="$1" class="$2" rc="$3" commits="$4"
+  printf '%s' "${BOT_COMMENT_PREFIX} recovery** — the worker on this ticket $(describe_worker_stop "$class") (rc=${rc}) before opening a PR. Its ${commits} commit(s), plus its uncommitted files, are on draft PR #${pr_num}. Nothing there has been through CI or review.
+
+The \`in-progress\` label is removed; PR #${pr_num} alone keeps this ticket out of the queue. Close that PR to hand the remaining work back to a worker, or finish it there."
+}
+
 # Build the worker prompt for one iteration. GitHub queue mode injects the
 # whole queue and the worker picks; GitHub pin mode injects exactly one
 # <issue>; file mode injects exactly ONE task — the first eligible in file
@@ -3356,6 +3423,7 @@ command_run() {
   log_event "Run start: repo=$REPO_ABS task_source=$_task_source_desc image=$IMAGE"
   measure_run_start "$REPO_ABS" "$_task_source_desc"
   local final_result='select(.type == "result").result // empty'
+  RUN_ATTENTION=()
 
   for ((i=1; i<=ITERATIONS; i++)); do
     echo "=== alucard iteration $i/$ITERATIONS ==="
@@ -3397,7 +3465,7 @@ command_run() {
       if [ "$count" -eq 0 ]; then
         _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
         log_event "Iteration $i/$ITERATIONS end: rc=0 duration=${_iter_duration}s"
-        log_event "Run end: queue empty — alucard rests after $((i-1)) iterations."
+        log_run_end "queue empty — alucard rests after $((i-1)) iterations."
         rm -rf "$WT_HOST"
         exit 0
       fi
@@ -3474,7 +3542,7 @@ command_run() {
       if [ -f "$log_file" ] && grep -q '"error":"billing_error"' "$log_file"; then
         _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
         log_event "Iteration $i/$ITERATIONS end: rc=$rc duration=${_iter_duration}s"
-        log_event "Run end: provider returned billing_error (credit balance too low) — aborting run."
+        log_run_end "provider returned billing_error (credit balance too low) — aborting run."
         rm -rf "$WT_HOST"
         exit 2
       fi
@@ -3551,10 +3619,16 @@ command_run() {
     # modes to recover from:
     #   1. Worker made commits but was killed before `git push` / `gh pr create`
     #      — the worktree is about to be deleted, so push it now and open a
-    #      draft recovery PR so `alucard continue <PR_NUM>` can resume.
+    #      draft recovery PR that holds both the work and the ticket.
     #   2. Worker claimed an issue (`gh issue edit <N> --add-label in-progress`)
     #      but never produced any commits — strip the label so the queue filter
     #      doesn't lock the issue out of future runs.
+    # The claim label comes off in both cases. An open recovery PR occupies its
+    # ticket by itself (the queue filter matches any #N mention in a PR body),
+    # and a ticket held by a label *and* a PR takes two separate actions to
+    # requeue. One run ended "queue empty" over exactly that: the only ticket
+    # left was locked twice by an unfinished recovery branch, and closing the
+    # PR alone would not have freed it.
     if [ "$_pr_found" = false ]; then
       _newly_claimed="[]"
       if [ "$TASK_SOURCE" = "github" ]; then
@@ -3567,6 +3641,8 @@ command_run() {
           '$after - $before' 2>/dev/null || echo '[]')
       fi
 
+      _recovery_pr_num=""
+      _worker_commits_ahead=0
       if [ -d "$WT_HOST/.git" ]; then
         # Commits the worker itself made, captured before the harness's own
         # recovery commit below — this is the figure the transport PR gate
@@ -3618,43 +3694,55 @@ command_run() {
             if [ "$_worker_class" = "transport" ] && [ "$_worker_commits_ahead" -eq 0 ]; then
               log_event "Recovery: transport failure with no worker commits — branch $_recover_branch preserved, no PR opened, ticket left in queue."
             else
-              # Closes #N on the first line lets the queue dedup filter
-              # (closingIssuesReferences in get_unblocked_tickets) match
-              # the issue to this PR so the issue isn't re-picked. The local
+              # Refs, not Closes. The queue's occupancy filter matches any #N
+              # mention in an open PR body, so Refs keeps the ticket out of
+              # the queue just as well — and it is what the worker prompt
+              # requires of partial work. Closes would shut a ticket with
+              # unmet criteria the moment someone merged the draft. The local
               # source uses a Task: line plus the in-flight heading flip below.
-              _closes_line=""
+              _ref_line=""
+              _ticket_ref=""
               if [ "$TASK_SOURCE" = "file" ]; then
-                _closes_line="Task: ${DISPATCHED_TASK_ID}"
+                _ref_line="Task: ${DISPATCHED_TASK_ID}"
+                _ticket_ref="task ${DISPATCHED_TASK_ID}"
               else
                 for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
-                  _closes_line="Closes #${_n}"
+                  _ref_line="Refs #${_n}"
+                  _ticket_ref="issue #${_n}"
                   break
                 done
               fi
-              _stub_body="${_closes_line}
-
-${BOT_COMMENT_PREFIX} recovery PR** — worker exited rc=${rc} before opening a PR. Its commits have been pushed here so the work isn't lost.
-
-Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or close this PR if the work isn't salvageable."
-              _stub_title="wip: alucard recovery — iter ${i} (worker killed rc=${rc})"
-              if _new_pr_url=$(cd "$REPO_ABS" && \
+              _stub_body=$(recovery_pr_body "$_ref_line" "$_worker_class" "$rc" \
+                "$_worker_commits_ahead" "$TASK_SOURCE")
+              _stub_title="wip: alucard recovery — iter ${i} (worker stopped: ${_worker_class}, rc=${rc})"
+              # gh prints its own warnings ("1 uncommitted change", about the
+              # cached clone) on the same stream as the URL, and every recovery
+              # event logged so far recorded that warning as the PR. Pick the
+              # URL out; keep the whole output for the failure message.
+              _new_pr_out=$(cd "$REPO_ABS" && \
                 gh pr create \
                   --head "$_recover_branch" \
                   --base "$BASE_BRANCH" \
                   --label alucard \
                   --draft \
                   --title "$_stub_title" \
-                  --body "$_stub_body" 2>&1); then
-                log_event "Recovery: opened PR $_new_pr_url"
+                  --body "$_stub_body" 2>&1) || true
+              _new_pr_url=$(printf '%s\n' "$_new_pr_out" \
+                | grep -oE 'https://[^[:space:]]+/pull/[0-9]+' | head -n1 || true)
+              if [ -n "$_new_pr_url" ]; then
+                _recovery_pr_num="${_new_pr_url##*/}"
+                log_event "Recovery: opened PR #${_recovery_pr_num} ($_new_pr_url)"
                 ACTUAL_BRANCH="$_recover_branch"
                 _recovery_pr=true
+                # The label every other outcome a human has to pick up gets.
+                add_pr_label "$REPO_ABS" "$_recovery_pr_num" "needs-human"
+                RUN_ATTENTION+=("recovery PR #${_recovery_pr_num}${_ticket_ref:+ holds $_ticket_ref}: the worker $(describe_worker_stop "$_worker_class") (rc=${rc}); the branch is unverified — finish it, or close it to requeue the work")
                 if [ "$TASK_SOURCE" = "file" ]; then
-                  _recovery_pr_num="${_new_pr_url##*/}"
                   mark_task_in_flight "$TASKS_FILE_ABS" "$DISPATCHED_TASK_ID" "$_recovery_pr_num" \
                     || die "could not mark task ${DISPATCHED_TASK_ID} in-flight in $TASKS_FILE_ABS — recovery PR #${_recovery_pr_num} is pushed and safe; fix the heading before the next run"
                 fi
               else
-                log_event "Recovery: could not open recovery PR: $_new_pr_url"
+                log_event "Recovery: could not open recovery PR: $_new_pr_out"
               fi
             fi
           else
@@ -3663,16 +3751,43 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
         fi
       fi
 
-      # No PR exists and recovery didn't produce one — strip the in-progress
-      # label so the next run can re-pick the issue. Local mode never
-      # claimed anything, so there is nothing to strip and the still-"[ ]"
-      # task is naturally re-picked next iteration.
-      if [ "$_recovery_pr" = false ] && [ "$TASK_SOURCE" = "github" ]; then
+      # The claim comes off either way. With a recovery PR, that PR is now the
+      # one thing holding the ticket, and the ticket is told where its work
+      # went. Without one, the ticket simply rejoins the queue. Local mode
+      # never claimed anything, so there is nothing to strip and the
+      # still-"[ ]" task is naturally re-picked next iteration.
+      if [ "$TASK_SOURCE" = "github" ]; then
         for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
-          echo "Worker claimed #$_n but produced no PR — removing 'in-progress' label."
+          if [ "$_recovery_pr" = true ]; then
+            echo "Recovery PR #${_recovery_pr_num} holds #$_n — removing 'in-progress' so closing that PR requeues it."
+            (cd "$REPO_ABS" && gh issue comment "$_n" --body \
+              "$(recovery_ticket_comment "$_recovery_pr_num" "$_worker_class" "$rc" "$_worker_commits_ahead")") \
+              >/dev/null 2>&1 || log_event "Recovery: could not comment on #$_n."
+          else
+            echo "Worker claimed #$_n but produced no PR — removing 'in-progress' label."
+          fi
           (cd "$REPO_ABS" && gh issue edit "$_n" --remove-label in-progress) \
             2>/dev/null || true
         done
+      fi
+
+      # A worker that judged its only option too large is told to park it
+      # under ready-for-human rather than attempt it or silently skip it.
+      # That leaves the queue shorter with no PR to show for it, which the
+      # run's last line would otherwise report as a finished queue. Anything
+      # dispatched this iteration that is no longer ready-for-agent is named.
+      if [ "$TASK_SOURCE" = "github" ] && [ -z "${PIN_ISSUE:-}" ]; then
+        _still_ready=$(cd "$REPO_ABS" && \
+          gh issue list --state open --label ready-for-agent --limit 500 --json number \
+            --jq '[.[].number]' 2>/dev/null || true)
+        if [ -n "${_still_ready:-}" ]; then
+          for _n in $(jq -nr \
+              --argjson q "$(echo "$issues" | jq -c '[.[].number]')" \
+              --argjson r "$_still_ready" '($q - $r)[]' 2>/dev/null); do
+            log_event "Worker took #$_n off the queue without a PR (no longer ready-for-agent) — its comments should say why."
+            RUN_ATTENTION+=("#$_n left the queue without a PR — the worker relabeled or closed it; see the ticket's comments")
+          done
+        fi
       fi
     fi
 
@@ -3706,14 +3821,14 @@ Resume with \`alucard continue <PR_NUM>\` once you've vetted the changes, or clo
       _remaining=""
       _remaining=$(get_task_queue "$REPO_ABS" | jq 'length' 2>/dev/null || true)
       if [ "${_remaining:-}" = "0" ]; then
-        log_event "Run end: alucard signaled completion after $i iterations (queue verified empty)."
+        log_run_end "alucard signaled completion after $i iterations (queue verified empty)."
         exit 0
       fi
       log_event "Worker promised NO MORE TASKS but queue still has ${_remaining:-unknown} unblocked issue(s) — ignoring (likely a wedged iteration). Continuing."
     fi
   done
 
-  log_event "Run end: reached max iterations ($ITERATIONS)."
+  log_run_end "reached max iterations ($ITERATIONS)."
 }
 
 command_continue() {

@@ -22,6 +22,18 @@ Pick ONE ticket. Priority order:
 
 **ONE TASK PER ITERATION.** Do not bundle.
 
+## Too large for one iteration
+
+Before claiming, size the ticket against `<turn_budget>`. A ticket that spans several layers (schema, backend, frontend, bot) with a long list of acceptance criteria will not finish in one iteration, and an attempt that exhausts the budget leaves unverified code on a branch nobody scheduled. Do not start it, and do not silently pick something else either: that judgment dies with your log, and a later iteration with nothing else to pick will attempt the same ticket unchanged. Two iterations in a row did exactly that once; the third exhausted its budget on it with nothing committed.
+
+Park it for a human instead:
+
+1. Comment on the ticket (`gh issue comment <N> --body-file <file>`): why it does not fit one iteration, and a proposed split into tickets that each would.
+2. Relabel it: `gh issue edit <N> --remove-label ready-for-agent --add-label ready-for-human`. It leaves the queue until a human splits it. The harness reports it at the end of the run.
+3. Pick another ticket. If none is left, output `<promise>NO MORE TASKS</promise>` and stop.
+
+Do this for the ticket you were about to pick, not as a triage pass over the whole queue.
+
 ## Claim the ticket
 
 First action — label it so no parallel iteration grabs it:
