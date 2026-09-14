@@ -8,6 +8,7 @@ These instructions are followed by context sections:
 - `<base_branch>` — the configured base branch name (e.g. `main`)
 - `<commits>` — last 5 commits on the base branch
 - `<turn_budget>` — how many turns this iteration gets, when the harness caps them. See **Commit cadence**.
+- `<toolchain_status>` — which dependency installs the harness verified in this container, and in which directory each belongs. Your checkout is fresh and has none of them done. See **Verify**.
 - the queue context described in the **Mode** section at the end of these instructions. Exactly one mode applies to this run; the Mode section is authoritative for where the task comes from, how to reference it in commits and the PR, and how to close it out.
 
 ## Explore
@@ -83,7 +84,9 @@ Before running lint and tests, read your own diff and check for each of the foll
 
 ## Verify
 
-**Import-existence check first.** Before lint and tests, verify every symbol your diff imports from an internal module is actually defined there. Tests that `patch()` a symbol at its import site inject the name into the module namespace and pass even when the definition was never written — so a green suite is not proof the import resolves, and the failure only surfaces as a deploy-time `ImportError`. For each internal module you touched, do a real load: in Python, `python -c "import the.module.path"` (or `from the.module import the_symbol`); otherwise grep the target module for each symbol's definition. This is mechanical and catches a deploy-breaking bug class in seconds. (Where the language has a build/typecheck step that already fails on an undefined symbol, that step covers this — the check matters most for interpreted code.)
+**Install first.** Your checkout has no dependencies installed. Run the install `<toolchain_status>` names for each directory you touch, in that directory, before running its lint, tests, or typecheck. One iteration spent its last turns on a typecheck in a frontend whose `node_modules` had never been installed; preflight had only ever vouched for the backend.
+
+**Import-existence check next.** Before lint and tests, verify every symbol your diff imports from an internal module is actually defined there. Tests that `patch()` a symbol at its import site inject the name into the module namespace and pass even when the definition was never written — so a green suite is not proof the import resolves, and the failure only surfaces as a deploy-time `ImportError`. For each internal module you touched, do a real load: in Python, `python -c "import the.module.path"` (or `from the.module import the_symbol`); otherwise grep the target module for each symbol's definition. This is mechanical and catches a deploy-breaking bug class in seconds. (Where the language has a build/typecheck step that already fails on an undefined symbol, that step covers this — the check matters most for interpreted code.)
 
 Then run the project's lint and test commands (e.g. `just lint && just test`). Do not proceed if they fail — fix or revert. A passing local check before commit is non-negotiable.
 

@@ -173,7 +173,7 @@ run_continue 0
 assert_eq "the feedback prompt still carries exactly one block" \
   "1" "$(blocks_per_prompt feedback)"
 assert_contains "the feedback agent is given the verified install command" \
-  'OK — `uv sync` completes in the container.' "$(injected_status feedback)"
+  'OK — `uv sync` at the repo root completes in the container.' "$(injected_status feedback)"
 assert_eq "both agents are told the same thing" \
   "$(injected_status review)" "$(injected_status feedback)"
 
@@ -183,7 +183,7 @@ run_continue 1
 assert_eq "the feedback prompt still carries exactly one block" \
   "1" "$(blocks_per_prompt feedback)"
 assert_contains "the feedback agent is told it cannot install" \
-  'BROKEN — `uv sync` fails' "$(injected_status feedback)"
+  'BROKEN — `uv sync` at the repo root fails' "$(injected_status feedback)"
 assert_contains "and told what that costs it" \
   "cannot run this repo's lint or test suite" "$(injected_status feedback)"
 assert_eq "both agents are told the same thing" \
