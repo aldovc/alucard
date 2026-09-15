@@ -3614,10 +3614,13 @@ wrapup_applies() {
 # happen exactly once and whether or not the agent finishes. The mechanical
 # recovery below is the fallback for anything it leaves undone.
 # $1 = iteration, $2 = worktree, $3 = worker log, $4 = worker provider,
-# $5 = failure class, $6 = worker rc, $7 = the ticket in words
+# $5 = failure class, $6 = worker rc, $7 = the ticket in words,
+# $8 = the base SHA the worker started from, $9 = task XML (file mode),
+# $10 = parent context XML (file mode)
 # Sets: WRAPUP_HANDOFF (the note, or empty), WRAPUP_RC
 run_wrapup_agent() {
   local iter="$1" wt="$2" worker_log="$3" worker_provider="$4" class="$5" rc="$6" ticket="$7"
+  local base_sha="$8" task_xml="${9:-}" parent_xml="${10:-}"
   WRAPUP_HANDOFF=""
   WRAPUP_RC=0
 
@@ -3632,9 +3635,13 @@ $(<"$TOOL_DIR/alucard-wrapup-prompt.md")
 <ticket>$(printf '%s' "$ticket" | xml_escape)</ticket>
 <stop_reason>The worker $(describe_worker_stop "$class") (rc=${rc}) before opening a PR.</stop_reason>
 <base_branch>${BASE_BRANCH}</base_branch>
+<base_sha>${base_sha}</base_sha>
 <worker_last_words>
 $(printf '%s' "${last_words:-No narration was captured from the worker.}" | xml_escape)
 </worker_last_words>"
+  # Local-mode acceptance criteria live in the tasks file, which the container
+  # may not have; hand them over the way the reviewer gets them.
+  prompt=$(append_task_context "$prompt" "$task_xml" "$parent_xml")
 
   log_event "Wrap-up: worker stopped ($class) with work in its worktree — launching wrap-up agent (max ${DEFAULT_WRAPUP_MAX_TURNS} turns)."
   set +e
@@ -4025,24 +4032,24 @@ command_run() {
       # well — and it is what the worker prompt requires of partial work.
       # Closes would shut a ticket with unmet criteria the moment someone
       # merged the draft. The local source uses a Task: line plus the
-      # in-flight heading flip below. A pinned run knows its ticket whether or
-      # not the worker got as far as labelling it: one recovery PR was
-      # attributed to the wrong ticket for want of this.
+      # in-flight heading flip below. A pinned run's ticket is the pin, full
+      # stop: the label diff is repository-wide, so with another worker running
+      # beside this one it can name that worker's claim instead — one recovery
+      # PR was attributed to a ticket a different run was working on.
       _ref_line=""
       _ticket_ref=""
       if [ "$TASK_SOURCE" = "file" ]; then
         _ref_line="Task: ${DISPATCHED_TASK_ID}"
         _ticket_ref="task ${DISPATCHED_TASK_ID}"
+      elif [ -n "${PIN_ISSUE:-}" ]; then
+        _ref_line="Refs #${PIN_ISSUE}"
+        _ticket_ref="issue #${PIN_ISSUE}"
       else
         for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
           _ref_line="Refs #${_n}"
           _ticket_ref="issue #${_n}"
           break
         done
-        if [ -z "$_ref_line" ] && [ -n "${PIN_ISSUE:-}" ]; then
-          _ref_line="Refs #${PIN_ISSUE}"
-          _ticket_ref="issue #${PIN_ISSUE}"
-        fi
       fi
 
       _recovery_pr_num=""
@@ -4066,7 +4073,8 @@ command_run() {
            && { [ "$_worker_commits_ahead" -gt 0 ] \
                 || [ -n "$(git -C "$WT_HOST" status --porcelain 2>/dev/null)" ]; }; then
           run_wrapup_agent "$i" "$WT_HOST" "$log_file" "$_worker_provider" \
-            "$_worker_class" "$rc" "${_ticket_ref:-unknown — the worker did not claim a ticket}"
+            "$_worker_class" "$rc" "${_ticket_ref:-unknown — the worker did not claim a ticket}" \
+            "$_base_sha" "$TASK_XML" "$PARENT_CONTEXT_XML"
           _wrapup_handoff="$WRAPUP_HANDOFF"
         fi
         # Stage and commit any uncommitted changes — work-in-progress would
@@ -4158,12 +4166,19 @@ command_run() {
       # never claimed anything, so there is nothing to strip and the
       # still-"[ ]" task is naturally re-picked next iteration.
       if [ "$TASK_SOURCE" = "github" ]; then
-        # A pinned ticket the worker never labelled still gets the comment:
-        # its recovery PR references it, so it is out of the queue either way.
-        _to_release="$_newly_claimed"
-        if [ -n "${PIN_ISSUE:-}" ] && [ "$_recovery_pr" = true ] \
-           && ! echo "$_newly_claimed" | jq -e --argjson n "$PIN_ISSUE" 'index($n) != null' >/dev/null 2>&1; then
-          _to_release=$(echo "$_newly_claimed" | jq -c --argjson n "$PIN_ISSUE" '. + [$n]' 2>/dev/null || echo "[$PIN_ISSUE]")
+        # A pinned run touches only its own ticket. The label diff is
+        # repository-wide, and a concurrent worker's fresh claim must not be
+        # stripped by this run. The pinned ticket is released when the worker
+        # labelled it, and told where its work went whenever a recovery PR
+        # references it — labelled or not.
+        if [ -n "${PIN_ISSUE:-}" ]; then
+          _to_release="[]"
+          if [ "$_recovery_pr" = true ] \
+             || echo "$_newly_claimed" | jq -e --argjson n "$PIN_ISSUE" 'index($n) != null' >/dev/null 2>&1; then
+            _to_release="[$PIN_ISSUE]"
+          fi
+        else
+          _to_release="$_newly_claimed"
         fi
         for _n in $(echo "$_to_release" | jq -r '.[]' 2>/dev/null); do
           if [ "$_recovery_pr" = true ]; then

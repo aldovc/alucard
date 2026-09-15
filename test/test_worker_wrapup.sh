@@ -211,7 +211,11 @@ case "$1 $2" in
   "issue list")
     case "$*" in
       *in-progress*)
-        if $ran && [ "${ALUCARD_TEST_CLAIMS:-yes}" = yes ]; then echo "[480]"; else echo "[]"; fi ;;
+        case "${ALUCARD_TEST_CLAIMS:-yes}" in
+          yes)   if $ran; then echo "[480]"; else echo "[]"; fi ;;
+          other) if $ran; then echo "[481]"; else echo "[]"; fi ;;
+          *)     echo "[]" ;;
+        esac ;;
       *ready-for-agent*)
         if $has_jq; then echo "[480]"; else
           echo '[{"number":480,"title":"Queue receipt ingest","body":"A big one.","labels":[{"name":"ready-for-agent"}]}]'
@@ -242,6 +246,7 @@ chmod +x "$MOCK_BIN/timeout" "$MOCK_BIN/docker" "$MOCK_BIN/gh"
 
 WRAPUP_TURNS=9   # not the default, so a frozen number cannot pass
 EXTRA_RUN_ARGS=()
+PRE_RUN_HOOK=""
 
 run_scenario() {
   local name="$1"; shift
@@ -258,6 +263,7 @@ run_scenario() {
   git -C "$target" add .
   git -C "$target" commit -qm initial
   git -C "$target" remote add origin "$remote"
+  if [ -n "${PRE_RUN_HOOK:-}" ]; then "$PRE_RUN_HOOK" "$target"; fi
   git -C "$target" push -qu origin main
 
   # Remaining arguments are env assignments; EXTRA_RUN_ARGS are CLI flags.
@@ -298,6 +304,13 @@ if [ -n "$PROMPT_FILE" ]; then
   assert_contains "it carries the worker's last words" "Now starting the frontend panel." "$PROMPT"
   assert_contains "it carries the earlier narration too" "Backend intake done" "$PROMPT"
   assert_contains "it names the base branch" "<base_branch>main</base_branch>" "$PROMPT"
+  assert_contains "it carries the exact base commit the worker started from" \
+    "<base_sha>$(git --git-dir="$REMOTE_DIR" rev-parse main)</base_sha>" "$PROMPT"
+  assert_contains "and is told to compare against that, not the stale ref" \
+    '`git log <base_sha>..HEAD --stat`' "$PROMPT"
+  assert_not_contains "no instruction compares against origin/<base_branch>" \
+    'origin/<base_branch>..HEAD' "$PROMPT"
+  assert_eq "a GitHub run carries no local task block" "0" "$(grep -c '^<task>' <<<"$PROMPT" || true)"
   assert_contains "it says what to write" "/work-output/.alucard-handoff" "$PROMPT"
   assert_contains "and what not to do" "Do not push" "$PROMPT"
   assert_eq "it is told its own cap" "1" "$(grep -c "This run gets ${WRAPUP_TURNS} turns" <<<"$PROMPT")"
@@ -369,6 +382,57 @@ assert_contains "the wrap-up was told the ticket" "issue #480" "$(<"$PROMPT_FILE
   || fail "the pinned ticket is told where its work went"
 assert_contains "the run's attention list names the ticket" "recovery PR #91 holds issue #480" "$EVENTS"
 assert_contains "the console usage table labels the wrap-up as its own role" "wrap-up 1" "$OUT"
+
+# A worker in another process claimed #481 while this pinned run was going.
+# The repository-wide label diff sees that claim; it is not this run's ticket.
+echo ""
+echo "── pinned run beside another worker's claim ──"
+run_scenario pinned_other ALUCARD_TEST_WRAPUP=handoff ALUCARD_TEST_CLAIMS=other
+assert_eq "the run completes" "0" "$RC"
+PR_BODY=$(<"$STATE/pr-body")
+assert_eq "the recovery PR is attributed to the pin, not the other worker's claim" \
+  "Refs #480" "$(printf '%s\n' "$PR_BODY" | head -n1)"
+assert_contains "the wrap-up was told the pinned ticket" "issue #480" "$(<"$PROMPT_FILE")"
+assert_not_contains "and not the other one" "#481" "$(<"$PROMPT_FILE")"
+assert_not_contains "the other worker's claim is left alone" "issue edit 481" "$TRACE"
+[ -f "$STATE/issue-comment-481" ] && fail "and its ticket gets no comment from this run" \
+  || pass "and its ticket gets no comment from this run"
+[ -f "$STATE/issue-comment-480" ] && pass "the pinned ticket is told where its work went" \
+  || fail "the pinned ticket is told where its work went"
+EXTRA_RUN_ARGS=()
+
+# ── Local task source: the criteria travel with the wrap-up ─────────────────
+# The tasks file is the worker's whole specification. The container may not
+# have it (an external --tasks path, or an untracked file), so the wrap-up is
+# handed the task and parent context the way the reviewer is.
+echo ""
+echo "── local task, wrap-up gets the criteria ──"
+prepare_local_tasks() {
+  mkdir -p "$1/.alucard"
+  cat > "$1/.alucard/tasks.md" <<'TASKS'
+# Upload plan
+
+Constraint that travels with every task: keep uploads under 10 MB.
+
+## [ ] 1: Build the multi-file upload panel
+
+Acceptance: drop zone accepts several files; skipped files are reported.
+TASKS
+  git -C "$1" add .alucard/tasks.md
+  git -C "$1" commit -qm 'plan'
+}
+PRE_RUN_HOOK=prepare_local_tasks
+run_scenario local ALUCARD_TEST_WRAPUP=handoff ALUCARD_TEST_CLAIMS=no
+PRE_RUN_HOOK=""
+assert_eq "the run completes" "0" "$RC"
+PROMPT=$(<"$PROMPT_FILE")
+assert_contains "the wrap-up is told which task" "task 1" "$PROMPT"
+assert_eq "it gets the task block" "1" "$(grep -c '^<task>' <<<"$PROMPT" || true)"
+assert_contains "with the acceptance criteria" "skipped files are reported" "$PROMPT"
+assert_contains "and the parent context" "keep uploads under 10 MB" "$PROMPT"
+PR_BODY=$(<"$STATE/pr-body")
+assert_eq "the recovery PR opens with the task line" "Task: 1" "$(printf '%s\n' "$PR_BODY" | head -n1)"
+assert_contains "and carries the handoff" "## Handoff from the wrap-up agent" "$PR_BODY"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
