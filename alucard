@@ -55,6 +55,14 @@ DEFAULT_CODEX_MODEL="${ALUCARD_CODEX_MODEL:-gpt-5.6-terra}"
 # existing recovery path. Default: 2 extra attempts (3 total).
 DEFAULT_TRANSPORT_RETRY_ATTEMPTS="${ALUCARD_TRANSPORT_RETRY_ATTEMPTS:-2}"
 
+# Concurrent alucard processes on one repository share its cached clone. Git
+# writes to that clone — the startup fetch, each agent's branch fetch and
+# local clone — take turns under a file lock so they cannot trip over each
+# other's ref locks. flock ships with util-linux; without it the writes run
+# unlocked, which is exactly the behaviour before the lock existed.
+if command -v flock >/dev/null 2>&1; then HAVE_FLOCK=true; else HAVE_FLOCK=false; fi
+REPO_LOCK_WAIT=600
+
 # Refresh agent settings after an env file is sourced. This keeps inherited
 # values working while allowing the selected env file to override them.
 refresh_agent_settings() {
@@ -233,6 +241,61 @@ is_github_ref() {
   fi
 }
 
+# The lock file guarding git writes to a repository that several alucard
+# processes may share. A cached clone gets a sibling file, so the lock exists
+# before the clone does and covers the first clone too; a local checkout gets
+# one inside its git dir, where git keeps its own locks and nothing of the
+# user's is touched.
+repo_lock_file() {
+  local repo_abs="$1" git_dir
+  case "$repo_abs" in
+    "$DEFAULT_CACHE_DIR"/*) printf '%s.lock' "$repo_abs" ;;
+    *)
+      git_dir=$(git -C "$repo_abs" rev-parse --absolute-git-dir 2>/dev/null) || git_dir=""
+      [ -n "$git_dir" ] || git_dir="$repo_abs/.git"
+      printf '%s/alucard.lock' "$git_dir" ;;
+  esac
+}
+
+# Run a command while holding a repo lock. Four `continue` processes started a
+# second apart all fetched into one cached clone at once and cloned from it
+# while it was changing (#92). Git's own ref locks turn that into "cannot lock
+# ref" aborts rather than corruption, so the fix is to take turns. The command
+# runs in a subshell: it must not need to set the caller's variables.
+with_repo_lock() {
+  local lock="$1"
+  shift
+  if [ "$HAVE_FLOCK" = true ]; then
+    mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+    (
+      flock -w "$REPO_LOCK_WAIT" 9 \
+        || die "timed out after ${REPO_LOCK_WAIT}s waiting for another alucard process to release $lock"
+      "$@"
+    ) 9>"$lock"
+  else
+    "$@"
+  fi
+}
+
+# Clone or fetch the cached clone of a GitHub repo. Runs under the repo lock:
+# a second process arriving while the first is still cloning waits, then finds
+# the clone in place and fetches.
+refresh_cache_clone() {
+  local owner_repo="$1" cache_path="$2" clone_url="$3"
+  if [ -d "$cache_path/.git" ]; then
+    echo "Refreshing cached clone of $owner_repo..." >&2
+    git -C "$cache_path" fetch --quiet origin
+  else
+    echo "Cloning $owner_repo into $cache_path..." >&2
+    git clone --quiet "$clone_url" "$cache_path"
+  fi
+}
+
+# Resolves TARGET_REPO to an absolute path, fetching a cached clone on the
+# way. One call per process: `continue` and `run --issue` need the repo before
+# the run environment exists and used to resolve it twice, so every one of
+# those runs fetched the cache twice (#92). Callers that resolve early leave
+# the result in REPO_ABS and setup_run_environment reuses it.
 resolve_repo() {
   local repo="$1"
 
@@ -248,21 +311,16 @@ resolve_repo() {
 
   if [ -n "$owner_repo" ]; then
     local cache_path="${DEFAULT_CACHE_DIR}/$owner_repo"
-    if [ -d "$cache_path/.git" ]; then
-      echo "Refreshing cached clone of $owner_repo..." >&2
-      git -C "$cache_path" fetch --quiet origin
+    mkdir -p "$(dirname "$cache_path")"
+    # For explicit SSH URLs, preserve the transport so host SSH keys are used.
+    local clone_url
+    if [[ "$repo" =~ ^git@github\.com: ]]; then
+      clone_url="$repo"
     else
-      echo "Cloning $owner_repo into $cache_path..." >&2
-      mkdir -p "$(dirname "$cache_path")"
-      # For explicit SSH URLs, preserve the transport so host SSH keys are used.
-      local clone_url
-      if [[ "$repo" =~ ^git@github\.com: ]]; then
-        clone_url="$repo"
-      else
-        clone_url="https://github.com/$owner_repo.git"
-      fi
-      git clone --quiet "$clone_url" "$cache_path"
+      clone_url="https://github.com/$owner_repo.git"
     fi
+    with_repo_lock "$(repo_lock_file "$cache_path")" \
+      refresh_cache_clone "$owner_repo" "$cache_path" "$clone_url"
     echo "$cache_path"
     return
   fi
@@ -1623,9 +1681,19 @@ feedback_stalled() {
 
 # The SHA a branch currently points at on the remote. Agent worktrees are
 # disposed as soon as their role finishes, so a local ref may never have been
-# updated — fetch rather than trust it. Echoes nothing and returns 1 when the
-# branch cannot be fetched or resolved.
+# updated — fetch rather than trust it. The fetch also brings the branch's
+# objects into the clone, which measure_stage needs to diff them. The answer
+# lands in FETCH_HEAD, one file per clone, so the fetch and the read hold the
+# repo lock together: two runs sharing a cached clone could otherwise read
+# each other's branch and misjudge whether their own had advanced. Echoes
+# nothing and returns 1 when the branch cannot be fetched or resolved.
 remote_branch_sha() {
+  local repo_dir="$1" branch="$2"
+  with_repo_lock "$(repo_lock_file "$repo_dir")" \
+    remote_branch_sha_locked "$repo_dir" "$branch"
+}
+
+remote_branch_sha_locked() {
   local repo_dir="$1" branch="$2"
   git -C "$repo_dir" fetch --quiet origin "$branch" 2>/dev/null || return 1
   git -C "$repo_dir" rev-parse FETCH_HEAD 2>/dev/null || return 1
@@ -2218,6 +2286,15 @@ command_doctor() {
 make_agent_clone() {
   local branch="$1" dest="$2" origin_url="$3" mode="${4:-branch}"
   rm -rf "$dest"
+  with_repo_lock "$(repo_lock_file "$REPO_ABS")" \
+    make_agent_clone_locked "$branch" "$dest" "$mode"
+  git -C "$dest" remote set-url origin "$origin_url"
+}
+
+# The part of make_agent_clone that writes to the shared clone. Split out so
+# with_repo_lock can run it as one unit.
+make_agent_clone_locked() {
+  local branch="$1" dest="$2" mode="$3"
   if [ "$mode" = "base" ]; then
     git -C "$REPO_ABS" fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch"
   else
@@ -2225,7 +2302,6 @@ make_agent_clone() {
     git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
   fi
   git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$dest"
-  git -C "$dest" remote set-url origin "$origin_url"
 }
 
 # Run one feedback container against the PR's head branch.
@@ -3176,7 +3252,8 @@ toolchain_preflight() {
   preflight_log="$LOG_DIR/toolchain-preflight.txt"
   : > "$preflight_log"
 
-  if ! git clone --local --no-tags --single-branch --branch "$BASE_BRANCH" \
+  if ! with_repo_lock "$(repo_lock_file "$REPO_ABS")" \
+       git clone --local --no-tags --single-branch --branch "$BASE_BRANCH" \
        "$REPO_ABS" "$preflight_dir" >/dev/null 2>&1; then
     TOOLCHAIN_STATUS="Preflight clone of ${BASE_BRANCH} failed — dependency build unverified."
     log_event "Toolchain preflight: clone of ${BASE_BRANCH} failed, skipping."
@@ -3337,15 +3414,52 @@ $PLAYWRIGHT_PIN_PROBE
   return 0
 }
 
+# Claim a directory that no other run holds. `mkdir` without -p is the atomic
+# test: the first run to ask for a name gets it, and a run that finds the name
+# taken appends its pid. Echoes the path it created. Used for the log dir and,
+# separately, for the worktree root under the repository — separately because
+# the log dir is unique only within one --logs-root, and two runs on one repo
+# with different log roots could still meet at the same worktree path.
+# $1 = the path wanted
+claim_unique_dir() {
+  local dir="$1"
+  mkdir -p "$(dirname "$dir")"
+  if ! mkdir "$dir" 2>/dev/null; then
+    dir="${dir}-$$"
+    mkdir -p "$dir"
+  fi
+  printf '%s' "$dir"
+}
+
+# The directory one run's logs go in. Named by the second it started, which
+# two runs can share: `continue` on four PRs launched a second apart wrote
+# into one directory.
+# $1 = log root, $2 = timestamp
+claim_log_dir() {
+  claim_unique_dir "$1/alucard-$2"
+}
+
 setup_run_environment() {
-  REPO_ABS=$(resolve_repo "$TARGET_REPO")
+  # Already resolved when the caller needed the repo before the run existed —
+  # continue's PR lookup, run --issue's pin. Resolving again fetched the cache
+  # clone a second time on every such run.
+  if [ -z "${REPO_ABS:-}" ]; then
+    REPO_ABS=$(resolve_repo "$TARGET_REPO")
+  fi
   [ -d "$(dirname "$ENV_FILE")" ] || die "env file directory does not exist: $(dirname "$ENV_FILE")"
   ENV_FILE="$(cd "$(dirname "$ENV_FILE")" && pwd)/$(basename "$ENV_FILE")"
   LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd)"
-  LOG_DIR="$LOG_ROOT/alucard-$(date +%Y%m%d-%H%M%S)"
-  WT_ROOT="${REPO_ABS}/.alucard-worktrees"
-
-  mkdir -p "$LOG_DIR" "$WT_ROOT"
+  LOG_DIR=$(claim_log_dir "$LOG_ROOT" "$(date +%Y%m%d-%H%M%S)")
+  # Worktrees live under a directory only this run uses, named after its log
+  # dir and claimed under the repository in its own right (two runs with
+  # different --logs-root can share the log dir name). Every run used to put
+  # its first worker at .alucard-worktrees/iter-1: six `run --issue` processes
+  # on one repo cloned into the same path, and the first to finish deleted the
+  # worktree from under the other five (#92).
+  WT_ROOT=$(claim_unique_dir "${REPO_ABS}/.alucard-worktrees/$(basename "$LOG_DIR")")
+  if [ "$HAVE_FLOCK" != true ]; then
+    echo "Warning: flock not found — concurrent alucard runs on this repo will not take turns on its clone." >&2
+  fi
   load_env_file "$ENV_FILE" true
   ensure_image "$IMAGE" "$AUTO_BUILD"
 
@@ -3360,6 +3474,11 @@ setup_run_environment() {
     for wt in "${CREATED_WORKTREES[@]}"; do
       rm -rf "$wt"
     done
+    # This run's own root only, and only once it is empty: another run's
+    # worktrees sit beside it under .alucard-worktrees and are not ours to
+    # touch. A leftover here means a worktree above failed to delete, and the
+    # directory stays for whoever investigates.
+    rmdir "$WT_ROOT" 2>/dev/null || true
     # Agent containers are force-removed after each run, so these are usually
     # gone already — this catches the interrupt case (Ctrl+C mid-agent), where
     # a still-running container would otherwise keep burning API budget and a
@@ -3950,9 +4069,11 @@ command_continue() {
   need_cmd docker
   need_cmd timeout
 
-  local _early_repo pr_json pr_state branch
-  _early_repo=$(resolve_repo "$TARGET_REPO")
-  pr_json=$(cd "$_early_repo" && \
+  local pr_json pr_state branch
+  # Left in REPO_ABS for setup_run_environment, which would otherwise resolve
+  # — and fetch — the same repo a second time.
+  REPO_ABS=$(resolve_repo "$TARGET_REPO")
+  pr_json=$(cd "$REPO_ABS" && \
     gh pr view "$pr_num" --json state,headRefName 2>/dev/null) \
     || die "PR #$pr_num not found in target repo"
   pr_state=$(echo "$pr_json" | jq -r '.state')
@@ -3965,8 +4086,11 @@ command_continue() {
   origin_url="$(git -C "$REPO_ABS" remote get-url origin)"
   origin_url="${origin_url/git@github.com:/https://github.com/}"
 
+  # The PR number is in the id because two continues on different PRs, started
+  # within the same second, minted the same id and then shared every path
+  # built from it. The timestamp still orders repeated continues of one PR.
   local iter
-  iter="continue-$(date +%s)"
+  iter="continue-${pr_num}-$(date +%s)"
 
   echo "=== alucard continue: PR #$pr_num on $branch (iter $iter) ==="
 
@@ -4036,7 +4160,8 @@ command_continue() {
     fi
   fi
   if [ -z "$MEASURE_BASE_SHA" ] && [ -n "$_pr_head" ]; then
-    git -C "$REPO_ABS" fetch --quiet origin "$branch" 2>/dev/null || true
+    with_repo_lock "$(repo_lock_file "$REPO_ABS")" \
+      git -C "$REPO_ABS" fetch --quiet origin "$branch" 2>/dev/null || true
     MEASURE_BASE_SHA=$(git -C "$REPO_ABS" merge-base \
       "origin/${BASE_BRANCH}" "$_pr_head" 2>/dev/null || echo "")
     MEASURE_BASELINE_SOURCE="merge-base"
