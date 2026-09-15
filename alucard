@@ -38,6 +38,14 @@ NO_WORKTREE_RC=78
 # read by the tests from here, so no copy of the string can drift out of step.
 BOT_COMMENT_PREFIX='**🤖 Alucard'
 BOT_LEDGER_MARKER="$BOT_COMMENT_PREFIX blocked findings**"
+# Posted on a recovery PR when it is parked. The title and body say the same,
+# but a feedback agent rewrites both — one did, on the PR that prompted this —
+# and a comment survives. The review gate lifts a parked PR's draft state and
+# label on approval only when it can see this mark (or the stanza, on PRs
+# parked before the mark existed).
+BOT_RECOVERY_MARKER="$BOT_COMMENT_PREFIX recovery PR parked**"
+BOT_RECOVERY_STANZA="$BOT_COMMENT_PREFIX recovery PR**"
+RECOVERY_TITLE_PREFIX="wip: alucard recovery"
 CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
 
 # Per-role --max-turns / --max-budget-usd (Claude only) and the Claude
@@ -1728,6 +1736,103 @@ add_pr_label() {
   return 0
 }
 
+# Remove a label from a PR. Same REST endpoint as add_pr_label, for the same
+# reason. Unlike add_pr_label this returns 1 on failure — the one caller keeps
+# the label's meaning alive in its comment when the removal did not happen.
+remove_pr_label() {
+  local repo_dir="$1" pr_num="$2" label="$3" encoded
+  encoded=$(jq -rn --arg l "$label" '$l | @uri')
+  if (cd "$repo_dir" && gh api --silent -X DELETE \
+        "repos/{owner}/{repo}/issues/${pr_num}/labels/${encoded}" 2>/dev/null); then
+    return 0
+  fi
+  log_event "Could not remove label '$label' from PR #$pr_num."
+  return 1
+}
+
+# Whether an APPROVED verdict is about the PR's current head. The decision file
+# is written by the reviewer that just ran, so it always is. A formal review
+# is taken as "the last APPROVED one, whoever wrote it, on whatever commit" —
+# good enough to skip feedback, not to lift a parked PR.
+# $1 = PR number, $2 = this cycle's decision-file verdict
+approval_is_current() {
+  local pr_num="$1" file_state="$2" head reviewed
+  [ "$file_state" = "APPROVED" ] && return 0
+  head=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+  reviewed=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json reviews \
+    --jq '[.reviews[] | select(.state == "APPROVED")] | last | .commit.oid // empty' 2>/dev/null || true)
+  [ -n "$head" ] && [ "$head" = "$reviewed" ]
+}
+
+# Lift what parking a recovery PR set, once the review gate has approved it.
+# $1 = repo dir, $2 = PR number, $3 = the PR's isDraft/labels/title/body JSON.
+# Prints the bullet list for the APPROVED comment. The label is the attention
+# marker, so it comes off only once the PR can actually merge: a draft whose
+# un-draft failed keeps it, and the comment says so. The body told a human to
+# flip Refs to Closes once every criterion is met; the reviewer has just
+# checked that against the ticket. A stub title has nothing behind it, so the
+# ticket's own title replaces it. Edits go through REST, like the labels.
+unpark_recovery_pr() {
+  local repo_dir="$1" pr_num="$2" pr_json="$3"
+  local is_draft labels title body first_line ticket="" new_title new_body note=""
+  is_draft=$(jq -r '.isDraft // false' <<<"$pr_json")
+  labels=$(jq -r '[.labels[]?.name | ascii_downcase] | join(",")' <<<"$pr_json")
+  title=$(jq -r '.title // ""' <<<"$pr_json")
+  body=$(jq -r '.body // ""' <<<"$pr_json")
+
+  if [ "$is_draft" = "true" ]; then
+    if (cd "$repo_dir" && gh pr ready "$pr_num" >/dev/null 2>&1); then
+      is_draft=false
+      log_event "Review gate: PR #$pr_num marked ready for review — it was a draft."
+      note+="- Marked ready for review: recovery opened this PR as a draft."$'\n'
+    else
+      log_event "Review gate: could not mark PR #$pr_num ready — it is still a draft; needs-human stays on it."
+      note+="- Could not mark this PR ready for review, so it is still a draft and \`needs-human\` stays on it. Run \`gh pr ready ${pr_num}\` and remove the label by hand."$'\n'
+    fi
+  fi
+  if [ "$is_draft" != "true" ]; then
+    case ",${labels}," in
+      *,needs-human,*)
+        if remove_pr_label "$repo_dir" "$pr_num" "needs-human"; then
+          note+="- Removed \`needs-human\`: the step it asked of a human — finishing this recovery PR — is done by this approval."$'\n'
+        else
+          note+="- Could not remove \`needs-human\`; take it off by hand, nothing is waiting on a human here."$'\n'
+        fi ;;
+    esac
+  fi
+
+  first_line="${body%%$'\n'*}"; first_line="${first_line%$'\r'}"
+  new_title="$title"; new_body="$body"
+  case "$first_line" in
+    "Refs #"[0-9]*)
+      ticket="${first_line#Refs #}"; ticket="${ticket%%[^0-9]*}"
+      new_body="Closes #${ticket}${body#"$first_line"}" ;;
+    "Closes #"[0-9]*)
+      ticket="${first_line#Closes #}"; ticket="${ticket%%[^0-9]*}" ;;
+  esac
+  if [ -n "$ticket" ] && [[ "$title" == "$RECOVERY_TITLE_PREFIX"* ]]; then
+    new_title=$(cd "$repo_dir" && gh issue view "$ticket" --json title --jq '.title' 2>/dev/null || true)
+    [ -n "$new_title" ] || new_title="$title"
+  fi
+  if [ "$new_title" != "$title" ] || [ "$new_body" != "$body" ]; then
+    if (cd "$repo_dir" && jq -n --arg t "$new_title" --arg b "$new_body" '{title: $t, body: $b}' \
+          | gh api --silent -X PATCH "repos/{owner}/{repo}/pulls/${pr_num}" --input - 2>/dev/null); then
+      if [ "$new_body" != "$body" ]; then
+        log_event "Review gate: PR #$pr_num body now closes #$ticket."
+        note+="- Changed \`Refs #${ticket}\` to \`Closes #${ticket}\`: the ticket closes when this merges."$'\n'
+      fi
+      if [ "$new_title" != "$title" ]; then
+        log_event "Review gate: PR #$pr_num stub title replaced with the ticket's."
+        note+="- Replaced the recovery stub title with the ticket's."$'\n'
+      fi
+    else
+      log_event "Review gate: could not edit PR #$pr_num title/body."
+      note+="- Could not edit the title or body: the \`Refs\` line and the stub title are still there."$'\n'
+    fi
+  fi
+  printf '%s' "$note"
+}
+
 # Whether a finished feedback agent should end the review loop: it failed AND
 # left the branch exactly where the reviewer found it. Anything it pushed gives
 # the next cycle new code to judge, and an unreadable SHA ("unknown") is not
@@ -2881,16 +2986,20 @@ review_gate() {
   echo "=== Review gate: PR #$pr_num on $branch ==="
 
   local review_cycle wt_review review_log review_rc review_state review_comments
+  local _pr_json _parked_marker _recovery_parked _unpark_note
 
   # Blocked-findings ledger. Seeded from marker comments already on the PR so a
   # re-run does not spend its whole budget rediscovering what a previous run
-  # already established was unfixable in-container.
-  local blocked_ledger
-  blocked_ledger=$(cd "$REPO_ABS" && \
-    gh pr view "$pr_num" --json comments 2>/dev/null \
-    | jq -r --arg marker "$BOT_LEDGER_MARKER" \
-        '[.comments[] | select(.body | startswith($marker)) | .body] | join("\n\n")' \
-    2>/dev/null || true)
+  # already established was unfixable in-container. The same comments say
+  # whether this is a recovery PR the harness parked.
+  local blocked_ledger _pr_comments
+  _pr_comments=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json comments 2>/dev/null || echo '{"comments":[]}')
+  blocked_ledger=$(jq -r --arg marker "$BOT_LEDGER_MARKER" \
+        '[.comments[]? | select(.body | startswith($marker)) | .body] | join("\n\n")' \
+    <<<"$_pr_comments" 2>/dev/null || true)
+  _parked_marker=$(jq -r --arg marker "$BOT_RECOVERY_MARKER" \
+        '[.comments[]? | select(.body | startswith($marker))] | length > 0' \
+    <<<"$_pr_comments" 2>/dev/null || echo false)
   if [ -n "$blocked_ledger" ]; then
     log_event "Blocked-ledger loaded from PR #$pr_num."
   fi
@@ -3022,10 +3131,36 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
 
     if [ "$review_state" = "APPROVED" ]; then
       log_event "Review gate: PR #$pr_num approved — ready to merge."
+      # A recovery PR reaches this point as a draft labeled needs-human, both
+      # set by the harness when its worker stopped, and nothing else clears
+      # them: one approved recovery PR sat an hour looking gated on a human
+      # until someone ran `gh pr ready` by hand. Only the harness's own parked
+      # PRs are touched — a draft a developer keeps on purpose, or a
+      # needs-human that BLOCKED or a maintainer set, is not this gate's to
+      # lift — and only on an approval of the current head. Nothing here is
+      # fatal, same as labelling.
+      _unpark_note=""
+      _pr_json=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json isDraft,labels,title,body 2>/dev/null || echo '{}')
+      _recovery_parked=$(jq -r --arg m "$_parked_marker" --arg stanza "$BOT_RECOVERY_STANZA" \
+        --arg prefix "$RECOVERY_TITLE_PREFIX" \
+        '($m == "true") or ((.body // "") | contains($stanza)) or ((.title // "") | startswith($prefix))' \
+        <<<"$_pr_json" 2>/dev/null || echo false)
+      if [ "$_recovery_parked" = true ]; then
+        if approval_is_current "$pr_num" "$_review_file_state"; then
+          _unpark_note=$(unpark_recovery_pr "$REPO_ABS" "$pr_num" "$_pr_json")
+        else
+          log_event "Review gate: the approval on PR #$pr_num is a formal review of an older commit — leaving it parked."
+        fi
+      fi
+      if [ -n "$_unpark_note" ]; then
+        _unpark_note="
+
+${_unpark_note}"
+      fi
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
 
-${review_comments}${_self_review_note}" 2>/dev/null || true
+${review_comments}${_self_review_note}${_unpark_note}" 2>/dev/null || true
       return 0
     fi
 
@@ -4157,7 +4292,7 @@ command_run() {
             else
               _stub_body=$(recovery_pr_body "$_ref_line" "$_worker_class" "$rc" \
                 "$_worker_commits_ahead" "$TASK_SOURCE" "$_wrapup_handoff")
-              _stub_title="wip: alucard recovery — iter ${i} (worker stopped: ${_worker_class}, rc=${rc})"
+              _stub_title="${RECOVERY_TITLE_PREFIX} — iter ${i} (worker stopped: ${_worker_class}, rc=${rc})"
               # gh prints its own warnings ("1 uncommitted change", about the
               # cached clone) on the same stream as the URL, and every recovery
               # event logged so far recorded that warning as the PR. Pick the
@@ -4179,6 +4314,11 @@ command_run() {
                 _recovery_pr=true
                 # The label every other outcome a human has to pick up gets.
                 add_pr_label "$REPO_ABS" "$_recovery_pr_num" "needs-human"
+                # The durable mark the review gate looks for before it lifts
+                # the draft and the label on approval (see BOT_RECOVERY_MARKER).
+                (cd "$REPO_ABS" && gh pr comment "$_recovery_pr_num" --body \
+                  "${BOT_RECOVERY_MARKER} — opened as a draft and labeled \`needs-human\` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the \`Refs\` line into \`Closes\`, and replaces the stub title with the ticket's." >/dev/null 2>&1) \
+                  || log_event "Recovery: could not post the parked mark on PR #${_recovery_pr_num} — approval will recognise it by its body stanza only."
                 RUN_ATTENTION+=("recovery PR #${_recovery_pr_num}${_ticket_ref:+ holds $_ticket_ref}: the worker $(describe_worker_stop "$_worker_class") (rc=${rc}); the branch is unverified — finish it, or close it to requeue the work")
                 if [ "$TASK_SOURCE" = "file" ]; then
                   mark_task_in_flight "$TASKS_FILE_ABS" "$DISPATCHED_TASK_ID" "$_recovery_pr_num" \
