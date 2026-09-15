@@ -165,6 +165,12 @@ case "$1 $2" in
     done
     echo "Warning: 1 uncommitted change" >&2
     echo "https://github.com/example/api/pull/91" ;;
+  "pr comment")
+    n="$3"; shift 3
+    while [ $# -gt 0 ]; do
+      case "$1" in --body) printf '%s\n---\n' "$2" >> "$ALUCARD_TEST_STATE/pr-comment-$n"; shift ;; esac
+      shift
+    done ;;
   "issue comment")
     n="$3"; shift 3
     while [ $# -gt 0 ]; do
@@ -258,6 +264,8 @@ assert_not_contains "no closing keyword anywhere in the body" "Closes #" "$PR_BO
 assert_contains "the title carries the failure class" "exhausted" "$(<"$STATE/pr-title")"
 assert_contains "the PR is labeled needs-human" "issues/91/labels" "$TRACE"
 assert_contains "with that exact label" "needs-human" "$TRACE"
+assert_contains "the recovery PR carries the parked mark the review gate looks for" \
+  "recovery PR parked" "$(cat "$STATE/pr-comment-91" 2>/dev/null || true)"
 assert_contains "the claim label comes off the ticket" \
   "gh issue edit 480 --remove-label in-progress" "$TRACE"
 if [ -f "$STATE/issue-comment-480" ]; then
