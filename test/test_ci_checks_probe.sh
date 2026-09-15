@@ -178,8 +178,8 @@ run_two_gates() {
   export ALUCARD_TEST_CHECKS_MODE="$1"
   export ALUCARD_TEST_RUN_CONCLUSION="${2:-success}"
   set +e
-  ci_gate 1 feature-a "$REMOTE" >"$TEST_DIR/out-a" 2>&1
-  ci_gate 2 feature-b "$REMOTE" >"$TEST_DIR/out-b" 2>&1
+  ci_gate 1 feature-a "$REMOTE" 101 >"$TEST_DIR/out-a" 2>&1
+  ci_gate 2 feature-b "$REMOTE" 102 >"$TEST_DIR/out-b" 2>&1
   set -e
   GH=$(<"$GH_TRACE")
   EV=$(<"$EVENTS")
@@ -235,7 +235,7 @@ export ALUCARD_TEST_RUN_CONCLUSION=failure
 # Short-circuit the 30s poll sleep: poll_ci_via_run_list sleeps only when
 # total==0 or in_progress>0; our mock returns a completed failure immediately.
 set +e
-ci_gate 1 feature-a "$REMOTE" >"$TEST_DIR/out-fail" 2>&1
+ci_gate 1 feature-a "$REMOTE" 101 >"$TEST_DIR/out-fail" 2>&1
 set -e
 EV=$(<"$EVENTS")
 assert_contains "a failed run list conclusion launches the fix agent" \
@@ -253,7 +253,7 @@ CI_CHECKS_AVAILABLE=false
 export ALUCARD_TEST_CHECKS_MODE=denied
 export ALUCARD_TEST_RUN_CONCLUSION=success
 set +e
-ci_gate 1 feature-a "$REMOTE" >"$TEST_DIR/out-skip" 2>&1
+ci_gate 1 feature-a "$REMOTE" 101 >"$TEST_DIR/out-skip" 2>&1
 set -e
 GH=$(<"$GH_TRACE")
 EV=$(<"$EVENTS")

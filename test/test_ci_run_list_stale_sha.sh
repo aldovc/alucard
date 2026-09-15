@@ -284,7 +284,7 @@ export ALUCARD_TEST_RUN_MODE=stale
 CI_CHECKS_AVAILABLE=false
 MEASURE_CI_RESULT=""
 set +e
-ci_gate 1 feature "$REMOTE" >"$TEST_DIR/out-stale" 2>&1
+ci_gate 1 feature "$REMOTE" 479 >"$TEST_DIR/out-stale" 2>&1
 set -e
 EV=$(<"$EVENTS")
 OUT=$(<"$TEST_DIR/out-stale")
@@ -305,7 +305,7 @@ export ALUCARD_TEST_RUN_MODE=head_failure
 CI_CHECKS_AVAILABLE=false
 MEASURE_CI_RESULT=""
 set +e
-ci_gate 1 feature "$REMOTE" >"$TEST_DIR/out-fail" 2>&1
+ci_gate 1 feature "$REMOTE" 479 >"$TEST_DIR/out-fail" 2>&1
 set -e
 EV=$(<"$EVENTS")
 assert_contains "a failed HEAD run launches the fix agent" \

@@ -137,7 +137,7 @@ CREATED_WORKTREES=()
 CREATED_CONTAINERS=()
 
 set +e
-ci_gate 1 "feature-branch" "$REMOTE" > "$TEST_DIR/out" 2>&1
+ci_gate 1 "feature-branch" "$REMOTE" "$PR_NUM" > "$TEST_DIR/out" 2>&1
 rc=$?
 set -e
 

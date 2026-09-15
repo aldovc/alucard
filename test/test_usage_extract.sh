@@ -131,7 +131,7 @@ chmod +x "$MOCK_BIN/gh"
 RUN_DIR="$TMP_ROOT/run"; mkdir -p "$RUN_DIR"
 cp "$CLAUDE_LOG" "$RUN_DIR/iter-1.jsonl"
 PATH="$MOCK_BIN:$PATH" ALUCARD_TEST_CAPTURE="$CAPTURE" \
-  post_iteration_usage 1 some-branch "$TMP_ROOT" "$RUN_DIR" >/dev/null
+  post_iteration_usage 1 7 "$TMP_ROOT" "$RUN_DIR" >/dev/null
 
 posted=$(cat "$CAPTURE" 2>/dev/null || true)
 case "$posted" in
