@@ -1728,6 +1728,18 @@ add_pr_label() {
   return 0
 }
 
+# Remove a label from a PR. Same REST endpoint as add_pr_label, for the same
+# reason; callers check the label is there first, so a failure here is real.
+remove_pr_label() {
+  local repo_dir="$1" pr_num="$2" label="$3"
+  if (cd "$repo_dir" && gh api --silent -X DELETE \
+        "repos/{owner}/{repo}/issues/${pr_num}/labels/${label}" 2>/dev/null); then
+    return 0
+  fi
+  log_event "Could not remove label '$label' from PR #$pr_num."
+  return 0
+}
+
 # Whether a finished feedback agent should end the review loop: it failed AND
 # left the branch exactly where the reviewer found it. Anything it pushed gives
 # the next cycle new code to judge, and an unreadable SHA ("unknown") is not
@@ -2881,6 +2893,7 @@ review_gate() {
   echo "=== Review gate: PR #$pr_num on $branch ==="
 
   local review_cycle wt_review review_log review_rc review_state review_comments
+  local _pr_is_draft _pr_labels _readied_note
 
   # Blocked-findings ledger. Seeded from marker comments already on the PR so a
   # re-run does not spend its whole budget rediscovering what a previous run
@@ -3022,10 +3035,39 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
 
     if [ "$review_state" = "APPROVED" ]; then
       log_event "Review gate: PR #$pr_num approved — ready to merge."
+      # A recovery PR reaches this point as a draft labeled needs-human, both
+      # set by the harness when its worker stopped. Approval is where both
+      # stop being true — a feedback agent finished the work — and GitHub
+      # will not merge a draft. Nothing else clears them: one approved
+      # recovery PR sat an hour looking gated on a human until someone ran
+      # `gh pr ready` by hand. Neither step is fatal, same as labelling.
+      _pr_is_draft=""; _pr_labels=""; _readied_note=""
+      # `read` fails at end of input, which `set -e` would turn into a dead
+      # run over a PR the API could not describe — an unlabelled PR is fine.
+      { read -r _pr_is_draft; read -r _pr_labels; } < <(cd "$REPO_ABS" && \
+        gh pr view "$pr_num" --json isDraft,labels \
+          --jq '(.isDraft // false), ([.labels[]?.name] | join(","))' 2>/dev/null || true) || true
+      if [ "$_pr_is_draft" = "true" ]; then
+        if (cd "$REPO_ABS" && gh pr ready "$pr_num" >/dev/null 2>&1); then
+          log_event "Review gate: PR #$pr_num marked ready for review — it was a draft."
+          _readied_note="- Marked ready for review: this PR was opened as a draft."
+        else
+          log_event "Review gate: could not mark PR #$pr_num ready — it is still a draft."
+        fi
+      fi
+      case ",${_pr_labels}," in
+        *,needs-human,*)
+          remove_pr_label "$REPO_ABS" "$pr_num" "needs-human"
+          _readied_note="${_readied_note:+$_readied_note
+}- Removed \`needs-human\`: the human step this label asked for is done by this approval." ;;
+      esac
+      [ -n "$_readied_note" ] && _readied_note="
+
+${_readied_note}"
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
 
-${review_comments}${_self_review_note}" 2>/dev/null || true
+${review_comments}${_self_review_note}${_readied_note}" 2>/dev/null || true
       return 0
     fi
 
