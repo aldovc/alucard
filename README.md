@@ -90,6 +90,12 @@ That PR is the only thing holding the ticket. The worker's `in-progress` label c
 
 The last lines of a run list everything it parked this way. "Run end: queue empty" is followed by a "Needs attention" list whenever the queue is empty because a recovery PR holds a ticket, or because the worker took one off the queue. In GitHub queue mode a worker that judges a ticket too large for one iteration comments a proposed split on it and moves it from `ready-for-agent` to `ready-for-human` rather than attempting it. Before that rule, two iterations in a row judged the same ticket too large, picked something else, and kept the judgment in their logs; the third had nothing else to pick, attempted it, and exhausted its budget with nothing committed.
 
+## Several runs on one repository
+
+More than one `alucard` process may work on the same repository at once: `alucard continue` on several PRs, or `alucard run --issue N` for several issues. Each process gets its own worktree root, named after its log directory, and its own log directory even when two start in the same second. Git writes to the shared cached clone under `~/.cache/alucard` — the startup fetch, each agent's branch fetch and local clone — take turns under a file lock next to the clone (`flock`; without it they run unlocked, with a warning). Before this, four `continue` processes started a second apart minted the same iteration id, cloned into each other's worktree, and the first to finish deleted a worktree another was still using.
+
+What is not coordinated is the GitHub queue itself: two `alucard run` processes without `--issue` can both pick the same ticket before either has labelled it `in-progress`. Run parallel workers with `--issue`, one ticket each.
+
 ## Threat model and safety design
 
 **The risk.** `claude` runs in `bypassPermissions` mode, no prompts, full tool access, so the agent doesn't get stuck mid-run on a missing tool permission. Without isolation, a confused or prompt-injected agent could `rm -rf` your home directory or exfiltrate credentials.
@@ -98,7 +104,7 @@ The last lines of a run list everything it parked this way. "Run end: queue empt
 
 1. **Kernel boundary (primary).** Docker container with `--read-only` root, `--cap-drop ALL`, `--security-opt no-new-privileges`, dedicated unprivileged user. Filesystem damage stays inside the bind-mounted worktree. The host's `/home`, `/etc`, dotfiles, and other repos are unreachable.
 2. **Resource caps.** `--memory 4g --cpus 2`. A runaway loop can't OOM the host.
-3. **Disposable worktrees.** Each iteration gets a fresh worktree at `${REPO}/.alucard-worktrees/iter-N`. The orchestrator removes it after each iteration. An `EXIT` trap handles interrupted runs.
+3. **Disposable worktrees.** Each iteration gets a fresh worktree at `${REPO}/.alucard-worktrees/<run>/iter-N`, where `<run>` is the name of that run's log directory. The orchestrator removes it after each iteration. An `EXIT` trap handles interrupted runs, and removes only that run's own directory.
 4. **PR-only output.** The agent never pushes to main. Branch protection on main as belt-and-suspenders.
 5. **Credential scoping.** GitHub token is a fine-grained PAT, single repo, 30-day expiry. Anthropic and OpenAI keys are dedicated worker keys with a monthly budget cap set in the console.
 6. **Pattern blacklist (last line).** `--disallowedTools` removes obvious foot-guns like `rm -rf /*`, `sudo`, `curl | sh`. Pattern-matching is leaky but cheap.
@@ -406,7 +412,8 @@ alucard continue 174 /path/to/target-repo
 # Manually un-stick an issue if Alucard crashed mid-task
 gh issue edit <N> --remove-label in-progress
 
-# Prune leftover clones if the orchestrator was hard-killed
+# Prune leftover clones if the orchestrator was hard-killed (each run's are
+# under a directory named after its log dir; leave any run still going)
 rm -rf .alucard-worktrees/
 
 # Watch a live run
