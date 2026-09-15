@@ -24,6 +24,10 @@ BAKED_BROWSERS_PATH="/opt/ms-playwright"
 # --timeout. See PLAYWRIGHT_REPO_INSTALL for why it needs its own.
 PLAYWRIGHT_INSTALL_TIMEOUT="8m"
 HARD_KILL_GRACE="30s"
+# The exit code entrypoint.sh uses when the container's checkout is empty or
+# missing. Nothing ran, so the failure says nothing about the task; the harness
+# hands the role a fresh worktree the way it does after a transport drop.
+NO_WORKTREE_RC=78
 
 # Prefix on every comment the wrapper posts to a PR. This is a protocol string,
 # not decoration: the blocked-findings ledger reload, the human-vs-bot comment
@@ -47,6 +51,11 @@ DEFAULT_REVIEWER_MAX_TURNS="${ALUCARD_REVIEWER_MAX_TURNS:-45}"
 DEFAULT_REVIEWER_MAX_BUDGET="${ALUCARD_REVIEWER_MAX_BUDGET:-2}"
 DEFAULT_FEEDBACK_MAX_TURNS="${ALUCARD_FEEDBACK_MAX_TURNS:-50}"
 DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-2}"
+# The wrap-up agent that runs in a stopped worker's worktree to commit what is
+# there honestly and write the handoff for the recovery PR. Deliberately small:
+# it is not there to finish the task. 0 disables it and recovery is mechanical.
+DEFAULT_WRAPUP_MAX_TURNS="${ALUCARD_WRAPUP_MAX_TURNS:-12}"
+DEFAULT_WRAPUP_MAX_BUDGET="${ALUCARD_WRAPUP_MAX_BUDGET:-1}"
 DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-sonnet}"
 DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-haiku}"
 DEFAULT_CODEX_MODEL="${ALUCARD_CODEX_MODEL:-gpt-5.6-terra}"
@@ -74,6 +83,8 @@ refresh_agent_settings() {
   DEFAULT_REVIEWER_MAX_BUDGET="${ALUCARD_REVIEWER_MAX_BUDGET:-$DEFAULT_REVIEWER_MAX_BUDGET}"
   DEFAULT_FEEDBACK_MAX_TURNS="${ALUCARD_FEEDBACK_MAX_TURNS:-$DEFAULT_FEEDBACK_MAX_TURNS}"
   DEFAULT_FEEDBACK_MAX_BUDGET="${ALUCARD_FEEDBACK_MAX_BUDGET:-$DEFAULT_FEEDBACK_MAX_BUDGET}"
+  DEFAULT_WRAPUP_MAX_TURNS="${ALUCARD_WRAPUP_MAX_TURNS:-$DEFAULT_WRAPUP_MAX_TURNS}"
+  DEFAULT_WRAPUP_MAX_BUDGET="${ALUCARD_WRAPUP_MAX_BUDGET:-$DEFAULT_WRAPUP_MAX_BUDGET}"
   DEFAULT_CLAUDE_MODEL="${ALUCARD_CLAUDE_MODEL:-$DEFAULT_CLAUDE_MODEL}"
   DEFAULT_CLAUDE_FALLBACK_MODEL="${ALUCARD_CLAUDE_FALLBACK_MODEL:-$DEFAULT_CLAUDE_FALLBACK_MODEL}"
   DEFAULT_CODEX_MODEL="${ALUCARD_CODEX_MODEL:-$DEFAULT_CODEX_MODEL}"
@@ -159,6 +170,12 @@ Environment:
   ALUCARD_REVIEWER_MAX_BUDGET  Reviewer --max-budget-usd (Claude only). Default: 2
   ALUCARD_FEEDBACK_MAX_TURNS   Feedback --max-turns (Claude only). Default: 50
   ALUCARD_FEEDBACK_MAX_BUDGET  Feedback --max-budget-usd (Claude only). Default: 2
+  ALUCARD_WRAPUP_MAX_TURNS     Wrap-up --max-turns (Claude only): the short agent
+                               that commits a stopped worker's leftovers and
+                               writes the recovery PR's handoff. 0 disables it.
+                               Runs with the WORKER role's provider and model.
+                               Default: 12
+  ALUCARD_WRAPUP_MAX_BUDGET    Wrap-up --max-budget-usd (Claude only). Default: 1
   ALUCARD_TRANSPORT_RETRY_ATTEMPTS
                                Extra attempts after a transport-classified worker
                                failure, same ticket, fresh worktree each time.
@@ -225,6 +242,17 @@ transport_attempt_budget() {
   printf '%s' "$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))"
 }
 
+# Failure classes that say nothing about the task and earn the role a fresh
+# worktree within its attempt budget: a dropped provider connection, or a
+# container whose checkout was empty before the agent ran. Anything else —
+# exhaustion, a wedge mid-run, a real error — breaks out after one attempt.
+retry_with_fresh_worktree() {
+  case "$1" in
+    transport|no_worktree) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 xml_escape() {
   sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
 }
@@ -238,6 +266,19 @@ is_github_ref() {
     echo "${BASH_REMATCH[1]}"
   elif [[ "$input" =~ ^([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)$ ]]; then
     echo "${BASH_REMATCH[1]}"
+  fi
+}
+
+# "owner/repo" for a checkout whose origin is on github.com, else empty. Only
+# the two URL forms count: a bare "a/b" would also match a relative path such
+# as ../remote.git, which is what a test fixture's origin looks like.
+github_repo_slug() {
+  local repo_abs="$1" url
+  url=$(git -C "$repo_abs" remote get-url origin 2>/dev/null) || return 0
+  url="${url%.git}"
+  if [[ "$url" =~ ^git@github\.com:([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)$ ]] \
+     || [[ "$url" =~ ^https://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
   fi
 }
 
@@ -542,6 +583,13 @@ classify_agent_failure() {
     return 0
   fi
 
+  # The entrypoint refused to start the agent: its checkout was empty. Before
+  # the log parse below because no agent ran, so there is no result to read.
+  if [ "$rc" -eq "$NO_WORKTREE_RC" ]; then
+    echo "no_worktree"
+    return 0
+  fi
+
   case "$rc" in
     124|137) echo "exhausted"; return 0 ;;
   esac
@@ -722,6 +770,9 @@ invoke_agent() {
     fix-*)      provider_role="CI_FIX" ;;
     review-*)   provider_role="REVIEWER" ;;
     feedback-*) provider_role="FEEDBACK" ;;
+    # The wrap-up finishes a worker's iteration, so it runs on the worker's
+    # provider and model rather than adding a fifth role to configure.
+    wrapup-*)   provider_role="WORKER" ;;
     *)          provider_role="WORKER" ;;
   esac
 
@@ -753,9 +804,16 @@ invoke_agent() {
     -e "HOME=/home/alucard"
     -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig"
     -e "GH_CONFIG_DIR=/tmp/gh"
-    "$@"
-    "$IMAGE"
   )
+  # Every `gh` call in the container resolves its repository from this rather
+  # than from the checkout's remote. A reviewer whose /work was empty ran
+  # `gh pr view N` with no remote to read, failed, and wrote that up as a
+  # high-severity human block (#92). Set only for github.com origins; a repo
+  # elsewhere keeps gh's own resolution.
+  if [ -n "${GH_REPO_SLUG:-}" ]; then
+    _docker_args+=(-e "GH_REPO=$GH_REPO_SLUG")
+  fi
+  _docker_args+=("$@" "$IMAGE")
 
   # Wedge detector: if /work goes "deleted" in the harness's CWD tracking,
   # every subsequent tool call fails silently and the iteration burns budget
@@ -1949,6 +2007,8 @@ print_usage_report() {
         mid="${base#iter-}"; label="review ${mid/-review-/.}" ;;
       iter-*-feedback-*)
         mid="${base#iter-}"; label="feedback ${mid/-feedback-/.}" ;;
+      iter-*-wrapup)
+        mid="${base#iter-}"; label="wrap-up ${mid%-wrapup}" ;;
       iter-*)
         label="worker ${base#iter-}" ;;
       *)
@@ -2053,6 +2113,8 @@ post_iteration_usage() {
         mid="${base#iter-}"; label="feedback ${mid/-feedback-/.}" ;;
       iter-"${iter}"-attempt-*)
         label="worker attempt ${base##*-attempt-}" ;;
+      iter-"${iter}"-wrapup)
+        label="wrap-up" ;;
       iter-"${iter}")
         label="worker $iter" ;;
       *)
@@ -2172,6 +2234,7 @@ REQUIRED_TOOL_FILES=(
   alucard-reviewer-prompt.md
   alucard-ci-fix-prompt.md
   alucard-feedback-prompt.md
+  alucard-wrapup-prompt.md
   alucard-engineering-policy.md
 )
 
@@ -2798,6 +2861,9 @@ no_verdict_reason() {
     wedged)
       printf 'The reviewer container wedged (its working directory went away) and was killed. Nothing was reviewed.'
       ;;
+    no_worktree)
+      printf 'The reviewer container found an empty checkout on every attempt — its worktree was missing when it mounted. Nothing was reviewed; this is a harness fault, not a finding about the PR. Re-run `alucard continue` for this PR.'
+      ;;
     *)
       printf 'The reviewer exited (rc=%s) without recording a verdict in `.alucard-review` and without posting a formal review.' "$rc"
       ;;
@@ -2915,8 +2981,8 @@ $(printf '%s' "${blocked_ledger:-None recorded.}" | xml_escape)
       # A reviewer that recorded its verdict before the connection dropped has
       # already done the work — take it rather than paying for it twice.
       [ -n "$_review_file_state" ] && break
-      [ "$_review_class" != "transport" ] && break
-      log_event "Review gate: transport failure on attempt $_review_attempt — retrying reviewer."
+      retry_with_fresh_worktree "$_review_class" || break
+      log_event "Review gate: ${_review_class} failure on attempt $_review_attempt — retrying reviewer."
     done
 
     review_state=$(cd "$REPO_ABS" && \
@@ -3465,6 +3531,7 @@ setup_run_environment() {
 
   stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
   codex_stream_text="$CODEX_STREAM_TEXT"
+  GH_REPO_SLUG=$(github_repo_slug "$REPO_ABS")
   CREATED_WORKTREES=()
   CREATED_CONTAINERS=()
   CI_CHECKS_AVAILABLE=""
@@ -3501,8 +3568,102 @@ describe_worker_stop() {
     exhausted) echo "ran out of turns or hit its time limit" ;;
     wedged)    echo "wedged its shell (every tool call failed after /work went missing)" ;;
     transport) echo "lost its provider connection" ;;
+    no_worktree) echo "never started: its checkout was empty when the container mounted it" ;;
     *)         echo "failed" ;;
   esac
+}
+
+# The last things an agent said, from its stream log: the worker's own
+# narration of what it was doing when it stopped. Handed to the wrap-up agent,
+# which otherwise knows the branch only by its diff. Best effort — empty when
+# the log is missing or in a shape this does not read. Keeps the tail, since
+# that is where "now starting the frontend" lives.
+# $1 = log file, $2 = provider, $3 = max characters
+agent_last_words() {
+  local log_file="$1" provider="$2" max_chars="${3:-4000}" text
+  [ -f "$log_file" ] || return 0
+  if [ "$provider" = "codex" ]; then
+    text=$(jq -r 'select(.type == "item.completed" and .item.type == "agent_message") | .item.text' \
+      "$log_file" 2>/dev/null) || text=""
+  else
+    text=$(jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' \
+      "$log_file" 2>/dev/null) || text=""
+  fi
+  [ -n "$text" ] || return 0
+  if [ "${#text}" -gt "$max_chars" ]; then
+    text="…${text: -$max_chars}"
+  fi
+  printf '%s' "$text"
+}
+
+# Whether a stopped worker's class gets the wrap-up agent. Exhaustion and a
+# plain failure leave a worktree worth explaining. A wedge left no usable
+# worktree; a transport drop was retried already and, if it still stopped the
+# worker, says nothing about the work.
+wrapup_applies() {
+  case "$1" in
+    exhausted|failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Run the wrap-up agent in a stopped worker's worktree. It commits what is
+# uncommitted with honest messages and writes /work-output/.alucard-handoff —
+# done, remaining, unverified, next step — for the recovery PR body. It does
+# not push, open the PR, or touch the ticket: the harness does those, so they
+# happen exactly once and whether or not the agent finishes. The mechanical
+# recovery below is the fallback for anything it leaves undone.
+# $1 = iteration, $2 = worktree, $3 = worker log, $4 = worker provider,
+# $5 = failure class, $6 = worker rc, $7 = the ticket in words,
+# $8 = the base SHA the worker started from, $9 = task XML (file mode),
+# $10 = parent context XML (file mode)
+# Sets: WRAPUP_HANDOFF (the note, or empty), WRAPUP_RC
+run_wrapup_agent() {
+  local iter="$1" wt="$2" worker_log="$3" worker_provider="$4" class="$5" rc="$6" ticket="$7"
+  local base_sha="$8" task_xml="${9:-}" parent_xml="${10:-}"
+  WRAPUP_HANDOFF=""
+  WRAPUP_RC=0
+
+  local out_dir last_words prompt
+  out_dir=$(mktemp -d /tmp/alucard_wrapup.XXXXXX)
+  CREATED_WORKTREES+=("$out_dir")
+  last_words=$(agent_last_words "$worker_log" "$worker_provider" 4000)
+
+  prompt="<instructions>
+$(<"$TOOL_DIR/alucard-wrapup-prompt.md")
+</instructions>
+<ticket>$(printf '%s' "$ticket" | xml_escape)</ticket>
+<stop_reason>The worker $(describe_worker_stop "$class") (rc=${rc}) before opening a PR.</stop_reason>
+<base_branch>${BASE_BRANCH}</base_branch>
+<base_sha>${base_sha}</base_sha>
+<worker_last_words>
+$(printf '%s' "${last_words:-No narration was captured from the worker.}" | xml_escape)
+</worker_last_words>"
+  # Local-mode acceptance criteria live in the tasks file, which the container
+  # may not have; hand them over the way the reviewer gets them.
+  prompt=$(append_task_context "$prompt" "$task_xml" "$parent_xml")
+
+  log_event "Wrap-up: worker stopped ($class) with work in its worktree — launching wrap-up agent (max ${DEFAULT_WRAPUP_MAX_TURNS} turns)."
+  set +e
+  invoke_agent \
+    "wrapup-${iter}" \
+    "$LOG_DIR/iter-${iter}-wrapup.jsonl" \
+    "$DEFAULT_WRAPUP_MAX_TURNS" "$DEFAULT_WRAPUP_MAX_BUDGET" \
+    "$prompt" \
+    -v "$wt:/work:rw" \
+    -v "$out_dir:/work-output:rw" \
+    -e "ALUCARD_ITER=${iter}-wrapup"
+  WRAPUP_RC=$?
+  set -e
+  echo ""
+
+  if [ -s "$out_dir/.alucard-handoff" ]; then
+    WRAPUP_HANDOFF=$(<"$out_dir/.alucard-handoff")
+    log_event "Wrap-up: handoff written (rc=$WRAPUP_RC)."
+  else
+    log_event "Wrap-up: agent left no handoff (rc=$WRAPUP_RC) — the recovery PR gets the harness's summary only."
+  fi
+  rm -rf "$out_dir" || true
 }
 
 # Body of the draft PR that holds a stopped worker's branch. It says what the
@@ -3511,20 +3672,28 @@ describe_worker_stop() {
 # the work; it runs the CI and review gates on what is there, nothing more.
 # $1 = reference line ("Refs #N", "Task: <id>", or empty when the worker's
 #      claim could not be attributed), $2 = failure class, $3 = worker rc,
-#      $4 = commits the worker itself made, $5 = task source (github|file)
+#      $4 = commits the worker itself made, $5 = task source (github|file),
+#      $6 = the wrap-up agent's handoff note, or empty
 recovery_pr_body() {
-  local ref_line="$1" class="$2" rc="$3" commits="$4" source="$5"
-  local finish handback
+  local ref_line="$1" class="$2" rc="$3" commits="$4" source="$5" handoff="${6:-}"
+  local finish handback handoff_section=""
   if [ "$source" = "file" ]; then
     finish="the harness flips the task to \`[x]\` when this PR merges."
     handback="close this PR and the task flips back to \`[ ]\` at the next queue build, with this attempt noted in its heading."
   else
     finish="when every acceptance criterion is met, change the \`Refs\` line above to \`Closes\` so the ticket closes on merge."
-    handback="close this PR and the ticket rejoins the queue on the next run — its \`in-progress\` label is already off, and this attempt is noted in its comments."
+    handback="close this PR and the ticket rejoins the queue on the next run — its \`in-progress\` label is already off, and this attempt is noted in its comments. \`alucard run --issue <N>\` starts a fresh attempt on it right away."
+  fi
+  if [ -n "$handoff" ]; then
+    handoff_section="
+
+## Handoff from the wrap-up agent
+
+${handoff}"
   fi
   printf '%s' "${ref_line:+$ref_line
 
-}${BOT_COMMENT_PREFIX} recovery PR** — the worker $(describe_worker_stop "$class") (rc=${rc}) before opening a PR. Its ${commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.
+}${BOT_COMMENT_PREFIX} recovery PR** — the worker $(describe_worker_stop "$class") (rc=${rc}) before opening a PR. Its ${commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.${handoff_section}
 
 This is not a finished change. What each next step does:
 
@@ -3764,18 +3933,21 @@ command_run() {
       _worker_class=$(classify_agent_failure "$log_file" "$_worker_provider" "$rc")
       log_event "Iteration $i attempt $_attempt/$_total_worker_attempts: rc=$rc class=$_worker_class"
 
-      if [ "$_worker_class" != "transport" ] || [ "$_attempt" -eq "$_total_worker_attempts" ]; then
+      if ! retry_with_fresh_worktree "$_worker_class" || [ "$_attempt" -eq "$_total_worker_attempts" ]; then
         break
       fi
       # A worker can create its PR and lose the provider connection while
       # reporting the result. Preserve that branch and let the normal PR-found
-      # path below run instead of launching a duplicate attempt.
-      _transport_pr=$(find_open_pr_for_branch "$REPO_ABS" "$BRANCH")
-      if [ -n "${_transport_pr:-}" ]; then
-        log_event "PR found after transport failure: #$_transport_pr on $BRANCH; skipping retry."
-        break
+      # path below run instead of launching a duplicate attempt. A worker that
+      # never started cannot have opened one, so that check is transport-only.
+      if [ "$_worker_class" = "transport" ]; then
+        _transport_pr=$(find_open_pr_for_branch "$REPO_ABS" "$BRANCH")
+        if [ -n "${_transport_pr:-}" ]; then
+          log_event "PR found after transport failure: #$_transport_pr on $BRANCH; skipping retry."
+          break
+        fi
       fi
-      log_event "Iteration $i: transport failure on attempt $_attempt — retrying with a fresh worktree."
+      log_event "Iteration $i: ${_worker_class} failure on attempt $_attempt — retrying with a fresh worktree."
     done
 
     # Worker should push to $BRANCH, but may misbehave and push to a custom
@@ -3855,8 +4027,34 @@ command_run() {
           '$after - $before' 2>/dev/null || echo '[]')
       fi
 
+      # Refs, not Closes. The queue's occupancy filter matches any #N mention
+      # in an open PR body, so Refs keeps the ticket out of the queue just as
+      # well — and it is what the worker prompt requires of partial work.
+      # Closes would shut a ticket with unmet criteria the moment someone
+      # merged the draft. The local source uses a Task: line plus the
+      # in-flight heading flip below. A pinned run's ticket is the pin, full
+      # stop: the label diff is repository-wide, so with another worker running
+      # beside this one it can name that worker's claim instead — one recovery
+      # PR was attributed to a ticket a different run was working on.
+      _ref_line=""
+      _ticket_ref=""
+      if [ "$TASK_SOURCE" = "file" ]; then
+        _ref_line="Task: ${DISPATCHED_TASK_ID}"
+        _ticket_ref="task ${DISPATCHED_TASK_ID}"
+      elif [ -n "${PIN_ISSUE:-}" ]; then
+        _ref_line="Refs #${PIN_ISSUE}"
+        _ticket_ref="issue #${PIN_ISSUE}"
+      else
+        for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
+          _ref_line="Refs #${_n}"
+          _ticket_ref="issue #${_n}"
+          break
+        done
+      fi
+
       _recovery_pr_num=""
       _worker_commits_ahead=0
+      _wrapup_handoff=""
       if [ -d "$WT_HOST/.git" ]; then
         # Commits the worker itself made, captured before the harness's own
         # recovery commit below — this is the figure the transport PR gate
@@ -3864,6 +4062,21 @@ command_run() {
         # which also counts the harness's own commit once it's made.
         _worker_commits_ahead=$(git -C "$WT_HOST" rev-list --count \
           "${_base_sha}..HEAD" 2>/dev/null || echo 0)
+        # A stopped worker with work behind it gets a short wrap-up agent in
+        # the same worktree before the mechanical steps below: it commits the
+        # leftovers with messages that say what they are, and writes the
+        # handoff the PR body carries. The one recovery PR that prompted this
+        # held 154 tool calls of backend work under a single "wip: alucard
+        # recovery" commit and a body that could say nothing about it.
+        if wrapup_applies "$_worker_class" \
+           && is_uint "$DEFAULT_WRAPUP_MAX_TURNS" && [ "$DEFAULT_WRAPUP_MAX_TURNS" -gt 0 ] \
+           && { [ "$_worker_commits_ahead" -gt 0 ] \
+                || [ -n "$(git -C "$WT_HOST" status --porcelain 2>/dev/null)" ]; }; then
+          run_wrapup_agent "$i" "$WT_HOST" "$log_file" "$_worker_provider" \
+            "$_worker_class" "$rc" "${_ticket_ref:-unknown — the worker did not claim a ticket}" \
+            "$_base_sha" "$TASK_XML" "$PARENT_CONTEXT_XML"
+          _wrapup_handoff="$WRAPUP_HANDOFF"
+        fi
         # Stage and commit any uncommitted changes — work-in-progress would
         # otherwise die with the worktree.
         if [ -n "$(git -C "$WT_HOST" status --porcelain 2>/dev/null)" ]; then
@@ -3908,26 +4121,8 @@ command_run() {
             if [ "$_worker_class" = "transport" ] && [ "$_worker_commits_ahead" -eq 0 ]; then
               log_event "Recovery: transport failure with no worker commits — branch $_recover_branch preserved, no PR opened, ticket left in queue."
             else
-              # Refs, not Closes. The queue's occupancy filter matches any #N
-              # mention in an open PR body, so Refs keeps the ticket out of
-              # the queue just as well — and it is what the worker prompt
-              # requires of partial work. Closes would shut a ticket with
-              # unmet criteria the moment someone merged the draft. The local
-              # source uses a Task: line plus the in-flight heading flip below.
-              _ref_line=""
-              _ticket_ref=""
-              if [ "$TASK_SOURCE" = "file" ]; then
-                _ref_line="Task: ${DISPATCHED_TASK_ID}"
-                _ticket_ref="task ${DISPATCHED_TASK_ID}"
-              else
-                for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
-                  _ref_line="Refs #${_n}"
-                  _ticket_ref="issue #${_n}"
-                  break
-                done
-              fi
               _stub_body=$(recovery_pr_body "$_ref_line" "$_worker_class" "$rc" \
-                "$_worker_commits_ahead" "$TASK_SOURCE")
+                "$_worker_commits_ahead" "$TASK_SOURCE" "$_wrapup_handoff")
               _stub_title="wip: alucard recovery — iter ${i} (worker stopped: ${_worker_class}, rc=${rc})"
               # gh prints its own warnings ("1 uncommitted change", about the
               # cached clone) on the same stream as the URL, and every recovery
@@ -3971,7 +4166,21 @@ command_run() {
       # never claimed anything, so there is nothing to strip and the
       # still-"[ ]" task is naturally re-picked next iteration.
       if [ "$TASK_SOURCE" = "github" ]; then
-        for _n in $(echo "$_newly_claimed" | jq -r '.[]' 2>/dev/null); do
+        # A pinned run touches only its own ticket. The label diff is
+        # repository-wide, and a concurrent worker's fresh claim must not be
+        # stripped by this run. The pinned ticket is released when the worker
+        # labelled it, and told where its work went whenever a recovery PR
+        # references it — labelled or not.
+        if [ -n "${PIN_ISSUE:-}" ]; then
+          _to_release="[]"
+          if [ "$_recovery_pr" = true ] \
+             || echo "$_newly_claimed" | jq -e --argjson n "$PIN_ISSUE" 'index($n) != null' >/dev/null 2>&1; then
+            _to_release="[$PIN_ISSUE]"
+          fi
+        else
+          _to_release="$_newly_claimed"
+        fi
+        for _n in $(echo "$_to_release" | jq -r '.[]' 2>/dev/null); do
           if [ "$_recovery_pr" = true ]; then
             echo "Recovery PR #${_recovery_pr_num} holds #$_n — removing 'in-progress' so closing that PR requeues it."
             (cd "$REPO_ABS" && gh issue comment "$_n" --body \
