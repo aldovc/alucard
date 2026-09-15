@@ -185,7 +185,7 @@ assert_eq "the feedback prompt still carries exactly one block" \
 assert_contains "the feedback agent is told it cannot install" \
   'BROKEN — `uv sync` at the repo root fails' "$(injected_status feedback)"
 assert_contains "and told what that costs it" \
-  "cannot run this repo's lint or test suite" "$(injected_status feedback)"
+  "local checks requiring those dependencies are blocked" "$(injected_status feedback)"
 assert_eq "both agents are told the same thing" \
   "$(injected_status review)" "$(injected_status feedback)"
 

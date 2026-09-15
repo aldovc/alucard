@@ -202,7 +202,7 @@ assert_contains "and the one that works" '`uv sync` in backend/ completes' "$TOO
 assert_contains "and scopes the consequence to the broken directory" \
   "CANNOT install dependencies for frontend/" "$TOOLCHAIN_STATUS"
 assert_contains "without waiving evidence elsewhere" \
-  "For the rest of the repo, missing test evidence is a real gap" "$TOOLCHAIN_STATUS"
+  "For the rest of the repo, run the documented local checks" "$TOOLCHAIN_STATUS"
 assert_contains "the banner names the failing install" '`npm ci` in frontend/ exited 3' "$out"
 assert_contains "and shows that install's last lines" "mock install in frontend" "$out"
 assert_not_contains "not the other manifest's" "mock install in backend" "$out"
@@ -212,14 +212,14 @@ assert_eq "one OK and one BROKEN event" "1|1" \
 ALUCARD_TEST_FAIL_DIRS="backend frontend" toolchain_preflight >"$TEST_DIR/pf.out" 2>&1; out=$(<"$TEST_DIR/pf.out")
 assert_starts_with "all broken: the status opens BROKEN" "BROKEN — " "$TOOLCHAIN_STATUS"
 assert_contains "and names both failures" '`uv sync` in backend/ fails inside the container (rc=3)' "$TOOLCHAIN_STATUS"
-assert_contains "with the whole-repo consequence" \
-  "cannot run this repo's lint or test suite" "$TOOLCHAIN_STATUS"
+assert_contains "with the consequence for checks requiring the failed dependencies" \
+  "local checks requiring those dependencies are blocked" "$TOOLCHAIN_STATUS"
 assert_not_contains "and no partial wording" "For the rest of the repo" "$TOOLCHAIN_STATUS"
 
 assert_contains "the feedback prompt treats BROKEN as potentially partial" \
   'A `BROKEN` status may be partial' "$(<"$SCRIPT_DIR/../alucard-feedback-prompt.md")"
-assert_contains "and requires tests in healthy directories" \
-  "still run tests in healthy directories" "$(<"$SCRIPT_DIR/../alucard-feedback-prompt.md")"
+assert_contains "and requires local checks in healthy directories" \
+  "still run the documented local checks in healthy directories" "$(<"$SCRIPT_DIR/../alucard-feedback-prompt.md")"
 
 # ── A single root manifest keeps its one container ───────────────────────────
 echo ""

@@ -88,7 +88,9 @@ Before running lint and tests, read your own diff and check for each of the foll
 
 **Import-existence check next.** Before lint and tests, verify every symbol your diff imports from an internal module is actually defined there. Tests that `patch()` a symbol at its import site inject the name into the module namespace and pass even when the definition was never written — so a green suite is not proof the import resolves, and the failure only surfaces as a deploy-time `ImportError`. For each internal module you touched, do a real load: in Python, `python -c "import the.module.path"` (or `from the.module import the_symbol`); otherwise grep the target module for each symbol's definition. This is mechanical and catches a deploy-breaking bug class in seconds. (Where the language has a build/typecheck step that already fails on an undefined symbol, that step covers this — the check matters most for interpreted code.)
 
-Then run the project's lint and test commands (e.g. `just lint && just test`). Do not proceed if they fail — fix or revert. A passing local check before commit is non-negotiable.
+Then run the project's documented local verification workflow for this environment, including the lint, tests, and typechecks it requires locally. Preflight verifies dependency installation only; it does not establish that tests ran or that services and credentials are available. Required local checks must pass. Fix or revert failures rather than treating them as environment limitations.
+
+If the project explicitly assigns service-backed checks to CI, run the local portion and push for CI verification. Follow the project's setup instructions; do not invent service provisioning or weaken checks just to make the full suite run locally. In the PR, list local commands and results, checks not run and why, and checks deferred to CI separately. Skipped or unrun tests are not passes. Required CI must still pass before merge; pending, missing, or failed required CI is not a pass.
 
 ## Commit
 

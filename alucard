@@ -3146,7 +3146,7 @@ fi
 SNIPPET
 )
 
-# Verify once, at run start, that the container can actually build the target
+# Verify once, at run start, that the container can actually install the target
 # repo's dependencies. Without this the failure is rediscovered independently
 # by every agent in every cycle — each reporting "lint/tests blocked" — while
 # unverified code keeps getting pushed for the whole run. Result is surfaced to
@@ -3155,6 +3155,7 @@ SNIPPET
 # fresh checkout needs and where, and to the operator as a startup banner.
 # One container per manifest, each in its manifest's directory, so a repo with
 # a backend/ and a frontend/ has both verified and both named.
+# This does not verify test execution or availability of services and credentials.
 # Sets: TOOLCHAIN_STATUS (one-liner injected into the worker, reviewer, and
 #       feedback prompts)
 # Uses globals: REPO_ABS BASE_BRANCH LOG_DIR ENV_FILE IMAGE TIMEOUT_MIN
@@ -3279,8 +3280,8 @@ $PLAYWRIGHT_PIN_PROBE
       echo "# TOOLCHAIN PREFLIGHT FAILED"
       echo "#"
       echo "#   \`$install_cmd\` in ${manifest_dir}/ exited $rc inside $IMAGE."
-      echo "#   Agents will NOT be able to run lint or tests for that part of the"
-      echo "#   repo, so every push touching it this run is unverified."
+      echo "#   Local checks requiring those dependencies are blocked until the"
+      echo "#   install failure is resolved. Report unrun checks separately from CI."
       echo "#"
       echo "#   Full output: $preflight_log"
       echo "#   Last lines:"
@@ -3319,12 +3320,12 @@ $PLAYWRIGHT_PIN_PROBE
   if [ "${#broken_desc[@]}" -eq 0 ]; then
     local where=""
     [ "${#ok_desc[@]}" -gt 1 ] && where="; run each in its own directory"
-    TOOLCHAIN_STATUS="OK — ${ok_list} in the container${where}. Agents can run this repo's lint and test suite; missing test evidence is a real gap."
+    TOOLCHAIN_STATUS="OK — ${ok_list} in the container${where}. This verifies dependency installation only, not test execution or availability of services and credentials. Follow the project's documented local and CI verification workflow."
     return 0
   fi
 
   if [ "${#ok_desc[@]}" -eq 0 ]; then
-    TOOLCHAIN_STATUS="BROKEN — ${broken_list}. Agents CANNOT install dependencies, so they cannot run this repo's lint or test suite. Do not raise findings that require local test execution or test output as evidence; they are unfixable until the container image is repaired."
+    TOOLCHAIN_STATUS="BROKEN — ${broken_list}. Agents CANNOT install dependencies, so local checks requiring those dependencies are blocked until the install failure is resolved. Do not demand local execution evidence for those checks; report them as unrun and follow the project's documented CI verification workflow."
     return 0
   fi
 
@@ -3332,7 +3333,7 @@ $PLAYWRIGHT_PIN_PROBE
   for d in "${broken_dirs[@]}"; do
     broken_where="${broken_where:+$broken_where, }${d}"
   done
-  TOOLCHAIN_STATUS="BROKEN — ${broken_list}; ${ok_list}. Agents CANNOT install dependencies for ${broken_where}, so they cannot run lint or tests there; do not raise findings that require test execution there as evidence — they are unfixable until the container image is repaired. For the rest of the repo, missing test evidence is a real gap."
+  TOOLCHAIN_STATUS="BROKEN — ${broken_list}; ${ok_list}. Agents CANNOT install dependencies for ${broken_where}; local checks requiring those dependencies are blocked until the install failure is resolved. Do not demand local execution evidence for those checks. For the rest of the repo, run the documented local checks. Successful installs do not verify test execution or availability of services and credentials. Follow the project's documented local and CI verification workflow and report unrun checks."
   return 0
 }
 

@@ -40,6 +40,8 @@ Review the PR end to end:
 
 CI status is verified by the harness in a separate loop — do not call `gh pr checks` or query `statusCheckRollup`. The container's token lacks the required scope and the harness already gates merge on CI independently.
 
+`<toolchain_status>` reports dependency installation only. An OK status does not prove that tests ran or that services and credentials are available. Judge local execution evidence against the project's documented verification workflow. Do not request changes or mark BLOCKED solely because checks explicitly assigned to CI were not run locally; CI verification remains the harness's responsibility. Missing evidence for required, runnable local checks is still a gap. Skipped or unrun tests must not be reported as passed, and required CI is not waived by an unavailable local service.
+
 ## Findings you must not raise
 
 The loop can only converge if each cycle's findings are ones the feedback agent can actually act on. These are not:
@@ -47,7 +49,7 @@ The loop can only converge if each cycle's findings are ones the feedback agent 
 - **Anything in `<known_blockers>`.** A previous cycle already found it and the feedback agent already established it cannot be done in this container. Do not re-report it, do not restate it as a new finding at a different line, and do not let it drive your verdict. It is recorded for the human.
 - **Anything requiring credentials, network services, or CLIs the container does not have.** The container ships `git`, `gh`, `jq`, `rg`, `uv`, `just`, `node`, `npm`, and a C toolchain — nothing else. There is no `gcloud`, `aws`, `terraform`, `kubectl`, or `docker`, and no cloud credentials. "Provision the infrastructure and attach a successful production invocation" is not a code review finding; the agent cannot do it at any cycle count.
 - **Human-only acceptance criteria.** An issue may require a manual console click, a staging deploy, or a screenshot. Those are real merge gates for the *human*, but the agent cannot satisfy them. Note them under the BLOCKED verdict instead of requesting changes.
-- **Test evidence the toolchain cannot produce.** If `<toolchain_status>` says BROKEN for the part of the repo this PR touches, no agent on this PR can run that suite. Review the tests as written — do they cover the behaviour? — but do not require test *output*, coverage numbers, or "verify locally and attach the result" as a fix.
+- **Test evidence the toolchain cannot produce.** If `<toolchain_status>` says BROKEN for the part of the repo this PR touches, checks requiring those dependencies cannot run locally until the install failure is resolved. Even with OK installs, services or credentials needed by some checks may be unavailable. Review the tests as written and follow the project's local-versus-CI verification policy; do not demand unavailable local test output, coverage numbers, or "verify locally and attach the result" as a fix. This does not excuse missing tests for changed behaviour or failures in checks that can run locally.
 - **Findings already fixed.** Before repeating a predecessor's finding, read the current file. The feedback agent may have already resolved it; the line number will have moved.
 
 ## The repository's own review policy
