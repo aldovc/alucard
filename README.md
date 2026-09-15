@@ -96,6 +96,8 @@ More than one `alucard` process may work on the same repository at once: `alucar
 
 What is not coordinated is the GitHub queue itself: two `alucard run` processes without `--issue` can both pick the same ticket before either has labelled it `in-progress`. Run parallel workers with `--issue`, one ticket each.
 
+Two guards make a lost worktree a harness event rather than an agent's finding. The container's entrypoint checks that its checkout is a git repository before starting the agent, and exits with a code the harness maps to a fresh worktree: workers and reviewers get another attempt within their transport retry budget, then the stop is reported as a harness fault (the reviewer's "no review posted" comment says so; a worker's ticket rejoins the queue). And every container gets `GH_REPO=owner/repo`, so `gh` inside it never depends on the checkout's remote — a reviewer that once found `/work` empty ran `gh pr view` against no remote, failed, and wrote the failure up as a high-severity human block.
+
 ## Threat model and safety design
 
 **The risk.** `claude` runs in `bypassPermissions` mode, no prompts, full tool access, so the agent doesn't get stuck mid-run on a missing tool permission. Without isolation, a confused or prompt-injected agent could `rm -rf` your home directory or exfiltrate credentials.

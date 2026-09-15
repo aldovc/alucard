@@ -24,6 +24,10 @@ BAKED_BROWSERS_PATH="/opt/ms-playwright"
 # --timeout. See PLAYWRIGHT_REPO_INSTALL for why it needs its own.
 PLAYWRIGHT_INSTALL_TIMEOUT="8m"
 HARD_KILL_GRACE="30s"
+# The exit code entrypoint.sh uses when the container's checkout is empty or
+# missing. Nothing ran, so the failure says nothing about the task; the harness
+# hands the role a fresh worktree the way it does after a transport drop.
+NO_WORKTREE_RC=78
 
 # Prefix on every comment the wrapper posts to a PR. This is a protocol string,
 # not decoration: the blocked-findings ledger reload, the human-vs-bot comment
@@ -225,6 +229,17 @@ transport_attempt_budget() {
   printf '%s' "$((10#$DEFAULT_TRANSPORT_RETRY_ATTEMPTS + 1))"
 }
 
+# Failure classes that say nothing about the task and earn the role a fresh
+# worktree within its attempt budget: a dropped provider connection, or a
+# container whose checkout was empty before the agent ran. Anything else —
+# exhaustion, a wedge mid-run, a real error — breaks out after one attempt.
+retry_with_fresh_worktree() {
+  case "$1" in
+    transport|no_worktree) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 xml_escape() {
   sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
 }
@@ -238,6 +253,19 @@ is_github_ref() {
     echo "${BASH_REMATCH[1]}"
   elif [[ "$input" =~ ^([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)$ ]]; then
     echo "${BASH_REMATCH[1]}"
+  fi
+}
+
+# "owner/repo" for a checkout whose origin is on github.com, else empty. Only
+# the two URL forms count: a bare "a/b" would also match a relative path such
+# as ../remote.git, which is what a test fixture's origin looks like.
+github_repo_slug() {
+  local repo_abs="$1" url
+  url=$(git -C "$repo_abs" remote get-url origin 2>/dev/null) || return 0
+  url="${url%.git}"
+  if [[ "$url" =~ ^git@github\.com:([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)$ ]] \
+     || [[ "$url" =~ ^https://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
   fi
 }
 
@@ -542,6 +570,13 @@ classify_agent_failure() {
     return 0
   fi
 
+  # The entrypoint refused to start the agent: its checkout was empty. Before
+  # the log parse below because no agent ran, so there is no result to read.
+  if [ "$rc" -eq "$NO_WORKTREE_RC" ]; then
+    echo "no_worktree"
+    return 0
+  fi
+
   case "$rc" in
     124|137) echo "exhausted"; return 0 ;;
   esac
@@ -753,9 +788,16 @@ invoke_agent() {
     -e "HOME=/home/alucard"
     -e "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig"
     -e "GH_CONFIG_DIR=/tmp/gh"
-    "$@"
-    "$IMAGE"
   )
+  # Every `gh` call in the container resolves its repository from this rather
+  # than from the checkout's remote. A reviewer whose /work was empty ran
+  # `gh pr view N` with no remote to read, failed, and wrote that up as a
+  # high-severity human block (#92). Set only for github.com origins; a repo
+  # elsewhere keeps gh's own resolution.
+  if [ -n "${GH_REPO_SLUG:-}" ]; then
+    _docker_args+=(-e "GH_REPO=$GH_REPO_SLUG")
+  fi
+  _docker_args+=("$@" "$IMAGE")
 
   # Wedge detector: if /work goes "deleted" in the harness's CWD tracking,
   # every subsequent tool call fails silently and the iteration burns budget
@@ -2798,6 +2840,9 @@ no_verdict_reason() {
     wedged)
       printf 'The reviewer container wedged (its working directory went away) and was killed. Nothing was reviewed.'
       ;;
+    no_worktree)
+      printf 'The reviewer container found an empty checkout on every attempt — its worktree was missing when it mounted. Nothing was reviewed; this is a harness fault, not a finding about the PR. Re-run `alucard continue` for this PR.'
+      ;;
     *)
       printf 'The reviewer exited (rc=%s) without recording a verdict in `.alucard-review` and without posting a formal review.' "$rc"
       ;;
@@ -2915,8 +2960,8 @@ $(printf '%s' "${blocked_ledger:-None recorded.}" | xml_escape)
       # A reviewer that recorded its verdict before the connection dropped has
       # already done the work — take it rather than paying for it twice.
       [ -n "$_review_file_state" ] && break
-      [ "$_review_class" != "transport" ] && break
-      log_event "Review gate: transport failure on attempt $_review_attempt — retrying reviewer."
+      retry_with_fresh_worktree "$_review_class" || break
+      log_event "Review gate: ${_review_class} failure on attempt $_review_attempt — retrying reviewer."
     done
 
     review_state=$(cd "$REPO_ABS" && \
@@ -3465,6 +3510,7 @@ setup_run_environment() {
 
   stream_text='select(.type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta") | .event.delta.text'
   codex_stream_text="$CODEX_STREAM_TEXT"
+  GH_REPO_SLUG=$(github_repo_slug "$REPO_ABS")
   CREATED_WORKTREES=()
   CREATED_CONTAINERS=()
   CI_CHECKS_AVAILABLE=""
@@ -3501,6 +3547,7 @@ describe_worker_stop() {
     exhausted) echo "ran out of turns or hit its time limit" ;;
     wedged)    echo "wedged its shell (every tool call failed after /work went missing)" ;;
     transport) echo "lost its provider connection" ;;
+    no_worktree) echo "never started: its checkout was empty when the container mounted it" ;;
     *)         echo "failed" ;;
   esac
 }
@@ -3764,18 +3811,21 @@ command_run() {
       _worker_class=$(classify_agent_failure "$log_file" "$_worker_provider" "$rc")
       log_event "Iteration $i attempt $_attempt/$_total_worker_attempts: rc=$rc class=$_worker_class"
 
-      if [ "$_worker_class" != "transport" ] || [ "$_attempt" -eq "$_total_worker_attempts" ]; then
+      if ! retry_with_fresh_worktree "$_worker_class" || [ "$_attempt" -eq "$_total_worker_attempts" ]; then
         break
       fi
       # A worker can create its PR and lose the provider connection while
       # reporting the result. Preserve that branch and let the normal PR-found
-      # path below run instead of launching a duplicate attempt.
-      _transport_pr=$(find_open_pr_for_branch "$REPO_ABS" "$BRANCH")
-      if [ -n "${_transport_pr:-}" ]; then
-        log_event "PR found after transport failure: #$_transport_pr on $BRANCH; skipping retry."
-        break
+      # path below run instead of launching a duplicate attempt. A worker that
+      # never started cannot have opened one, so that check is transport-only.
+      if [ "$_worker_class" = "transport" ]; then
+        _transport_pr=$(find_open_pr_for_branch "$REPO_ABS" "$BRANCH")
+        if [ -n "${_transport_pr:-}" ]; then
+          log_event "PR found after transport failure: #$_transport_pr on $BRANCH; skipping retry."
+          break
+        fi
       fi
-      log_event "Iteration $i: transport failure on attempt $_attempt — retrying with a fresh worktree."
+      log_event "Iteration $i: ${_worker_class} failure on attempt $_attempt — retrying with a fresh worktree."
     done
 
     # Worker should push to $BRANCH, but may misbehave and push to a custom
