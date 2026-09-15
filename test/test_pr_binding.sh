@@ -5,7 +5,9 @@
 # no longer mint the same alucard/iter-N-<epoch>. And the gates take the PR
 # the harness found: a worker that renames its branch is still gated on its
 # own PR, and an alucard PR another run opened in the same window is never
-# adopted, because its head is not a commit in this worker's worktree.
+# adopted, because its head is not a commit this worker made — even though
+# the worktree, a --local clone of the shared checkout, already holds that
+# commit's object.
 set -euo pipefail
 
 # The mocks stand in for tools that read stdin; see test_timeout_recovery.sh.
@@ -136,9 +138,11 @@ esac
 MOCK
 
 # GitHub. No PR ever exists on the harness branch. The alucard-labeled list
-# carries another run's PR #55 (newest) whose head is a commit this worktree
-# has never seen, and — once this worker has pushed — its own PR #56 on the
-# renamed branch.
+# is returned unfiltered, as the real gh does: another run's PR #55 (newest)
+# whose head is a real commit on another branch of the target, #54 opened
+# long before this iteration (with this worker's own head, so a broken time
+# filter would adopt it), and — once this worker has pushed — its own PR #56
+# on the renamed branch. Like the real gh, the mock rejects `--jq --arg`.
 cat > "$MOCK_BIN/gh" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
@@ -158,13 +162,17 @@ case "$1 $2" in
     esac ;;
   "pr list")
     case "$*" in
+      *--arg*) echo 'unknown arguments ["since"]; please quote all values that have spaces' >&2; exit 1 ;;
       *--head*) printf '' ;;
       *--label*)
-        printf '{"number":55,"createdAt":"2999-01-01T00:00:02Z","headRefName":"alucard/20260915-000000/iter-1","headRefOid":"1111111111111111111111111111111111111111"}\n'
+        own=$(cat "$ALUCARD_TEST_STATE/worker-head" 2>/dev/null || echo 2222222222222222222222222222222222222222)
+        printf '[{"number":55,"createdAt":"2999-01-01T00:00:02Z","headRefName":"alucard/20260915-000000/iter-1","headRefOid":"%s"},' \
+          "$(<"$ALUCARD_TEST_STATE/foreign-head")"
+        printf '{"number":54,"createdAt":"2000-01-01T00:00:00Z","headRefName":"feature/old","headRefOid":"%s"}' "$own"
         if [ -f "$ALUCARD_TEST_STATE/worker-head" ]; then
-          printf '{"number":56,"createdAt":"2999-01-01T00:00:01Z","headRefName":"feature/renamed","headRefOid":"%s"}\n' \
-            "$(<"$ALUCARD_TEST_STATE/worker-head")"
-        fi ;;
+          printf ',{"number":56,"createdAt":"2999-01-01T00:00:01Z","headRefName":"feature/renamed","headRefOid":"%s"}' "$own"
+        fi
+        printf ']\n' ;;
     esac ;;
   "pr view")
     case "$*" in
@@ -196,6 +204,15 @@ run_scenario() {
   git -C "$target" commit -qm initial
   git -C "$target" remote add origin "$remote"
   git -C "$target" push -qu origin main
+  # Another run's pushed head, already in the shared checkout the worker's
+  # worktree is cloned from — so its object is in the worktree too.
+  git -C "$target" checkout -qb alucard/20260915-000000/iter-1
+  printf 'theirs\n' > "$target/theirs.txt"
+  git -C "$target" add -A
+  git -C "$target" commit -qm 'feat: another run'
+  git -C "$target" push -qu origin HEAD
+  git -C "$target" rev-parse HEAD > "$STATE/foreign-head"
+  git -C "$target" checkout -q main
 
   set +e
   PATH="$MOCK_BIN:$PATH" \
@@ -218,6 +235,7 @@ assert_eq "the run completes" "0" "$RC"
 assert_contains "the harness saw the other run's PR and said whose it is not" \
   "PR #55 on alucard/20260915-000000/iter-1 opened during this iteration, but its head is not this worker's" "$EVENTS"
 assert_not_contains "it did not adopt it" "PR found" "$EVENTS"
+assert_not_contains "a PR opened before this iteration is not even considered" "PR #54" "$EVENTS"
 assert_not_contains "so no gate ran on it" "=== CI gate" "$OUT"
 assert_not_contains "no PR comment went to it" "pr comment 55" "$TRACE"
 
@@ -231,6 +249,7 @@ assert_contains "the other run's PR is still passed over" \
   "PR #55 on alucard/20260915-000000/iter-1 opened during this iteration, but its head is not this worker's" "$EVENTS"
 assert_contains "the worker's own PR is found by its head commit" \
   "PR found (non-harness branch): #56 on feature/renamed" "$EVENTS"
+assert_not_contains "not the older PR that carries the same head" "PR #54" "$EVENTS"
 assert_contains "the CI gate runs on that PR" "=== CI gate: PR #56 on feature/renamed" "$OUT"
 assert_contains "and so does the review gate" "=== Review gate: PR #56 on feature/renamed" "$OUT"
 assert_contains "the review reaches a verdict on it" "Review gate: PR #56 approved" "$EVENTS"

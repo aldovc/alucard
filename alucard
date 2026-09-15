@@ -3980,23 +3980,27 @@ command_run() {
     else
       # Every open alucard PR opened since this iteration started is a
       # candidate — and in a concurrent run, so is every other run's. Adopt
-      # one only when its head is a commit this worker made: present in its
-      # worktree and not the base it started from. Anything else is left
-      # alone; its own harness is gating it.
+      # one only when its head is a commit this worker made: on its HEAD,
+      # past the base it started from. Object existence is not enough — the
+      # worktree is a --local clone, and the shared clone's object store
+      # already holds other branches' commits, another run's pushed head
+      # included. Anything else is left alone; its own harness is gating it.
+      # gh's --jq takes one expression and forwards no jq options, so the
+      # filter runs in jq itself.
       _fallback=$(cd "$REPO_ABS" && \
         gh pr list --label alucard --state open \
-          --json number,createdAt,headRefName,headRefOid \
-          --jq --arg since "$ITER_STARTED_AT" \
+          --json number,createdAt,headRefName,headRefOid 2>/dev/null \
+        | jq -r --arg since "$ITER_STARTED_AT" \
           '[.[] | select(.createdAt > $since)] | sort_by(.createdAt) | reverse | .[] | @json' \
-        2>/dev/null || true)
+          2>/dev/null || true)
+      _worker_commits=$(git -C "$WT_HOST" rev-list "${_base_sha}..HEAD" 2>/dev/null || true)
       while IFS= read -r _candidate; do
         [ -n "$_candidate" ] || continue
         _cand_num=$(echo "$_candidate" | jq -r '.number // empty' 2>/dev/null || true)
         [ -n "$_cand_num" ] || continue
         _cand_branch=$(echo "$_candidate" | jq -r '.headRefName // empty' 2>/dev/null || true)
         _cand_sha=$(echo "$_candidate" | jq -r '.headRefOid // empty' 2>/dev/null || true)
-        if [ -n "$_cand_sha" ] && [ "$_cand_sha" != "$_base_sha" ] && \
-           git -C "$WT_HOST" cat-file -e "${_cand_sha}^{commit}" 2>/dev/null; then
+        if [ -n "$_cand_sha" ] && grep -qxF -- "$_cand_sha" <<<"$_worker_commits"; then
           ACTUAL_BRANCH="$_cand_branch"
           _iter_pr_num="$_cand_num"
           _pr_found=true
