@@ -2079,14 +2079,11 @@ print_usage_report() {
 
 # Post a collapsible markdown token-usage table to the GitHub issue closed by
 # this iteration's PR.
-# $1 = iteration index, $2 = branch, $3 = repo abs path, $4 = log dir
+# $1 = iteration index, $2 = PR number (empty when the iteration opened none),
+# $3 = repo abs path, $4 = log dir
 post_iteration_usage() {
-  local iter="$1" branch="$2" repo_abs="$3" log_dir="$4"
+  local iter="$1" pr_num="$2" repo_abs="$3" log_dir="$4"
 
-  local pr_num
-  pr_num=$(cd "$repo_abs" && \
-    gh pr list --head "$branch" --state all --json number \
-      --jq '.[0].number // empty' 2>/dev/null || true)
   [ -n "${pr_num:-}" ] || return 0
 
   # Local-source PRs carry "Task: <id>" instead of a closing keyword — no
@@ -2530,16 +2527,14 @@ poll_ci_via_run_list() {
 }
 
 # Run a fresh fix agent on the branch if CI fails after a PR is opened.
-# $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
+# $1 = iteration index, $2 = branch name (the PR's head), $3 = origin HTTPS URL,
+# $4 = PR number. The gates take the PR the harness found rather than looking
+# one up by branch name: a worker that renamed its branch, or two runs whose
+# branches shared a name, left that lookup on someone else's PR.
 # Uses globals: REPO_ABS WT_ROOT LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
 #               CREATED_WORKTREES stream_text CI_CHECKS_AVAILABLE
 ci_gate() {
-  local iter="$1" branch="$2" origin_url="$3"
-
-  local pr_num
-  pr_num=$(cd "$REPO_ABS" && \
-    gh pr list --head "$branch" --state open --json number \
-      --jq '.[0].number // empty' 2>/dev/null || true)
+  local iter="$1" branch="$2" origin_url="$3" pr_num="${4:-}"
 
   [ -n "${pr_num:-}" ] || return 0
 
@@ -2872,18 +2867,14 @@ no_verdict_reason() {
 
 # Run reviewer then feedback agents on the open PR, up to MAX_REVIEW_CYCLES times.
 # $1 = iteration index, $2 = branch name, $3 = origin HTTPS URL
-# $4 = task XML (file mode only, empty in github mode)
-# $5 = parent context XML (file mode only, empty in github mode)
+# $4 = PR number (see ci_gate)
+# $5 = task XML (file mode only, empty in github mode)
+# $6 = parent context XML (file mode only, empty in github mode)
 # Uses globals: REPO_ABS WT_ROOT LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
 #               CREATED_WORKTREES stream_text MAX_REVIEW_CYCLES
 review_gate() {
-  local iter="$1" branch="$2" origin_url="$3"
-  local task_xml="${4:-}" parent_context_xml="${5:-}"
-
-  local pr_num
-  pr_num=$(cd "$REPO_ABS" && \
-    gh pr list --head "$branch" --state open --json number \
-      --jq '.[0].number // empty' 2>/dev/null || true)
+  local iter="$1" branch="$2" origin_url="$3" pr_num="${4:-}"
+  local task_xml="${5:-}" parent_context_xml="${6:-}"
 
   [ -n "${pr_num:-}" ] || return 0
 
@@ -3162,7 +3153,7 @@ ${_blocked_body}"
     fi
 
     # Re-check CI before the next reviewer sees the updated branch.
-    ci_gate "$iter" "$branch" "$origin_url"
+    ci_gate "$iter" "$branch" "$origin_url" "$pr_num"
   done
 }
 
@@ -3505,6 +3496,29 @@ claim_log_dir() {
   claim_unique_dir "$1/alucard-$2"
 }
 
+# The branch a worker pushes. It used to be alucard/iter-N-<epoch seconds>,
+# and two runs on one repository that reached iteration N in the same second
+# minted the same name and raced for it on the remote — the #92 worktree
+# collision one layer up. The run's worktree root is already claimed unique
+# under the repository, so its name is the run id. The ticket or task goes in
+# when the harness knows it before the worker starts (a pinned issue, a local
+# task); in queue mode the worker picks, so there is nothing to add yet.
+# $1 = iteration index, $2 = worker attempt (omitted or 1 for the first)
+mint_branch() {
+  local iter="$1" attempt="${2:-1}"
+  local run_id="${WT_ROOT##*/}"
+  run_id="${run_id#alucard-}"
+  local subject=""
+  if [ -n "${PIN_ISSUE:-}" ]; then
+    subject="-issue-${PIN_ISSUE}"
+  elif [ -n "${DISPATCHED_TASK_ID:-}" ]; then
+    subject="-task-$(printf '%s' "$DISPATCHED_TASK_ID" | tr -c 'A-Za-z0-9._' '-')"
+  fi
+  local name="alucard/${run_id}/iter-${iter}${subject}"
+  [ "$attempt" -gt 1 ] && name="${name}-${attempt}"
+  printf '%s' "$name"
+}
+
 setup_run_environment() {
   # Already resolved when the caller needed the repo before the run existed —
   # continue's PR lookup, run --issue's pin. Resolving again fetched the cache
@@ -3814,7 +3828,6 @@ command_run() {
     log_event "Iteration $i/$ITERATIONS start"
 
     WT_HOST="${WT_ROOT}/iter-$i"
-    BRANCH="alucard/iter-${i}-$(date +%s)"
     CREATED_WORKTREES+=("$WT_HOST")
 
     # Clone locally so the container gets a self-contained .git dir.
@@ -3836,7 +3849,6 @@ command_run() {
     # never made. Using a pinned base SHA measures only what this iteration
     # added on top of where it started.
     _base_sha="$(git -C "$WT_HOST" rev-parse HEAD)"
-    git -C "$WT_HOST" checkout -b "$BRANCH"
 
     # A pin must not take the empty ready-for-agent path (that exits 0).
     if [ -n "${PIN_ISSUE:-}" ]; then
@@ -3868,6 +3880,9 @@ command_run() {
 
     build_worker_prompt "$issues" "$commits" "$prompt"
     full_prompt="$FULL_PROMPT"
+    # Minted after dispatch so a pinned issue or local task is in the name.
+    BRANCH=$(mint_branch "$i")
+    git -C "$WT_HOST" checkout -b "$BRANCH"
     if [ "$TASK_SOURCE" = "file" ]; then
       echo "Dispatching task ${DISPATCHED_TASK_ID}: $(echo "$issues" | jq -r '.[0].title')"
     elif [ -n "${PIN_ISSUE:-}" ]; then
@@ -3896,7 +3911,7 @@ command_run() {
         # discarded along with its worktree.
         rm -rf "$WT_HOST" || true
         WT_HOST="${WT_ROOT}/iter-${i}-${_attempt}"
-        BRANCH="alucard/iter-${i}-$(date +%s)-${_attempt}"
+        BRANCH=$(mint_branch "$i" "$_attempt")
         CREATED_WORKTREES+=("$WT_HOST")
         make_agent_clone "$BASE_BRANCH" "$WT_HOST" "$_origin_url" base
         git -C "$WT_HOST" reset --hard "$(git -C "$REPO_ABS" rev-parse "origin/$BASE_BRANCH")"
@@ -3963,18 +3978,33 @@ command_run() {
       _iter_pr_num="$_harness_pr"
       log_event "PR found: #$_iter_pr_num on $ACTUAL_BRANCH"
     else
+      # Every open alucard PR opened since this iteration started is a
+      # candidate — and in a concurrent run, so is every other run's. Adopt
+      # one only when its head is a commit this worker made: present in its
+      # worktree and not the base it started from. Anything else is left
+      # alone; its own harness is gating it.
       _fallback=$(cd "$REPO_ABS" && \
-        gh pr list --label alucard --state open --json number,createdAt,headRefName \
+        gh pr list --label alucard --state open \
+          --json number,createdAt,headRefName,headRefOid \
           --jq --arg since "$ITER_STARTED_AT" \
-          '[.[] | select(.createdAt > $since)] | sort_by(.createdAt) | last // empty' \
+          '[.[] | select(.createdAt > $since)] | sort_by(.createdAt) | reverse | .[] | @json' \
         2>/dev/null || true)
-      if [ -n "${_fallback:-}" ] && [ "$_fallback" != "null" ]; then
-        ACTUAL_BRANCH=$(echo "$_fallback" | jq -r '.headRefName')
-        _fallback_num=$(echo "$_fallback" | jq -r '.number')
-        log_event "PR found (non-harness branch): #$_fallback_num on $ACTUAL_BRANCH"
-        _pr_found=true
-        _iter_pr_num="$_fallback_num"
-      fi
+      while IFS= read -r _candidate; do
+        [ -n "$_candidate" ] || continue
+        _cand_num=$(echo "$_candidate" | jq -r '.number // empty' 2>/dev/null || true)
+        [ -n "$_cand_num" ] || continue
+        _cand_branch=$(echo "$_candidate" | jq -r '.headRefName // empty' 2>/dev/null || true)
+        _cand_sha=$(echo "$_candidate" | jq -r '.headRefOid // empty' 2>/dev/null || true)
+        if [ -n "$_cand_sha" ] && [ "$_cand_sha" != "$_base_sha" ] && \
+           git -C "$WT_HOST" cat-file -e "${_cand_sha}^{commit}" 2>/dev/null; then
+          ACTUAL_BRANCH="$_cand_branch"
+          _iter_pr_num="$_cand_num"
+          _pr_found=true
+          log_event "PR found (non-harness branch): #$_iter_pr_num on $ACTUAL_BRANCH"
+          break
+        fi
+        log_event "PR #$_cand_num on $_cand_branch opened during this iteration, but its head is not this worker's — another run's; ignored."
+      done <<<"$_fallback"
     fi
     _recovery_pr=false
 
@@ -4229,10 +4259,10 @@ command_run() {
     # definition. The user should vet the diff and run `alucard continue`
     # to resume gates against the recovered branch.
     if [ "$_recovery_pr" = false ]; then
-      ci_gate "$i" "$ACTUAL_BRANCH" "$_origin_url"
-      review_gate "$i" "$ACTUAL_BRANCH" "$_origin_url" "$TASK_XML" "$PARENT_CONTEXT_XML"
+      ci_gate "$i" "$ACTUAL_BRANCH" "$_origin_url" "$_iter_pr_num"
+      review_gate "$i" "$ACTUAL_BRANCH" "$_origin_url" "$_iter_pr_num" "$TASK_XML" "$PARENT_CONTEXT_XML"
     fi
-    post_iteration_usage "$i" "$ACTUAL_BRANCH" "$REPO_ABS" "$LOG_DIR"
+    post_iteration_usage "$i" "${_iter_pr_num:-${_recovery_pr_num:-}}" "$REPO_ABS" "$LOG_DIR"
 
     _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
     log_event "Iteration $i/$ITERATIONS end: rc=$rc duration=${_iter_duration}s"
@@ -4408,7 +4438,7 @@ The feedback agent did not finish and pushed nothing, so this branch is still at
 
 A turn-cap or budget stop is the usual cause. Its work died with the worktree: the agent is told to commit and push before verifying, and one that spends its whole budget exploring never reaches that step. Raising \`ALUCARD_FEEDBACK_MAX_TURNS\`, or narrowing the findings above, is the usual fix." 2>/dev/null || true
       add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
-      post_iteration_usage "$iter" "$branch" "$REPO_ABS" "$LOG_DIR"
+      post_iteration_usage "$iter" "$pr_num" "$REPO_ABS" "$LOG_DIR"
       measure_iteration "$iter" "$pr_num" 0 "$(( $(date +%s) - _continue_start_epoch ))" \
         "$MEASURE_CI_RESULT" "$MEASURE_VERDICT" "$MEASURE_CYCLES" "$MEASURE_BASE_SHA"
       return 0
@@ -4422,9 +4452,9 @@ The agent did not finish, but it had already pushed. What is on the branch may a
   else
     echo "No actionable comments on PR #$pr_num — skipping feedback; running gates only."
   fi
-  ci_gate "$iter" "$branch" "$origin_url"
-  review_gate "$iter" "$branch" "$origin_url"
-  post_iteration_usage "$iter" "$branch" "$REPO_ABS" "$LOG_DIR"
+  ci_gate "$iter" "$branch" "$origin_url" "$pr_num"
+  review_gate "$iter" "$branch" "$origin_url" "$pr_num"
+  post_iteration_usage "$iter" "$pr_num" "$REPO_ABS" "$LOG_DIR"
   measure_iteration "$iter" "$pr_num" 0 "$(( $(date +%s) - _continue_start_epoch ))" \
     "$MEASURE_CI_RESULT" "$MEASURE_VERDICT" "$MEASURE_CYCLES" "$MEASURE_BASE_SHA"
 }
