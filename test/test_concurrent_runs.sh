@@ -68,6 +68,18 @@ assert_eq "a run in the same second gets its pid appended" \
 [ -d "$second" ] && pass "and that directory exists too" || fail "and that directory exists too"
 [ -d "$first" ] && pass "the first run's directory is untouched" || fail "the first run's directory is untouched"
 
+# The worktree root is claimed under the repository in its own right: two runs
+# with different --logs-root values can both hold "alucard-<stamp>" as a log
+# dir name, and must still not meet at the same worktree path.
+WTS="$TEST_DIR/repo-wts/.alucard-worktrees"
+first_wt=$(claim_unique_dir "$WTS/alucard-20260914-101500")
+assert_eq "the first run gets the worktree root named after its log dir" \
+  "$WTS/alucard-20260914-101500" "$first_wt"
+second_wt=$(claim_unique_dir "$WTS/alucard-20260914-101500")
+assert_eq "a second run wanting the same name gets its pid appended" \
+  "$WTS/alucard-20260914-101500-$$" "$second_wt"
+[ -d "$first_wt" ] && [ -d "$second_wt" ] && pass "both roots exist" || fail "both roots exist"
+
 # ── repo_lock_file: where the lock lives ────────────────────────────────────
 echo ""
 echo "── lock file ──"
@@ -300,6 +312,48 @@ if command -v flock >/dev/null 2>&1; then
   [ -e "$CACHE/example/api.lock" ] && pass "git writes to the cache went through its lock file" \
     || fail "git writes to the cache went through its lock file"
 fi
+
+# ── End to end: the worktree name is already taken under the repository ─────
+# Another run, with a different --logs-root, holds this second's name under
+# .alucard-worktrees. Pre-take the next few seconds' names so the run under
+# test is certain to find its own taken, whichever second it lands in.
+echo ""
+echo "── continue when another run holds this second's worktree name ──"
+
+TAKEN=()
+for off in 0 1 2 3 4 5 6 7; do
+  d="$CACHE/example/api/.alucard-worktrees/alucard-$(date -d "+${off} sec" +%Y%m%d-%H%M%S)"
+  mkdir -p "$d/iter-1"
+  printf 'another run\n' > "$d/iter-1/keep"
+  TAKEN+=("$d")
+done
+: > "$TEST_DIR/argv"
+set +e
+(
+  cd "$CWD" && \
+  PATH="$MOCK_BIN:$PATH" ALUCARD_CACHE_DIR="$CACHE" \
+  ALUCARD_TEST_BRANCH="$BRANCH" ALUCARD_TEST_ARGV="$TEST_DIR/argv" \
+  "$ALUCARD" continue 77 example/api --no-build --max-review-cycles 1 \
+    --env-file "$TEST_DIR/alucard.env" --logs-root "$TEST_DIR/run-logs-2"
+) > "$TEST_DIR/out2" 2>&1
+RC=$?
+set -e
+ARGV=$(<"$TEST_DIR/argv")
+assert_eq "the continue completes" "0" "$RC"
+RUN_ID_2=$(basename "$(ls -1d "$TEST_DIR"/run-logs-2/alucard-* | head -n1)")
+WT_MOUNT=$(grep -oE -- '-v [^ ]+:/work:ro' <<<"$ARGV" | head -n1 | sed 's/^-v //; s/:\/work:ro$//')
+WT_PARENT=$(basename "$(dirname "$WT_MOUNT")")
+if [[ "$WT_PARENT" =~ ^alucard-[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
+  pass "the worktree root gets a pid suffix instead of the taken name"
+else
+  fail "the worktree root gets a pid suffix instead of the taken name (got '$WT_PARENT')"
+fi
+[ "$WT_PARENT" != "$RUN_ID_2" ] && pass "so it differs from the log dir name this time" \
+  || fail "so it differs from the log dir name this time"
+all_kept=true
+for d in "${TAKEN[@]}"; do [ -f "$d/iter-1/keep" ] || all_kept=false; done
+[ "$all_kept" = true ] && pass "every other run's worktree is untouched" \
+  || fail "every other run's worktree is untouched"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"

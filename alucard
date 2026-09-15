@@ -3414,19 +3414,29 @@ $PLAYWRIGHT_PIN_PROBE
   return 0
 }
 
-# The directory one run's logs go in. Named by the second it started, which
-# two runs can share: `continue` on four PRs launched a second apart wrote
-# into one directory. The first run to claim a name keeps it; a run that finds
-# the name taken adds its pid. Echoes the path it created.
-# $1 = log root, $2 = timestamp
-claim_log_dir() {
-  local log_root="$1" stamp="$2" dir
-  dir="$log_root/alucard-$stamp"
+# Claim a directory that no other run holds. `mkdir` without -p is the atomic
+# test: the first run to ask for a name gets it, and a run that finds the name
+# taken appends its pid. Echoes the path it created. Used for the log dir and,
+# separately, for the worktree root under the repository — separately because
+# the log dir is unique only within one --logs-root, and two runs on one repo
+# with different log roots could still meet at the same worktree path.
+# $1 = the path wanted
+claim_unique_dir() {
+  local dir="$1"
+  mkdir -p "$(dirname "$dir")"
   if ! mkdir "$dir" 2>/dev/null; then
     dir="${dir}-$$"
     mkdir -p "$dir"
   fi
   printf '%s' "$dir"
+}
+
+# The directory one run's logs go in. Named by the second it started, which
+# two runs can share: `continue` on four PRs launched a second apart wrote
+# into one directory.
+# $1 = log root, $2 = timestamp
+claim_log_dir() {
+  claim_unique_dir "$1/alucard-$2"
 }
 
 setup_run_environment() {
@@ -3441,13 +3451,12 @@ setup_run_environment() {
   LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd)"
   LOG_DIR=$(claim_log_dir "$LOG_ROOT" "$(date +%Y%m%d-%H%M%S)")
   # Worktrees live under a directory only this run uses, named after its log
-  # dir. Every run used to put its first worker at .alucard-worktrees/iter-1:
-  # six `run --issue` processes on one repo cloned into the same path, and the
-  # first to finish deleted the worktree from under the other five (#92).
-  RUN_ID="$(basename "$LOG_DIR")"
-  WT_ROOT="${REPO_ABS}/.alucard-worktrees/${RUN_ID}"
-
-  mkdir -p "$WT_ROOT"
+  # dir and claimed under the repository in its own right (two runs with
+  # different --logs-root can share the log dir name). Every run used to put
+  # its first worker at .alucard-worktrees/iter-1: six `run --issue` processes
+  # on one repo cloned into the same path, and the first to finish deleted the
+  # worktree from under the other five (#92).
+  WT_ROOT=$(claim_unique_dir "${REPO_ABS}/.alucard-worktrees/$(basename "$LOG_DIR")")
   if [ "$HAVE_FLOCK" != true ]; then
     echo "Warning: flock not found — concurrent alucard runs on this repo will not take turns on its clone." >&2
   fi
