@@ -68,6 +68,7 @@ After fixing each finding, scan only the code you wrote or modified for these vi
 - Any function whose responsibility cannot be stated in one sentence.
 - Any `except` block that swallows an exception without a deliberate fallback or explicit logging.
 - Any layer crossing: routers must not make external API calls; domain models must not format user-facing strings.
+- Any comment you added that restates the finding, the ticket, or a sibling module.
 
 Fix violations you introduced before pushing. Do not fix pre-existing violations — that is out of scope.
 

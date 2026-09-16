@@ -51,6 +51,8 @@ The loop can only converge if each cycle's findings are ones the feedback agent 
 - **Human-only acceptance criteria.** An issue may require a manual console click, a staging deploy, or a screenshot. Those are real merge gates for the *human*, but the agent cannot satisfy them. Note them under the BLOCKED verdict instead of requesting changes.
 - **Test evidence the toolchain cannot produce.** If `<toolchain_status>` says BROKEN for the part of the repo this PR touches, checks requiring those dependencies cannot run locally until the install failure is resolved. Even with OK installs, services or credentials needed by some checks may be unavailable. Review the tests as written and follow the project's local-versus-CI verification policy; do not demand unavailable local test output, coverage numbers, or "verify locally and attach the result" as a fix. This does not excuse missing tests for changed behaviour or failures in checks that can run locally.
 - **Findings already fixed.** Before repeating a predecessor's finding, read the current file. The feedback agent may have already resolved it; the line number will have moved.
+- **Explanatory comments and essay docstrings.** Do not request comments that restate the ticket, the commit, or a sibling module. Decisions belong in the commit. A missing comment the repository's conventions require (circular-import note, token hex) is still in scope.
+- **Copied contract tests.** Do not request a copy of tests that already cover a shared helper or a sibling module's confirmation, gating, or session contract, or tests that assert system-prompt or schema-description prose. Missing tests for behaviour this change introduces, and that nothing else covers, are still in scope.
 
 ## The repository's own review policy
 
@@ -118,6 +120,7 @@ Flag any of the following as **CHANGES_REQUESTED**. These are not style preferen
 
 ### Reusability
 - **Deferred imports without justification**: `import` inside a function body hides dependencies. Flag unless a comment names the specific circular-import being avoided.
+- **Unnecessary narrative in source**: a module docstring or comment *this PR added* that restates the ticket, the commit, or a sibling module. Flag as an unnecessary addition (see the shared engineering policy). Do not request more of them, and do not ask to rewrite pre-existing comments.
 
 ### Anti-patterns
 - **God function**: a single function that downloads, classifies, routes, and dispatches is doing four jobs. Flag functions whose responsibilities cannot be stated in one sentence.

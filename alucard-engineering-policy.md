@@ -18,6 +18,14 @@ more specific rule, that rule wins.
 - Meet every acceptance criterion, then stop. Once the change is complete and
   adequately verified, further improvement is outside the task.
 
+## Comments
+
+- A module docstring names what the file is, in one sentence.
+- Comment only a non-obvious invariant, or a comment the repository's conventions
+  require (circular-import note, token hex).
+- Do not restate the ticket, the commit message, or a sibling module. Decisions
+  stay in the commit and the PR body.
+
 ## Tests
 
 - Cover the behaviour the change alters and each distinct failure mode it can
@@ -31,6 +39,10 @@ more specific rule, that rule wins.
   without a separate purpose, or build elaborate mocks for trivial wiring. Each
   added test should catch a distinct plausible failure or supply integration
   evidence nothing else supplies.
+- Do not re-test a shared helper's contract at every caller, and do not copy a
+  sibling module's confirmation, gating, or session tests. Test the distinct
+  behaviour this change adds. Equivalent input variations are a parameter, not a
+  new case. Do not assert system-prompt or schema-description prose.
 - Keep coverage for materially distinct entry points, permissions, races,
   cleanup, data loss, and other real boundary conditions. A large test diff is
   the right answer when the behaviour warrants it.
@@ -40,11 +52,11 @@ cap how many tests a change may add, or ban unit tests and fixtures.
 
 ## Asking for changes
 
-- A merge-blocking request for more structure, more abstraction, or more tests
-  must name the concrete failure, the violated contract, or the material
-  maintenance problem — and the smallest fix that resolves it. "It appears
-  twice", "that literal is inline", and "this could be polymorphic" do not on
-  their own mandate a change.
+- A merge-blocking request for more structure, more abstraction, more comments,
+  or more tests must name the concrete failure, the violated contract, or the
+  material maintenance problem — and the smallest fix that resolves it. "It
+  appears twice", "that literal is inline", "this could be polymorphic", and
+  "document this decision in source" do not on their own mandate a change.
 - Naming an unnecessary addition is useful. Repeated cycles over equivalent
   design preferences are not.
 - An optional suggestion is not implemented automatically, and resolving a
