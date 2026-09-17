@@ -57,6 +57,10 @@ Name your file with `$NEXT`. Two iterations that started from the same base-bran
 
 Before running lint and tests, read your own diff and check for each of the following. Fix any you find — the reviewer will catch them if you don't.
 
+Apply the shared engineering policy: remove unnecessary code, essay docstrings,
+and copied sibling tests. Keep existing ports. File limits are caps, not targets;
+do not add files or tests to match a ticket's estimate.
+
 **Correctness hazards**
 - Every `asyncio.create_task(...)` has a done-callback that logs exceptions.
 - No token, API key, or credential is passed as a plain `str` parameter through more than one function boundary.
