@@ -119,12 +119,17 @@ case "$1 $2" in
   "issue view") printf 'Small fix\n' ;;
   "pr view")
     case "$*" in
+      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s"}\n' "$ALUCARD_TEST_BRANCH" ;;
+      *comments*)
+        jq -n --argjson c "$ALUCARD_TEST_COMMENTS" --arg a "$ALUCARD_TEST_PR_AUTHOR" \
+          --argjson d "$ALUCARD_TEST_DRAFT" --argjson l "$ALUCARD_TEST_LABELS" \
+          --arg t "$ALUCARD_TEST_TITLE" \
+          '{comments: $c, author: {login: $a}, isDraft: $d,
+            labels: ($l | map({name: .})), title: $t}' ;;
       *isDraft*)
         jq -n --argjson d "$ALUCARD_TEST_DRAFT" --argjson l "$ALUCARD_TEST_LABELS" \
           --arg t "$ALUCARD_TEST_TITLE" --arg b "$ALUCARD_TEST_BODY" \
           '{isDraft: $d, labels: ($l | map({name: .})), title: $t, body: $b}' ;;
-      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s"}\n' "$ALUCARD_TEST_BRANCH" ;;
-      *comments*)          printf '{"comments":%s}\n' "$ALUCARD_TEST_COMMENTS" ;;
       *reviews*)
         case "$*" in
           *".state // empty"*) printf '%s\n' "${ALUCARD_TEST_FORMAL_STATE:-}" ;;
@@ -163,6 +168,7 @@ reset_pr() {
   FORMAL_STATE=""
   FORMAL_OID=""
   LOGIN=alucard-bot
+  PR_AUTHOR=alucard-bot
   PR_HEAD="$REVIEWED_SHA"
 }
 
@@ -183,6 +189,7 @@ run_continue() {
   ALUCARD_TEST_FORMAL_STATE="$FORMAL_STATE" \
   ALUCARD_TEST_FORMAL_OID="$FORMAL_OID" \
   ALUCARD_TEST_LOGIN="$LOGIN" \
+  ALUCARD_TEST_PR_AUTHOR="$PR_AUTHOR" \
   ALUCARD_TEST_PR_HEAD="$PR_HEAD" \
   ALUCARD_TRANSPORT_RETRY_ATTEMPTS=0 \
     "$ALUCARD" continue 77 "$TARGET" --no-build --max-review-cycles 1 \
@@ -226,6 +233,7 @@ echo ""
 echo "── APPROVED on a draft with needs-human that the harness never parked ──"
 reset_pr
 COMMENTS='[]'
+PR_AUTHOR=passer-by
 TITLE="feat: kept in draft on purpose"
 BODY=$'Closes #12\n\nA developer'"'"'s own draft, labelled by a maintainer.'
 run_continue
@@ -237,6 +245,7 @@ echo ""
 echo "── APPROVED on a PR carrying a marker comment somebody else posted ──"
 reset_pr
 COMMENTS="$SPOOFED_MARK"
+PR_AUTHOR=passer-by
 run_continue
 assert_contains "the gate approves" "Review gate: PR #77 approved" "$EVENTS"
 assert_untouched "a marker the harness did not write"
@@ -245,9 +254,29 @@ echo ""
 echo "── APPROVED on a PR whose author typed the stub title and body ──"
 reset_pr
 COMMENTS='[]'
+PR_AUTHOR=passer-by
 run_continue
 assert_contains "the gate approves" "Review gate: PR #77 approved" "$EVENTS"
 assert_untouched "recovery title and body without the harness's mark"
+
+echo ""
+echo "── APPROVED on a recovery PR whose marker comment never posted ──"
+# Parking posts the marker best-effort; when that call fails the PR is still
+# the harness's own draft stub, and the approval must still un-park it.
+reset_pr
+COMMENTS='[]'
+run_continue
+assert_contains "the draft is marked ready" "$READY_CALL" "$TRACE"
+assert_contains "and the label comes off" "$UNLABEL_CALL" "$TRACE"
+assert_eq "the stub title is replaced by the ticket's" "Small fix" "$(jq -r '.title' <<<"$PATCH")"
+
+echo ""
+echo "── APPROVED on a harness draft that is not a recovery stub ──"
+reset_pr
+COMMENTS='[]'
+TITLE="feat: an ordinary harness PR left in draft"
+run_continue
+assert_untouched "no recovery mark of any kind"
 
 echo ""
 echo "── APPROVED on a parked PR but the harness's own login is unreadable ──"

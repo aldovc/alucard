@@ -38,9 +38,10 @@ NO_WORKTREE_RC=78
 # read by the tests from here, so no copy of the string can drift out of step.
 BOT_COMMENT_PREFIX='**🤖 Alucard'
 BOT_LEDGER_MARKER="$BOT_COMMENT_PREFIX blocked findings**"
-# Posted on a recovery PR when it is parked. Only this marker in a comment
-# authored by the authenticated harness account identifies a parked recovery
-# PR; the title and body carry the same mark but are writable by anyone.
+# Posted on a recovery PR when it is parked. It counts only in a comment
+# authored by the authenticated harness account; the title and body carry the
+# same mark but are writable by anyone, so they count only on a PR the harness
+# itself authored (see review_gate).
 BOT_RECOVERY_MARKER="$BOT_COMMENT_PREFIX recovery PR parked**"
 RECOVERY_TITLE_PREFIX="wip: alucard recovery"
 CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
@@ -2989,14 +2990,25 @@ review_gate() {
   # already established was unfixable in-container. The same comments carry the
   # parked-recovery marker.
   local blocked_ledger _pr_comments _harness_login
-  _pr_comments=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json comments 2>/dev/null || echo '{"comments":[]}')
+  _pr_comments=$(cd "$REPO_ABS" && gh pr view "$pr_num" \
+    --json comments,author,isDraft,labels,title 2>/dev/null || echo '{"comments":[]}')
   blocked_ledger=$(jq -r --arg marker "$BOT_LEDGER_MARKER" \
         '[.comments[]? | select(.body | startswith($marker)) | .body] | join("\n\n")' \
     <<<"$_pr_comments" 2>/dev/null || true)
   _harness_login=$(cd "$REPO_ABS" && gh api user --jq '.login' 2>/dev/null || true)
+  # Either authenticated mark identifies a PR the harness parked: the marker
+  # comment, or — when posting it failed — harness authorship of a draft still
+  # carrying the recovery stub title and `needs-human`. GitHub reports both
+  # authors, so neither path can be forged by an ordinary user's draft.
   _parked_marker=$(jq -r --arg marker "$BOT_RECOVERY_MARKER" --arg login "$_harness_login" \
-        '[.comments[]? | select($login != "" and (.author.login // "") == $login
-           and (.body | startswith($marker)))] | length > 0' \
+        --arg stub "$RECOVERY_TITLE_PREFIX" '
+      ($login != "") and (
+        ([.comments[]? | select((.author.login // "") == $login
+           and (.body | startswith($marker)))] | length > 0)
+        or (((.author.login // "") == $login)
+            and (.isDraft // false)
+            and (((.title // "") | startswith($stub)))
+            and ([.labels[]?.name | ascii_downcase] | index("needs-human") != null)))' \
     <<<"$_pr_comments" 2>/dev/null || echo false)
   if [ -z "$_harness_login" ]; then
     log_event "Review gate: could not read the harness's GitHub login — a parked recovery PR stays parked."
@@ -4313,7 +4325,7 @@ command_run() {
                 # BOT_RECOVERY_MARKER.
                 (cd "$REPO_ABS" && gh pr comment "$_recovery_pr_num" --body \
                   "${BOT_RECOVERY_MARKER} — opened as a draft and labeled \`needs-human\` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the \`Refs\` line into \`Closes\`, and replaces the stub title with the ticket's." >/dev/null 2>&1) \
-                  || log_event "Recovery: could not post the parked mark on PR #${_recovery_pr_num} — approval will recognise it by its body stanza only."
+                  || log_event "Recovery: could not post the parked mark on PR #${_recovery_pr_num} — approval will recognise it by its harness-authored draft stub instead."
                 RUN_ATTENTION+=("recovery PR #${_recovery_pr_num}${_ticket_ref:+ holds $_ticket_ref}: the worker $(describe_worker_stop "$_worker_class") (rc=${rc}); the branch is unverified — finish it, or close it to requeue the work")
                 if [ "$TASK_SOURCE" = "file" ]; then
                   mark_task_in_flight "$TASKS_FILE_ABS" "$DISPATCHED_TASK_ID" "$_recovery_pr_num" \
