@@ -343,7 +343,9 @@ If a worker stops with work but no PR, Alucard attempts to preserve it in a draf
 
 For GitHub tasks, recovery removes `in-progress`, links the PR from the issue, and uses `Refs #N` instead of closing the issue. An explicitly pinned issue remains the attribution even if the worker stopped before claiming it.
 
-Finish the work on the recovery branch, then change `Refs #N` to `Closes #N` when all acceptance criteria are met. Or close the PR to let the task rejoin the queue. `alucard run --issue N` starts a fresh attempt immediately. For local tasks, closing an unmerged recovery PR returns the task to the queue on reconciliation.
+Finish the work on the recovery branch, then run `alucard continue <PR>` to address feedback and repeat CI and review. When the review gate approves the current head, Alucard marks its recovery PR ready, removes `needs-human`, changes `Refs #N` to `Closes #N`, and replaces the stub title with the issue's title. It identifies recovery PRs by a marker comment from the authenticated harness account, or by that account's authorship of a draft still carrying the recovery stub title and `needs-human`. If marking the draft ready fails, the label stays and the approval comment explains the manual steps.
+
+Alternatively, close the PR to let the task rejoin the queue. `alucard run --issue N` starts a fresh attempt immediately. For local tasks, closing an unmerged recovery PR returns the task to the queue on reconciliation.
 
 The run's final `Needs attention` list includes recovery PRs and issues parked for a human. An empty eligible queue does not mean every task is complete.
 
