@@ -1751,17 +1751,22 @@ remove_pr_label() {
 }
 
 # Whether an APPROVED verdict is about the PR's current head. The decision file
-# is written by the reviewer that just ran, so it always is. A formal review
-# is taken as "the last APPROVED one, whoever wrote it, on whatever commit" —
-# good enough to skip feedback, not to lift a parked PR.
-# $1 = PR number, $2 = this cycle's decision-file verdict
+# is written by the reviewer that just ran, but the author can push while it
+# runs, so it stands for the commit its worktree was cloned at and no later
+# one. A formal review is taken as "the last APPROVED one, whoever wrote it,
+# on whatever commit" — good enough to skip feedback, not to lift a parked PR.
+# $1 = PR number, $2 = this cycle's decision-file verdict, $3 = the SHA that
+# cycle's reviewer worktree was cloned at (empty when it could not be read).
 approval_is_current() {
-  local pr_num="$1" file_state="$2" head reviewed
-  [ "$file_state" = "APPROVED" ] && return 0
+  local pr_num="$1" file_state="$2" reviewed_sha="${3:-}" head reviewed
   head=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+  [ -n "$head" ] || return 1
+  if [ "$file_state" = "APPROVED" ] && [ "$reviewed_sha" = "$head" ]; then
+    return 0
+  fi
   reviewed=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json reviews \
     --jq '[.reviews[] | select(.state == "APPROVED")] | last | .commit.oid // empty' 2>/dev/null || true)
-  [ -n "$head" ] && [ "$head" = "$reviewed" ]
+  [ -n "$reviewed" ] && [ "$head" = "$reviewed" ]
 }
 
 # Lift what parking a recovery PR set, once the review gate has approved it.
@@ -3039,6 +3044,7 @@ $(printf '%s' "${blocked_ledger:-None recorded.}" | xml_escape)
     # exhausted reviewer against the same turn cap just spends the cap again.
     local _review_provider _total_review_attempts _review_attempt
     local _review_class="failed" _review_file_state="" _review_file_body=""
+    local _reviewed_sha=""
     _review_provider=$(resolve_provider REVIEWER)
     _total_review_attempts=$(transport_attempt_budget)
 
@@ -3048,6 +3054,9 @@ $(printf '%s' "${blocked_ledger:-None recorded.}" | xml_escape)
       review_out_dir=$(mktemp -d /tmp/alucard_review.XXXXXX)
       CREATED_WORKTREES+=("$wt_review" "$review_out_dir")
       make_agent_clone "$branch" "$wt_review" "$origin_url"
+      # The commit the reviewer actually reads. Its verdict is only ever an
+      # approval of this SHA: the author can push while the container runs.
+      _reviewed_sha=$(git -C "$wt_review" rev-parse HEAD 2>/dev/null || true)
 
       # First attempt keeps the unsuffixed name so the usage table's label for
       # the common case is unchanged; retries get a suffix, as the worker's do.
@@ -3147,10 +3156,10 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
       _unpark_note=""
       _pr_json=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json isDraft,labels,title,body 2>/dev/null || echo '{}')
       if [ "$_parked_marker" = true ]; then
-        if approval_is_current "$pr_num" "$_review_file_state"; then
+        if approval_is_current "$pr_num" "$_review_file_state" "$_reviewed_sha"; then
           _unpark_note=$(unpark_recovery_pr "$REPO_ABS" "$pr_num" "$_pr_json")
         else
-          log_event "Review gate: the approval on PR #$pr_num is a formal review of an older commit — leaving it parked."
+          log_event "Review gate: the approval on PR #$pr_num is not an approval of its current head — leaving it parked."
         fi
       fi
       if [ -n "$_unpark_note" ]; then

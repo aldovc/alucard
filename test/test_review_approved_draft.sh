@@ -76,6 +76,7 @@ git -C "$TARGET" checkout -q -b "$BRANCH"
 printf 'change\n' >> "$TARGET/README.md"
 git -C "$TARGET" commit -qam change
 git -C "$TARGET" push -q origin "$BRANCH"
+REVIEWED_SHA=$(git -C "$TARGET" rev-parse HEAD)
 git -C "$TARGET" checkout -q main
 
 # Reviewer and feedback containers. The reviewer (rw output mount) writes the
@@ -139,7 +140,7 @@ case "$1 $2" in
           *".commit.oid"*)     printf '%s\n' "${ALUCARD_TEST_FORMAL_OID:-}" ;;
           *)                   [ -n "${ALUCARD_TEST_FORMAL_STATE:-}" ] && printf 'formal review body\n' || printf '\n' ;;
         esac ;;
-      *headRefOid*)        printf 'deadbeef\n' ;;
+      *headRefOid*)        printf '%s\n' "$ALUCARD_TEST_PR_HEAD" ;;
       *)                   printf '{}\n' ;;
     esac ;;
   "api --silent")
@@ -173,6 +174,7 @@ reset_pr() {
   FORMAL_STATE=""
   FORMAL_OID=""
   LOGIN=alucard-bot
+  PR_HEAD="$REVIEWED_SHA"
 }
 
 run_continue() {
@@ -192,6 +194,7 @@ run_continue() {
   ALUCARD_TEST_FORMAL_STATE="$FORMAL_STATE" \
   ALUCARD_TEST_FORMAL_OID="$FORMAL_OID" \
   ALUCARD_TEST_LOGIN="$LOGIN" \
+  ALUCARD_TEST_PR_HEAD="$PR_HEAD" \
   ALUCARD_TRANSPORT_RETRY_ATTEMPTS=0 \
     "$ALUCARD" continue 77 "$TARGET" --no-build --max-review-cycles 1 \
       --env-file "$TEST_DIR/alucard.env" --logs-root "$TEST_DIR/logs" > "$TEST_DIR/out" 2>&1
@@ -294,7 +297,7 @@ FORMAL_STATE=APPROVED
 FORMAL_OID=0000000000000000000000000000000000000000
 run_continue
 assert_contains "the gate still approves" "Review gate: PR #77 approved" "$EVENTS"
-assert_contains "but says why it leaves the PR parked" "formal review of an older commit" "$EVENTS"
+assert_contains "but says why it leaves the PR parked" "not an approval of its current head" "$EVENTS"
 assert_untouched "stale approval"
 
 echo ""
@@ -302,10 +305,21 @@ echo "── APPROVED comes from a formal review of the current head ──"
 reset_pr
 VERDICT=""
 FORMAL_STATE=APPROVED
-FORMAL_OID=deadbeef
+FORMAL_OID="$REVIEWED_SHA"
 run_continue
 assert_contains "a current formal approval un-parks" "$READY_CALL" "$TRACE"
 assert_contains "and the label comes off" "$UNLABEL_CALL" "$TRACE"
+
+echo ""
+echo "── APPROVED, but the author pushed while the reviewer was running ──"
+# The decision file approves the snapshot the reviewer worktree was cloned at.
+# The live head has moved past it, so nothing about the new code is reviewed.
+reset_pr
+PR_HEAD=1111111111111111111111111111111111111111
+run_continue
+assert_contains "the gate still approves" "Review gate: PR #77 approved" "$EVENTS"
+assert_contains "but says why it leaves the PR parked" "not an approval of its current head" "$EVENTS"
+assert_untouched "head advanced under the reviewer"
 
 echo ""
 echo "── CHANGES_REQUESTED on a parked recovery PR ──"
