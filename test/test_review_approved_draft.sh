@@ -1,17 +1,10 @@
 #!/bin/bash
-# A recovery PR is parked: opened as a draft, labeled needs-human, marked with
-# a harness comment. When the review gate later approves it, the harness lifts
-# what it set — ready, label off, `Refs #N` to `Closes #N`, stub title replaced
-# by the ticket's. One approved recovery PR sat an hour looking gated on a
-# human until someone ran `gh pr ready` by hand (#97).
-#
-# The un-park must be keyed on a mark the harness's own account wrote and on an
-# approval of the current head: a marker comment from any other login, a
-# recovery-shaped title or body a PR author typed, a draft a developer keeps on
-# purpose, a needs-human some other path set, or a stale formal review must not
-# un-park anything. Every
-# other verdict leaves draft state and the label alone. Driven through
-# `alucard continue`, which reaches the review gate without the worker loop.
+# Covers un-parking a recovery PR on approval — ready, label off, `Refs #N` to
+# `Closes #N`, stub title replaced — and what must not un-park it: a marker
+# comment from another login, a recovery-shaped title or body, a needs-human or
+# draft the harness did not set, a stale approval, or any other verdict. Driven
+# through `alucard continue`, which reaches the review gate without the worker
+# loop.
 set -euo pipefail
 
 exec </dev/null
@@ -155,14 +148,12 @@ MOCK
 chmod +x "$MOCK_BIN/docker" "$MOCK_BIN/timeout" "$MOCK_BIN/gh"
 
 PARKED_MARK='[{"author":{"login":"alucard-bot"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft and labeled needs-human by the harness."}]'
-# The same marker text from somebody else. Any account with read access can
-# post it, so authorship is what the un-park keys on.
+# The same marker text, from an account that is not the harness's.
 SPOOFED_MARK='[{"author":{"login":"passer-by"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft and labeled needs-human by the harness."}]'
 STUB_TITLE='wip: alucard recovery — iter 1 (worker stopped: exhausted, rc=1)'
 STUB_BODY=$'Refs #534\n\n**🤖 Alucard recovery PR** — the worker ran out of turns (rc=1) before opening a PR.\n\nThis is not a finished change.'
 
-# The default scenario: a parked recovery PR exactly as the harness left it,
-# approved by this cycle's reviewer through its decision file.
+# Default scenario: a parked recovery PR, approved via the decision file.
 reset_pr() {
   VERDICT=APPROVED
   DRAFT=true
@@ -312,8 +303,7 @@ assert_contains "and the label comes off" "$UNLABEL_CALL" "$TRACE"
 
 echo ""
 echo "── APPROVED, but the author pushed while the reviewer was running ──"
-# The decision file approves the snapshot the reviewer worktree was cloned at.
-# The live head has moved past it, so nothing about the new code is reviewed.
+# The decision file approves the SHA the reviewer read; the live head has moved.
 reset_pr
 PR_HEAD=1111111111111111111111111111111111111111
 run_continue
