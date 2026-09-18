@@ -1,505 +1,442 @@
-# Alucard, autonomous worker loop
+# Alucard
 
-> **Experimental, personal project.** This is built for my own workflow and goals. It works for me but has no stability guarantees, no support commitment, and will change without notice. Use at your own risk.
+An unattended coding-agent loop that turns GitHub issues or local Markdown tasks into pull requests.
 
-## What it is
+Alucard picks one task, gives an agent an isolated clone in Docker, and runs implementation, CI repair, and code review. You come back to PRs to review and merge, plus explicit handoffs for work that needs you. It supports Claude Code and Codex, with a separate provider and model choice for each role.
 
-A containerized agent loop that picks work off a queue, completes it one item at a time in isolated git clones, opens PRs, and runs unattended. The queue is GitHub issues labeled `ready-for-agent`, or a [local tasks file](#local-task-source). `ready-for-human` is left for you. How work gets onto the queue is your business.
+This is an experimental personal project, built for my own workflow. Expect rough edges and breaking changes.
 
-1. **Tickets exist** on the target repo, labeled `ready-for-agent`. Write them by hand, or use whatever authoring skills you already have. `/to-spec` then `/to-tickets` is one optional path, derived from [mattpocock/skills](https://github.com/mattpocock/skills).
-2. **Alucard runs unattended.** It pulls the ready-for-agent queue, picks one, implements, tests, commits, opens a PR, and repeats until the queue is empty or the iteration cap is hit.
-3. **CI gate.** After a PR is opened, Alucard polls CI and launches a fix agent (up to 3 attempts) if checks fail.
-4. **Review gate.** A reviewer agent evaluates the PR, then a feedback agent addresses findings, repeating up to `--max-review-cycles` times (default 10). The loop ends early on `APPROVED` or `BLOCKED`. See [Loop convergence](#loop-convergence).
-5. **You review PRs when you check back** and merge what's good.
+[Get started](#get-started) · [Commands](#commands) · [Local tasks](#local-task-source) · [Configuration](#configuration) · [Recovery](#when-a-run-needs-you)
 
-Before the first iteration, a **toolchain preflight** checks that the container can actually install the target repo's dependencies: every `pyproject.toml` (`uv sync`) and `package-lock.json` (`npm ci`) at the repo root or one level down, each verified in its own directory. Alucard prints the result at startup, saves it to `toolchain-preflight.txt` in the log directory, and hands it to every worker, reviewer, and feedback agent, naming each install and where it belongs.
+## How it works
 
-An OK preflight verifies dependency installation only. It does not mean tests ran or that services and credentials are available. Agents follow the project's documented local verification workflow and any explicit assignment of service-backed checks to CI, reporting local results and unrun checks separately. Required local checks and required CI must still pass.
-
-Preflight also handles **Playwright browsers**. Every container shares one browser directory on the host, under `~/.cache/alucard/playwright-browsers`, seeded once from the copy baked into the image. Preflight then asks the target repo's own pinned Playwright to install what it wants — that is the one moment the repo's `node_modules` exists, so it is the only place that knows which revision to fetch. Without this a repo pinning a different Playwright version downloads a full browser inside every iteration, because Playwright keys its browsers by an internal revision number and each release pins exactly one. When the repo's pin and the image's disagree, preflight says so; the repo can align its pin to stop carrying a second revision. Deleting the cache directory is safe and is how you prune it.
-
-The build stamps the image with a hash of the `Dockerfile` and `entrypoint.sh` that produced it, and rebuilds automatically when they change. An existing tag is not proof the image is current. A Dockerfile fix sitting inert behind a cached tag is how the toolchain stayed broken for 25 review cycles. `--no-build` warns instead of rebuilding.
-
-Alucard never pushes to main. Each iteration produces an independent PR.
-
-## Flow
+1. Add small, well-defined tasks to the queue. Use GitHub issues labeled `ready-for-agent`, or a local tasks file.
+2. Run `alucard run`. A worker implements one task, verifies its changes, commits, and opens a PR.
+3. Alucard checks CI and runs a fix agent when checks fail. A reviewer then evaluates the PR, and a feedback agent addresses actionable findings.
+4. The loop moves to the next task until the queue is empty or the iteration limit is reached. Review stops on approval, a human blocker, a failed feedback attempt with no pushed changes, or the review-cycle limit.
+5. You inspect the PRs and merge them. Alucard's agents are instructed to work on branches and never push to `main`; Alucard does not merge PRs.
 
 ```mermaid
 flowchart TD
-    A[Open GitHub tickets] --> D{Label?}
-    D -->|ready-for-human| E[Operator handles when they check back]
-    D -->|ready-for-agent| F[ready-for-agent queue]
-    D -->|other / none| E
-
-    F --> G[alucard run<br/>unattended loop]
-    G --> H[Pick next ready-for-agent ticket,<br/>label in-progress]
-    H --> I[Spin up isolated container<br/>+ disposable worktree]
-    I --> J[Worker agent: implement,<br/>test, commit]
-    J --> K[Open PR]
-
-    K --> L{CI passes?}
-    L -->|no| M[Fix agent<br/>up to 3 attempts]
-    M --> L
-    L -->|yes| N[Reviewer agent]
-    N --> O{Findings?}
-    O -->|yes, cycles left| P[Feedback agent<br/>addresses findings]
-    P --> N
-    O -->|no, or max cycles hit| Q[PR ready for human]
-
-    Q --> R[Loop: next iteration<br/>until queue empty / cap hit]
-    R --> G
-    Q --> S[Operator reviews and merges<br/>when they check back]
+    A[GitHub issues or local tasks] --> B[Pick one eligible task]
+    B --> C[Worker in Docker: implement, verify, open PR]
+    C --> D[CI checks and bounded repair attempts]
+    D --> E[Reviewer]
+    E --> F{Review outcome}
+    F -->|Actionable changes, cycles left| G[Feedback agent]
+    G -->|Changes pushed or completed successfully| D
+    G -->|Failed without pushing| H[Human handoff]
+    F -->|Approved| I[PR ready for human review]
+    F -->|Blocked, no verdict, or limit reached| H
+    C -->|Stopped with work but no PR| J[Wrap-up and draft recovery PR]
+    J --> H
+    I --> L[Human reviews and merges]
+    I --> K[Next eligible task]
+    H --> K
+    K --> B
 ```
 
-## Architecture
+Each task starts from the configured base branch. Dependencies wait for their blockers to finish, so a run can empty its eligible queue while PRs still await your review or merge.
 
-- **CLI / host orchestrator** (`alucard`). Bash CLI that loops, manages isolated git clones on the host, queries the GitHub issue queue, and shells out to `docker run` per iteration.
-- **Container** (Dockerfile + entrypoint). Disposable per agent run. Opinionated personal image: Node 24, git, gh, uv, just, Python 3.12, Claude Code, Codex, shellcheck, and build-essential (native extensions). Extend it with a local image (`alucard build --image …` / `ALUCARD_IMAGE`), not by shrinking the published one. Worker, CI-fix, reviewer, and feedback each get their own container.
-- **Agent prompts.** One file per role: `alucard-worker-prompt.md` (main worker, mode-agnostic core, assembled at dispatch with `alucard-worker-github-prompt.md`, `alucard-worker-github-issue-prompt.md`, or `alucard-worker-local-prompt.md` depending on the task source), `alucard-reviewer-prompt.md` (code reviewer), `alucard-ci-fix-prompt.md` (CI failure fixer), `alucard-feedback-prompt.md` (review feedback handler). Worker, reviewer, and feedback also get `alucard-engineering-policy.md`, one shared fragment holding the solution, test, and change-request policy those three roles must agree on. CI-fix does not: its own prompt already forbids touching anything outside the failing check, and shared policy could only loosen that.
-- **Repository review policy.** If the target repository has a `REVIEW.md` at its root, it is injected into the reviewer and feedback prompts as `<review_policy>`: extra review passes, a severity threshold, classes of finding the repo does not want raised. It is capped at 16 KB (`REVIEW_POLICY_MAX_BYTES`) and truncated with a marker rather than dropped. It is repo-authored, so it is treated as untrusted: it can refine what gets flagged and how it is graded, but it cannot lift the reviewer's contract, change the verdicts or output format, or instruct an approval. Repositories without the file are unaffected.
-- **Turn budget.** Each role runs under a `--max-turns` cap (`ALUCARD_WORKER_MAX_TURNS` and friends). The number is injected into that role's prompt as `<turn_budget>`, and the role prompts say what to do as it runs low: bank committed work and say what remains, rather than stopping mid-action. `--max-turns` is a Claude flag, so a codex-backed role gets no block — nothing there enforces a cap. Runs that could not see the number all exhausted it without ever signalling, losing whatever was uncommitted.
-- **Queue.** GitHub issues labeled `ready-for-agent`, or a [local tasks file](#local-task-source). Authoring skills are not part of the runner.
+## Get started
 
-## Loop convergence
+### Prerequisites
 
-The review gate can end five ways:
+- A host with Bash, `git`, `gh`, `jq`, GNU `timeout`, and `sha256sum`. Linux is the simplest setup.
+- Docker running and accessible to your user without `sudo`.
+- `gh auth login` for host-side repository access.
+- A GitHub repository with at least one commit on `main`, or another branch selected with `--base`.
+- A GitHub token and an API key for each agent provider you use.
 
-| Verdict | What it means | What happens |
-|---|---|---|
-| `APPROVED` | Nothing merge-blocking left. | Loop ends, PR ready to merge. |
-| `CHANGES_REQUESTED` | Merge-blocking issues **a feedback agent can fix in the container**. | Feedback agent runs, then the next cycle. |
-| `BLOCKED` | Code work is done; merge is gated on something no agent can do, a human-only acceptance criterion, a live deploy, a credential the container does not hold. | Loop ends, PR labeled `needs-human`, reviewer's reasoning posted. |
-| *(cycles exhausted)* | The loop hit `--max-review-cycles`. | PR left open for manual review. |
-| *(no verdict)* | The reviewer produced neither a formal review nor a `.alucard-review` file — it ran out of turns or budget, wedged, or lost its connection on every attempt. | Loop ends, PR labeled `needs-human`, with the failure class and what to raise. A transport drop is retried first (`ALUCARD_TRANSPORT_RETRY_ATTEMPTS`). |
+Install `flock` from `util-linux` if you plan to run multiple Alucard processes against the same repository. Alucard uses it to serialize writes to the shared clone.
 
-Without `BLOCKED`, the loop had only two ends: approval or exhaustion. A finding no agent could act on was re-reported until the budget ran out. One real run is the failure mode this fixes: 25 review cycles across 4 runs, ~20 of them re-reporting the same "run the scheduled job manually and attach production evidence" finding into a container that had no way to do either. Zero approvals. The feedback agent eventually drifted into rewriting unrelated production logic, because that was the only thing it *could* change.
-
-A no-verdict cycle used to `return 0` after a one-line "no review posted (rc=N)" comment, so a PR that was never reviewed looked the same as one that passed every gate — one PR hit this when the reviewer exhausted its 20-turn cap mid-orientation. It is now labeled `needs-human` like any other outcome a human has to pick up, and the reviewer's turn cap defaults to 45.
-
-Three mechanisms keep the loop converging:
-
-- **Blocked-findings ledger.** When the feedback agent hits a finding it cannot action, it writes `/work-output/.alucard-blocked` instead of posting a "blocked" comment. The harness posts that once as a `**🤖 Alucard blocked findings**` marker comment and feeds it to every later reviewer as `<known_blockers>`. Reviewers are told not to re-report those. The harness reloads the ledger from the PR at the start of each run, so a re-run does not rediscover it.
-- **Reviewers read the conversation.** Each reviewer reads prior cycles' findings and the feedback agent's replies before judging, so they don't raise a finding that's already fixed or already recorded as blocked, just at a new line number.
-- **Toolchain status.** Every agent is told which dependency installs work in the container and in which directory. Workers and feedback agents run them before verifying; reviewers, when an install fails, review the tests as written but do not demand test *output* no agent on the PR could produce.
-
-## When the worker stops without a PR
-
-A worker that runs out of turns, hits the iteration timeout, wedges, or fails before `gh pr create` leaves a worktree the harness is about to delete. Recovery commits whatever is there, pushes the branch, and opens a draft PR titled `wip: alucard recovery`, labeled `needs-human`. Its body says what the branch is (unverified, possibly mid-edit) and what each next step does. When the review gate later approves that PR, the harness lifts what it set: the draft becomes ready, `needs-human` comes off, `Refs #N` becomes `Closes #N`, and the stub title is replaced by the ticket's. It recognises its own recovery PRs by a marker comment posted at parking, so a draft or a label anyone else set is left alone, and it acts only on an approval of the current head.
-
-Before the mechanical steps, a worker that ran out of turns or failed with work in its worktree gets a **wrap-up agent**: a second, short agent (`ALUCARD_WRAPUP_MAX_TURNS`, default 12; `0` disables it) in the same worktree, given the ticket, how the worker stopped, and the worker's own last narration from its log. It commits the leftovers with messages that say what they are and writes a handoff — done, remaining, unverified, next step — that the recovery PR body carries under "Handoff from the wrap-up agent". It does not push, open the PR, or touch the ticket; the harness does those once, whether or not the agent finishes, and commits anything it left uncommitted. The recovery PR that prompted this held two hours of backend work under one `wip: alucard recovery` commit and a body that could say nothing about it.
-
-That PR is the only thing holding the ticket. The worker's `in-progress` label comes off, the PR body says `Refs #N` rather than `Closes #N`, and the ticket gets a comment pointing at the PR. A run pinned with `--issue N` attributes the PR to that ticket even when the worker never got as far as labelling it. The morning-after decision is one action: finish the branch on the PR, or close the PR and the ticket rejoins the queue on the next run (or `alucard run --issue N` to start a fresh attempt right away). `alucard continue <PR>` runs the CI and review gates on the branch as it stands; it does not resume implementation.
-
-The last lines of a run list everything it parked this way. "Run end: queue empty" is followed by a "Needs attention" list whenever the queue is empty because a recovery PR holds a ticket, or because the worker took one off the queue. In GitHub queue mode a worker that judges a ticket too large for one iteration comments a proposed split on it and moves it from `ready-for-agent` to `ready-for-human` rather than attempting it. Before that rule, two iterations in a row judged the same ticket too large, picked something else, and kept the judgment in their logs; the third had nothing else to pick, attempted it, and exhausted its budget with nothing committed.
-
-## Several runs on one repository
-
-More than one `alucard` process may work on the same repository at once: `alucard continue` on several PRs, or `alucard run --issue N` for several issues. Each process gets its own worktree root under the repository and its own log directory, each claimed atomically, so two runs that start in the same second — even with different `--logs-root` values — never share either. Git writes to the shared cached clone under `~/.cache/alucard` — the startup fetch, each agent's branch fetch and local clone — take turns under a file lock next to the clone (`flock`; without it they run unlocked, with a warning). Before this, four `continue` processes started a second apart minted the same iteration id, cloned into each other's worktree, and the first to finish deleted a worktree another was still using.
-
-What is not coordinated is the GitHub queue itself: two `alucard run` processes without `--issue` can both pick the same ticket before either has labelled it `in-progress`. Run parallel workers with `--issue`, one ticket each.
-
-Two guards make a lost worktree a harness event rather than an agent's finding. The container's entrypoint checks that its checkout is a git repository before starting the agent, and exits with a code the harness maps to a fresh worktree: workers and reviewers get another attempt within their transport retry budget, then the stop is reported as a harness fault (the reviewer's "no review posted" comment says so; a worker's ticket rejoins the queue). And every container gets `GH_REPO=owner/repo`, so `gh` inside it never depends on the checkout's remote — a reviewer that once found `/work` empty ran `gh pr view` against no remote, failed, and wrote the failure up as a high-severity human block.
-
-## Threat model and safety design
-
-**The risk.** `claude` runs in `bypassPermissions` mode, no prompts, full tool access, so the agent doesn't get stuck mid-run on a missing tool permission. Without isolation, a confused or prompt-injected agent could `rm -rf` your home directory or exfiltrate credentials.
-
-**The defenses, layered.**
-
-1. **Kernel boundary (primary).** Docker container with `--read-only` root, `--cap-drop ALL`, `--security-opt no-new-privileges`, dedicated unprivileged user. Filesystem damage stays inside the bind-mounted worktree. The host's `/home`, `/etc`, dotfiles, and other repos are unreachable.
-2. **Resource caps.** `--memory 4g --cpus 2`. A runaway loop can't OOM the host.
-3. **Disposable worktrees.** Each iteration gets a fresh worktree at `${REPO}/.alucard-worktrees/<run>/iter-N`, where `<run>` is the name of that run's log directory, with the pid appended if another run already holds that name under this repository. The orchestrator removes it after each iteration. An `EXIT` trap handles interrupted runs, and removes only that run's own directory.
-4. **PR-only output.** The agent never pushes to main. Branch protection on main as belt-and-suspenders.
-5. **Credential scoping.** GitHub token is a fine-grained PAT, single repo, 30-day expiry. Anthropic and OpenAI keys are dedicated worker keys with a monthly budget cap set in the console.
-6. **Pattern blacklist (last line).** `--disallowedTools` removes obvious foot-guns like `rm -rf /*`, `sudo`, `curl | sh`. Pattern-matching is leaky but cheap.
-7. **Hard caps per iteration.** Worker: `--max-turns 180`, `--max-budget-usd 10`, `timeout 30m`. CI-fix 30/$2, reviewer 45/$2, feedback 50/$2. All except the timeout are overridable via `ALUCARD_*` env vars. See `alucard.env.example`.
-
-The image is stamped with a `alucard.build-inputs` label — a digest of `Dockerfile` + `entrypoint.sh`. Every run compares it and rebuilds when it drifts, so a Dockerfile fix cannot sit inert behind a cached tag. A rebuild also removes the image it supersedes, which would otherwise be orphaned as ~1.6GB of dangling layers; the old image is kept if another tag still points at it, if the rebuild was fully cached (same image ID), or if the build failed.
-
-**What's still possible.** Credential exfiltration via network, bounded by token scoping. Worst case, an attacker gets push access to one repo for up to 30 days. Recoverable.
-
-## File layout
-
-```
-alucard/
-├── README.md                    # this file
-├── alucard                      # CLI
-├── Dockerfile                   # node:24.14.0-slim + git + gh + uv + just + Python 3.12 + claude/codex + alucard user
-├── entrypoint.sh                # configures git identity and gh auth at container start
-├── alucard-worker-prompt.md     # worker agent instructions (mode-agnostic core)
-├── alucard-worker-github-prompt.md  # worker mode section: GitHub tickets queue
-├── alucard-worker-github-issue-prompt.md  # worker mode section: pinned GitHub issue
-├── alucard-worker-local-prompt.md   # worker mode section: local tasks file
-├── alucard-reviewer-prompt.md   # reviewer agent instructions
-├── alucard-ci-fix-prompt.md     # CI-fix agent instructions
-├── alucard-feedback-prompt.md   # review-feedback agent instructions
-├── alucard-engineering-policy.md    # shared policy fragment: worker, reviewer, feedback
-├── alucard.env.example          # template for credentials (real one is gitignored)
-├── test/                        # bash unit tests — `for t in test/*.sh; do bash "$t"; done`
-├── .claude/skills/to-tickets/   # optional authoring helper, not required to run
-└── .gitignore                   # ignores alucard.env and logs/
-```
-
-The target repo (the one Alucard works on) needs:
-
-```
-target-repo/
-├── .gitignore                   # add: .alucard-worktrees/
-└── (your code)
-```
-
-Alucard lives in its own folder so you can reuse it across projects. Point the CLI at a target repo with a positional path, `--repo`, or `ALUCARD_TARGET_REPO`. The target repo does not need Alucard skills installed.
-
-## Local task source
-
-GitHub issues are the default queue. Alucard can also read tasks from a plain markdown file. No issue tracker, no per-repo labels, no `Issues` PAT scope. Useful for personal repos where opening a GitHub issue per planning slice is more ceremony than the work deserves.
-
-### Format
-
-One file per plan, by default `.alucard/tasks.md` inside the target repo. Gitignored. A host-side ledger, never committed or pushed. Everything above the first task heading is the plan's shared **parent context**. Alucard injects it verbatim into every worker and reviewer prompt, so individual tasks stay terse without drifting from the plan. Each `## [<state>] <id>: <title>` heading starts a task. Everything until the next task heading is its free-form body.
-
-States:
-
-| State | Meaning |
-|-------|---------|
-| `[ ]` | Queued, eligible for the next iteration |
-| `[>]` | PR in flight. The harness appends `(PR #N)` to the title when it dispatches the task |
-| `[x]` | Done |
-| `[h]` | Human task (`ready-for-human`). Never queued, but kept in the file so the whole plan lives in one artifact |
-
-A task can declare dependencies with a bare `Blocked by:` line in its body, comma-separated task ids, or `none`. The harness also honors the legacy `Blocked by #N` GitHub-issue form. An open blocker issue keeps the task blocked. File order is queue order. Reprioritizing is moving lines, not relabeling.
-
-**Worked example** (`.alucard/tasks.md`):
-
-```markdown
-# Widget export — CSV and JSON
-
-Ship a CSV/JSON export for the widget list. Reuse the existing
-`/api/widgets` endpoint; no new query params beyond `format`.
-
-## [ ] 1: Add `format` query param and CSV/JSON serializers
-
-## What to build
-
-Extend `/api/widgets/export` to accept `?format=csv|json`.
-
-## Acceptance criteria
-
-- [ ] `?format=json` returns the existing JSON shape unchanged
-- [ ] `?format=csv` returns a CSV with a header row
-
-Blocked by: none
-
-## [h] 2: Decide whether export is rate-limited
-
-Large lists could make this endpoint expensive — cap, paginate, or rate-limit?
-
-Blocked by: none
-
-## [ ] 3: Add a "Download" button
-
-Blocked by: 1
-```
-
-`alucard queue` against this file returns exactly task `1`. Task `2` is human (never queued) and task `3` stays blocked until task `1` reaches `[x]`.
-
-### Flags and auto-detection
-
-- `--tasks PATH` / `ALUCARD_TASKS_FILE` uses this tasks file instead of the GitHub queue.
-- Auto-detect: with neither flag set, `alucard` looks for `.alucard/tasks.md` in the target repo and switches to it automatically.
-- `--github` forces the GitHub issue queue even when a local tasks file is present or configured. Combining `--tasks` and `--github` is an error.
-- `--issue N` runs exactly one iteration on open GitHub issue N and forces the GitHub task source, including when `.alucard/tasks.md` would auto-detect. Combining `--tasks` and `--issue` is an error. `queue`, `doctor`, and `continue` reject `--issue`.
-- `alucard doctor` validates the file structurally (duplicate ids, dangling `Blocked by:` references, empty header, malformed headings) with line numbers, before a run ever starts.
-
-### Lifecycle / morning-after flow
-
-- Each iteration, the harness picks the first eligible (`[ ]`, unblocked) task itself and hands the worker exactly that one task plus the parent context. There is no queue to pick from, so bundling is structurally impossible.
-- There is no claim/label step in local mode, and no `in-progress` label. Runs are sequential, so nothing else can grab the same task mid-run. Local task blockers should use task ids (`Blocked by: 1, 2`). Legacy `Blocked by #N` issue blockers still require `gh issue view` access so open GitHub issues can keep tasks blocked.
-- When a PR opens, the harness flips the task's heading from `[ ]` to `[>] … (PR #N)`. One atomic line edit.
-- The PR body's first line is `Task: <id>`, never a GitHub closing keyword. Task ids aren't issue numbers, and a stray `Closes #N` would close an unrelated issue in the target repo.
-- At queue build, the harness reconciles `[>]` headings against GitHub. Merged PRs flip to `[x]` and keep `(PR #N)`. Closed unmerged PRs flip back to `[ ]` with `(previous attempt: PR #N)`, so the task rejoins the queue. Open PRs are left alone. A `gh` failure leaves the file untouched.
-- `alucard queue` shows exactly what the next iteration would pick up. The file doubles as the morning-after dashboard.
-
-### Reduced PAT scope
-
-Local mode can run without the GitHub Issues API when local tasks use task-id blockers exclusively (`Blocked by: 1, 2`). In that case, the fine-grained PAT described in [Credentials to provision](#credentials-to-provision) needs only Contents R/W, Pull requests R/W, and Metadata R. Drop `Issues R/W`. If any local task uses the legacy `Blocked by #N` GitHub-issue form, keep Issues read access so the queue can resolve whether that issue is still open.
-
-## Setup checklist for the new folder
-
-### Prerequisites on the host
-
-- Docker installed and the user in the `docker` group (or `sudo` available)
-- `git`, `gh`, `jq` installed on host (host orchestrator uses them for queue inspection)
-- `gh auth login` already done as the human user (separate from the container's auth)
-- The target repo cloned locally with at least one commit on `main` and a remote on GitHub
-
-### Install the CLI
+### Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | bash
 ```
 
-This clones the repo into `~/.local/share/alucard`, symlinks the `alucard` CLI into `~/.local/bin`, and writes a credential template to `~/.local/share/alucard/alucard.env`. Override defaults with env vars:
+The installer clones Alucard into `~/.local/share/alucard`, links the CLI into `~/.local/bin`, and creates `alucard.env` from the example if it does not already exist. Add `~/.local/bin` to your `PATH` if needed. Re-run the installer to update.
+
+For a different installation directory, pass the variables to the shell running the installer:
 
 ```bash
-ALUCARD_HOME=~/tools/alucard ALUCARD_BIN_DIR=~/bin curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh \
+  | ALUCARD_HOME="$HOME/tools/alucard" ALUCARD_BIN_DIR="$HOME/bin" bash
 ```
 
-Re-run the same command to update an existing install.
-
-The rest of this README uses `$ALUCARD_HOME` for the install path (`~/.local/share/alucard` by default).
-
-Use it from anywhere:
-
-TARGET_REPO can be a local path, `owner/repo` (cloned into `~/.cache/alucard` on first run), or a GitHub HTTPS URL.
+The examples below use the default location:
 
 ```bash
-alucard run /path/to/target-repo --iterations 1 --timeout-minutes 10
-alucard queue /path/to/target-repo
-alucard doctor /path/to/target-repo
-alucard continue 174 /path/to/target-repo
+export ALUCARD_HOME="$HOME/.local/share/alucard"
 ```
 
-### Credentials to provision
+### Configure credentials
 
-Create the local env file:
+Edit `$ALUCARD_HOME/alucard.env`. For the default Claude setup, fill in:
 
-```bash
-cp "$ALUCARD_HOME/alucard.env.example" "$ALUCARD_HOME/alucard.env"
+```dotenv
+GITHUB_TOKEN=your-github-token
+ANTHROPIC_API_KEY=your-anthropic-api-key
 ```
 
-1. **GitHub fine-grained PAT.**
-   - github.com → Settings → Developer settings → Personal access tokens → Fine-grained
-   - Repository access: only the target repo
-   - Permissions: Contents R/W, Issues R/W, Pull requests R/W, Metadata R
-   - Expiry: 30 days
-   - Paste into `alucard.env` as `GITHUB_TOKEN=`
-   - Fine-grained PATs cannot access the GitHub GraphQL `statusCheckRollup` field. GitHub has not shipped a "Checks" permission for fine-grained tokens ([known limitation](https://github.com/cli/cli/issues/12597)) — there is no grant to add. Alucard probes once per run and, when the surface is closed, uses `gh run list` for the rest of the run without retrying the failed call. If you want the primary `gh pr checks --watch` path, use a classic PAT with `repo` scope instead.
-   - **Local task source.** Running a repo exclusively off a [local tasks file](#local-task-source) instead of GitHub issues needs only Contents R/W, Pull requests R/W, Metadata R. Drop `Issues R/W` only when local tasks use task-id blockers exclusively. Keep Issues read access for legacy `Blocked by #N` issue blockers.
+Use a fine-grained GitHub PAT restricted to the target repository, with these repository permissions:
 
-2. **Anthropic worker API key.**
-   - console.anthropic.com → API keys → create new key named "alucard-worker"
-   - In the workspace settings, set a monthly spend cap (e.g. $50)
-   - Paste into `alucard.env` as `ANTHROPIC_API_KEY=`
-   - Default provider is Claude (`ALUCARD_PROVIDER` unset or `claude`).
+| Permission | Access | Used for |
+|---|---|---|
+| Contents | Read and write | Fetching and pushing branches |
+| Issues | Read and write | Reading, claiming, and updating GitHub tasks |
+| Pull requests | Read and write | Opening PRs and posting review results |
+| Actions | Read | Reading workflow runs and failed-job logs |
+| Metadata | Read | Repository metadata |
 
-3. **OpenAI API key**, only if any role uses Codex.
-   - Set `ALUCARD_PROVIDER=codex`, or a per-role override (`ALUCARD_WORKER_PROVIDER`, `ALUCARD_REVIEWER_PROVIDER`, and so on).
-   - Paste into `alucard.env` as `OPENAI_API_KEY=`
-   - Model defaults to `gpt-5.6-terra` via `ALUCARD_CODEX_MODEL`.
+Local tasks using only task-id dependencies can omit Issues access. Legacy `Blocked by #N` references still need Issues read access. Use short-lived tokens and dedicated provider keys with spending limits set in the provider console.
 
-### One-time setup commands in target repo
+If the token cannot access the PR checks API, Alucard falls back to `gh run list` for that run. That path needs Actions read access. If no checks or current-commit workflow runs are visible after polling, Alucard logs a skip and proceeds to review. A skipped CI gate is not evidence that tests passed.
 
-```bash
-# Add gitignores
-cat >> .gitignore <<'EOF'
-.alucard/tasks.md
+For Codex, set `ALUCARD_PROVIDER=codex` and `OPENAI_API_KEY` in the env file. You only need `ANTHROPIC_API_KEY` when at least one role uses Claude. See [Configuration](#configuration) for mixed-provider setups.
+
+### Prepare the target repository
+
+Alucard lives outside the repository it works on. It accepts a local clone, `owner/repo`, or a GitHub HTTPS URL. GitHub references are cloned into `~/.cache/alucard` on first use.
+
+Add these entries to the target repository's `.gitignore`:
+
+```gitignore
 .alucard-worktrees/
-EOF
+.alucard/tasks.md
+```
 
-# Create labels
-for L in ready-for-agent ready-for-human in-progress wip alucard; do
-  gh label create "$L" --force
+For the GitHub issue queue, create the labels once. Replace `owner/repo` with your repository:
+
+```bash
+for label in ready-for-agent ready-for-human in-progress wip alucard needs-human; do
+  gh label create "$label" --repo owner/repo --force
 done
-
-# Branch protection on main (via gh or GitHub UI):
-# Require PR, require status checks, no direct pushes
-gh api -X PUT "repos/{owner}/{repo}/branches/main/protection" \
-  --input - <<'EOF'
-{
-  "required_status_checks": null,
-  "enforce_admins": false,
-  "required_pull_request_reviews": {"required_approving_review_count": 0},
-  "restrictions": null
-}
-EOF
 ```
 
-### Authoring tickets (optional)
+Configure branch protection in GitHub to enforce your merge requirements. All agent roles currently share one GitHub identity, so an agent's `APPROVED` verdict is recorded in a comment when GitHub rejects self-review. It does not satisfy a required approval from another reviewer.
 
-Alucard never invokes a planning skill. A hand-written `gh issue create --label ready-for-agent` is enough, which is what the smoke test below does.
+### Run your first task
 
-If you want help writing the spec and breaking it into tickets, `/to-spec` then `/to-tickets` (from [mattpocock/skills](https://github.com/mattpocock/skills), or the copy under `.claude/skills/to-tickets` in this repo) is a suggested path, not a requirement. Use them, ignore them, or use something else. The runner only sees labels.
-
-### First smoke test
+Build the image and check the setup:
 
 ```bash
-# Pull the pre-built image (default path)
-docker pull ghcr.io/aldovc/alucard:latest
-
-# Create one trivial ready-for-agent ticket manually for the test
-cd /path/to/target-repo
-gh issue create --label ready-for-agent \
-  --title "Add a CHANGELOG.md" \
-  --body "## Type
-ready-for-agent
-
-## What to build
-Create a CHANGELOG.md at repo root with a Keep a Changelog template.
-
-## Acceptance criteria
-- [ ] CHANGELOG.md exists at repo root
-- [ ] Contains 'Unreleased' section header
-- [ ] Linked from README.md
-
-## Blocked by
-None — can start immediately"
-```
-
-```bash
-# Run one iteration with a 10-min cap and watch
-"$ALUCARD_HOME/alucard" run /path/to/target-repo -n 1 -t 10
-```
-
-If a PR appears within 10 minutes, the setup works. If not, check `$ALUCARD_HOME/logs/alucard-*/iter-1.jsonl` for what the agent saw and did.
-
-**Local/custom image.** If you need to modify the container, build locally and point Alucard at it:
-
-```bash
-# Build a local image with an explicit tag
-"$ALUCARD_HOME/alucard" build --image myproject/alucard:dev
-
-# Override the image for this run (or export it permanently)
-ALUCARD_IMAGE=myproject/alucard:dev alucard run /path/to/target-repo -n 1 -t 15
-```
-
-`ALUCARD_IMAGE` overrides the default (`ghcr.io/aldovc/alucard:latest`) for any `alucard run` invocation.
-
-## Open questions for the setup agent
-
-These are choices the operator hasn't locked yet. Surface them rather than guessing:
-
-1. **Project toolchain in the Dockerfile.** Decided: keep an opinionated personal image (Node, git, gh, uv, just, Python 3.12, Claude Code, Codex, shellcheck, build-essential). That is enough for the repos this tool actually runs against. A different toolchain is a local image via `alucard build --image …` / `ALUCARD_IMAGE`, not a slimmer public base.
-2. **Branch protection enforcement.** Do you want admin enforcement on, or off so you can hotfix? Default off is fine for solo work.
-3. **Notification on completion.** Currently the loop just exits. You might want a Telegram/Discord ping when the run finishes.
-4. **Concurrent iterations.** Current design is sequential, one container at a time. If you want parallel workers picking different issues, the `in-progress` label coordination needs to handle race conditions (gh API isn't atomic for label-add). Don't add unless asked.
-5. **Two-identity reviewer (deferred).** Right now the worker, reviewer, fix, and feedback agents all share one `GITHUB_TOKEN`. GitHub blocks formal `gh pr review --approve` / `--request-changes` when the PR author and reviewer are the same identity (this is a hardcoded product rule, not configurable in branch protection, repo, or org settings). Consequence: the reviewer can only post audit comments via the shell wrapper, which don't satisfy branch-protection "require N approvals" rules. To enable real approval-gated merging, split into two identities:
-   - `GITHUB_TOKEN` (worker). Opens PRs, pushes commits, comments on issues. Used by worker, fix, and feedback agents.
-   - `GITHUB_REVIEWER_TOKEN` (reviewer). Separate PAT or GitHub App installation token, scoped to PR-read + PR-review write on the target repo. Used only by the reviewer agent's container.
-
-   Plumbing sketch when implemented:
-   - Add `GITHUB_REVIEWER_TOKEN=` to `alucard.env.example` and the docs above.
-   - In `alucard`, the reviewer `docker run` block (around the `--name "alucard-review-…"` invocation) overrides `GITHUB_TOKEN` with the reviewer token: drop `--env-file` for `GITHUB_TOKEN` and pass `-e GITHUB_TOKEN="$GITHUB_REVIEWER_TOKEN"` explicitly. Worker/fix/feedback blocks stay unchanged.
-   - Restore `gh pr review --approve` / `--request-changes` as primary in `alucard-reviewer-prompt.md` (the dedup logic in the shell already prefers a formal review over the decision file).
-   - Remove the defensive comment at `alucard:679-686` that distrusts file-based APPROVED. Once formal reviews work, the file fallback is no longer the only path.
-
-## Quick-reference commands
-
-```bash
-# Pull the latest pre-built image
-docker pull ghcr.io/aldovc/alucard:latest
-
-# Build a local custom image (stamps the staleness label, drops the image it supersedes)
 alucard build
+alucard doctor owner/repo
+```
 
-# Run unattended (20 iterations max, 30 min each) — uses ghcr.io/aldovc/alucard:latest by default
-alucard run /path/to/target-repo -n 20 -t 30
+Create a small issue, such as adding a changelog to a repository that does not have one:
 
-# Run one iteration to test
-alucard run /path/to/target-repo -n 1 -t 15
+```bash
+gh issue create --repo owner/repo --label ready-for-agent \
+  --title "Add a changelog" \
+  --body 'Add CHANGELOG.md at the repository root with an Unreleased section.
+Link it from README.md. No application behavior should change.'
+```
 
-# Run one open GitHub issue, then stop
-alucard run /path/to/target-repo --issue 90
+Use the issue number returned by GitHub:
 
-# Check what's in the queue right now
-alucard queue /path/to/target-repo
+```bash
+alucard run owner/repo --issue 123 --timeout-minutes 15
+```
 
-# Run against a local tasks file instead of GitHub issues
-alucard run /path/to/target-repo --tasks /path/to/target-repo/.alucard/tasks.md -n 1 -t 15
+`--issue` runs exactly one open GitHub issue, regardless of queue labels or local-task auto-detection. It is useful for a first run or a deliberate retry.
 
-# Validate a tasks file (duplicate ids, dangling blockers, malformed headings)
-alucard doctor /path/to/target-repo
+The console streams agent activity and prints the log directory. Inspect the resulting PR, its CI status, and Alucard's review comments. The timeout applies to each agent invocation, so the complete implementation and review pipeline can take longer than 15 minutes.
 
-# Re-run feedback, CI, and review on a parked PR
-alucard continue 174 /path/to/target-repo
+## Commands
 
-# Manually un-stick an issue if Alucard crashed mid-task
-gh issue edit <N> --remove-label in-progress
+```bash
+# Inspect the eligible queue as JSON
+alucard queue owner/repo
 
-# Prune leftover clones if the orchestrator was hard-killed (each run's are
-# under a directory named after its log dir; leave any run still going)
-rm -rf .alucard-worktrees/
+# Work through the queue, up to 20 iterations
+alucard run owner/repo --iterations 20 --timeout-minutes 30
 
-# Watch a live run
-tail -f "$ALUCARD_HOME"/logs/alucard-*/iter-*.jsonl | jq -r 'select(.type=="assistant").message.content[]?.text // empty'
+# Run one open GitHub issue
+alucard run owner/repo --issue 90
 
-# Reconstruct a finished run — one timestamped line per run/iteration/gate transition
-cat "$ALUCARD_HOME"/logs/alucard-*/events.log
+# Use a local clone and a local tasks file
+alucard run /path/to/repo --tasks /path/to/repo/.alucard/tasks.md -n 1
 
-# Compare two runs — one JSON record per run, per stage, and per iteration
+# Force GitHub issues even if a local tasks file exists
+alucard run /path/to/repo --github
+
+# Check prerequisites and validate a local tasks file
+alucard doctor /path/to/repo
+
+# Address PR comments, then re-run CI and review
+alucard continue 174 owner/repo
+
+# Show all options or the installed CLI version
+alucard --help
+alucard version
+```
+
+The target defaults to the current directory. You can also select it with `--repo` or `ALUCARD_TARGET_REPO`.
+
+| Option | Default | Purpose |
+|---|---|---|
+| `-n`, `--iterations` | `20` | Maximum worker iterations per run |
+| `-t`, `--timeout-minutes` | `30` | Timeout for each agent invocation and dependency preflight |
+| `--base` | `main` | Base branch on `origin` |
+| `--max-review-cycles` | `10` | Maximum reviewer cycles per PR |
+| `--env-file` | `alucard.env` beside the CLI | Credentials and agent settings |
+| `--image` | `ghcr.io/aldovc/alucard:latest` | Container image |
+| `--logs-root` | `logs/` beside the CLI | Run logs and measurements |
+| `--no-build` | Off | Use an existing image without rebuilding; warn if stale |
+
+`--issue` is valid only for `run`. It forces the GitHub task source and cannot be combined with `--tasks`. `--tasks` and `--github` are also mutually exclusive.
+
+## Task sources
+
+### GitHub issues
+
+The default queue contains open issues labeled `ready-for-agent`. Alucard filters out issues labeled `in-progress` or `wip`, blocked issues, and issues already referenced by an open PR. Keep human work labeled `ready-for-human` instead of `ready-for-agent`. Use `Blocked by #N` in an issue body to declare a dependency on another issue.
+
+The worker picks one eligible issue and labels it `in-progress`. Complete work uses `Closes #N` in the PR body; partial work uses `Refs #N`. The issue closes when a complete PR merges. In queue mode, a worker that judges an issue too large proposes a split in an issue comment and moves it to `ready-for-human`.
+
+Write tasks with observable acceptance criteria and enough context to work independently. No authoring skill or template is required. `/to-spec` and `/to-tickets` are optional helpers; this repository includes a [to-tickets skill](.claude/skills/to-tickets/SKILL.md).
+
+### Local task source
+
+Alucard can read a host-side Markdown file instead of GitHub issues. PRs still live on GitHub. The file is a local task ledger and should stay gitignored.
+
+Select it with `--tasks PATH` or `ALUCARD_TASKS_FILE`. If neither is set, Alucard automatically uses `.alucard/tasks.md` when it exists in the target repository. `--github` overrides both configured and auto-detected local files.
+
+Everything above the first task heading is shared parent context, passed to workers and reviewers. Each heading has the form `## [<state>] <id>: <title>`. Its body continues until the next task heading and can contain ordinary Markdown headings.
+
+```markdown
+# Widget export
+
+Add CSV export to the existing /api/widgets/export endpoint.
+Preserve its current JSON response and authentication rules.
+
+## [ ] 1: Add a CSV response format
+
+### Acceptance criteria
+
+- [ ] ?format=json returns the existing JSON shape.
+- [ ] ?format=csv returns CSV with a header row.
+- [ ] An unsupported format returns a validation error.
+
+Blocked by: none
+
+## [h] 2: Decide the export rate limit
+
+Choose the limit before enabling export for all users.
+
+Blocked by: none
+
+## [ ] 3: Add a Download CSV button
+
+Use the export endpoint with format=csv.
+
+Blocked by: 1
+```
+
+| State | Meaning |
+|---|---|
+| `[ ]` | Queued, eligible when dependencies are complete |
+| `[>]` | PR in flight, with `(PR #N)` appended to the title |
+| `[x]` | Done |
+| `[h]` | Human task, never dispatched |
+
+File order determines queue order. In the example, only task `1` is eligible. Task `3` waits until task `1` reaches `[x]`.
+
+Use `Blocked by: 1, 2` for task-id dependencies, or `Blocked by: none`. Legacy `Blocked by #N` lines refer to GitHub issues and require Issues read access.
+
+When a worker opens a PR, Alucard changes the task to `[>]`. The PR starts with `Task: <id>` rather than a GitHub issue-closing keyword. On the next queue build, merged PRs move to `[x]`; closed, unmerged PRs return to `[ ]` with the previous PR recorded. Open PRs stay in flight. A GitHub API failure leaves the task file untouched.
+
+`alucard doctor` reports malformed headings, missing parent context, duplicate ids, and dangling task dependencies with line numbers. `alucard queue` reconciles PR state and shows eligible tasks. Run only one process against a given local tasks file.
+
+## Configuration
+
+Use [alucard.env.example](alucard.env.example) as the reference for provider, model, effort, and per-role settings. Claude defaults to `sonnet` with `haiku` as fallback. Codex defaults to `gpt-5.6-terra`.
+
+For example, these settings in `alucard.env` use Claude for implementation and Codex for review:
+
+```dotenv
+ALUCARD_PROVIDER=claude
+ALUCARD_REVIEWER_PROVIDER=codex
+ALUCARD_REVIEWER_CODEX_MODEL=gpt-5.6-terra
+```
+
+Per-role settings use `WORKER`, `CI_FIX`, `REVIEWER`, or `FEEDBACK`, and fall back to the corresponding global setting. The wrap-up agent uses the worker's provider and model.
+
+### Limits and cost
+
+Claude receives a turn and dollar budget for each invocation:
+
+| Role | Max turns | Max budget, USD |
+|---|---|---|
+| Worker | 180 | 10 |
+| CI fix | 30 | 2 |
+| Reviewer | 45 | 2 |
+| Feedback | 50 | 2 |
+| Wrap-up | 12 | 1 |
+
+Override these with `ALUCARD_<ROLE>_MAX_TURNS` and `ALUCARD_<ROLE>_MAX_BUDGET`. The wrap-up settings use `WRAPUP`; `ALUCARD_WRAPUP_MAX_TURNS=0` disables it. Claude agents see their turn budget in the prompt so they can commit work before it runs out.
+
+These turn and dollar caps do not apply to Codex. The container timeout applies to both providers. Budgets are per invocation, not per PR or run; retries and review cycles add to the total.
+
+`ALUCARD_TRANSPORT_RETRY_ATTEMPTS` defaults to `2` extra attempts for retryable worker and reviewer failures. Connection drops and missing container checkouts get fresh clones within that budget.
+
+### Container and toolchain
+
+The image includes Node 24, Python 3.12, `uv`, `just`, `git`, `gh`, Claude Code, Codex, ShellCheck, native build tools, and Playwright Chromium.
+
+Before dispatching agents, dependency preflight checks Python projects with `uv sync` and npm projects with `npm ci`. For each ecosystem, a root manifest takes precedence over nested manifests. Without a root manifest, preflight checks every matching manifest one directory level down. It records the install commands, directories, and results in `toolchain-preflight.txt` and passes them to workers, reviewers, and feedback agents.
+
+Preflight verifies dependency installation only. Agents still need to follow the target repository's verification workflow and report tests they ran separately from checks they could not run. Service-backed checks assigned to CI remain CI's responsibility.
+
+Playwright browsers are cached across containers under `~/.cache/alucard/playwright-browsers`. Preflight seeds the cache from the image and installs Chromium for the target repository's own Playwright version when detected. Different revisions coexist; preflight reports version mismatches. `ALUCARD_CACHE_DIR` relocates both repository and browser caches, and the default honors `XDG_CACHE_HOME`. You can prune the browser cache between runs; preflight recreates it.
+
+`alucard build` stamps the image with a hash of `Dockerfile` and `entrypoint.sh`. Runs rebuild missing, unstamped, or stale images from the installed CLI source. Successful rebuilds also try to remove a superseded image if it has no remaining tags. `--no-build` keeps an existing image with a warning, but fails if the image is missing.
+
+To use a custom image, edit the Dockerfile in your Alucard checkout and build with an explicit tag:
+
+```bash
+alucard build --image myproject/alucard:dev
+alucard run owner/repo --image myproject/alucard:dev -n 1
+```
+
+You can also select the image with `ALUCARD_IMAGE`. Prebuilt images are available from `ghcr.io/aldovc/alucard`; see [Releases](#releases).
+
+### Engineering and review policy
+
+Workers, reviewers, and feedback agents share [alucard-engineering-policy.md](alucard-engineering-policy.md). It asks for the smallest correct change, reuse of existing patterns, and tests for distinct behavior and failure modes. Existing coverage counts. File-size limits and ticket estimates are caps, not targets. Design rationale belongs in specs, commits, or PRs; comments explain contracts and non-obvious constraints.
+
+Reviewers must name a concrete defect, violated contract, or maintenance problem before asking for more structure or tests. Optional suggestions do not automatically become feedback-agent work. CI-fix has its own narrower instructions to repair the failing check.
+
+A root `REVIEW.md` in the target repository adds repository-specific review guidance to reviewer and feedback prompts. It can define review passes, severity thresholds, and excluded finding classes. It cannot override verdicts or instruct approval. Alucard includes up to 16 KiB by default, with a truncation marker; `REVIEW_POLICY_MAX_BYTES` changes the cap.
+
+## When a run needs you
+
+### CI and review outcomes
+
+Each CI gate makes up to three check attempts, with at most two fix-agent runs between them. CI still failing after that leaves the PR open and is recorded in the logs; the reviewer still runs. Each check attempt polls for up to 45 minutes.
+
+| Review outcome | What happens |
+|---|---|
+| `APPROVED` | Review ends. Inspect CI and the diff before merging. |
+| `CHANGES_REQUESTED` | Feedback addresses actionable findings, then CI and review repeat while cycles remain. |
+| `BLOCKED` | Work needs something an agent cannot do, such as a credential or human acceptance step. Alucard posts the reason and labels the PR `needs-human`. |
+| Review-cycle limit reached | Alucard posts an exhaustion comment and labels the PR `needs-human`. |
+| No reviewer verdict | After applicable retries, Alucard reports the failure and labels the unreviewed PR `needs-human`. |
+| Feedback failed without pushing changes | Alucard stops rather than reviewing the same commit again and labels the PR `needs-human`. |
+
+Reviewers read earlier findings and replies. Findings the feedback agent cannot resolve are recorded in a blocked-findings comment and passed to later reviewers, including on subsequent runs. This keeps a known human blocker from consuming every remaining cycle.
+
+To address PR feedback and run the gates again:
+
+```bash
+alucard continue 174 owner/repo
+```
+
+`continue` uses the latest Alucard change request plus subsequent human comments, or all human comments if there is no change request. Without actionable comments it runs CI and review only. It does not restart the original implementation task.
+
+### Worker recovery
+
+If a worker stops with work but no PR, Alucard attempts to preserve it in a draft `wip: alucard recovery` PR labeled `needs-human`. For turn or budget exhaustion and ordinary agent failures, a short wrap-up agent first commits the remaining work and writes a handoff describing what is done, remaining, and unverified. The orchestrator then commits any leftovers, pushes the branch, and opens the recovery PR. Other stop conditions use mechanical recovery without the wrap-up agent.
+
+For GitHub tasks, recovery removes `in-progress`, links the PR from the issue, and uses `Refs #N` instead of closing the issue. An explicitly pinned issue remains the attribution even if the worker stopped before claiming it.
+
+Finish the work on the recovery branch, then run `alucard continue <PR>` to address feedback and repeat CI and review. When the review gate approves the current head, Alucard marks its recovery PR ready, removes `needs-human`, changes `Refs #N` to `Closes #N`, and replaces the stub title with the issue's title. It identifies recovery PRs by a marker comment from the authenticated harness account, or by that account's authorship of a draft still carrying the recovery stub title and `needs-human`. If marking the draft ready fails, the label stays and the approval comment explains the manual steps.
+
+Alternatively, close the PR to let the task rejoin the queue. `alucard run --issue N` starts a fresh attempt immediately. For local tasks, closing an unmerged recovery PR returns the task to the queue on reconciliation.
+
+The run's final `Needs attention` list includes recovery PRs and issues parked for a human. An empty eligible queue does not mean every task is complete.
+
+### Concurrent runs
+
+Separate processes can work on different pinned issues or continue different PRs in the same repository. Each run has its own log directory, clone directory, and branch names. Branches include the run id and, when known at dispatch, the issue number or local task id. CI, review, and usage reporting stay bound to the PR identified for that worker, including when it renames its branch.
+
+Writes to the shared source clone use `flock`; without it, Alucard warns and proceeds unlocked. Containers receive an explicit GitHub repository context, and a missing checkout is treated as a runner failure with a fresh-clone retry.
+
+Queue claims are not atomic. For parallel workers, use `--issue` with a different issue per process. Avoid concurrent runs on the same PR or local tasks file.
+
+## Isolation and permissions
+
+Agents run without interactive permission prompts. Docker provides the isolation boundary:
+
+- A read-only container root, dropped Linux capabilities, and `no-new-privileges`.
+- Containers run as the invoking user's UID and GID, with temporary home and `/tmp` directories.
+- Each container has a 4 GiB memory limit and a two-CPU limit.
+- Agents work in disposable clones under `.alucard-worktrees/<run>/`. Cleanup removes only the current run's directories.
+- Writable mounts include the working clone, role output directories where needed, and the shared browser cache.
+
+Agents have network access and receive the configured credentials. Isolation does not prevent credential exfiltration or misuse of the GitHub token. Scope credentials to the work and use branch protection to enforce repository rules. Claude also gets a small command blacklist, which is not the isolation boundary.
+
+## Logs and measurements
+
+Each run writes to `logs/alucard-*/` beside the CLI unless you set `--logs-root` or `ALUCARD_LOG_ROOT`.
+
+| Path within the run directory | Contents |
+|---|---|
+| `events.log` | Timestamped run, iteration, and gate transitions |
+| `iter-*.jsonl` | Agent output and usage records |
+| `toolchain-preflight.txt` | Dependency-install results |
+| `measurements.jsonl` | Run configuration, diff measurements, and iteration outcomes |
+| `prompts/` | The actual prompts dispatched to agents |
+
+For example, compare code growth across stages:
+
+```bash
 jq -r 'select(.record=="stage")
        | "\(.iter) \(.stage)/\(.cycle)  +\(.from_base.added) since base"' \
   "$ALUCARD_HOME"/logs/alucard-*/measurements.jsonl
 ```
 
-### measurements.jsonl
+Measurements contain three record types:
 
-Written beside `events.log` for offline comparison of runs; nothing in the loop
-reads it back, and a measurement that fails is logged and skipped rather than
-allowed to affect the run.
+- `run` records the runner revision, prompt digest, image ID, and per-role provider and model settings.
+- `stage` measures worker, CI-fix, and feedback changes against the iteration's base and previous stage. Changes are grouped as tests, implementation, configuration/docs, and generated files, with paths retained. `baseline_source` and `base_drifted` describe the comparison base; an unavailable diff is marked explicitly.
+- `iteration` records CI result, review verdict, cycles, elapsed time, and token usage by role. Cost is `null` when the provider reports none. `cost_complete`, invocation counts, and `usage_missing` distinguish complete totals from partial data.
 
-- `record: "run"` — the harness revision, prompt digest, image ID, and per-role
-  provider/model settings. Two runs claiming to differ in one variable can be
-  checked against this.
-- `record: "stage"` — one per head-moving stage (`worker`, `cifix`, `feedback`).
-  `from_base` is measured against the iteration's pinned base SHA and `from_prev`
-  against the previous stage, split into `tests` / `impl` / `confdoc` /
-  `generated` with the changed paths kept so the buckets can be corrected
-  without re-running. Binary files are counted as files, never as lines, and
-  renames keep their full destination path. A diff that could not be taken is
-  `{"unavailable": true, "reason": …}` rather than zero statistics — an empty
-  diff and a failed one are otherwise indistinguishable. `base_drifted` flags a
-  base branch that moved mid-run; `baseline_source` says how the base was
-  arrived at (`pinned` and `prior-run` are exact, `merge-base` is the
-  recomputed fork point, `current-base` is today's base branch and inexact).
-  A base reused from an earlier run keeps that run's provenance rather than
-  being promoted to exact. `repo_id` is `owner/name` from the origin remote —
-  PR numbers are repository-local and every repository's runs share one logs
-  directory, so records are matched on both.
-- `record: "iteration"` — CI result, review verdict and cycle count, elapsed
-  time, and tokens by role and cache category. `cost` is `null` for a provider
-  that reports none (codex): unknown, not zero. `cost_complete` is true only
-  when *every* invocation reported a cost; `costed_invocations` and
-  `total_invocations` show the split, so a partial total is never read as the
-  whole bill. An invocation whose log has no parseable usage — a worker killed
-  by a timeout or a transport drop — is still counted, and shows up as
-  `usage_missing` on its role.
+Measurements and archived prompts stay local. Alucard also posts usage summaries on PRs. Measurement failures are logged and do not stop the run.
 
-Dispatched role prompts are archived under `logs/alucard-*/prompts/`. Both are
-local only — neither is posted to GitHub.
+## Development
+
+The Bash CLI in [`alucard`](alucard) manages queues, clones, containers, and PR gates. [`entrypoint.sh`](entrypoint.sh) sets up container-side Git and GitHub authentication. Role instructions live in `alucard-*-prompt.md`, including separate worker modes and the recovery wrap-up prompt.
+
+Read [AGENTS.md](AGENTS.md) and the [engineering policy](alucard-engineering-policy.md) before making changes. The CI checks are:
+
+```bash
+for t in test/test_*.sh; do
+  bash "$t" </dev/null || exit 1
+done
+
+shellcheck --severity=warning --exclude=SC2034 \
+  alucard entrypoint.sh install.sh test-*.sh test/*.sh
+```
+
+For prompt changes, run `bash test/test_engineering_policy.sh` to verify prompt assembly.
 
 ## Releases
 
-```bash
-# Tag and publish a new release
-git tag v0.2.0
-git push --tags
-```
-
-The push triggers `.github/workflows/docker-publish.yml`, which builds and publishes:
+The [publish workflow](.github/workflows/docker-publish.yml) builds images on pushes to `main` and tags matching `v*.*.*`.
 
 | Image tag | Meaning |
-|-----------|---------|
-| `ghcr.io/aldovc/alucard:vX.Y.Z` | Exact release, pinned, reproducible |
-| `ghcr.io/aldovc/alucard:vX.Y` | Floating minor, patch updates only |
-| `ghcr.io/aldovc/alucard:vX` | Floating major, any compatible update |
-| `ghcr.io/aldovc/alucard:latest` | Tracks `main`, unpinned |
-| `ghcr.io/aldovc/alucard:<short-sha>` | Every push, for debugging |
+|---|---|
+| `ghcr.io/aldovc/alucard:vX.Y.Z` | Release tag |
+| `ghcr.io/aldovc/alucard:vX.Y` | Latest published patch in that minor version |
+| `ghcr.io/aldovc/alucard:vX` | Latest published release in that major version |
+| `ghcr.io/aldovc/alucard:latest` | Most recently published image, whether from `main` or a release tag |
+| `ghcr.io/aldovc/alucard:<short-sha>` | Image for a specific source commit |
 
-`:latest` is also updated on every tag push. It always points to the most recently published image (tag or main push, whichever came last).
+To use a published image without the CLI rebuilding it against local source:
 
-**Pinning.** Operators who want reproducible runs can set `ALUCARD_IMAGE=ghcr.io/aldovc/alucard:v0.2.0`. `:latest` stays the default.
+```bash
+docker pull ghcr.io/aldovc/alucard:latest
+alucard run owner/repo --image ghcr.io/aldovc/alucard:latest --no-build -n 1
+```
 
-**CLI version.** `alucard version` (or `alucard --version`) prints the version derived from `git describe` against the CLI source directory. On a tagged checkout it shows `v0.1.0`; on a post-tag commit, `v0.1.0-3-gabc1234`; on an untagged tree, the short SHA.
+Substitute a release tag to select a release. Keep the CLI checkout aligned with that release's prompts and behavior. `alucard version` prints the CLI's `git describe` version, or its short commit SHA when no tag is available.
 
-## Acknowledgements
+## Acknowledgements and license
 
-`/to-spec` and `/to-tickets` are optional authoring helpers, derived from [mattpocock/skills](https://github.com/mattpocock/skills). Alucard does not depend on them.
+Alucard follows the Ralph-style unattended worker-loop pattern. The optional `/to-spec` and `/to-tickets` authoring workflow is derived from [mattpocock/skills](https://github.com/mattpocock/skills).
 
-## Design references for the setup agent
-
-The design conversation that produced this, in short:
-
-- **Worker loop.** Based on the "ralph" pattern: issues as queue, agent as worker, sentinel for termination. Hardened to filter the queue in bash rather than asking the model, PRs not main, a worktree per iteration, hard timeouts and budget caps.
-- **Queue.** GitHub issues labeled `ready-for-agent`. Blockers via `Blocked by #N`, occupancy via an open PR that mentions `#N`. How tickets are authored is outside the runner.
-- **Containerization.** Chosen over an unprivileged user after weighing the threat model. The kernel boundary is the only real defense against `rm -rf /`, and the operational cost is low for a single-machine homelab setup.
+[MIT license](LICENSE).

@@ -57,6 +57,10 @@ Name your file with `$NEXT`. Two iterations that started from the same base-bran
 
 Before running lint and tests, read your own diff and check for each of the following. Fix any you find — the reviewer will catch them if you don't.
 
+Apply the shared engineering policy: remove unnecessary code, essay docstrings,
+and copied sibling tests. Keep existing ports. File limits are caps, not targets;
+do not add files or tests to match a ticket's estimate.
+
 **Correctness hazards**
 - Every `asyncio.create_task(...)` has a done-callback that logs exceptions.
 - No token, API key, or credential is passed as a plain `str` parameter through more than one function boundary.
@@ -81,6 +85,7 @@ Before running lint and tests, read your own diff and check for each of the foll
 **Anti-patterns**
 - Each function's responsibility can be stated in one sentence. If it cannot, split it.
 - No `except` block silently swallows an exception without either a deliberate fallback or explicit logging.
+- No comment restates the ticket, the commit, or a sibling module. Decisions stay in the commit.
 
 ## Verify
 
@@ -98,7 +103,7 @@ You are on a branch the harness already created from the latest base branch. **S
 
 Commit messages must include:
 - The task reference the Mode section specifies
-- Key decisions made
+- Key decisions made (commit body only — do not copy them into source comments)
 - High-level summary of files changed
 - Any blockers or notes for the next iteration
 

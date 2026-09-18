@@ -35,7 +35,7 @@ Review the PR end to end:
 3. Read the acceptance criteria: use `<task>` when present — do not call `gh issue view` in that case. Otherwise, find the linked issue number in the PR body and read it: `gh issue view <N>`
 4. Read the full diff: `gh pr diff <pr_num>`
 5. Read changed source files for context beyond the diff
-6. Check test coverage — do the tests cover the changed behaviour and edge cases?
+6. Check that tests cover the changed behaviour and its distinct failure modes, accounting for existing coverage.
 7. Evaluate security — any injection, auth bypass, data exposure, or trust-boundary issues?
 
 CI status is verified by the harness in a separate loop — do not call `gh pr checks` or query `statusCheckRollup`. The container's token lacks the required scope and the harness already gates merge on CI independently.
@@ -51,6 +51,8 @@ The loop can only converge if each cycle's findings are ones the feedback agent 
 - **Human-only acceptance criteria.** An issue may require a manual console click, a staging deploy, or a screenshot. Those are real merge gates for the *human*, but the agent cannot satisfy them. Note them under the BLOCKED verdict instead of requesting changes.
 - **Test evidence the toolchain cannot produce.** If `<toolchain_status>` says BROKEN for the part of the repo this PR touches, checks requiring those dependencies cannot run locally until the install failure is resolved. Even with OK installs, services or credentials needed by some checks may be unavailable. Review the tests as written and follow the project's local-versus-CI verification policy; do not demand unavailable local test output, coverage numbers, or "verify locally and attach the result" as a fix. This does not excuse missing tests for changed behaviour or failures in checks that can run locally.
 - **Findings already fixed.** Before repeating a predecessor's finding, read the current file. The feedback agent may have already resolved it; the line number will have moved.
+- **Explanatory comments and essay docstrings.** Do not request comments that restate the ticket, the commit, or a sibling module. Decisions belong in the commit. A missing comment the repository's conventions require (circular-import note, token hex) is still in scope.
+- **Copied contract tests.** Do not request a copy of tests that already cover a shared helper or a sibling module's confirmation, decline, gating, or session contract, or tests that assert system-prompt or schema-description prose. Missing tests for behaviour this change introduces, and that nothing else covers, are still in scope.
 
 ## The repository's own review policy
 
@@ -101,7 +103,12 @@ Fast, high-yield, and able to catch deploy-breaking bugs that green CI hides. Do
 
 ## Engineering standards checklist
 
-Flag any of the following as **CHANGES_REQUESTED**. These are not style preferences — each category represents a class of bugs, maintenance traps, or design failures.
+Apply the shared engineering policy to this checklist. A merge-blocking finding
+must name a concrete failure, violated contract, or material maintenance problem
+and its smallest adequate fix. Check for unnecessary additions as well as gaps:
+essay docstrings, copied tests, avoidable new abstractions, and unfocused files.
+Request removal where sufficient, and preserve existing package ports. File-size
+caps and ticket file estimates are never targets.
 
 ### Correctness hazards
 - **Fire-and-forget without exception logging**: `asyncio.create_task(...)` silently drops exceptions. Every detached task must attach a done-callback that logs failures.
@@ -118,6 +125,7 @@ Flag any of the following as **CHANGES_REQUESTED**. These are not style preferen
 
 ### Reusability
 - **Deferred imports without justification**: `import` inside a function body hides dependencies. Flag unless a comment names the specific circular-import being avoided.
+- **Unnecessary narrative in source**: a module docstring or comment *this PR added* that restates the ticket, the commit, or a sibling module. Flag as an unnecessary addition (see the shared engineering policy). Do not request more of them, and do not ask to rewrite pre-existing comments.
 
 ### Anti-patterns
 - **God function**: a single function that downloads, classifies, routes, and dispatches is doing four jobs. Flag functions whose responsibilities cannot be stated in one sentence.

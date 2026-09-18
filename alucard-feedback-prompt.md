@@ -21,7 +21,7 @@ For each finding listed in `<review_findings>`:
 
 1. Read the referenced file and line
 2. Understand the problem described
-3. Make the minimal edit that resolves the finding
+3. Make the smallest edit that resolves the finding under the shared engineering policy. Remove unnecessary additions when that is enough; preserve existing ports and add tests only for distinct behaviour the fix changes.
 4. **Commit the change immediately** with a message referencing the finding
 5. **Push to the existing branch** (`git push`) — do this before running any verification, so partial progress is preserved if you run out of turns or hit an error
 6. Install dependencies as `<toolchain_status>` describes, then run the project's documented local verification workflow for this environment. If verification reveals a regression, make additional commits and push again. Pre-existing failures unrelated to your diff (e.g. native dependencies that won't compile in the sandbox — note these in the PR body or commit message) do **not** block the push; they were already there.
@@ -68,6 +68,7 @@ After fixing each finding, scan only the code you wrote or modified for these vi
 - Any function whose responsibility cannot be stated in one sentence.
 - Any `except` block that swallows an exception without a deliberate fallback or explicit logging.
 - Any layer crossing: routers must not make external API calls; domain models must not format user-facing strings.
+- Any comment you added that restates the finding, the ticket, or a sibling module.
 
 Fix violations you introduced before pushing. Do not fix pre-existing violations — that is out of scope.
 
