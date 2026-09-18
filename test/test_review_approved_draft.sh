@@ -117,7 +117,10 @@ cat > "$MOCK_BIN/gh" <<'MOCK'
 set -euo pipefail
 { printf 'gh'; printf ' %q' "$@"; printf '\n'; } >> "$ALUCARD_TEST_STATE/gh-trace"
 case "$1 $2" in
-  "api user") printf '%s\n' "${ALUCARD_TEST_LOGIN:-alucard-bot}" ;;
+  "api user")
+    # Unauthenticated gh fails here rather than naming an account.
+    [ -n "${ALUCARD_TEST_LOGIN:-}" ] || exit 1
+    printf '%s\n' "$ALUCARD_TEST_LOGIN" ;;
   "pr checks") echo "no checks reported" >&2; exit 1 ;;
   "pr list")   printf '77\n' ;;
   "pr ready")  exit "${ALUCARD_TEST_READY_RC:-0}" ;;
