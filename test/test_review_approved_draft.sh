@@ -1,10 +1,8 @@
 #!/bin/bash
-# Covers un-parking a recovery PR on approval — ready, label off, `Refs #N` to
-# `Closes #N`, stub title replaced — and what must not un-park it: a marker
-# comment from another login, a recovery-shaped title or body, a needs-human or
-# draft the harness did not set, a stale approval, or any other verdict. Driven
-# through `alucard continue`, which reaches the review gate without the worker
-# loop.
+# Covers un-parking a recovery PR on approval and the trust boundary that gates
+# it: only a PR the harness itself parked, and only on an approval of the
+# current head. Driven through `alucard continue`, which reaches the review
+# gate without the worker loop.
 set -euo pipefail
 
 exec </dev/null

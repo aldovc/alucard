@@ -40,8 +40,7 @@ BOT_COMMENT_PREFIX='**🤖 Alucard'
 BOT_LEDGER_MARKER="$BOT_COMMENT_PREFIX blocked findings**"
 # Posted on a recovery PR when it is parked. Only this marker in a comment
 # authored by the authenticated harness account identifies a parked recovery
-# PR: the title and body carry the same mark but a feedback agent can rewrite
-# them, and anyone with read access can type either into a PR they opened.
+# PR; the title and body carry the same mark but are writable by anyone.
 BOT_RECOVERY_MARKER="$BOT_COMMENT_PREFIX recovery PR parked**"
 RECOVERY_TITLE_PREFIX="wip: alucard recovery"
 CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
