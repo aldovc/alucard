@@ -5,9 +5,11 @@
 # by the ticket's. One approved recovery PR sat an hour looking gated on a
 # human until someone ran `gh pr ready` by hand (#97).
 #
-# The un-park must be keyed on the harness's own mark and on an approval of
-# the current head: a draft a developer keeps on purpose, a needs-human some
-# other path set, or a stale formal review must not un-park anything. Every
+# The un-park must be keyed on a mark the harness's own account wrote and on an
+# approval of the current head: a marker comment from any other login, a
+# recovery-shaped title or body a PR author typed, a draft a developer keeps on
+# purpose, a needs-human some other path set, or a stale formal review must not
+# un-park anything. Every
 # other verdict leaves draft state and the label alone. Driven through
 # `alucard continue`, which reaches the review gate without the worker loop.
 set -euo pipefail
@@ -115,6 +117,7 @@ cat > "$MOCK_BIN/gh" <<'MOCK'
 set -euo pipefail
 { printf 'gh'; printf ' %q' "$@"; printf '\n'; } >> "$ALUCARD_TEST_STATE/gh-trace"
 case "$1 $2" in
+  "api user") printf '%s\n' "${ALUCARD_TEST_LOGIN:-alucard-bot}" ;;
   "pr checks") echo "no checks reported" >&2; exit 1 ;;
   "pr list")   printf '77\n' ;;
   "pr ready")  exit "${ALUCARD_TEST_READY_RC:-0}" ;;
@@ -147,7 +150,10 @@ esac
 MOCK
 chmod +x "$MOCK_BIN/docker" "$MOCK_BIN/timeout" "$MOCK_BIN/gh"
 
-PARKED_MARK='[{"body":"**🤖 Alucard recovery PR parked** — opened as a draft and labeled needs-human by the harness."}]'
+PARKED_MARK='[{"author":{"login":"alucard-bot"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft and labeled needs-human by the harness."}]'
+# The same marker text from somebody else. Any account with read access can
+# post it, so authorship is what the un-park keys on.
+SPOOFED_MARK='[{"author":{"login":"passer-by"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft and labeled needs-human by the harness."}]'
 STUB_TITLE='wip: alucard recovery — iter 1 (worker stopped: exhausted, rc=1)'
 STUB_BODY=$'Refs #534\n\n**🤖 Alucard recovery PR** — the worker ran out of turns (rc=1) before opening a PR.\n\nThis is not a finished change.'
 
@@ -163,6 +169,7 @@ reset_pr() {
   READY_RC=0
   FORMAL_STATE=""
   FORMAL_OID=""
+  LOGIN=alucard-bot
 }
 
 run_continue() {
@@ -181,6 +188,7 @@ run_continue() {
   ALUCARD_TEST_READY_RC="$READY_RC" \
   ALUCARD_TEST_FORMAL_STATE="$FORMAL_STATE" \
   ALUCARD_TEST_FORMAL_OID="$FORMAL_OID" \
+  ALUCARD_TEST_LOGIN="$LOGIN" \
   ALUCARD_TRANSPORT_RETRY_ATTEMPTS=0 \
     "$ALUCARD" continue 77 "$TARGET" --no-build --max-review-cycles 1 \
       --env-file "$TEST_DIR/alucard.env" --logs-root "$TEST_DIR/logs" > "$TEST_DIR/out" 2>&1
@@ -231,6 +239,30 @@ assert_untouched "not the harness's recovery PR"
 assert_not_contains "and the comment carries no un-park note" "Marked ready" "$APPROVED_COMMENT"
 
 echo ""
+echo "── APPROVED on a PR carrying a marker comment somebody else posted ──"
+reset_pr
+COMMENTS="$SPOOFED_MARK"
+run_continue
+assert_contains "the gate approves" "Review gate: PR #77 approved" "$EVENTS"
+assert_untouched "a marker the harness did not write"
+
+echo ""
+echo "── APPROVED on a PR whose author typed the stub title and body ──"
+reset_pr
+COMMENTS='[]'
+run_continue
+assert_contains "the gate approves" "Review gate: PR #77 approved" "$EVENTS"
+assert_untouched "recovery title and body without the harness's mark"
+
+echo ""
+echo "── APPROVED on a parked PR but the harness's own login is unreadable ──"
+reset_pr
+LOGIN=""
+run_continue
+assert_contains "the gate says why it cannot tell" "could not read the harness's GitHub login" "$EVENTS"
+assert_untouched "unknown harness identity"
+
+echo ""
 echo "── APPROVED but marking ready fails ──"
 reset_pr
 READY_RC=1
@@ -242,7 +274,6 @@ assert_contains "and the comment says the label stays and what to do" "stays on 
 echo ""
 echo "── a recovery PR the feedback agent already rewrote, labelled Needs-Human ──"
 reset_pr
-COMMENTS='[]'
 DRAFT=false
 LABELS='["alucard","Needs-Human"]'
 TITLE="test(db): utilities readings and exchange-rate upserts"

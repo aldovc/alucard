@@ -41,10 +41,10 @@ BOT_LEDGER_MARKER="$BOT_COMMENT_PREFIX blocked findings**"
 # Posted on a recovery PR when it is parked. The title and body say the same,
 # but a feedback agent rewrites both — one did, on the PR that prompted this —
 # and a comment survives. The review gate lifts a parked PR's draft state and
-# label on approval only when it can see this mark (or the stanza, on PRs
-# parked before the mark existed).
+# label on approval only when it can see this mark in a comment written by the
+# account the harness itself posts as: anyone with read access can type the
+# marker, or the title prefix, into a PR they opened.
 BOT_RECOVERY_MARKER="$BOT_COMMENT_PREFIX recovery PR parked**"
-BOT_RECOVERY_STANZA="$BOT_COMMENT_PREFIX recovery PR**"
 RECOVERY_TITLE_PREFIX="wip: alucard recovery"
 CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
 
@@ -2986,20 +2986,25 @@ review_gate() {
   echo "=== Review gate: PR #$pr_num on $branch ==="
 
   local review_cycle wt_review review_log review_rc review_state review_comments
-  local _pr_json _parked_marker _recovery_parked _unpark_note
+  local _pr_json _parked_marker _unpark_note
 
   # Blocked-findings ledger. Seeded from marker comments already on the PR so a
   # re-run does not spend its whole budget rediscovering what a previous run
   # already established was unfixable in-container. The same comments say
   # whether this is a recovery PR the harness parked.
-  local blocked_ledger _pr_comments
+  local blocked_ledger _pr_comments _harness_login
   _pr_comments=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json comments 2>/dev/null || echo '{"comments":[]}')
   blocked_ledger=$(jq -r --arg marker "$BOT_LEDGER_MARKER" \
         '[.comments[]? | select(.body | startswith($marker)) | .body] | join("\n\n")' \
     <<<"$_pr_comments" 2>/dev/null || true)
-  _parked_marker=$(jq -r --arg marker "$BOT_RECOVERY_MARKER" \
-        '[.comments[]? | select(.body | startswith($marker))] | length > 0' \
+  _harness_login=$(cd "$REPO_ABS" && gh api user --jq '.login' 2>/dev/null || true)
+  _parked_marker=$(jq -r --arg marker "$BOT_RECOVERY_MARKER" --arg login "$_harness_login" \
+        '[.comments[]? | select($login != "" and (.author.login // "") == $login
+           and (.body | startswith($marker)))] | length > 0' \
     <<<"$_pr_comments" 2>/dev/null || echo false)
+  if [ -z "$_harness_login" ]; then
+    log_event "Review gate: could not read the harness's GitHub login — a parked recovery PR stays parked."
+  fi
   if [ -n "$blocked_ledger" ]; then
     log_event "Blocked-ledger loaded from PR #$pr_num."
   fi
@@ -3141,11 +3146,7 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
       # fatal, same as labelling.
       _unpark_note=""
       _pr_json=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json isDraft,labels,title,body 2>/dev/null || echo '{}')
-      _recovery_parked=$(jq -r --arg m "$_parked_marker" --arg stanza "$BOT_RECOVERY_STANZA" \
-        --arg prefix "$RECOVERY_TITLE_PREFIX" \
-        '($m == "true") or ((.body // "") | contains($stanza)) or ((.title // "") | startswith($prefix))' \
-        <<<"$_pr_json" 2>/dev/null || echo false)
-      if [ "$_recovery_parked" = true ]; then
+      if [ "$_parked_marker" = true ]; then
         if approval_is_current "$pr_num" "$_review_file_state"; then
           _unpark_note=$(unpark_recovery_pr "$REPO_ABS" "$pr_num" "$_pr_json")
         else
