@@ -7,22 +7,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
-
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    pass "$label"
-  else
-    fail "$label (expected '$expected', got '$actual')"
-  fi
-}
 
 TEST_DIR=$(mktemp -d /tmp/alucard_test_measure_run.XXXXXX)
 trap 'rm -rf "$TEST_DIR"' EXIT
@@ -163,6 +149,4 @@ echo "── the dispatched prompt is archived ──"
 assert_eq "the worker prompt is kept" "true" \
   "$([ -s "$(dirname "$MEAS_FILE")/prompts/iter-1.txt" ] && echo true || echo false)"
 
-echo ""
-echo "Passed: $PASS  Failed: $FAIL"
-[ "$FAIL" -eq 0 ]
+finish

@@ -6,22 +6,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
-
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    pass "$label"
-  else
-    fail "$label (expected '$expected', got '$actual')"
-  fi
-}
 
 # shellcheck disable=SC1090
 source "$ALUCARD"
@@ -390,6 +376,4 @@ measure_archive_prompt "iter-7" "the dispatched prompt"
 assert_eq "prompt archived verbatim" "the dispatched prompt" \
   "$(cat "$LOG_DIR/prompts/iter-7.txt")"
 
-echo ""
-echo "Passed: $PASS  Failed: $FAIL"
-[ "$FAIL" -eq 0 ]
+finish

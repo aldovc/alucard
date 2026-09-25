@@ -6,40 +6,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
-
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    pass "$label"
-  else
-    fail "$label (expected '$expected', got '$actual')"
-  fi
-}
-
-assert_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if grep -qF -- "$needle" <<<"$haystack"; then
-    pass "$label"
-  else
-    fail "$label (output does not contain '$needle')"
-  fi
-}
-
-assert_not_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if grep -qF -- "$needle" <<<"$haystack"; then
-    fail "$label (output unexpectedly contains '$needle')"
-  else
-    pass "$label"
-  fi
-}
 
 # The number, not the sentence around it: assertions here must survive a
 # reworded block but fail on a wrong or frozen value.
@@ -251,6 +219,4 @@ assert_eq "a claude role keeps its block alongside a codex one" \
 assert_eq "the codex role beside it still gets none" \
   "0" "$(blocks_per_prompt feedback)"
 
-echo
-echo "── $PASS passed, $FAIL failed ──"
-[ "$FAIL" -eq 0 ]
+finish

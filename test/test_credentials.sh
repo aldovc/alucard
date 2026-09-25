@@ -2,13 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
 
 # Run function in subshell; assert its exit code matches EXPECTED_EXIT.
 assert_exit() {
@@ -152,6 +147,4 @@ assert_output_absent   "doctor codex-only missing key: ANTHROPIC not checked"   
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
-echo ""
-echo "Results: ${PASS} passed, ${FAIL} failed"
-[ "$FAIL" -eq 0 ]
+finish

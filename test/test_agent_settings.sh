@@ -2,23 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
 SETTINGS_ENV="$SCRIPT_DIR/fixtures/agent-settings.env"
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
-
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    pass "$label"
-  else
-    fail "$label (expected '$expected', got '$actual')"
-  fi
-}
 
 assert_flag_value() {
   local label="$1" flag="$2" expected="$3" file="$4" actual
@@ -166,6 +152,4 @@ assert_invalid_transport_retries() {
 assert_invalid_transport_retries "negative transport retries are rejected" "-1"
 assert_invalid_transport_retries "malformed transport retries are rejected" "two"
 
-echo ""
-echo "Results: ${PASS} passed, ${FAIL} failed"
-[ "$FAIL" -eq 0 ]
+finish

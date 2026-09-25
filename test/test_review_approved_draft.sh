@@ -8,40 +8,8 @@ set -euo pipefail
 exec </dev/null
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
-
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    pass "$label"
-  else
-    fail "$label (expected '$expected', got '$actual')"
-  fi
-}
-
-assert_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if printf '%s\n' "$haystack" | grep -qF -- "$needle"; then
-    pass "$label"
-  else
-    fail "$label (missing '$needle')"
-  fi
-}
-
-assert_not_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if printf '%s\n' "$haystack" | grep -qF -- "$needle"; then
-    fail "$label (unexpected '$needle')"
-  else
-    pass "$label"
-  fi
-}
 
 TEST_DIR=$(mktemp -d /tmp/alucard_test_approved_draft.XXXXXX)
 trap 'rm -rf "$TEST_DIR"' EXIT
@@ -353,6 +321,4 @@ run_continue
 assert_contains "the gate blocks" "blocked on human action" "$EVENTS"
 assert_untouched "blocked"
 
-echo ""
-echo "Results: ${PASS} passed, ${FAIL} failed"
-[ "$FAIL" -eq 0 ]
+finish

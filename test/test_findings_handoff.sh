@@ -6,40 +6,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
-
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    pass "$label"
-  else
-    fail "$label (expected '$expected', got '$actual')"
-  fi
-}
-
-assert_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if grep -qF -- "$needle" <<<"$haystack"; then
-    pass "$label"
-  else
-    fail "$label (missing '$needle')"
-  fi
-}
-
-assert_not_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if grep -qF -- "$needle" <<<"$haystack"; then
-    fail "$label (unexpectedly contains '$needle')"
-  else
-    pass "$label"
-  fi
-}
 
 # shellcheck disable=SC1090
 source "$ALUCARD"
@@ -306,6 +274,4 @@ else
   assert_not_contains "the out-of-scope section does not" "DROP-OUT-OF-SCOPE" "$fb"
 fi
 
-echo
-echo "── $PASS passed, $FAIL failed ──"
-[ "$FAIL" -eq 0 ]
+finish
