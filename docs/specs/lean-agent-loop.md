@@ -131,9 +131,9 @@ The shared policy must express these decisions:
 ### Worker and CI-fix behavior *(revised)*
 
 The worker checks existing implementation and coverage before adding either.
-For testable changes, retain red/green verification where useful, but replace
-"repeat per criterion" with coverage of changed behavior and distinct failure
-modes. An existing test that already covers a criterion counts.
+It changes the code first and pins changed behavior by extending the nearest
+existing test, writing a new one only when none fits. An existing test that
+already covers a criterion counts.
 
 CI-fix keeps its own prompt unchanged and does not receive the shared fragment,
 for the reason given above.
@@ -147,12 +147,10 @@ internal interactions when those interactions are themselves consequential.
 Avoid testing framework guarantees, duplicating the same guarantee at multiple
 layers without a separate purpose, or creating elaborate mocks for trivial
 wiring. Every added test should detect a distinct plausible failure or provide
-necessary integration evidence. This is a judgment rule, not a required written
-justification per test, test-count cap, or ban on unit tests and fixtures.
+necessary integration evidence.
 
 Retain coverage for materially distinct entry points, permissions, races, cleanup,
-data loss, and other meaningful boundary conditions. A larger test diff can be
-correct when the behavior warrants it.
+data loss, and other meaningful boundary conditions.
 
 ### Reviewer and feedback behavior *(revised)*
 

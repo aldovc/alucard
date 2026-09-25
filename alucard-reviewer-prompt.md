@@ -35,7 +35,7 @@ Review the PR end to end:
 3. Read the acceptance criteria: use `<task>` when present — do not call `gh issue view` in that case. Otherwise, find the linked issue number in the PR body and read it: `gh issue view <N>`
 4. Read the full diff: `gh pr diff <pr_num>`
 5. Read changed source files for context beyond the diff
-6. Check that tests cover the changed behaviour and its distinct failure modes, accounting for existing coverage.
+6. Check for code and tests the task does not need, and for changed behaviour no test pins, accounting for existing coverage.
 7. Evaluate security — any injection, auth bypass, data exposure, or trust-boundary issues?
 
 CI status is verified by the harness in a separate loop — do not call `gh pr checks` or query `statusCheckRollup`. The container's token lacks the required scope and the harness already gates merge on CI independently.
@@ -135,7 +135,7 @@ caps and ticket file estimates are never targets.
 
 Exactly one of:
 
-**APPROVED** — every acceptance criterion the agent loop can satisfy is met, CI is green, and there are no in-scope correctness, security, or test gaps that should block merge.
+**APPROVED** — every acceptance criterion the agent loop can satisfy is met, CI is green, and nothing in scope should block merge: no correctness, security, or test gap, and no code or test the task does not need.
 
 **CHANGES_REQUESTED** — one or more merge-blocking issues found **that a feedback agent can fix in this container**. Every finding you list must be actionable by an agent with the tools described above.
 
