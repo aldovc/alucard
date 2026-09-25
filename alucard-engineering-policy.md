@@ -41,8 +41,8 @@ regardless of how they were authored; no authoring skill or template is required
 
 ## Tests
 
-- Cover the behaviour the change alters and each distinct failure mode it can
-  produce. An acceptance criterion an existing test already covers needs no test
+- Pin the behaviour the change alters with the fewest tests that would catch it
+  breaking. An acceptance criterion an existing test already covers needs no test
   of its own.
 - Extend an existing test when that is practical. Parameterize equivalent input
   variations when it reads more clearly than separate cases.
@@ -57,11 +57,7 @@ regardless of how they were authored; no authoring skill or template is required
   behaviour this change adds. Equivalent input variations are a parameter, not a
   new case. Do not assert system-prompt or schema-description prose.
 - Keep coverage for materially distinct entry points, permissions, races,
-  cleanup, data loss, and other real boundary conditions. A large test diff is
-  the right answer when the behaviour warrants it.
-
-This is a judgment rule. It does not require a written justification per test,
-cap how many tests a change may add, or ban unit tests and fixtures.
+  cleanup, data loss, and other real boundary conditions.
 
 ## Asking for changes
 

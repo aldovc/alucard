@@ -15,15 +15,9 @@ These instructions are followed by context sections:
 
 Read the task's full body, acceptance criteria, and any prior-attempt notes before starting — the Mode section says where they live. Skim relevant code before writing.
 
-## Implement (red → green → refactor)
+## Implement
 
-For testable work:
-- **RED** — failing test capturing behaviour the task changes
-- **GREEN** — minimal code to pass
-- **REFACTOR** — clean up while green
-- Repeat until the changed behaviour and its distinct failure modes are covered
-
-For non-testable work (config, scripts, docs), skip the test loop but still work in small verifiable steps.
+Change the code. When it alters behaviour no existing test pins, extend the nearest existing test to pin it; write a new test only when none fits. Config, scripts, and docs need no test.
 
 ## Commit cadence
 
