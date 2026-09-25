@@ -7,38 +7,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
 ROOT="$SCRIPT_DIR/.."
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
-
-# These match with a herestring rather than the `printf | grep -q` idiom the
-# other test files use. One haystack here is the whole 138 KB alucard source:
-# `grep -q` exits at the first match, `printf` then dies of SIGPIPE, and under
-# `set -o pipefail` the pipeline reports 141 — so a needle that IS present reads
-# as absent. Small haystacks fit the pipe buffer and hide it. Do not "simplify"
-# these back into a pipe.
-assert_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if grep -qF -- "$needle" <<<"$haystack"; then
-    pass "$label"
-  else
-    fail "$label (output does not contain '$needle')"
-  fi
-}
-
-assert_not_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if grep -qF -- "$needle" <<<"$haystack"; then
-    fail "$label (output unexpectedly contains '$needle')"
-  else
-    pass "$label"
-  fi
-}
 
 # Source alucard to load helper functions without running main.
 # shellcheck disable=SC1090
@@ -127,6 +98,4 @@ assert_not_contains "feedback has no blanket magic-value rule" \
   "literal with domain meaning that should be a named constant" \
   "$(cat "$ROOT/alucard-feedback-prompt.md")"
 
-echo
-echo "── $PASS passed, $FAIL failed ──"
-[ "$FAIL" -eq 0 ]
+finish

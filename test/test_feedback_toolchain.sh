@@ -6,33 +6,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
-
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    pass "$label"
-  else
-    fail "$label (expected '$expected', got '$actual')"
-  fi
-}
-
-# Herestring, not a pipe: `printf | grep -q` under pipefail returns 141 on a
-# large haystack, because grep exits before printf has finished writing.
-assert_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if grep -qF -- "$needle" <<<"$haystack"; then
-    pass "$label"
-  else
-    fail "$label (output does not contain '$needle')"
-  fi
-}
 
 TMP_ROOT=$(mktemp -d /tmp/alucard_test_feedback_toolchain.XXXXXX)
 trap 'rm -rf "$TMP_ROOT"' EXIT
@@ -196,6 +171,4 @@ echo "── the role prompt documents the input ──"
 assert_contains "alucard-feedback-prompt.md explains <toolchain_status>" \
   '`<toolchain_status>`' "$(cat "$SCRIPT_DIR/../alucard-feedback-prompt.md")"
 
-echo
-echo "── $PASS passed, $FAIL failed ──"
-[ "$FAIL" -eq 0 ]
+finish

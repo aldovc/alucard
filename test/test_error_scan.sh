@@ -5,31 +5,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 ALUCARD="$SCRIPT_DIR/../alucard"
-
-PASS=0
-FAIL=0
-
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
-fail() { echo "FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
-
-assert_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if printf '%s' "$haystack" | grep -qF "$needle"; then
-    pass "$label"
-  else
-    fail "$label (output does not contain '$needle')"
-  fi
-}
-
-assert_not_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if printf '%s' "$haystack" | grep -qF "$needle"; then
-    fail "$label (output unexpectedly contains '$needle')"
-  else
-    pass "$label"
-  fi
-}
 
 assert_empty() {
   local label="$1" actual="$2"
@@ -37,15 +14,6 @@ assert_empty() {
     pass "$label"
   else
     fail "$label (expected empty, got '$actual')"
-  fi
-}
-
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [ "$expected" = "$actual" ]; then
-    pass "$label"
-  else
-    fail "$label (expected '$expected', got '$actual')"
   fi
 }
 
@@ -295,6 +263,4 @@ assert_eq "a missing log with rc=0 classifies as clean" "clean" "$out"
 out=$(classify_agent_failure "$TMP_ROOT/does-not-exist.jsonl" "claude" "1")
 assert_eq "a missing log with a non-zero rc classifies as failed" "failed" "$out"
 
-echo ""
-echo "Results: $PASS passed, $FAIL failed"
-[ "$FAIL" -eq 0 ]
+finish
