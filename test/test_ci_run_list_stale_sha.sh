@@ -187,7 +187,7 @@ run_poll() {
 echo "── stale SHA: skip without the 45-minute wait ──"
 run_poll stale
 
-assert_eq "stale SHA skip-as-green (cannot force Actions to start)" "0" "$POLL_RC"
+assert_eq "a stale SHA reports no CI, not green (cannot force Actions to start)" "2" "$POLL_RC"
 assert_contains "logs no run for current HEAD" \
   "no run for current HEAD" "$EV"
 assert_contains "names the HEAD SHA" \
@@ -201,12 +201,12 @@ assert_not_contains "does not print the empty-branch wait line" \
 assert_eq "probes twice (one lag, then skip)" "2" "$RUN_N"
 assert_eq "sleeps once between the two probes" "1" "$SLEEP_N"
 
-# ── Empty branch: still skip-as-green after a short wait ─────────────────────
+# ── Empty branch: no CI after a short wait ───────────────────────────────────
 echo ""
-echo "── empty branch: short wait then skip-as-green ──"
+echo "── empty branch: short wait then no CI ──"
 run_poll empty
 
-assert_eq "empty branch skip-as-green" "0" "$POLL_RC"
+assert_eq "an empty branch reports no CI, not green" "2" "$POLL_RC"
 assert_contains "empty branch still names the Actions-permission skip" \
   "token may lack 'actions' read permission" "$EV"
 assert_not_contains "empty branch does not use the stale-HEAD log" \
@@ -264,6 +264,8 @@ assert_not_contains "ci_gate does not launch a fix agent for a missing HEAD run"
   "launching fix agent" "$EV"
 assert_not_contains "ci_gate does not sit on the empty-branch wait line" \
   "No workflow runs found yet" "$OUT"
+assert_eq "ci_gate records that no CI ran" "none" "$MEASURE_CI_RESULT"
+assert_not_contains "and does not call the PR green" "green — ready" "$EV"
 
 # ── ci_gate: failing HEAD still launches the fix agent ───────────────────────
 echo ""

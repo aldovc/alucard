@@ -81,7 +81,9 @@ case "$1 $2" in
     # Unauthenticated gh fails here rather than naming an account.
     [ -n "${ALUCARD_TEST_LOGIN:-}" ] || exit 1
     printf '%s\n' "$ALUCARD_TEST_LOGIN" ;;
-  "pr checks") echo "no checks reported" >&2; exit 1 ;;
+  "pr checks")
+    [ "${ALUCARD_TEST_CHECKS:-}" = none ] || exit 0
+    echo "no checks reported" >&2; exit 1 ;;
   "pr list")   printf '77\n' ;;
   "pr ready")  exit "${ALUCARD_TEST_READY_RC:-0}" ;;
   "issue view") printf 'Small fix\n' ;;
@@ -138,6 +140,7 @@ reset_pr() {
   LOGIN=alucard-bot
   PR_AUTHOR=alucard-bot
   PR_HEAD="$REVIEWED_SHA"
+  CHECKS=pass
 }
 
 run_continue() {
@@ -159,6 +162,7 @@ run_continue() {
   ALUCARD_TEST_LOGIN="$LOGIN" \
   ALUCARD_TEST_PR_AUTHOR="$PR_AUTHOR" \
   ALUCARD_TEST_PR_HEAD="$PR_HEAD" \
+  ALUCARD_TEST_CHECKS="$CHECKS" \
   ALUCARD_TRANSPORT_RETRY_ATTEMPTS=0 \
     "$ALUCARD" continue 77 "$TARGET" --no-build --max-review-cycles 1 \
       --env-file "$TEST_DIR/alucard.env" --logs-root "$TEST_DIR/logs" > "$TEST_DIR/out" 2>&1
@@ -305,6 +309,19 @@ run_continue
 assert_contains "the gate still approves" "Review gate: PR #77 approved" "$EVENTS"
 assert_contains "but says why it leaves the PR parked" "not an approval of its current head" "$EVENTS"
 assert_untouched "head advanced under the reviewer"
+
+echo ""
+echo "── APPROVED on a parked recovery PR, but no CI ran ──"
+# With nothing run beyond the container's own checks, an approval is a code
+# review, not a merge signal (#107).
+reset_pr
+CHECKS=none
+run_continue
+assert_not_contains "the CI gate does not call it green" "green — ready" "$EVENTS"
+assert_contains "the CI gate says on the PR that no CI ran" "CI gate: no CI ran" "$TRACE"
+assert_contains "the approval is flagged for a human" "APPROVED — no CI ran, needs human" "$APPROVED_COMMENT"
+assert_contains "and labelled needs-human" "needs-human" "$(grep -F -- '-X POST' <<<"$TRACE")"
+assert_untouched "no CI ran"
 
 echo ""
 echo "── CHANGES_REQUESTED on a parked recovery PR ──"

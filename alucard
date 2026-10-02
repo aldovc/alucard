@@ -2560,7 +2560,8 @@ $(printf '%s' "$feedback_findings" | xml_escape)
 # the watch path. Reset in setup_run_environment.
 CI_CHECKS_AVAILABLE=""
 
-# Poll CI via the Actions run list. Echoes 0 (green/skip) or 1 (failed).
+# Poll CI via the Actions run list. Echoes 0 (green), 1 (failed), or 2 (no run
+# for the PR's head: nothing ran, which is not a pass).
 # $1=pr_num $2=branch $3=pr_head_sha (may be empty)
 # Uses globals: REPO_ABS
 #
@@ -2568,7 +2569,7 @@ CI_CHECKS_AVAILABLE=""
 # already have runs for older commits, and waiting 45 minutes will not create
 # a run for HEAD. Two empty-HEAD probes (one 30s lag for enqueue) then skip
 # with a distinct log. A truly empty branch still gets a short window, then
-# the same skip-as-green as before. The 2700s deadline is for in-progress
+# the same no-CI result. The 2700s deadline is for in-progress
 # runs on the current HEAD only.
 #
 # log_event is redirected to stderr here: this function's stdout is captured
@@ -2596,8 +2597,8 @@ poll_ci_via_run_list() {
       if [ "$branch_runs" -gt 0 ]; then
         empty_head_probes=$((empty_head_probes + 1))
         if [ "$empty_head_probes" -ge "$empty_head_limit" ]; then
-          log_event "CI gate: no run for current HEAD ${pr_head_sha}; older SHAs on this branch did run — skipping." >&2
-          result=0
+          log_event "CI gate: no run for current HEAD ${pr_head_sha}; older SHAs on this branch did run." >&2
+          result=2
           break
         fi
         echo "No run for current HEAD yet. Waiting..." >&2
@@ -2605,8 +2606,8 @@ poll_ci_via_run_list() {
       fi
       empty_branch_probes=$((empty_branch_probes + 1))
       if [ "$empty_branch_probes" -ge "$empty_branch_limit" ]; then
-        log_event "CI gate: no CI runs visible for PR #$pr_num (token may lack 'actions' read permission) — skipping." >&2
-        result=0
+        log_event "CI gate: no CI runs visible for PR #$pr_num (Actions may be off, or the token may lack 'actions' read permission)." >&2
+        result=2
         break
       fi
       echo "No workflow runs found yet — waiting..." >&2
@@ -2666,12 +2667,11 @@ ci_gate() {
       set -e
 
       # No CI workflows configured (or none triggered for this PR's changed
-      # paths) — treat as a pass. Without this, `gh pr checks --watch` exits 1
-      # with "no checks reported", which falls through to the fix-agent loop
-      # and burns budget trying to repair CI that does not exist.
+      # paths, or Actions disabled). Not a failure: a fix agent cannot repair
+      # CI that does not exist. Not a pass either (#107).
       if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "no checks reported"; then
-        log_event "CI gate: no checks configured for PR #$pr_num — skipping."
-        ci_rc=0
+        log_event "CI gate: no checks configured for PR #$pr_num."
+        ci_rc=2
         CI_CHECKS_AVAILABLE=true
       elif [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "Resource not accessible"; then
         # Token-type limitation (fine-grained PAT), not a missing grant. Probe
@@ -2691,6 +2691,21 @@ ci_gate() {
     if [ "$ci_rc" -eq 0 ]; then
       log_event "CI gate: PR #$pr_num green — ready for review."
       MEASURE_CI_RESULT="green"
+      return 0
+    fi
+
+    # Workers run only the checks the container can, so with no CI nothing
+    # has run the full suite. review_gate reads "none" to keep an approval
+    # from reading as ready to merge.
+    if [ "$ci_rc" -eq 2 ]; then
+      log_event "CI gate: no CI ran for PR #$pr_num — not green; reviewing, then flagging for human."
+      MEASURE_CI_RESULT="none"
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "${BOT_COMMENT_PREFIX} CI gate: no CI ran — not green**
+
+No CI checks reported for this PR's head commit. Workflows may be missing or disabled, or the token cannot see their runs. The agents ran only the checks the container can run, so nothing has run this repository's full suite.
+
+Review continues, but an approval will not mark this PR ready to merge. Run the full checks before merging." 2>/dev/null || true
       return 0
     fi
 
@@ -3145,6 +3160,20 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
     # review with an empty verdict and zero cycles.
     MEASURE_VERDICT="$review_state"
     MEASURE_CYCLES="$review_cycle"
+
+    if [ "$review_state" = "APPROVED" ] && [ "${MEASURE_CI_RESULT:-}" = "none" ]; then
+      # An approval with no CI behind it is a code review, not a merge signal
+      # (#107). A parked recovery PR stays parked for the same reason.
+      log_event "Review gate: PR #$pr_num approved, but no CI ran — flagging for human."
+      cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED — no CI ran, needs human**
+
+The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.
+
+${review_comments}${_self_review_note}" 2>/dev/null || true
+      add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
+      return 0
+    fi
 
     if [ "$review_state" = "APPROVED" ]; then
       log_event "Review gate: PR #$pr_num approved — ready to merge."

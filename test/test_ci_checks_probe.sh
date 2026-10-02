@@ -189,8 +189,10 @@ assert_eq "pr checks is used on every gate when available" "2" "$checks_calls"
 assert_eq "availability is remembered as true" "true" "$CI_CHECKS_AVAILABLE"
 assert_not_contains "no degradation log when the API works" \
   "checks API unavailable" "$EV"
-assert_contains "no-checks still skips as green" \
+assert_contains "no checks is logged as such" \
   "no checks configured" "$EV"
+assert_not_contains "and is not reported green" "green — ready" "$EV"
+assert_eq "MEASURE_CI_RESULT records that no CI ran" "none" "$MEASURE_CI_RESULT"
 
 # ── Failure still detected via run list ──────────────────────────────────────
 echo ""

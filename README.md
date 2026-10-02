@@ -92,7 +92,7 @@ Use a fine-grained GitHub PAT restricted to the target repository, with these re
 
 Local tasks using only task-id dependencies can omit Issues access. Legacy `Blocked by #N` references still need Issues read access. Use short-lived tokens and dedicated provider keys with spending limits set in the provider console.
 
-If the token cannot access the PR checks API, Alucard falls back to `gh run list` for that run. That path needs Actions read access. If no checks or current-commit workflow runs are visible after polling, Alucard logs a skip and proceeds to review. A skipped CI gate is not evidence that tests passed.
+If the token cannot access the PR checks API, Alucard falls back to `gh run list` for that run. That path needs Actions read access. If no checks or current-commit workflow runs are visible after polling, the CI gate is not green. Alucard posts a "no CI ran" comment on the PR and still runs the review. An approval then gets the `needs-human` label instead of being marked ready to merge, because nothing has run the full suite.
 
 For Codex, set `ALUCARD_PROVIDER=codex` and `OPENAI_API_KEY` in the env file. You only need `ANTHROPIC_API_KEY` when at least one role uses Claude. See [Configuration](#configuration) for mixed-provider setups.
 
