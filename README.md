@@ -320,8 +320,8 @@ Each CI gate makes up to three check attempts, with at most two fix-agent runs b
 
 | Review outcome | What happens |
 |---|---|
-| `APPROVED` | Review ends. Inspect CI and the diff before merging. |
-| `CHANGES_REQUESTED` | Feedback addresses actionable findings, then CI and review repeat while cycles remain. |
+| `APPROVED` | Review ends. Non-blocking findings (style, naming, import order, comment wording, optional refactors) appear in the approval comment. Inspect CI and the diff before merging. |
+| `CHANGES_REQUESTED` | At least one blocking finding. Feedback addresses the blocking findings only, then CI and review repeat while cycles remain. |
 | `BLOCKED` | Work needs something an agent cannot do, such as a credential or human acceptance step. Alucard posts the reason and labels the PR `needs-human`. |
 | Review-cycle limit reached | Alucard posts an exhaustion comment and labels the PR `needs-human`. |
 | No reviewer verdict | After applicable retries, Alucard reports the failure and labels the unreviewed PR `needs-human`. |

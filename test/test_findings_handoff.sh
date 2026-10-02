@@ -29,7 +29,11 @@ DROP-TOO-LARGE — a cross-cutting refactor.
 
 ## Out of scope (follow-up)
 
-DROP-OUT-OF-SCOPE — predates the branch.'
+DROP-OUT-OF-SCOPE — predates the branch.
+
+## Non-blocking
+
+DROP-NIT — sort the test imports.'
 
 out=$(printf '%s' "$BODY" | strip_nonactionable_sections)
 
@@ -38,6 +42,7 @@ assert_not_contains "the too-large section is dropped" "DROP-TOO-LARGE" "$out"
 assert_not_contains "its heading goes too" "Too large for this loop" "$out"
 assert_not_contains "the out-of-scope section is dropped" "DROP-OUT-OF-SCOPE" "$out"
 assert_not_contains "its heading goes too" "Out of scope (follow-up)" "$out"
+assert_not_contains "the non-blocking nits are dropped" "DROP-NIT" "$out"
 
 # A section that FOLLOWS a stripped one must come back — skipping must end at
 # the next heading, not run to the end of the body.

@@ -131,13 +131,23 @@ caps and ticket file estimates are never targets.
 - **God function**: a single function that downloads, classifies, routes, and dispatches is doing four jobs. Flag functions whose responsibilities cannot be stated in one sentence.
 - **Swallowed exceptions**: bare `except Exception: pass` or logging without re-raise (unless the fallback behaviour is explicit and intentional) hides bugs. Flag any exception handler that does not either recover deliberately or propagate.
 
+## Blocking and non-blocking findings
+
+Every review round costs a full feedback run and a full review run. Spend one only on a finding that blocks merge.
+
+**Blocking**: a correctness bug, a security issue, an unmet spec or acceptance criterion, a failing check, a vacuous test or changed behaviour no test pins, or code or tests the task does not need.
+
+**Non-blocking**: style, naming, import order, formatting, comment wording, and optional refactors. Lint and format problems are the repository's own checks' job: if those checks pass, the problem is not worth a round.
+
+List non-blocking findings at the end of your review body under a heading of exactly `## Non-blocking`. One line each is enough. They never decide the verdict, and the harness does not hand them to the feedback agent. The heading is matched literally, so keep it as written.
+
 ## Verdict
 
 Exactly one of:
 
-**APPROVED** — every acceptance criterion the agent loop can satisfy is met, CI is green, and nothing in scope should block merge: no correctness, security, or test gap, and no code or test the task does not need.
+**APPROVED**: every acceptance criterion the agent loop can satisfy is met, CI is green, and no blocking finding remains. Non-blocking findings do not prevent approval. Approve and list them under `## Non-blocking`.
 
-**CHANGES_REQUESTED** — one or more merge-blocking issues found **that a feedback agent can fix in this container**. Every finding you list must be actionable by an agent with the tools described above.
+**CHANGES_REQUESTED**: at least one blocking finding **that a feedback agent can fix in this container**. Every finding you list must be actionable by an agent with the tools described above.
 
 **BLOCKED** — the code-level work is done, but merge is still gated on something no agent in this loop can do: a human-only acceptance criterion, a live deploy, a credential the container does not hold, an entry in `<known_blockers>`, or a merge-blocking fix too large for one pass (see **Size the remedy**). Use this the moment your only remaining objections are of that kind. It ends the loop and hands the PR to a human with your reasoning attached.
 
@@ -149,7 +159,7 @@ Do not approve out of politeness. Do not request changes out of thoroughness. If
 
 Try to post a formal review:
 
-- Approved: `gh pr review <pr_num> --approve --body "LGTM"`
+- Approved: `gh pr review <pr_num> --approve --body-file /work-output/.alucard-review-body`, so any `## Non-blocking` list reaches the PR. Write that file first (see **Output files**).
 - Changes: `gh pr review <pr_num> --request-changes --body "<findings>"`
 - Blocked: `gh pr review <pr_num> --request-changes --body "<findings>"` — GitHub has no BLOCKED state, so post it as request-changes. Your decision file is what the harness acts on.
 
@@ -157,7 +167,7 @@ GitHub may block self-review when the bot identity is also the PR author — in 
 
 ## Findings format
 
-For CHANGES_REQUESTED, list each finding as:
+For CHANGES_REQUESTED, list each blocking finding as:
 
 - **Severity**: High / Medium / Low
 - **Location**: `file:line` — when one cause has several sites, list every one of them here, each on its own line. Do not split them across several findings, and do not drop sites to keep the list short.
