@@ -36,6 +36,12 @@ assert_eq "a run in the same second gets its pid appended" \
 [ -d "$second" ] && pass "and that directory exists too" || fail "and that directory exists too"
 [ -d "$first" ] && pass "the first run's directory is untouched" || fail "the first run's directory is untouched"
 
+# A reboot empties /tmp and every run log under it (#111).
+assert_contains "a log root under /tmp warns that it will not survive a reboot" \
+  "will not survive a reboot" "$(warn_if_volatile_log_root /tmp/wave/issue-3 2>&1)"
+assert_eq "a persistent log root does not" \
+  "" "$(warn_if_volatile_log_root "$HOME/.local/state/alucard/logs" 2>&1)"
+
 # The worktree root is claimed under the repository in its own right: two runs
 # with different --logs-root values can both hold "alucard-<stamp>" as a log
 # dir name, and must still not meet at the same worktree path.
