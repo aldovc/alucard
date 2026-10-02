@@ -208,6 +208,8 @@ assert_eq "the stub title is replaced by the ticket's" "Small fix" "$(jq -r '.ti
 assert_contains "the APPROVED comment says the PR was marked ready" "Marked ready for review" "$APPROVED_COMMENT"
 assert_contains "that the label came off" "is done by this approval" "$APPROVED_COMMENT"
 assert_contains "and that the ticket now closes on merge" "the ticket closes when this merges" "$APPROVED_COMMENT"
+assert_contains "the APPROVED comment names the commit the reviewer approved, for alucard merge" \
+  "Reviewed head: \`$REVIEWED_SHA\`" "$APPROVED_COMMENT"
 
 echo ""
 echo "── APPROVED on a draft with needs-human that the harness never parked ──"
@@ -307,6 +309,8 @@ FORMAL_OID="$REVIEWED_SHA"
 run_continue
 assert_contains "a current formal approval un-parks" "$READY_CALL" "$TRACE"
 assert_contains "and the label comes off" "$UNLABEL_CALL" "$TRACE"
+assert_not_contains "a formal review is not recorded as the harness reviewer's approval" \
+  "Reviewed head:" "$APPROVED_COMMENT"
 
 echo ""
 echo "── an outside approval of the current head, harness requested changes ──"

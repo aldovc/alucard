@@ -44,6 +44,12 @@ BOT_LEDGER_MARKER="$BOT_COMMENT_PREFIX blocked findings**"
 # itself authored (see review_gate).
 BOT_RECOVERY_MARKER="$BOT_COMMENT_PREFIX recovery PR parked**"
 RECOVERY_TITLE_PREFIX="wip: alucard recovery"
+# Line in a review-cycle APPROVED comment naming the commit the harness
+# reviewer approved. `alucard merge` refuses a PR whose head is not that
+# commit. Written only when the harness reviewer's own decision file says
+# APPROVED: a formal review from someone else can carry the verdict, but it
+# is not the harness's approval.
+BOT_REVIEWED_HEAD="Reviewed head:"
 CODEX_STREAM_TEXT='select(.type == "item.completed") | if .item.type == "agent_message" then .item.text + "\n" elif .item.type == "command_execution" then "$ " + (.item.command | split("\n")[0] | .[0:200]) + "\n" elif .item.type == "error" then "⚠ codex error: " + .item.message + "\n" else empty end'
 
 # Per-role --max-turns / --max-budget-usd (Claude only) and the Claude
@@ -105,6 +111,7 @@ Usage:
   alucard build [options]
   alucard doctor [TARGET_REPO] [options]
   alucard continue <PR_NUM> [TARGET_REPO] [options]
+  alucard merge <PR_NUM> [TARGET_REPO] [options]
   alucard version
 
 TARGET_REPO accepts:
@@ -119,6 +126,8 @@ Commands:
   build     Build the Alucard Docker image.
   doctor    Check local prerequisites without running the worker.
   continue  Re-run the feedback+CI+review pipeline on a parked PR.
+  merge     Rebase a harness-approved PR onto its base, run the full check
+            command on this machine, post the result, and squash-merge.
   version   Print the CLI version and exit.
 
 Run options:
@@ -150,6 +159,19 @@ Continue options:
   <PR_NUM>                     Open PR number to continue (required, positional).
   Same flags as run apply: -C, -t, --env-file, --image, --logs-root,
   --max-review-cycles, --no-build.
+
+Merge options:
+  <PR_NUM>                     Open PR to merge (required, positional). Refused
+                               unless the harness reviewer approved its
+                               current head.
+      --check-command CMD      Full check command, run with bash in a fresh
+                               clone of the rebased branch on this machine,
+                               not in a container. Defaults to
+                               ALUCARD_CHECK_COMMAND (environment or env
+                               file). Never read from the PR. -t bounds it.
+      --dry-run                Rebase and run the checks, but push, comment,
+                               label and merge nothing.
+  Also accepts -C, -t, --env-file, --logs-root.
 
 Environment:
   ALUCARD_CACHE_DIR            Where GitHub repos, and the shared Playwright
@@ -195,6 +217,7 @@ Examples:
   ALUCARD_TARGET_REPO=/path/to/target-repo alucard run -n 20 -t 30
   cd /path/to/target-repo && alucard queue
   alucard continue 174 -C /path/to/target-repo
+  alucard merge 174 owner/repo --check-command 'just ci'
 EOF
 }
 
@@ -3190,6 +3213,13 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
     MEASURE_VERDICT="$review_state"
     MEASURE_CYCLES="$review_cycle"
 
+    local _reviewed_line=""
+    if [ "$_review_file_state" = "APPROVED" ] && [ -n "$_reviewed_sha" ]; then
+      _reviewed_line="${BOT_REVIEWED_HEAD} \`${_reviewed_sha}\`
+
+"
+    fi
+
     if [ "$review_state" = "APPROVED" ] && [ "${MEASURE_CI_RESULT:-}" = "none" ]; then
       # An approval with no CI behind it is a code review, not a merge signal
       # (#107). A parked recovery PR stays parked for the same reason.
@@ -3197,7 +3227,7 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED — no CI ran, needs human**
 
-The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.
+${_reviewed_line}The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.
 
 ${review_comments}${_self_review_note}" 2>/dev/null || true
       add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
@@ -3225,7 +3255,7 @@ ${_unpark_note}"
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED**
 
-${review_comments}${_self_review_note}${_unpark_note}" 2>/dev/null || true
+${_reviewed_line}${review_comments}${_self_review_note}${_unpark_note}" 2>/dev/null || true
       return 0
     fi
 
@@ -4682,6 +4712,210 @@ The agent did not finish, but it had already pushed. What is on the branch may a
     "$MEASURE_CI_RESULT" "$MEASURE_VERDICT" "$MEASURE_CYCLES" "$MEASURE_BASE_SHA"
 }
 
+# The commit the harness reviewer last approved, from a PR's comments JSON
+# ($1, `gh pr view --json comments`), counting only comments by the harness's
+# login ($2). The latest review-cycle comment decides, so a later
+# CHANGES_REQUESTED or BLOCKED supersedes an earlier approval. Echoes the SHA,
+# or nothing.
+harness_approved_sha() {
+  local comments_json="$1" login="$2"
+  [ -n "$login" ] || return 0
+  jq -r --arg login "$login" --arg prefix "${BOT_COMMENT_PREFIX} review cycle " \
+        --arg mark "$BOT_REVIEWED_HEAD" '
+    [.comments[]? | select((.author.login // "") == $login
+                           and ((.body // "") | startswith($prefix)))]
+    | last | .body // ""
+    | select(split("\n")[0] | test(": APPROVED"))
+    | capture($mark + " `(?<sha>[0-9a-f]{40})`") | .sha' <<<"$comments_json" 2>/dev/null || true
+}
+
+# The tail of a check log, for a PR comment: enough to show the summary lines
+# without posting the whole suite.
+merge_check_tail() {
+  tail -n 25 "$1" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g'
+}
+
+# Posts $2 on PR $1, or prints it under --dry-run.
+merge_post() {
+  local pr_num="$1" body="$2"
+  if [ "$MERGE_DRY_RUN" = true ]; then
+    printf '\n--- dry run: would comment on PR #%s ---\n%s\n---\n' "$pr_num" "$body"
+    return 0
+  fi
+  (cd "$REPO_ABS" && gh pr comment "$pr_num" --body "$body" >/dev/null 2>&1) \
+    || log_event "merge: could not comment on PR #$pr_num."
+}
+
+command_merge() {
+  local pr_arg="${1:-}"
+  is_uint "$pr_arg" || die "usage: alucard merge <PR_NUM> [options] — PR_NUM must be a positive integer"
+  local pr_num="$pr_arg"
+  shift
+
+  local check_flag="" arg
+  local -a rest=()
+  MERGE_DRY_RUN=false
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    case "$arg" in
+      --check-command)
+        [ -n "${2:-}" ] || die "$arg requires a command"
+        check_flag="$2"
+        shift 2 ;;
+      --dry-run)
+        MERGE_DRY_RUN=true
+        shift ;;
+      *)
+        rest+=("$arg")
+        shift ;;
+    esac
+  done
+  parse_repo_options ${rest[@]+"${rest[@]}"}
+  [ -z "${PIN_ISSUE:-}" ] || die "--issue is only valid with alucard run"
+
+  need_cmd git
+  need_cmd gh
+  need_cmd jq
+  need_cmd timeout
+
+  # The token the harness posts with, so the approval's author is read as the
+  # same login. Agent keys are not needed here.
+  load_env_file "$ENV_FILE" false
+  # The command comes from the operator, never from the PR under test: a check
+  # the branch can edit is a check the branch can switch off.
+  local check_cmd="${check_flag:-${ALUCARD_CHECK_COMMAND:-}}"
+  [ -n "$check_cmd" ] || die "no check command: pass --check-command CMD or set ALUCARD_CHECK_COMMAND"
+
+  REPO_ABS=$(resolve_repo "$TARGET_REPO")
+
+  local pr_json state branch base cross login approved_sha
+  pr_json=$(cd "$REPO_ABS" && \
+    gh pr view "$pr_num" --json state,headRefName,baseRefName,isCrossRepository,comments 2>/dev/null) \
+    || die "PR #$pr_num not found in target repo"
+  state=$(jq -r '.state' <<<"$pr_json")
+  branch=$(jq -r '.headRefName' <<<"$pr_json")
+  base=$(jq -r '.baseRefName' <<<"$pr_json")
+  cross=$(jq -r '.isCrossRepository // false' <<<"$pr_json")
+  [ "$state" = "OPEN" ] || die "PR #$pr_num is not open (state: $state)"
+  [ "$cross" != "true" ] || die "PR #$pr_num comes from a fork; merge only rebases branches on origin"
+
+  login=$(cd "$REPO_ABS" && gh api user --jq '.login' 2>/dev/null || true)
+  [ -n "$login" ] || die "could not read the GitHub login the harness posts as"
+  approved_sha=$(harness_approved_sha "$pr_json" "$login")
+  [ -n "$approved_sha" ] || die "PR #$pr_num has no harness approval to merge: the latest review-cycle comment by $login is not APPROVED or names no reviewed head. Run: alucard continue $pr_num"
+
+  LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd)"
+  LOG_DIR=$(claim_unique_dir "$LOG_ROOT/alucard-merge-${pr_num}-$(date +%Y%m%d-%H%M%S)")
+
+  local wt
+  wt=$(claim_unique_dir "${REPO_ABS}/.alucard-worktrees/merge-${pr_num}-$$")
+  # shellcheck disable=SC2064
+  trap "rm -rf '$wt'" EXIT
+
+  # The branch ref, not refs/pull/N/head, which can trail the tip by a commit.
+  make_agent_clone "$branch" "$wt" "$(git -C "$REPO_ABS" remote get-url origin)" >/dev/null 2>&1 \
+    || die "could not fetch $branch"
+  local head_sha base_sha new_sha rebased=false
+  head_sha=$(git -C "$wt" rev-parse HEAD)
+  [ "$head_sha" = "$approved_sha" ] \
+    || die "PR #$pr_num head ${head_sha:0:12} is not the commit the harness approved (${approved_sha:0:12}). Run: alucard continue $pr_num"
+
+  git -C "$wt" fetch --quiet origin "+refs/heads/$base:refs/remotes/origin/$base" \
+    || die "could not fetch $base"
+  base_sha=$(git -C "$wt" rev-parse "origin/$base")
+  log_event "merge: PR #$pr_num approved at $head_sha; base $base at $base_sha."
+
+  if git -C "$wt" merge-base --is-ancestor "$base_sha" HEAD; then
+    new_sha="$head_sha"
+  elif git -C "$wt" rebase "$base_sha" >"$LOG_DIR/rebase.log" 2>&1; then
+    new_sha=$(git -C "$wt" rev-parse HEAD)
+    rebased=true
+  else
+    local conflicts
+    conflicts=$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null || true)
+    git -C "$wt" rebase --abort >/dev/null 2>&1 || true
+    [ -n "$conflicts" ] || die "rebase of PR #$pr_num failed without a conflict; see $LOG_DIR/rebase.log"
+    log_event "merge: PR #$pr_num conflicts with $base — nothing pushed."
+    merge_post "$pr_num" "${BOT_COMMENT_PREFIX} merge: rebase conflict — needs human**
+
+Rebasing \`${head_sha}\` onto ${base} (\`${base_sha}\`) conflicts in:
+
+$(printf '%s\n' "$conflicts" | sed 's/^/- `/; s/$/`/')
+
+Nothing was pushed or merged."
+    [ "$MERGE_DRY_RUN" = true ] || add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
+    echo "PR #$pr_num conflicts with $base:" >&2
+    sed 's/^/  /' <<<"$conflicts" >&2
+    return 1
+  fi
+
+  local start check_rc elapsed where tail_text
+  echo "Running checks on ${new_sha:0:12}: $check_cmd (log: $LOG_DIR/check.log)"
+  start=$(date +%s)
+  set +e
+  (cd "$wt" && timeout --kill-after="$HARD_KILL_GRACE" "${TIMEOUT_MIN}m" bash -c "$check_cmd") \
+    </dev/null >"$LOG_DIR/check.log" 2>&1
+  check_rc=$?
+  set -e
+  elapsed=$(( $(date +%s) - start ))
+  log_event "merge: checks on PR #$pr_num exited $check_rc after ${elapsed}s."
+  tail_text=$(merge_check_tail "$LOG_DIR/check.log")
+  if [ "$rebased" = true ]; then
+    where="Rebased \`${head_sha}\` onto ${base} (\`${base_sha}\`) as \`${new_sha}\`."
+  else
+    where="\`${head_sha}\` already contains ${base} (\`${base_sha}\`)."
+  fi
+
+  local verdict="checks passed" outcome="" evidence
+  [ "$check_rc" -eq 0 ] || { verdict="checks failed — not merged"; outcome=" Nothing was pushed or merged."; }
+  evidence="${BOT_COMMENT_PREFIX} merge: ${verdict}**
+
+${where}${outcome}
+
+Ran \`${check_cmd}\` on \`${new_sha}\`: exit ${check_rc} after $((elapsed / 60))m $((elapsed % 60))s.
+
+<details><summary>Last lines of output</summary>
+
+\`\`\`\`
+${tail_text}
+\`\`\`\`
+
+</details>"
+  if [ "$check_rc" -ne 0 ]; then
+    merge_post "$pr_num" "$evidence"
+    echo "Checks failed (exit $check_rc); see $LOG_DIR/check.log" >&2
+    return 1
+  fi
+  if [ "$MERGE_DRY_RUN" = true ]; then
+    merge_post "$pr_num" "$evidence"
+    echo "Dry run: checks passed on ${new_sha:0:12}; not pushing or merging."
+    return 0
+  fi
+
+  if [ "$rebased" = true ]; then
+    git -C "$wt" push --quiet --force-with-lease="refs/heads/${branch}:${head_sha}" \
+      origin "HEAD:refs/heads/${branch}" \
+      || die "push of the rebased PR #$pr_num was rejected: the branch moved since it was checked. Nothing merged."
+    log_event "merge: pushed $new_sha to $branch."
+    # GitHub moves the PR's head a moment after the push lands.
+    local _i _pr_head=""
+    for _i in $(seq 1 30); do
+      _pr_head=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+      [ "$_pr_head" = "$new_sha" ] && break
+      sleep 2
+    done
+  fi
+  merge_post "$pr_num" "$evidence"
+
+  if ! (cd "$REPO_ABS" && gh pr merge "$pr_num" --squash --match-head-commit "$new_sha"); then
+    log_event "merge: gh pr merge failed for PR #$pr_num at $new_sha."
+    die "merging PR #$pr_num failed after the checks passed; the evidence is on the PR. Merge it by hand: gh pr merge $pr_num --squash --delete-branch"
+  fi
+  (cd "$REPO_ABS" && gh api --silent -X DELETE "repos/{owner}/{repo}/git/refs/heads/${branch}" 2>/dev/null) || true
+  log_event "merge: PR #$pr_num squash-merged at $new_sha."
+  echo "PR #$pr_num merged."
+}
+
 main() {
   if [ "$#" -eq 0 ]; then
     usage
@@ -4718,6 +4952,9 @@ main() {
       ;;
     continue)
       command_continue "$@"
+      ;;
+    merge)
+      command_merge "$@"
       ;;
     version|--version|-V)
       command_version
