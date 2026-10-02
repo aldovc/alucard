@@ -1747,21 +1747,27 @@ remove_pr_label() {
   return 1
 }
 
-# Whether an APPROVED verdict is about the PR's current head: this cycle's
+# Whether the harness reviewer approved the PR's current head: this cycle's
 # decision file counts only for the SHA its reviewer read, since the author can
-# push while the container runs, and a formal review only when GitHub reports
-# it against the head commit.
+# push while the container runs. When the reviewer wrote a decision file, it is
+# the harness's verdict and nothing else stands in for it. Without one, a
+# formal review counts only if the harness's own login posted it against the
+# head commit: anyone with access can approve a PR on GitHub (#104).
 # $1 = PR number, $2 = this cycle's decision-file verdict, $3 = the SHA that
-# cycle's reviewer worktree was cloned at (empty when it could not be read).
+# cycle's reviewer worktree was cloned at (empty when it could not be read),
+# $4 = the harness's GitHub login.
 approval_is_current() {
-  local pr_num="$1" file_state="$2" reviewed_sha="${3:-}" head reviewed
+  local pr_num="$1" file_state="$2" reviewed_sha="${3:-}" login="${4:-}" head reviewed
   head=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
   [ -n "$head" ] || return 1
-  if [ "$file_state" = "APPROVED" ] && [ "$reviewed_sha" = "$head" ]; then
-    return 0
+  if [ -n "$file_state" ]; then
+    [ "$file_state" = "APPROVED" ] && [ "$reviewed_sha" = "$head" ]
+    return
   fi
+  [ -n "$login" ] || return 1
   reviewed=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json reviews \
-    --jq '[.reviews[] | select(.state == "APPROVED")] | last | .commit.oid // empty' 2>/dev/null || true)
+    --jq "[.reviews[] | select(.state == \"APPROVED\" and .author.login == \"${login}\")] | last | .commit.oid // empty" \
+    2>/dev/null || true)
   [ -n "$reviewed" ] && [ "$head" = "$reviewed" ]
 }
 
@@ -3153,7 +3159,7 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
       _unpark_note=""
       _pr_json=$(cd "$REPO_ABS" && gh pr view "$pr_num" --json isDraft,labels,title,body 2>/dev/null || echo '{}')
       if [ "$_parked_marker" = true ]; then
-        if approval_is_current "$pr_num" "$_review_file_state" "$_reviewed_sha"; then
+        if approval_is_current "$pr_num" "$_review_file_state" "$_reviewed_sha" "$_harness_login"; then
           _unpark_note=$(unpark_recovery_pr "$REPO_ABS" "$pr_num" "$_pr_json")
         else
           log_event "Review gate: the approval on PR #$pr_num is not an approval of its current head — leaving it parked."

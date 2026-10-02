@@ -101,7 +101,13 @@ case "$1 $2" in
       *reviews*)
         case "$*" in
           *".state // empty"*) printf '%s\n' "${ALUCARD_TEST_FORMAL_STATE:-}" ;;
-          *".commit.oid"*)     printf '%s\n' "${ALUCARD_TEST_FORMAL_OID:-}" ;;
+          *".commit.oid"*)
+            # Evaluated like the real gh, so a filter on the author is honoured.
+            jq -n --arg s "${ALUCARD_TEST_FORMAL_STATE:-}" --arg o "${ALUCARD_TEST_FORMAL_OID:-}" \
+              --arg a "${ALUCARD_TEST_FORMAL_AUTHOR:-}" \
+              '{reviews: (if $s == "" then [] else
+                 [{state: $s, commit: {oid: $o}, author: {login: $a}}] end)}' \
+              | jq -r "${*: -1}" ;;
           *)                   [ -n "${ALUCARD_TEST_FORMAL_STATE:-}" ] && printf 'formal review body\n' || printf '\n' ;;
         esac ;;
       *headRefOid*)        printf '%s\n' "$ALUCARD_TEST_PR_HEAD" ;;
@@ -135,6 +141,7 @@ reset_pr() {
   READY_RC=0
   FORMAL_STATE=""
   FORMAL_OID=""
+  FORMAL_AUTHOR=alucard-bot
   LOGIN=alucard-bot
   PR_AUTHOR=alucard-bot
   PR_HEAD="$REVIEWED_SHA"
@@ -156,6 +163,7 @@ run_continue() {
   ALUCARD_TEST_READY_RC="$READY_RC" \
   ALUCARD_TEST_FORMAL_STATE="$FORMAL_STATE" \
   ALUCARD_TEST_FORMAL_OID="$FORMAL_OID" \
+  ALUCARD_TEST_FORMAL_AUTHOR="$FORMAL_AUTHOR" \
   ALUCARD_TEST_LOGIN="$LOGIN" \
   ALUCARD_TEST_PR_AUTHOR="$PR_AUTHOR" \
   ALUCARD_TEST_PR_HEAD="$PR_HEAD" \
@@ -295,6 +303,28 @@ FORMAL_OID="$REVIEWED_SHA"
 run_continue
 assert_contains "a current formal approval un-parks" "$READY_CALL" "$TRACE"
 assert_contains "and the label comes off" "$UNLABEL_CALL" "$TRACE"
+
+echo ""
+echo "── an outside approval of the current head, harness requested changes ──"
+# Anyone with access can approve on GitHub, and a formal review outranks the
+# decision file for the verdict. It must not stand in for the harness (#104).
+reset_pr
+VERDICT=CHANGES_REQUESTED
+FORMAL_STATE=APPROVED
+FORMAL_OID="$REVIEWED_SHA"
+FORMAL_AUTHOR=passer-by
+run_continue
+assert_untouched "outside approval over the harness's changes requested"
+
+echo ""
+echo "── an outside approval of the current head, harness gave no verdict ──"
+reset_pr
+VERDICT=""
+FORMAL_STATE=APPROVED
+FORMAL_OID="$REVIEWED_SHA"
+FORMAL_AUTHOR=passer-by
+run_continue
+assert_untouched "outside approval with no harness verdict"
 
 echo ""
 echo "── APPROVED, but the author pushed while the reviewer was running ──"
