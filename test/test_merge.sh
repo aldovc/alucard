@@ -110,6 +110,7 @@ echo "── stale but clean approved PR ──"
 setup_repos stale
 ALUCARD_TEST_STATE="$STATE" run_merge --check-command "$PASSING_CHECK"
 assert_eq "merge succeeds" "0" "$RC"
+assert_contains "a logs root under /tmp warns, as for run" "will not survive a reboot" "$OUT"
 assert_eq "the checks ran on the rebased tree" "base moved" "$(cat "$STATE/checked" 2>/dev/null)"
 if [ "$REMOTE_HEAD" != "$PR_SHA" ] \
    && git --git-dir="$REMOTE" merge-base --is-ancestor "$BASE_SHA" "$REMOTE_HEAD"; then
