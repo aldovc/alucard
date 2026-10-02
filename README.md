@@ -169,6 +169,9 @@ alucard doctor /path/to/repo
 # Address PR comments, then re-run CI and review
 alucard continue 174 owner/repo
 
+# Rebase an approved PR, run the full checks here, post the result, squash-merge
+alucard merge 174 owner/repo --check-command 'just ci'
+
 # Show all options or the installed CLI version
 alucard --help
 alucard version
@@ -336,6 +339,17 @@ alucard continue 174 owner/repo
 ```
 
 `continue` uses the latest Alucard change request plus subsequent human comments, or all human comments if there is no change request. Without actionable comments it runs CI and review only. It does not restart the original implementation task.
+
+### Merging an approved PR
+
+Approved PRs go stale as other PRs land. `alucard merge <PR>` does the merge steps:
+
+1. Refuses unless the latest review-cycle comment from the harness account is an APPROVED comment, and its `Reviewed head:` commit is the tip of the PR branch. It reads the branch ref, not `refs/pull/N/head`, which can trail the tip.
+2. Rebases a fresh clone of the branch onto the current base. On a conflict it pushes nothing, comments with the conflicting paths, and labels the PR `needs-human`. It never resolves conflicts.
+3. Runs the check command in that clone with `bash`, bounded by `-t`. The full log goes to the merge's log directory.
+4. If the checks fail, it posts the failure summary and stops. Otherwise it force-pushes with a lease on the approved commit, posts the evidence (commits, command, exit code, last lines of output), squash-merges that exact commit, and deletes the branch.
+
+The check command runs **on your machine**, outside the container, so it can use local services such as a test database. It comes from `--check-command` or `ALUCARD_CHECK_COMMAND` (environment or env file), never from the PR. A PR could otherwise edit the command that checks it. The clone has no installed dependencies, so include the install step when the suite needs one, for example `npm --prefix frontend ci && just ci`. `--dry-run` rebases and runs the checks, then prints the evidence without pushing, commenting, labelling, or merging.
 
 ### Worker recovery
 
