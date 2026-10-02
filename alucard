@@ -2818,11 +2818,12 @@ append_task_context() {
 }
 
 # The feedback agent is handed the review body verbatim, so every section the
-# reviewer wrote for a human arrives looking like a finding. Two of them are
-# deliberately not actionable: out-of-scope follow-ups, and fixes too large for
-# one pass. An agent that acts on either does the exact damage those sections
-# exist to prevent — chasing pre-existing weaknesses, or burning a whole budget
-# on a refactor it cannot land. They stay on the PR comment for the human; they
+# reviewer wrote for a human arrives looking like a finding. Three of them are
+# deliberately not actionable: out-of-scope follow-ups, fixes too large for
+# one pass, and non-blocking nits. An agent that acts on any of them does the
+# exact damage those sections exist to prevent — chasing pre-existing
+# weaknesses, burning a whole budget on a refactor it cannot land, or spending
+# a review round on import order. They stay on the PR comment for the human; they
 # just do not travel to feedback. Headings are matched literally, which is why
 # the reviewer prompt tells the reviewer to keep them as written.
 strip_nonactionable_sections() {
@@ -2881,7 +2882,7 @@ strip_nonactionable_sections() {
       skip = 0
       for (i = 1; i <= NR; i++) {
         if (!fenced[i]) {
-          if (line[i] ~ /^##[[:space:]]+(Out of scope \(follow-up\)|Too large for this loop)[[:space:]]*$/) {
+          if (line[i] ~ /^##[[:space:]]+(Out of scope \(follow-up\)|Too large for this loop|Non-blocking)[[:space:]]*$/) {
             skip = 1
             continue
           }
