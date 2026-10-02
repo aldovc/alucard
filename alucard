@@ -4804,7 +4804,8 @@ command_merge() {
   approved_sha=$(harness_approved_sha "$pr_json" "$login")
   [ -n "$approved_sha" ] || die "PR #$pr_num has no harness approval to merge: the latest review-cycle comment by $login is not APPROVED or names no reviewed head. Run: alucard continue $pr_num"
 
-  LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd)"
+  LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd -P)"
+  warn_if_volatile_log_root "$LOG_ROOT"
   LOG_DIR=$(claim_unique_dir "$LOG_ROOT/alucard-merge-${pr_num}-$(date +%Y%m%d-%H%M%S)")
 
   local wt
