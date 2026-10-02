@@ -116,14 +116,27 @@ chmod +x "$MOCK_BIN/gh"
 
 RUN_DIR="$TMP_ROOT/run"; mkdir -p "$RUN_DIR"
 cp "$CLAUDE_LOG" "$RUN_DIR/iter-1.jsonl"
+# Two review rounds, the second retried after a transport drop, one feedback
+# round between them, and a feedback round whose agent died before reporting
+# usage: rounds count the runs, not the rows with usage.
+cp "$CLAUDE_LOG" "$RUN_DIR/iter-1-review-1.jsonl"
+cp "$CLAUDE_LOG" "$RUN_DIR/iter-1-feedback-1.jsonl"
+cp "$CLAUDE_LOG" "$RUN_DIR/iter-1-review-2.jsonl"
+cp "$CLAUDE_LOG" "$RUN_DIR/iter-1-review-2-attempt-2.jsonl"
+: > "$RUN_DIR/iter-1-feedback-2.jsonl"
+# Another iteration's rounds are not this one's.
+cp "$CLAUDE_LOG" "$RUN_DIR/iter-10-review-1.jsonl"
 PATH="$MOCK_BIN:$PATH" ALUCARD_TEST_CAPTURE="$CAPTURE" \
-  post_iteration_usage 1 7 "$TMP_ROOT" "$RUN_DIR" >/dev/null
+  post_iteration_usage 1 7 "$TMP_ROOT" "$RUN_DIR" 754 >/dev/null
 
 posted=$(cat "$CAPTURE" 2>/dev/null || true)
 case "$posted" in
   "$BOT_COMMENT_PREFIX"*) pass "the usage comment opens with the wrapper prefix" ;;
   *) fail "the usage comment opens with the wrapper prefix (got '${posted:0:40}')" ;;
 esac
+
+assert_contains "the comment states the run's duration and its review and feedback rounds" \
+  "Duration: 12m 34s · Review rounds: 2 · Feedback rounds: 2" "$posted"
 
 excluded=$(jq -nr --arg body "$posted" --arg prefix "$BOT_COMMENT_PREFIX" \
   '[$body] | map(select(startswith($prefix) | not)) | length')

@@ -184,7 +184,7 @@ The target defaults to the current directory. You can also select it with `--rep
 | `--max-review-cycles` | `10` | Maximum reviewer cycles per PR |
 | `--env-file` | `alucard.env` beside the CLI | Credentials and agent settings |
 | `--image` | `ghcr.io/aldovc/alucard:latest` | Container image |
-| `--logs-root` | `logs/` beside the CLI | Run logs and measurements |
+| `--logs-root` | `~/.local/state/alucard/logs` | Run logs and measurements; a path under `/tmp` prints a warning |
 | `--no-build` | Off | Use an existing image without rebuilding; warn if stale |
 
 `--issue` is valid only for `run`. It forces the GitHub task source and cannot be combined with `--tasks`. `--tasks` and `--github` are also mutually exclusive.
@@ -371,7 +371,7 @@ Agents have network access and receive the configured credentials. Isolation doe
 
 ## Logs and measurements
 
-Each run writes to `logs/alucard-*/` beside the CLI unless you set `--logs-root` or `ALUCARD_LOG_ROOT`.
+Each run writes to `alucard-*/` under `$XDG_STATE_HOME/alucard/logs` (default `~/.local/state/alucard/logs`) unless you set `--logs-root` or `ALUCARD_LOG_ROOT`. Keep logs out of `/tmp`, which a reboot empties.
 
 | Path within the run directory | Contents |
 |---|---|
@@ -386,7 +386,7 @@ For example, compare code growth across stages:
 ```bash
 jq -r 'select(.record=="stage")
        | "\(.iter) \(.stage)/\(.cycle)  +\(.from_base.added) since base"' \
-  "$ALUCARD_HOME"/logs/alucard-*/measurements.jsonl
+  ~/.local/state/alucard/logs/alucard-*/measurements.jsonl
 ```
 
 Measurements contain three record types:
@@ -395,7 +395,7 @@ Measurements contain three record types:
 - `stage` measures worker, CI-fix, and feedback changes against the iteration's base and previous stage. Changes are grouped as tests, implementation, configuration/docs, and generated files, with paths retained. `baseline_source` and `base_drifted` describe the comparison base; an unavailable diff is marked explicitly.
 - `iteration` records CI result, review verdict, cycles, elapsed time, and token usage by role. Cost is `null` when the provider reports none. `cost_complete`, invocation counts, and `usage_missing` distinguish complete totals from partial data.
 
-Measurements and archived prompts stay local. Alucard also posts usage summaries on PRs. Measurement failures are logged and do not stop the run.
+Measurements and archived prompts stay local. Alucard also posts a usage summary on the issue (or the PR, for local tasks) with the run's duration, its review and feedback rounds, and per-agent token usage. Measurement failures are logged and do not stop the run.
 
 ## Development
 

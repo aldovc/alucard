@@ -12,7 +12,7 @@ TOOL_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 DEFAULT_IMAGE="${ALUCARD_IMAGE:-ghcr.io/aldovc/alucard:latest}"
 DEFAULT_ENV_FILE="${ALUCARD_ENV_FILE:-$TOOL_DIR/alucard.env}"
 DEFAULT_BASE_BRANCH="${ALUCARD_BASE_BRANCH:-main}"
-DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-$TOOL_DIR/logs}"
+DEFAULT_LOG_ROOT="${ALUCARD_LOG_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/alucard/logs}"
 DEFAULT_CACHE_DIR="${ALUCARD_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/alucard}"
 # Shared Playwright browser cache, mounted into every container. Lives under
 # the same cache dir so one ALUCARD_CACHE_DIR still moves everything.
@@ -130,8 +130,9 @@ Run options:
       --env-file PATH          Credential env file. Default: ./alucard.env
                                beside this CLI.
       --image NAME             Docker image name. Default: ghcr.io/aldovc/alucard:latest.
-      --logs-root PATH         Directory for run logs. Default: ./logs beside
-                               this CLI.
+      --logs-root PATH         Directory for run logs. Default:
+                               ~/.local/state/alucard/logs (XDG_STATE_HOME
+                               honoured). A path under /tmp prints a warning.
       --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 10.
       --no-build               Do not build the image if it is missing or
                                stale. Warns instead of rebuilding.
@@ -2179,12 +2180,16 @@ print_usage_report() {
   printf '\n'
 }
 
+count_distinct_lines() {
+  printf '%s' "$1" | sed '/^$/d' | sort -u | wc -l | tr -d ' '
+}
+
 # Post a collapsible markdown token-usage table to the GitHub issue closed by
 # this iteration's PR.
 # $1 = iteration index, $2 = PR number (empty when the iteration opened none),
-# $3 = repo abs path, $4 = log dir
+# $3 = repo abs path, $4 = log dir, $5 = iteration wall time in seconds
 post_iteration_usage() {
-  local iter="$1" pr_num="$2" repo_abs="$3" log_dir="$4"
+  local iter="$1" pr_num="$2" repo_abs="$3" log_dir="$4" duration_s="${5:-}"
 
   [ -n "${pr_num:-}" ] || return 0
 
@@ -2200,6 +2205,10 @@ post_iteration_usage() {
   local total_inp=0 total_out=0 total_cr=0 total_cw=0 total_turns=0
   local total_cost="0" have_cost=0
   local f base label mid inp out cr cw turns cost cost_disp
+  # Rounds come from the log names, not the usage rows: an agent that died
+  # before reporting usage still cost a round. A review retried after a
+  # transport drop (review-N-attempt-M) is still round N.
+  local review_rounds="" feedback_rounds=""
 
   while IFS= read -r f; do
     base=$(basename "$f" .jsonl)
@@ -2207,9 +2216,11 @@ post_iteration_usage() {
       iter-"${iter}"-fix-*)
         mid="${base#iter-}"; label="ci-fix ${mid/-fix-/.}" ;;
       iter-"${iter}"-review-*)
-        mid="${base#iter-}"; label="review ${mid/-review-/.}" ;;
+        mid="${base#iter-}"; label="review ${mid/-review-/.}"
+        mid="${base#iter-"${iter}"-review-}"; review_rounds+="${mid%%-*}"$'\n' ;;
       iter-"${iter}"-feedback-*)
-        mid="${base#iter-}"; label="feedback ${mid/-feedback-/.}" ;;
+        mid="${base#iter-}"; label="feedback ${mid/-feedback-/.}"
+        feedback_rounds+="${base##*-}"$'\n' ;;
       iter-"${iter}"-attempt-*)
         label="worker attempt ${base##*-attempt-}" ;;
       iter-"${iter}"-wrapup)
@@ -2253,8 +2264,19 @@ post_iteration_usage() {
     total_cost_disp="-"
   fi
 
+  local summary="" duration_disp=""
+  if [ -n "$duration_s" ]; then
+    duration_disp="$((duration_s / 60))m $((duration_s % 60))s"
+    [ "$duration_s" -ge 3600 ] && \
+      duration_disp="$((duration_s / 3600))h $((duration_s % 3600 / 60))m"
+    summary="Duration: ${duration_disp} · "
+  fi
+  summary="${summary}Review rounds: $(count_distinct_lines "$review_rounds") · Feedback rounds: $(count_distinct_lines "$feedback_rounds")"
+
   local body
   body="${BOT_COMMENT_PREFIX} token usage (iteration ${iter})**
+
+${summary}
 
 <details><summary>Per-agent breakdown</summary>
 
@@ -3661,6 +3683,17 @@ mint_branch() {
   printf '%s' "$name"
 }
 
+# A reboot empties /tmp, and with it every worker transcript and review log of
+# the runs before it; only the posted usage comments survive.
+# $1 = absolute, symlink-resolved log root
+warn_if_volatile_log_root() {
+  case "$1" in
+    /tmp|/tmp/*|/private/tmp|/private/tmp/*)
+      echo "Warning: --logs-root $1 is under /tmp — these run logs will not survive a reboot." >&2 ;;
+  esac
+  return 0
+}
+
 setup_run_environment() {
   # Already resolved when the caller needed the repo before the run existed —
   # continue's PR lookup, run --issue's pin. Resolving again fetched the cache
@@ -3670,7 +3703,8 @@ setup_run_environment() {
   fi
   [ -d "$(dirname "$ENV_FILE")" ] || die "env file directory does not exist: $(dirname "$ENV_FILE")"
   ENV_FILE="$(cd "$(dirname "$ENV_FILE")" && pwd)/$(basename "$ENV_FILE")"
-  LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd)"
+  LOG_ROOT="$(mkdir -p "$LOG_ROOT" && cd "$LOG_ROOT" && pwd -P)"
+  warn_if_volatile_log_root "$LOG_ROOT"
   LOG_DIR=$(claim_log_dir "$LOG_ROOT" "$(date +%Y%m%d-%H%M%S)")
   # Worktrees live under a directory only this run uses, named after its log
   # dir and claimed under the repository in its own right (two runs with
@@ -4413,9 +4447,9 @@ command_run() {
       ci_gate "$i" "$ACTUAL_BRANCH" "$_origin_url" "$_iter_pr_num"
       review_gate "$i" "$ACTUAL_BRANCH" "$_origin_url" "$_iter_pr_num" "$TASK_XML" "$PARENT_CONTEXT_XML"
     fi
-    post_iteration_usage "$i" "${_iter_pr_num:-${_recovery_pr_num:-}}" "$REPO_ABS" "$LOG_DIR"
-
     _iter_duration=$(( $(date +%s) - _iter_start_epoch ))
+    post_iteration_usage "$i" "${_iter_pr_num:-${_recovery_pr_num:-}}" "$REPO_ABS" "$LOG_DIR" "$_iter_duration"
+
     log_event "Iteration $i/$ITERATIONS end: rc=$rc duration=${_iter_duration}s"
     measure_iteration "$i" "$_iter_pr_num" "$rc" "$_iter_duration" \
       "$MEASURE_CI_RESULT" "$MEASURE_VERDICT" "$MEASURE_CYCLES" "$MEASURE_BASE_SHA"
@@ -4589,7 +4623,8 @@ The feedback agent did not finish and pushed nothing, so this branch is still at
 
 A turn-cap or budget stop is the usual cause. Its work died with the worktree: the agent is told to commit and push before verifying, and one that spends its whole budget exploring never reaches that step. Raising \`ALUCARD_FEEDBACK_MAX_TURNS\`, or narrowing the findings above, is the usual fix." 2>/dev/null || true
       add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
-      post_iteration_usage "$iter" "$pr_num" "$REPO_ABS" "$LOG_DIR"
+      post_iteration_usage "$iter" "$pr_num" "$REPO_ABS" "$LOG_DIR" \
+        "$(( $(date +%s) - _continue_start_epoch ))"
       measure_iteration "$iter" "$pr_num" 0 "$(( $(date +%s) - _continue_start_epoch ))" \
         "$MEASURE_CI_RESULT" "$MEASURE_VERDICT" "$MEASURE_CYCLES" "$MEASURE_BASE_SHA"
       return 0
@@ -4605,7 +4640,8 @@ The agent did not finish, but it had already pushed. What is on the branch may a
   fi
   ci_gate "$iter" "$branch" "$origin_url" "$pr_num"
   review_gate "$iter" "$branch" "$origin_url" "$pr_num"
-  post_iteration_usage "$iter" "$pr_num" "$REPO_ABS" "$LOG_DIR"
+  post_iteration_usage "$iter" "$pr_num" "$REPO_ABS" "$LOG_DIR" \
+    "$(( $(date +%s) - _continue_start_epoch ))"
   measure_iteration "$iter" "$pr_num" 0 "$(( $(date +%s) - _continue_start_epoch ))" \
     "$MEASURE_CI_RESULT" "$MEASURE_VERDICT" "$MEASURE_CYCLES" "$MEASURE_BASE_SHA"
 }
