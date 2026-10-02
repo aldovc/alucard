@@ -59,6 +59,7 @@ do not add files or tests to match a ticket's estimate.
 - Every `asyncio.create_task(...)` has a done-callback that logs exceptions.
 - No token, API key, or credential is passed as a plain `str` parameter through more than one function boundary.
 - External/user input is validated at the trust boundary before use.
+- A new or changed call to a third-party HTTP API parses the response shape the vendor documents. Read the vendor's docs or source before writing the parser and its test mock, and name the source in the PR body. A mock copied from your own assumption tests nothing.
 
 **Completeness** — the gaps a green test suite hides
 - Every symbol you import from an internal module is actually *defined* there, not merely planned. A name you referenced across files and patched in tests but never wrote is an `ImportError` at module load — see the runnable check in Verify below.
