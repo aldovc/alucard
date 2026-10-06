@@ -294,6 +294,8 @@ Before dispatching agents, dependency preflight checks Python projects with `uv 
 
 Preflight verifies dependency installation only. Agents still need to follow the target repository's verification workflow and report tests they ran separately from checks they could not run. Service-backed checks assigned to CI remain CI's responsibility.
 
+A target repository whose tests need Postgres can name an image in `.alucard/postgres`, for example `pgvector/pgvector:pg16`. Alucard reads that file from the base branch, never from a PR. Each run then gets its own Docker network, and each iteration a fresh database on it. Every agent receives `DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres`, and the toolchain status tells agents the database is there. The database container runs outside the agent sandbox, so name only images you trust.
+
 Playwright browsers are cached across containers under `~/.cache/alucard/playwright-browsers`. Preflight seeds the cache from the image and installs Chromium for the target repository's own Playwright version when detected. Different revisions coexist; preflight reports version mismatches. `ALUCARD_CACHE_DIR` relocates both repository and browser caches, and the default honors `XDG_CACHE_HOME`. You can prune the browser cache between runs; preflight recreates it.
 
 `alucard build` stamps the image with a hash of `Dockerfile` and `entrypoint.sh`. Runs rebuild missing, unstamped, or stale images from the installed CLI source. Successful rebuilds also try to remove a superseded image if it has no remaining tags. `--no-build` keeps an existing image with a warning, but fails if the image is missing.

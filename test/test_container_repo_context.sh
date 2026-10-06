@@ -172,6 +172,39 @@ GH_REPO_SLUG=""
 invoke_agent iter-1 "$TEST_DIR/agent2.jsonl" 10 1 'prompt' -v "$CHECKOUT:/work:rw" >/dev/null 2>&1 || true
 assert_not_contains "a non-GitHub origin sets no GH_REPO" "GH_REPO=" "$(<"$ALUCARD_TEST_ARGV")"
 
+# ── Postgres declared by the target repo ────────────────────────────────────
+echo ""
+echo "── Postgres service ──"
+
+PG_UP="$TEST_DIR/pg-up"; PG_REPO="$TEST_DIR/pg-repo"
+git init -q -b main "$PG_UP"; mkdir -p "$PG_UP/.alucard"
+printf '# pinned\n  example/pg:16  \n' > "$PG_UP/.alucard/postgres"
+git -C "$PG_UP" add . && git -C "$PG_UP" -c user.name=t -c user.email=t@e commit -qm pg
+git clone -q "$PG_UP" "$PG_REPO"
+# A declaration only on the checked-out branch, not the base, must not count.
+printf 'example/evil:1\n' > "$PG_REPO/.alucard/postgres"
+git -C "$PG_REPO" -c user.name=t -c user.email=t@e commit -qam local
+REPO_ABS="$PG_REPO"; BASE_BRANCH=main; TOOLCHAIN_STATUS="OK."
+: > "$ALUCARD_TEST_ARGV"
+setup_postgres >/dev/null
+assert_contains "the base branch's image starts on the run's network as host postgres" \
+  "run -d --rm --name alucard-postgres-$$ --network alucard-$$ --network-alias postgres" "$(<"$ALUCARD_TEST_ARGV")"
+assert_contains "with the image the base branch names" "example/pg:16" "$(<"$ALUCARD_TEST_ARGV")"
+assert_not_contains "not one only the checkout declares" "example/evil" "$(<"$ALUCARD_TEST_ARGV")"
+assert_contains "agents are told where it is" "DATABASE_URL=$POSTGRES_URL" "$TOOLCHAIN_STATUS"
+: > "$ALUCARD_TEST_ARGV"
+invoke_agent iter-1 "$TEST_DIR/agent3.jsonl" 10 1 'prompt' -v "$CHECKOUT:/work:rw" >/dev/null 2>&1 || true
+assert_contains "agents join the run's network" "--network alucard-$$" "$(<"$ALUCARD_TEST_ARGV")"
+assert_contains "and get the URL" "-e DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres" "$(<"$ALUCARD_TEST_ARGV")"
+
+git -C "$PG_UP" rm -q .alucard/postgres && git -C "$PG_UP" -c user.name=t -c user.email=t@e commit -qm rm
+git -C "$PG_REPO" fetch -q
+RUN_NETWORK=""; : > "$ALUCARD_TEST_ARGV"
+setup_postgres >/dev/null
+invoke_agent iter-1 "$TEST_DIR/agent4.jsonl" 10 1 'prompt' -v "$CHECKOUT:/work:rw" >/dev/null 2>&1 || true
+assert_contains "without a declaration agents stay on the default bridge" "--network bridge" "$(<"$ALUCARD_TEST_ARGV")"
+assert_not_contains "and get no database" "DATABASE_URL" "$(<"$ALUCARD_TEST_ARGV")"
+
 # ── End to end: a worker whose checkout was empty gets a fresh one ──────────
 echo ""
 echo "── worker: empty checkout, then a fresh worktree ──"
