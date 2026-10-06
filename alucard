@@ -715,7 +715,7 @@ classify_agent_failure() {
 docker_sandbox_args() {
   # shellcheck disable=SC2054 # commas live inside single flag values (--tmpfs …,size=2g), not between elements
   DOCKER_SANDBOX_ARGS=(
-    --network bridge
+    --network "${RUN_NETWORK:-bridge}"
     --memory 4g --cpus 2
     --read-only
     --tmpfs /tmp:exec,size=2g
@@ -758,6 +758,45 @@ docker_sandbox_args() {
       -e "PLAYWRIGHT_SKIP_BROWSER_GC=1"
     )
   fi
+  if [ -n "${POSTGRES_IMAGE:-}" ]; then
+    DOCKER_SANDBOX_ARGS+=(-e "DATABASE_URL=$POSTGRES_URL")
+  fi
+}
+
+# A target repo whose tests need a database names its Postgres image in
+# .alucard/postgres on the base branch (first non-comment line). The run then
+# gets its own network, and every container on it reaches the database as
+# host `postgres`. Read from the base branch, never the PR, because the image
+# runs on the host's Docker without the agent sandbox.
+setup_postgres() {
+  POSTGRES_IMAGE=$(git -C "$REPO_ABS" show "origin/$BASE_BRANCH:.alucard/postgres" 2>/dev/null \
+    | sed -n '/^[[:space:]]*[^#[:space:]]/{s/[[:space:]]//g;p;q;}') || true
+  [ -n "$POSTGRES_IMAGE" ] || return 0
+  POSTGRES_URL="postgresql://postgres:postgres@postgres:5432/postgres"
+  docker network create "alucard-$$" >/dev/null || die "cannot create Docker network alucard-$$"
+  RUN_NETWORK="alucard-$$"
+  start_postgres
+  TOOLCHAIN_STATUS="${TOOLCHAIN_STATUS} Postgres runs beside this container, fresh for each iteration, at DATABASE_URL=$POSTGRES_URL. Run the database-backed checks against it; Docker is not needed."
+}
+
+# Replaces this run's database with an empty one and waits until it accepts
+# TCP connections. pg_isready over TCP, because the image's init server listens
+# on the Unix socket only and would read as ready before init finished.
+start_postgres() {
+  local name="alucard-postgres-$$" _
+  docker rm -fv "$name" >/dev/null 2>&1 || true
+  docker run -d --rm --name "$name" --network "$RUN_NETWORK" --network-alias postgres \
+    --memory 1g --security-opt no-new-privileges \
+    -e POSTGRES_PASSWORD=postgres "$POSTGRES_IMAGE" >/dev/null \
+    || die "cannot start Postgres from $POSTGRES_IMAGE"
+  for _ in $(seq 60); do
+    docker exec "$name" pg_isready -q -h 127.0.0.1 -U postgres 2>/dev/null && {
+      log_event "Postgres: $POSTGRES_IMAGE ready"
+      return 0
+    }
+    sleep 1
+  done
+  die "Postgres from $POSTGRES_IMAGE not ready after 60s"
 }
 
 # Appends <turn_budget> so the agent can see the wall it is running at. Claude
@@ -3809,11 +3848,16 @@ setup_run_environment() {
     for c in "${CREATED_CONTAINERS[@]}"; do
       docker rm -f "$c" >/dev/null 2>&1 || true
     done
+    if [ -n "${RUN_NETWORK:-}" ]; then
+      docker rm -fv "alucard-postgres-$$" >/dev/null 2>&1 || true
+      docker network rm "$RUN_NETWORK" >/dev/null 2>&1 || true
+    fi
     print_usage_report "$LOG_DIR"
   }
   trap cleanup EXIT
 
   toolchain_preflight
+  setup_postgres
 }
 
 # One sentence for the class classify_agent_failure gave a stopped worker, for
@@ -4140,6 +4184,11 @@ command_run() {
       _in_progress_before=$(cd "$REPO_ABS" && \
         gh issue list --state open --label in-progress --limit 500 --json number \
           --jq '[.[].number]' 2>/dev/null || echo '[]')
+    fi
+
+    # The first iteration's database was started by setup_postgres.
+    if [ -n "${POSTGRES_IMAGE:-}" ] && [ "$i" -gt 1 ]; then
+      start_postgres
     fi
 
     _worker_provider=$(resolve_provider WORKER)
