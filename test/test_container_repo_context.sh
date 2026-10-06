@@ -192,6 +192,7 @@ assert_contains "the base branch's image starts on the run's network as host pos
 assert_contains "with the image the base branch names" "example/pg:16" "$(<"$ALUCARD_TEST_ARGV")"
 assert_not_contains "not one only the checkout declares" "example/evil" "$(<"$ALUCARD_TEST_ARGV")"
 assert_contains "agents are told where it is" "DATABASE_URL=$POSTGRES_URL" "$TOOLCHAIN_STATUS"
+assert_not_contains "the declaration is not echoed into agent status" "example/pg:16" "$TOOLCHAIN_STATUS"
 : > "$ALUCARD_TEST_ARGV"
 invoke_agent iter-1 "$TEST_DIR/agent3.jsonl" 10 1 'prompt' -v "$CHECKOUT:/work:rw" >/dev/null 2>&1 || true
 assert_contains "agents join the run's network" "--network alucard-$$" "$(<"$ALUCARD_TEST_ARGV")"

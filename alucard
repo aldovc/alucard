@@ -776,7 +776,7 @@ setup_postgres() {
   docker network create "alucard-$$" >/dev/null || die "cannot create Docker network alucard-$$"
   RUN_NETWORK="alucard-$$"
   start_postgres
-  TOOLCHAIN_STATUS="${TOOLCHAIN_STATUS} Postgres ($POSTGRES_IMAGE) runs beside this container, fresh for each iteration, at DATABASE_URL=$POSTGRES_URL. Run the database-backed checks against it; Docker is not needed."
+  TOOLCHAIN_STATUS="${TOOLCHAIN_STATUS} Postgres runs beside this container, fresh for each iteration, at DATABASE_URL=$POSTGRES_URL. Run the database-backed checks against it; Docker is not needed."
 }
 
 # Replaces this run's database with an empty one and waits until it accepts
