@@ -1899,13 +1899,13 @@ unpark_recovery_pr() {
   printf '%s' "$note"
 }
 
-# Whether a finished feedback agent should end the review loop: it failed AND
-# left the branch exactly where the reviewer found it. Anything it pushed gives
-# the next cycle new code to judge, and an unreadable SHA ("unknown") is not
-# evidence that nothing happened.
+# Whether a finished feedback agent should end the review loop: it left the
+# branch exactly where the reviewer found it, and either failed or retained
+# unpublished work. Anything it pushed gives the next cycle new code to judge,
+# and an unreadable SHA ("unknown") is not evidence that nothing happened.
 feedback_stalled() {
-  local rc="${1:-0}" advanced="${2:-unknown}"
-  [ "$rc" -ne 0 ] && [ "$advanced" = "false" ]
+  local rc="${1:-0}" advanced="${2:-unknown}" retained="${3:-false}"
+  [ "$advanced" = "false" ] && { [ "$rc" -ne 0 ] || [ "$retained" = "true" ]; }
 }
 
 # The SHA a branch currently points at on the remote. Agent worktrees are
@@ -2556,18 +2556,35 @@ make_agent_clone_locked() {
   git clone --local --no-tags --single-branch --branch "$branch" "$REPO_ABS" "$dest"
 }
 
+# Delete an editing clone only when it has no unpublished commits or files.
+cleanup_edit_clone() {
+  local wt="$1" dirty unpublished
+  [ -d "$wt" ] || return 0
+  local stashes
+  dirty=$(git -C "$wt" status --porcelain --untracked-files=all 2>/dev/null) || dirty="unknown"
+  # Push updates origin's tracking refs; stale refs only retain extra work.
+  unpublished=$(git -C "$wt" rev-list --count HEAD --branches --not --remotes=origin 2>/dev/null) \
+    || unpublished="unknown"
+  stashes=$(git -C "$wt" stash list 2>/dev/null) || stashes="unknown"
+  if [ -z "$dirty" ] && [ "$unpublished" = "0" ] && [ -z "$stashes" ]; then
+    rm -rf "$wt"
+  else
+    log_event "Unpublished work preserved at $wt — inspect this checkout and run required local checks before pushing."
+  fi
+}
+
 # Run one feedback container against the PR's head branch.
 # $1=iter $2=branch $3=origin_url $4=pr_num $5=feedback_findings $6=cycle
 # Sets: FEEDBACK_BLOCKED — findings the agent could not resolve in-container
 #       (missing credentials/tooling). Empty when everything was actionable.
 #       FEEDBACK_RC — the agent's exit code. Non-zero means it did not finish:
-#       a turn-cap or budget stop leaves whatever it had already pushed and
-#       loses the rest with the worktree.
+#       unpublished work is retained in the editing clone.
 #       FEEDBACK_ADVANCED — whether the pushed branch moved while it ran.
 #       "unknown" when the branch SHA could not be read on either side, which
 #       must not be read as "no progress".
+#       FEEDBACK_RETAINED — whether cleanup kept unpublished work.
 # Uses globals: WT_ROOT REPO_ABS LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
-#               CREATED_WORKTREES stream_text TOOLCHAIN_STATUS
+#               CREATED_WORKTREES EDIT_WORKTREES stream_text TOOLCHAIN_STATUS
 #
 # The preflight result goes to this agent as well as the reviewer. It used to
 # reach only the reviewer, which reads code and never installs anything, while
@@ -2582,14 +2599,16 @@ run_feedback_once() {
   FEEDBACK_BLOCKED=""
   FEEDBACK_RC=0
   FEEDBACK_ADVANCED="unknown"
+  FEEDBACK_RETAINED=false
 
   local _head_before
   _head_before=$(remote_branch_sha "$REPO_ABS" "$branch") || _head_before=""
 
-  wt_feedback="${WT_ROOT}/feedback-${iter}-${cycle}"
+  wt_feedback=$(mktemp -d "${WT_ROOT}/feedback-${iter}-${cycle}.XXXXXX")
   local feedback_out_dir
   feedback_out_dir=$(mktemp -d /tmp/alucard_feedback.XXXXXX)
-  CREATED_WORKTREES+=("$wt_feedback" "$feedback_out_dir")
+  EDIT_WORKTREES+=("$wt_feedback")
+  CREATED_WORKTREES+=("$feedback_out_dir")
   make_agent_clone "$branch" "$wt_feedback" "$origin_url"
 
   feedback_log="$LOG_DIR/iter-${iter}-feedback-${cycle}.jsonl"
@@ -2640,7 +2659,11 @@ $(printf '%s' "$feedback_findings" | xml_escape)
     FEEDBACK_BLOCKED=$(< "$feedback_out_dir/.alucard-blocked")
   fi
 
-  rm -rf "$wt_feedback" "$feedback_out_dir" || true
+  cleanup_edit_clone "$wt_feedback"
+  if [ -d "$wt_feedback" ]; then
+    FEEDBACK_RETAINED=true
+  fi
+  rm -rf "$feedback_out_dir" || true
 }
 
 # Whether `gh pr checks` (GraphQL statusCheckRollup) works for this token.
@@ -2725,7 +2748,7 @@ poll_ci_via_run_list() {
 # one up by branch name: a worker that renamed its branch, or two runs whose
 # branches shared a name, left that lookup on someone else's PR.
 # Uses globals: REPO_ABS WT_ROOT LOG_DIR TIMEOUT_MIN ENV_FILE IMAGE TOOL_DIR
-#               CREATED_WORKTREES stream_text CI_CHECKS_AVAILABLE
+#               EDIT_WORKTREES stream_text CI_CHECKS_AVAILABLE
 ci_gate() {
   local iter="$1" branch="$2" origin_url="$3" pr_num="${4:-}"
 
@@ -2820,8 +2843,8 @@ Review continues, but an approval will not mark this PR ready to merge. Run the 
       log_event "CI gate: could not resolve a failed run ID for PR #$pr_num (attempt $ci_attempt) — fix agent will get no failure log."
     fi
 
-    wt_fix="${WT_ROOT}/fix-${iter}-${ci_attempt}"
-    CREATED_WORKTREES+=("$wt_fix")
+    wt_fix=$(mktemp -d "${WT_ROOT}/fix-${iter}-${ci_attempt}.XXXXXX")
+    EDIT_WORKTREES+=("$wt_fix")
     make_agent_clone "$branch" "$wt_fix" "$origin_url"
 
     fix_log="$LOG_DIR/iter-${iter}-fix-${ci_attempt}.jsonl"
@@ -2847,7 +2870,7 @@ $(printf '%s' "$failure_log" | xml_escape)
     set -e
 
     echo ""
-    rm -rf "$wt_fix" || true
+    cleanup_edit_clone "$wt_fix"
     measure_stage "$iter" "$pr_num" cifix "$ci_attempt" \
       "$REPO_ABS" "$MEASURE_BASE_SHA" "$MEASURE_PREV_SHA" "$branch"
   done
@@ -3375,21 +3398,21 @@ If the same finding has been repeating, it is probably one no agent in this loop
     measure_stage "$iter" "$pr_num" feedback "$review_cycle" \
       "$REPO_ABS" "$MEASURE_BASE_SHA" "$MEASURE_PREV_SHA" "$branch"
 
-    # A feedback agent that died without pushing anything leaves the branch at
-    # the commit the reviewer just read. Continuing hands the next cycle the
-    # same code and buys an identical review: one run spent four cycles this
-    # way, re-reviewing one unchanged commit twice, because a turn-capped agent
-    # exits non-zero and nothing here looked. Only the no-progress case ends
-    # the loop — a failed agent that still pushed has given the next reviewer
-    # something new to read, and "unknown" is not evidence of no progress.
-    if feedback_stalled "${FEEDBACK_RC:-0}" "${FEEDBACK_ADVANCED:-unknown}"; then
-      log_event "Review gate: feedback agent failed (rc=$FEEDBACK_RC) without advancing $branch — ending review loop at cycle $review_cycle."
+    # A feedback agent that failed, or left its work unpublished, without
+    # pushing leaves the branch at the commit the reviewer just read.
+    # Continuing hands the next cycle the same code and buys an identical
+    # review: one run spent four cycles this way, re-reviewing one unchanged
+    # commit twice. Only the no-progress case ends the loop — an agent that
+    # pushed has given the next reviewer something new to read, and "unknown"
+    # is not evidence of no progress.
+    if feedback_stalled "${FEEDBACK_RC:-0}" "${FEEDBACK_ADVANCED:-unknown}" "${FEEDBACK_RETAINED:-false}"; then
+      log_event "Review gate: feedback agent stopped without publishing (rc=$FEEDBACK_RC, retained=$FEEDBACK_RETAINED) — ending review loop at cycle $review_cycle."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: feedback agent failed — needs human** (rc=${FEEDBACK_RC})
+        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: feedback agent stopped without publishing — needs human** (rc=${FEEDBACK_RC})
 
-The feedback agent did not finish and pushed nothing, so this branch is still at the commit the reviewer above read. Alucard stopped rather than spend the remaining $((MAX_REVIEW_CYCLES - review_cycle)) cycle(s) re-reviewing it.
+The feedback agent pushed nothing, so this branch is still at the commit the reviewer above read. Alucard stopped rather than spend the remaining $((MAX_REVIEW_CYCLES - review_cycle)) cycle(s) re-reviewing it.
 
-A turn-cap or budget stop is the usual cause. Its work died with the worktree: the agent is told to commit and push before verifying, and one that spends its whole budget exploring never reaches that step. Raising \`ALUCARD_FEEDBACK_MAX_TURNS\`, or narrowing the findings above, is the usual fix." 2>/dev/null || true
+A turn-cap or budget stop, or unfinished local verification, is the usual cause. Any unpublished work is retained locally; the run output and \`events.log\` name its checkout. Inspect that checkout and finish the required local checks before pushing. Raising \`ALUCARD_FEEDBACK_MAX_TURNS\`, or narrowing the findings above, may help a later attempt finish." 2>/dev/null || true
       add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
       return 0
     fi
@@ -3401,7 +3424,7 @@ A turn-cap or budget stop is the usual cause. Its work died with the worktree: t
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "${BOT_COMMENT_PREFIX} cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: feedback agent failed after pushing** (rc=${FEEDBACK_RC}, branch advanced=${FEEDBACK_ADVANCED})
 
-The agent did not finish, but it had already pushed. What is on the branch may address only some of the findings above, and anything it had not committed is gone. The next review cycle will judge what actually landed." 2>/dev/null || true
+The agent did not finish, but it had already pushed. What is on the branch may address only some of the findings above. Any unpublished work is retained locally at the checkout named in the run output and \`events.log\`. The next review cycle will judge what actually landed." 2>/dev/null || true
     fi
 
     # Record what the feedback agent could not act on, so the next reviewer is
@@ -3828,26 +3851,26 @@ setup_run_environment() {
   codex_stream_text="$CODEX_STREAM_TEXT"
   GH_REPO_SLUG=$(github_repo_slug "$REPO_ABS")
   CREATED_WORKTREES=()
+  EDIT_WORKTREES=()
   CREATED_CONTAINERS=()
   CI_CHECKS_AVAILABLE=""
 
   cleanup() {
     local wt c
+    # Stop writers before inspecting or deleting their checkouts on interruption.
+    for c in "${CREATED_CONTAINERS[@]}"; do
+      docker rm -f "$c" >/dev/null 2>&1 || true
+    done
+    for wt in "${EDIT_WORKTREES[@]}"; do
+      cleanup_edit_clone "$wt"
+    done
     for wt in "${CREATED_WORKTREES[@]}"; do
       rm -rf "$wt"
     done
     # This run's own root only, and only once it is empty: another run's
     # worktrees sit beside it under .alucard-worktrees and are not ours to
-    # touch. A leftover here means a worktree above failed to delete, and the
-    # directory stays for whoever investigates.
+    # touch. Retained editing clones also keep this root in place.
     rmdir "$WT_ROOT" 2>/dev/null || true
-    # Agent containers are force-removed after each run, so these are usually
-    # gone already — this catches the interrupt case (Ctrl+C mid-agent), where
-    # a still-running container would otherwise keep burning API budget and a
-    # stopped one would squat on its name.
-    for c in "${CREATED_CONTAINERS[@]}"; do
-      docker rm -f "$c" >/dev/null 2>&1 || true
-    done
     if [ -n "${RUN_NETWORK:-}" ]; then
       docker rm -fv "alucard-postgres-$$" >/dev/null 2>&1 || true
       docker network rm "$RUN_NETWORK" >/dev/null 2>&1 || true
@@ -4723,20 +4746,21 @@ command_continue() {
       "$REPO_ABS" "$MEASURE_BASE_SHA" "$MEASURE_PREV_SHA" "$branch"
 
     # Same stall decision review_gate uses inside its loop. continue runs this
-    # feedback once, outside any cycle, then its gates — so a dead agent that
-    # pushed nothing would still hand ci_gate and review_gate the commit the
-    # last reviewer already read. Stop here instead: comment, label, measure,
-    # and leave the gates unrun. A failed agent that did push keeps going —
-    # the gates have new code to judge — but the partial failure is said out
-    # loud rather than rolling into CI looking finished.
-    if feedback_stalled "${FEEDBACK_RC:-0}" "${FEEDBACK_ADVANCED:-unknown}"; then
-      log_event "continue: feedback agent failed (rc=$FEEDBACK_RC) without advancing $branch — stopping before gates."
+    # feedback once, outside any cycle, then its gates — so an agent that
+    # failed or left its work unpublished would still hand ci_gate and
+    # review_gate the commit the last reviewer already read. Stop here
+    # instead: comment, label, measure, and leave the gates unrun. A failed
+    # agent that did push keeps going — the gates have new code to judge — but
+    # the partial failure is said out loud rather than rolling into CI looking
+    # finished.
+    if feedback_stalled "${FEEDBACK_RC:-0}" "${FEEDBACK_ADVANCED:-unknown}" "${FEEDBACK_RETAINED:-false}"; then
+      log_event "continue: feedback agent stopped without publishing (rc=$FEEDBACK_RC, retained=$FEEDBACK_RETAINED) — stopping before gates."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "${BOT_COMMENT_PREFIX} continue: feedback agent failed — needs human** (rc=${FEEDBACK_RC})
+        "${BOT_COMMENT_PREFIX} continue: feedback agent stopped without publishing — needs human** (rc=${FEEDBACK_RC})
 
-The feedback agent did not finish and pushed nothing, so this branch is still at the commit the previous review already read. Alucard stopped rather than re-run CI and review against it.
+The feedback agent pushed nothing, so this branch is still at the commit the previous review already read. Alucard stopped rather than re-run CI and review against it.
 
-A turn-cap or budget stop is the usual cause. Its work died with the worktree: the agent is told to commit and push before verifying, and one that spends its whole budget exploring never reaches that step. Raising \`ALUCARD_FEEDBACK_MAX_TURNS\`, or narrowing the findings above, is the usual fix." 2>/dev/null || true
+A turn-cap or budget stop, or unfinished local verification, is the usual cause. Any unpublished work is retained locally; the run output and \`events.log\` name its checkout. Inspect that checkout and finish the required local checks before pushing. Raising \`ALUCARD_FEEDBACK_MAX_TURNS\`, or narrowing the findings above, may help a later attempt finish." 2>/dev/null || true
       add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
       post_iteration_usage "$iter" "$pr_num" "$REPO_ABS" "$LOG_DIR" \
         "$(( $(date +%s) - _continue_start_epoch ))"
@@ -4748,7 +4772,7 @@ A turn-cap or budget stop is the usual cause. Its work died with the worktree: t
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
         "${BOT_COMMENT_PREFIX} continue: feedback agent failed after pushing** (rc=${FEEDBACK_RC}, branch advanced=${FEEDBACK_ADVANCED})
 
-The agent did not finish, but it had already pushed. What is on the branch may address only some of the findings above, and anything it had not committed is gone. CI and review will judge what actually landed." 2>/dev/null || true
+The agent did not finish, but it had already pushed. What is on the branch may address only some of the findings above. Any unpublished work is retained locally at the checkout named in the run output and \`events.log\`. CI and review will judge what actually landed." 2>/dev/null || true
     fi
   else
     echo "No actionable comments on PR #$pr_num — skipping feedback; running gates only."

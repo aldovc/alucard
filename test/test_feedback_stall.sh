@@ -18,7 +18,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 # ── feedback_stalled ─────────────────────────────────────────────────────────
 echo "── feedback_stalled ──"
 
-stalled() { if feedback_stalled "$1" "$2"; then echo yes; else echo no; fi; }
+stalled() { if feedback_stalled "$1" "$2" "${3:-false}"; then echo yes; else echo no; fi; }
 
 assert_eq "failed agent that pushed nothing is a stall" \
   "yes" "$(stalled 1 false)"
@@ -32,6 +32,12 @@ assert_eq "successful agent is never a stall" \
   "no" "$(stalled 0 false)"
 assert_eq "successful agent that pushed is never a stall" \
   "no" "$(stalled 0 true)"
+# A clean exit that kept its work local would otherwise buy an identical
+# review of the unchanged branch.
+assert_eq "successful agent that retained unpublished work is a stall" \
+  "yes" "$(stalled 0 false true)"
+assert_eq "retained work beside a push is not a stall" \
+  "no" "$(stalled 0 true true)"
 
 # ── remote_branch_sha ────────────────────────────────────────────────────────
 echo "── remote_branch_sha ──"
@@ -78,6 +84,50 @@ else
   pass "fails on a branch the remote does not have"
 fi
 
+# ── editing-clone cleanup ───────────────────────────────────────────────────
+echo "── editing-clone cleanup ──"
+
+for state in clean committed staged unstaged untracked hidden-untracked stashed other-branch unknown pushed; do
+  clone="$TMP_ROOT/cleanup-$state"
+  git clone --quiet --branch feature "$ORIGIN" "$clone"
+  git -C "$clone" config user.email t@example.com
+  git -C "$clone" config user.name Test
+  case "$state" in
+    committed|pushed)
+      echo "$state" > "$clone/f"
+      git -C "$clone" commit --quiet -am "$state"
+      if [ "$state" = pushed ]; then
+        git -C "$clone" push --quiet origin feature
+      fi ;;
+    staged)
+      echo staged > "$clone/f"
+      git -C "$clone" add f ;;
+    unstaged) echo unstaged > "$clone/f" ;;
+    untracked) echo untracked > "$clone/new-file" ;;
+    hidden-untracked)
+      git -C "$clone" config status.showUntrackedFiles no
+      echo untracked > "$clone/new-file" ;;
+    stashed)
+      echo stashed > "$clone/f"
+      git -C "$clone" stash --quiet ;;
+    other-branch)
+      git -C "$clone" checkout --quiet -b side
+      echo side > "$clone/f"
+      git -C "$clone" commit --quiet -am side
+      git -C "$clone" checkout --quiet feature ;;
+    unknown) printf 'invalid index' > "$clone/.git/index" ;;
+  esac
+  cleanup_edit_clone "$clone" >/dev/null
+  case "$state" in
+    clean|pushed)
+      [ ! -d "$clone" ] && pass "$state checkout is removed" \
+        || fail "$state checkout is removed" ;;
+    *)
+      [ -d "$clone/.git" ] && pass "$state checkout is retained" \
+        || fail "$state checkout is retained" ;;
+  esac
+done
+
 # ── run_feedback_once bookkeeping ────────────────────────────────────────────
 echo "── run_feedback_once ──"
 
@@ -85,10 +135,21 @@ echo "── run_feedback_once ──"
 # optionally pushes (as a real agent would) and exits with a chosen code.
 STUB_RC=0
 STUB_PUSHES=false
-make_agent_clone() { mkdir -p "$2"; }
+STUB_CHECKPOINTS=false
+make_agent_clone() { git clone --quiet --branch "$1" "$ORIGIN" "$2"; }
 log_event() { :; }
 measure_stage() { :; }
 invoke_agent() {
+  local arg wt
+  if [ "$STUB_CHECKPOINTS" = "true" ]; then
+    for arg in "$@"; do
+      case "$arg" in
+        *:/work:rw) wt="${arg%:/work:rw}" ;;
+      esac
+    done
+    git -C "$wt" -c user.email=t@example.com -c user.name=Test \
+      commit --quiet --allow-empty -m checkpoint
+  fi
   # Pushes from the agent clone, not the host checkout, so the host's
   # remote-tracking ref stays stale exactly as it does in a real run.
   if [ "$STUB_PUSHES" = "true" ]; then
@@ -110,8 +171,8 @@ DEFAULT_FEEDBACK_MAX_TURNS=50
 DEFAULT_FEEDBACK_MAX_BUDGET=2
 
 run_case() {
-  STUB_RC="$1"; STUB_PUSHES="$2"
-  FEEDBACK_RC=""; FEEDBACK_ADVANCED=""
+  STUB_RC="$1"; STUB_PUSHES="$2"; STUB_CHECKPOINTS="${3:-false}"
+  FEEDBACK_RC=""; FEEDBACK_ADVANCED=""; FEEDBACK_RETAINED=""
   run_feedback_once 1 feature "$ORIGIN" 99 "findings" 1 >/dev/null 2>&1
 }
 
@@ -119,6 +180,12 @@ run_case 0 false
 assert_eq "clean agent records rc=0"            "0"     "$FEEDBACK_RC"
 assert_eq "clean agent that pushed nothing sees no advance" \
   "false" "$FEEDBACK_ADVANCED"
+assert_eq "a clean checkout is not reported retained" "false" "$FEEDBACK_RETAINED"
+
+run_case 0 false true
+assert_eq "an unpublished checkpoint is reported retained" "true" "$FEEDBACK_RETAINED"
+assert_eq "a clean exit that kept its work local is the stall case" "yes" \
+  "$(stalled "$FEEDBACK_RC" "$FEEDBACK_ADVANCED" "$FEEDBACK_RETAINED")"
 
 run_case 1 false
 assert_eq "failed agent records its exit code"  "1"     "$FEEDBACK_RC"

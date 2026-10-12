@@ -22,15 +22,13 @@ For each finding listed in `<review_findings>`:
 1. Read the referenced file and line
 2. Understand the problem described
 3. Make the smallest edit that resolves the finding under the shared engineering policy. Remove unnecessary additions when that is enough; preserve existing ports and add tests only for distinct behaviour the fix changes.
-4. **Commit the change immediately** with a message referencing the finding
-5. **Push to the existing branch** (`git push`) — do this before running any verification, so partial progress is preserved if you run out of turns or hit an error
-6. Install dependencies as `<toolchain_status>` describes, then run the project's documented local verification workflow for this environment, including its lint and format commands. Commit and push whatever they fix. If verification reveals a regression, make additional commits and push again. Pre-existing failures unrelated to your diff (e.g. native dependencies that won't compile in the sandbox — note these in the PR body or commit message) do **not** block the push; they were already there.
+4. Commit each coherent fix with a message referencing the finding. Keep these checkpoints local until verification passes.
 
-Order matters: edit → commit → push → verify. If you verify before pushing and run out of turns, your work is discarded. Always push first.
+After addressing the findings, install dependencies as `<toolchain_status>` describes and run the project's documented local verification workflow for this environment, including its lint and format commands. Apply the repository's autofixes, fix regressions you introduced, and rerun affected checks. Commit the verified result, then push once to the existing branch (`git push`). Do not push intermediate fixes or changes made after the last passing checks without verifying them.
 
 When the project explicitly assigns service-backed checks to CI, follow that policy rather than inventing service setup or weakening checks. Report local results, checks not run and why, and checks deferred to CI separately. Skipped or unrun tests are not passes. Required local checks must pass, and required CI must still pass before merge; deferring a check to CI does not waive it.
 
-When `<turn_budget>` is running low, finish and push the finding you are on and say which ones remain, rather than opening the next one and losing both.
+When `<turn_budget>` is running low, commit the work so far and report remaining findings and checks. Do not skip verification to push. The harness preserves unpublished commits and uncommitted files in this checkout if you stop before publishing.
 
 ## Findings you cannot fix
 
@@ -53,13 +51,13 @@ Rules for it:
 - Write the file only for findings you genuinely cannot action. A finding that is merely hard, or that needs a test you cannot run, is still yours to fix.
 - Never claim a verification you did not perform. If you could not run the suite, say so — do not describe the result you expect.
 - Still fix every other finding in the same cycle. A blocked finding does not excuse the rest.
-- If *every* finding is blocked, write the file, push any work you did do, and stop. Do not invent changes.
+- If *every* finding is blocked, write the file and stop. Publish any work only after its required local checks pass. Do not invent changes.
 
 ## Self-review of new code
 
 After fixing each finding, scan only the code you wrote or modified for these violations. Do not scan pre-existing code — but do fix anything you introduced:
 
-- Any symbol you newly imported from an internal module that is not actually defined there — a green test suite hides this when a test `patch()`es the symbol, and you push before verifying, so confirm the import resolves (`python -c "import the.module"`, or grep the target). A phantom import is a deploy-time `ImportError`.
+- Any symbol you newly imported from an internal module that is not actually defined there. A test that `patch()`es the symbol can hide this, so confirm the import resolves (`python -c "import the.module"`, or grep the target). A phantom import is a deploy-time `ImportError`.
 - Any cleanup/rollback you added (release-claim, delete-resource, unlock) that does not fire on *every* exit of the function — each `return` as well as each `raise`, not only the `except` blocks.
 - Any `asyncio.create_task(...)` missing a done-callback that logs exceptions.
 - Any token, API key, or credential passed as a plain `str` parameter across more than one function boundary.
