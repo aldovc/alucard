@@ -66,6 +66,23 @@ _line=$(sed -n "${_n}p" "$ALUCARD_TEST_SCRIPT")
 _rc="${_line%% *}"
 _json="${_line#* }"
 
+if [ "${_line##* }" = "checkpoint" ]; then
+  _json="${_json% checkpoint}"
+  for _a in "$@"; do
+    case "$_a" in
+      *:/work:rw)
+        _wt="${_a%:/work:rw}"
+        git -C "$_wt" config user.email test@example.invalid
+        git -C "$_wt" config user.name test
+        printf 'checkpoint\n' >> "$_wt/README.md"
+        git -C "$_wt" commit --quiet -am checkpoint
+        printf 'unfinished\n' >> "$_wt/README.md"
+        printf 'new work\n' > "$_wt/new-file"
+        printf '%s\n' "$_wt" > "$ALUCARD_TEST_DIR/retained-path" ;;
+    esac
+  done
+fi
+
 # Optional: a "push" line tells this agent to advance the branch the way a real
 # feedback agent does — from a separate clone, so the host tracking ref stays
 # stale and only remote_branch_sha's fetch sees the move.
@@ -170,7 +187,7 @@ run_continue() {
 
 # ── Scenario 1: feedback dies without pushing ────────────────────────────────
 echo "── continue: feedback stalled ──"
-printf '1 %s\n' "$MAX_TURNS_RESULT" > "$TEST_DIR/script"
+printf '1 %s checkpoint\n' "$MAX_TURNS_RESULT" > "$TEST_DIR/script"
 run_continue
 
 assert_eq "continue exits zero after handing off" "0" "$CONTINUE_RC"
@@ -181,11 +198,19 @@ assert_contains "the stall is logged" \
 assert_contains "the PR gets the needs-human label" \
   "issues/88/labels" "$GH"
 assert_contains "the comment names the continue stall" \
-  "feedback agent failed — needs human" "$GH"
+  "feedback agent stopped without publishing — needs human" "$GH"
 assert_contains "the comment points at the turn cap" \
   "ALUCARD_FEEDBACK_MAX_TURNS" "$GH"
 assert_not_contains "review gate never starts" \
   "Review gate" "$OUT"
+retained=$(<"$TEST_DIR/retained-path")
+assert_eq "the unpublished commit survives process-exit cleanup" \
+  "checkpoint" "$(git -C "$retained" log -1 --format=%s)"
+assert_contains "tracked edits survive cleanup" "unfinished" "$(<"$retained/README.md")"
+assert_eq "untracked files survive cleanup" "new work" "$(<"$retained/new-file")"
+assert_contains "the recovery path is recorded" "$retained" "$EVENTS"
+assert_not_contains "the checkpoint was not pushed" "checkpoint" \
+  "$(git --git-dir="$REMOTE" log -1 --format=%s "$BRANCH")"
 
 # ── Scenario 2: feedback dies after pushing — gates still run ────────────────
 echo ""

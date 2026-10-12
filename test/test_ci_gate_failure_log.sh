@@ -88,8 +88,13 @@ set -euo pipefail
 if [ "\$1" = "--kill-after" ]; then
   shift 3
   printf '%s\n' "\$@" > "$CAPTURE"
+  for a in "\$@"; do
+    case "\$a" in
+      *:/work:rw) printf 'unfinished fix\n' >> "\${a%:/work:rw}/README.md" ;;
+    esac
+  done
   printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}'
-  exit 0
+  exit 1
 fi
 shift
 exec "\$@"
@@ -138,5 +143,12 @@ assert_contains "fix agent prompt carries the real failure text" \
   "$FAILURE_TEXT" "$docker_args"
 assert_not_contains "ci_gate does not log the empty-failure-log warning when the lookup succeeds" \
   "could not resolve a failed run ID" "$out"
+
+assert_eq "both CI-fix attempts register recoverable checkouts" "2" "${#EDIT_WORKTREES[@]}"
+for wt in "${EDIT_WORKTREES[@]}"; do
+  assert_contains "the failed CI-fix checkout retains its edits" \
+    "unfinished fix" "$(<"$wt/README.md")"
+  assert_contains "the CI-fix recovery path is reported" "$wt" "$out"
+done
 
 finish

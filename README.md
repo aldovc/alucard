@@ -342,6 +342,10 @@ alucard continue 174 owner/repo
 
 `continue` uses the latest Alucard change request plus subsequent human comments, or all human comments if there is no change request. Without actionable comments it runs CI and review only. It does not restart the original implementation task.
 
+Agents checkpoint changes in local commits and run the target repository's required local checks before pushing. Feedback agents batch a review cycle's fixes into one verified push. The repository's instructions determine which checks run locally and which require CI.
+
+Feedback and CI-fix checkouts with unpublished commits or uncommitted files survive cleanup, including when an agent runs out of time or turns. The console and `events.log` report the retained path under `.alucard-worktrees/<run>/`. Inspect that checkout, finish verification, and push from it before running `continue` again. A later run starts from the remote branch; it does not resume the retained checkout automatically. Remove the retained checkout when you no longer need it.
+
 ### Merging an approved PR
 
 Approved PRs go stale as other PRs land. `alucard merge <PR>` does the merge steps:
@@ -380,7 +384,7 @@ Agents run without interactive permission prompts. Docker provides the isolation
 - A read-only container root, dropped Linux capabilities, and `no-new-privileges`.
 - Containers run as the invoking user's UID and GID, with temporary home and `/tmp` directories.
 - Each container has a 4 GiB memory limit and a two-CPU limit.
-- Agents work in disposable clones under `.alucard-worktrees/<run>/`. Cleanup removes only the current run's directories.
+- Agents work in clones under `.alucard-worktrees/<run>/`. Cleanup removes only the current run's directories and retains feedback and CI-fix clones with unpublished work.
 - Writable mounts include the working clone, role output directories where needed, and the shared browser cache.
 
 Agents have network access and receive the configured credentials. Isolation does not prevent credential exfiltration or misuse of the GitHub token. Scope credentials to the work and use branch protection to enforce repository rules. Claude also gets a small command blacklist, which is not the isolation boundary.
