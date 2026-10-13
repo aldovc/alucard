@@ -1,15 +1,17 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    begin_operation, build_image, compose_role_prompt, database_path, find_run, finish_operation,
-    finish_run, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
-    local_queue_with_open_issues, local_queue_with_open_prs, migrate, open, parse_tasks,
-    prepare_run, recent_runs, record_recovery_failure, record_recovery_pr, record_task_pr, release,
-    run_claims, run_command as execute_command, run_pull_requests, run_recovery, start_retry_run,
-    start_task_run, status, task_id, task_is_pending, toolchain_preflight, transition_task,
-    warn_if_stale_image, write_task_headings, AgentInvocation, AgentRole, AgentSettings,
-    GithubPullRequest, GithubTask, Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate,
-    TaskState, TaskStatus,
+    archive_prompt, begin_operation, build_image, compose_role_prompt, database_path, find_run,
+    finish_operation, finish_run, github_queue, github_ticket_blockers, import_github_tasks,
+    import_local_tasks, local_queue_with_open_issues, local_queue_with_open_prs, log_event,
+    migrate, open, parse_tasks, prepare_run, recent_runs, record_recovery_failure,
+    record_recovery_pr, record_task_pr, release, run_claims, run_command as execute_command,
+    run_pull_requests, run_recovery, start_retry_run, start_task_run, status, task_id,
+    task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image,
+    write_iteration_measurement, write_run_measurement, write_stage_measurement,
+    write_task_headings, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask,
+    IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState,
+    TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -722,7 +724,27 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 return fail(&format!("alucard: {error}"));
             }
         };
+        write_run_measurement(
+            &prepared.directory,
+            &options.queue.repository,
+            &options.base,
+            if selected.issue.is_some() {
+                "github"
+            } else {
+                "local"
+            },
+        );
+        archive_prompt(
+            &prepared.directory,
+            &format!("iter-{iteration}-attempt-1"),
+            &prompt,
+        );
+        log_event(
+            &prepared.directory,
+            &format!("Iteration {iteration}/{} start", options.iterations),
+        );
         loop {
+            let started = std::time::Instant::now();
             let name = format!("alucard-worker-{}-{attempt}", attempt_run.id);
             let log = prepared
                 .directory
@@ -750,6 +772,36 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 .unwrap_or(alucard::AgentExit::Failed);
             match find_attempt_pr(&options.queue.repository, &prepared) {
                 Ok(Some((number, branch, sha))) => {
+                    write_stage_measurement(
+                        &prepared.directory,
+                        &prepared.clone,
+                        iteration,
+                        Some(number),
+                        prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        &sha,
+                    );
+                    write_iteration_measurement(IterationMeasurement {
+                        database: &database,
+                        run_id: &attempt_run.id,
+                        log_dir: &prepared.directory,
+                        iteration,
+                        pr: Some(number),
+                        base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        status: result.as_ref().ok().and_then(|value| value.status),
+                        duration: started.elapsed().as_secs(),
+                    });
+                    log_event(
+                        &prepared.directory,
+                        &format!(
+                            "Iteration {iteration}/{} end: rc={}",
+                            options.iterations,
+                            result
+                                .as_ref()
+                                .ok()
+                                .and_then(|value| value.status)
+                                .unwrap_or(1)
+                        ),
+                    );
                     if let Err(error) = record_task_pr(
                         &database,
                         &selected.ledger_id,

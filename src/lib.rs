@@ -3,7 +3,7 @@
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::CStr;
@@ -994,6 +994,258 @@ pub struct AgentResult {
     pub classification: AgentExit,
 }
 
+/// Appends a Bash-compatible event line without allowing log failures to affect a run.
+pub fn log_event(log_dir: &Path, message: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let timestamp = format!("{now}");
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("events.log"))
+        .and_then(|mut file| writeln!(file, "{timestamp}\t{message}"));
+}
+
+/// Extracts the provider-independent usage fields written by Claude and Codex JSONL streams.
+pub fn extract_agent_usage(log: &Path) -> Option<Usage> {
+    let contents = fs::read_to_string(log).ok()?;
+    let records = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    if let Some(claude) = records
+        .iter()
+        .rev()
+        .find(|record| record["type"] == "result")
+    {
+        if let Some(models) = claude.get("modelUsage").and_then(Value::as_object) {
+            let mut usage = Usage::default();
+            for model in models.values() {
+                usage.input += model["inputTokens"].as_u64().unwrap_or(0);
+                usage.output += model["outputTokens"].as_u64().unwrap_or(0);
+                usage.cache_read += model["cacheReadInputTokens"].as_u64().unwrap_or(0);
+                usage.cache_write += model["cacheCreationInputTokens"].as_u64().unwrap_or(0);
+            }
+            usage.turns = claude["num_turns"].as_u64().unwrap_or(0);
+            usage.cost = claude["total_cost_usd"].as_f64();
+            return Some(usage);
+        }
+    }
+    let mut usage = Usage::default();
+    let mut found = false;
+    for record in &records {
+        if record["type"] == "turn.completed" {
+            let value = &record["usage"];
+            let input = value["input_tokens"].as_u64().unwrap_or(0);
+            usage.cache_read += value["cached_input_tokens"].as_u64().unwrap_or(0);
+            usage.input += input.saturating_sub(value["cached_input_tokens"].as_u64().unwrap_or(0));
+            usage.output += value["output_tokens"].as_u64().unwrap_or(0);
+            usage.cache_write += value["cache_write_input_tokens"].as_u64().unwrap_or(0);
+            found = true;
+        }
+        if record["type"] == "item.completed" && record["item"]["type"] == "command_execution" {
+            usage.turns += 1;
+        }
+    }
+    found.then_some(usage)
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub turns: u64,
+    pub cost: Option<f64>,
+}
+
+/// Writes the stable run summary used by Bash measurement consumers.
+pub fn write_run_measurement(
+    log_dir: &Path,
+    repository: &Path,
+    base_branch: &str,
+    task_source: &str,
+) {
+    write_measurement(
+        log_dir,
+        json!({
+            "format": 1, "record": "run", "ts": timestamp(),
+            "repo": repository, "repo_id": repository_id(repository),
+            "base_branch": base_branch, "task_source": task_source,
+        }),
+    );
+}
+
+/// Writes a worker-stage record, preserving unavailable diffs instead of treating them as zero.
+pub fn write_stage_measurement(
+    log_dir: &Path,
+    repository: &Path,
+    iteration: usize,
+    pr: Option<i64>,
+    base_sha: &str,
+    head_sha: &str,
+) {
+    write_measurement(
+        log_dir,
+        json!({
+            "format": 1, "record": "stage", "ts": timestamp(), "repo_id": repository_id(repository),
+            "iter": iteration.to_string(), "pr": pr.map(|number| number.to_string()).unwrap_or_default(),
+            "stage": "worker", "cycle": 0, "base_sha": base_sha, "prev_sha": "", "head_sha": head_sha,
+            "is_merge": false, "base_drifted": false, "baseline_source": "pinned",
+            "from_base": diff_measurement(repository, base_sha, head_sha), "from_prev": {}
+        }),
+    );
+}
+
+pub struct IterationMeasurement<'a> {
+    pub database: &'a Path,
+    pub run_id: &'a str,
+    pub log_dir: &'a Path,
+    pub iteration: usize,
+    pub pr: Option<i64>,
+    pub base_sha: &'a str,
+    pub status: Option<i32>,
+    pub duration: u64,
+}
+
+/// Rolls one iteration's attempt logs into a measurement record and SQLite summary.
+pub fn write_iteration_measurement(measurement: IterationMeasurement<'_>) {
+    let IterationMeasurement {
+        database,
+        run_id,
+        log_dir,
+        iteration,
+        pr,
+        base_sha,
+        status,
+        duration,
+    } = measurement;
+    let mut roles = Map::new();
+    let mut total = 0_u64;
+    let mut costed = 0_u64;
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(&format!("iter-{iteration}-")) {
+                continue;
+            }
+            total += 1;
+            let role = if name.contains("review") {
+                "review"
+            } else if name.contains("feedback") {
+                "feedback"
+            } else if name.contains("fix") {
+                "cifix"
+            } else {
+                "worker"
+            };
+            let usage = extract_agent_usage(&path);
+            if usage.as_ref().is_some_and(|usage| usage.cost.is_some()) {
+                costed += 1;
+            }
+            let item = roles.entry(role.to_string()).or_insert_with(|| json!({"invocations":0,"usage_missing":0,"input":0,"output":0,"cache_read":0,"cache_write":0,"turns":0,"cost":null}));
+            item["invocations"] = json!(item["invocations"].as_u64().unwrap_or(0) + 1);
+            if let Some(usage) = usage {
+                for (key, value) in [
+                    ("input", usage.input),
+                    ("output", usage.output),
+                    ("cache_read", usage.cache_read),
+                    ("cache_write", usage.cache_write),
+                    ("turns", usage.turns),
+                ] {
+                    item[key] = json!(item[key].as_u64().unwrap_or(0) + value);
+                }
+                if let Some(cost) = usage.cost {
+                    item["cost"] = json!(item["cost"].as_f64().unwrap_or(0.0) + cost);
+                }
+            } else {
+                item["usage_missing"] = json!(item["usage_missing"].as_u64().unwrap_or(0) + 1);
+            }
+        }
+    }
+    let complete = total > 0 && total == costed;
+    write_measurement(
+        log_dir,
+        json!({
+            "format": 1, "record": "iteration", "ts": timestamp(), "iter": iteration.to_string(),
+            "pr": pr.map(|number| number.to_string()).unwrap_or_default(), "base_sha": base_sha,
+            "baseline_source": "pinned", "rc": status.map(|value| value.to_string()).unwrap_or_default(),
+            "duration_s": duration, "ci_result": "", "review_verdict": "", "review_cycles": 0,
+            "cost_complete": complete, "costed_invocations": costed, "total_invocations": total, "roles": roles
+        }),
+    );
+    if let Ok(connection) = open(database) {
+        let _ = connection.execute(
+            "INSERT OR REPLACE INTO measurement_summaries (run_id, iteration, measurements_path, total_invocations, costed_invocations, created_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            (run_id, iteration as i64, log_dir.join("measurements.jsonl").to_string_lossy().to_string(), total as i64, costed as i64),
+        );
+    }
+}
+
+pub fn archive_prompt(log_dir: &Path, name: &str, prompt: &str) {
+    let directory = log_dir.join("prompts");
+    let _ = fs::create_dir_all(&directory);
+    let _ = fs::write(directory.join(format!("{name}.txt")), prompt);
+}
+
+fn write_measurement(log_dir: &Path, value: Value) {
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("measurements.jsonl"))
+        .and_then(|mut file| writeln!(file, "{value}"));
+}
+
+fn timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+fn repository_id(repository: &Path) -> String {
+    repository.to_string_lossy().to_string()
+}
+
+fn diff_measurement(repository: &Path, base: &str, head: &str) -> Value {
+    let Ok(output) = run_command(
+        "git",
+        &["diff", "--numstat", "--find-renames", base, head],
+        repository,
+        None,
+    ) else {
+        return json!({"unavailable": true, "reason": "git failed"});
+    };
+    if !output.status.success() {
+        return json!({"unavailable": true, "reason": "unavailable ref"});
+    }
+    let mut added = 0_u64;
+    let mut deleted = 0_u64;
+    let mut files = 0_u64;
+    let mut paths = Vec::new();
+    let output = String::from_utf8_lossy(&output.stdout);
+    for line in output.lines() {
+        let fields = line.splitn(3, '\t').collect::<Vec<_>>();
+        if fields.len() != 3 {
+            continue;
+        }
+        files += 1;
+        paths.push(fields[2]);
+        added += fields[0].parse::<u64>().unwrap_or(0);
+        deleted += fields[1].parse::<u64>().unwrap_or(0);
+    }
+    json!({"files":files,"added":added,"deleted":deleted,"binary_files":0,"renames":0,"paths":paths,"impl":{"added":added,"deleted":deleted,"binary_files":0},"tests":{"added":0,"deleted":0,"binary_files":0},"confdoc":{"added":0,"deleted":0,"binary_files":0},"generated":{"added":0,"deleted":0,"binary_files":0}})
+}
+
 /// Classifies an agent process exit from its final provider result record.
 pub fn classify_agent_output(provider: Provider, status: Option<i32>, log: &str) -> AgentExit {
     if log.contains("Shell cwd was reset to /work (deleted)") {
@@ -1911,6 +2163,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_run_owners.sql")),
     (3, include_str!("../migrations/0003_recovery_checkout.sql")),
+    (4, include_str!("../migrations/0004_measurements.sql")),
 ];
 
 pub struct DatabaseStatus {
