@@ -2339,6 +2339,21 @@ pub fn record_task_pr(
     Ok(())
 }
 
+/// Records the CI gate result for an opened task pull request.
+pub fn record_task_pr_gate_state(
+    path: &Path,
+    task_id: &str,
+    number: i64,
+    gate_state: &str,
+) -> Result<(), DatabaseError> {
+    let connection = open(path)?;
+    connection.execute(
+        "UPDATE pull_requests SET gate_state = ?1 WHERE task_id = ?2 AND number = ?3",
+        (gate_state, task_id, number),
+    )?;
+    Ok(())
+}
+
 /// Records a recovery PR and moves its task to the same in-flight state as a normal PR.
 pub fn record_recovery_pr(
     path: &Path,
