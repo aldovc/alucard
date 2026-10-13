@@ -1242,7 +1242,11 @@ where
     )
     .and_then(|output| {
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .take(400)
+                .collect::<Vec<_>>()
+                .join("\n"))
         } else {
             Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
         }
@@ -2420,6 +2424,33 @@ printf '%s' "$FULL_PROMPT""#,
             ci_fix_prompt(Path::new(env!("CARGO_MANIFEST_DIR")), 1, "branch", &log).unwrap();
 
         assert!(prompt.contains("<failure_log>\nselected &lt;failure&gt; log\n</failure_log>"));
+    }
+
+    #[test]
+    fn ci_fix_failed_run_log_is_limited_to_400_lines() {
+        let mut outputs = VecDeque::from([
+            command_output(
+                r#"[{"databaseId":22,"headSha":"head","conclusion":"failure"}]"#,
+                "",
+                0,
+            ),
+            command_output(
+                &(0..401)
+                    .map(|line| format!("failure line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "",
+                0,
+            ),
+        ]);
+        let mut command = |_args: &[&str], _timeout| Ok(outputs.pop_front().unwrap());
+
+        let log = failed_run_log_with(Path::new("."), "branch", "head", &mut command).unwrap();
+
+        assert_eq!(log.lines().count(), 400);
+        assert!(log.starts_with("failure line 0"));
+        assert!(log.contains("failure line 399"));
+        assert!(!log.contains("failure line 400"));
     }
 
     #[test]
