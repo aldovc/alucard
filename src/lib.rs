@@ -556,6 +556,7 @@ mod agent_tests {
         fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
         fs::write(dir.join("entrypoint.sh"), "#!/bin/sh\n").unwrap();
         let trace = dir.join("trace");
+        fs::write(&trace, "").unwrap();
         let built = dir.join("built");
         let docker = dir.join("docker");
         let script = format!(
