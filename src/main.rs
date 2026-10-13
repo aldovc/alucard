@@ -6066,9 +6066,6 @@ printf '%s' "$prompt""#,
         };
 
         assert!(!pull.recovery("alucard"));
-        assert_eq!(
-            continue_feedback_findings(&pull.comments, "alucard"),
-            ""
-        );
+        assert_eq!(continue_feedback_findings(&pull.comments, "alucard"), "");
     }
 }
