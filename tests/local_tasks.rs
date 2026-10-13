@@ -830,6 +830,11 @@ fn parser_normalizes_crlf_task_content() {
 #[test]
 fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     let database = temporary_path("queue").join("ledger.db");
+    let gh_root = temporary_path("queue-gh");
+    fs::create_dir_all(&gh_root).unwrap();
+    let gh = gh_root.join("gh");
+    fs::write(&gh, "#!/bin/sh\necho 'gh stub failed' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     let binary = env!("CARGO_BIN_EXE_alucard");
     let contract = PathBuf::from("test/fixtures/contracts/local-tasks.md")
         .canonicalize()
@@ -837,6 +842,7 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     let expected = fs::read_to_string("test/fixtures/contracts/local-queue.json").unwrap();
 
     let output = Command::new(binary)
+        .env("PATH", &gh_root)
         .args([
             "--db-path",
             database.to_str().unwrap(),
@@ -862,6 +868,7 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     assert_eq!(connection.total_changes(), changed_before);
     drop(connection);
     fs::remove_dir_all(database.parent().unwrap()).unwrap();
+    fs::remove_dir_all(gh_root).unwrap();
 }
 
 #[test]

@@ -2008,7 +2008,10 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         .any(|task| !task.issue_blockers.is_empty())
         .then(|| fetch_open_issue_numbers(&options.repository))
         .flatten();
-    let open_prs = if locally_eligible.is_empty() {
+    let open_prs = if !locally_eligible
+        .iter()
+        .any(|task| task.previous_pr_number.is_some())
+    {
         Vec::new()
     } else {
         match fetch_open_local_prs(&options.repository) {
