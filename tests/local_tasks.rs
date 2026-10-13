@@ -216,6 +216,29 @@ fn queue_resolves_explicit_environment_and_detected_task_sources() {
         .unwrap();
     assert!(environment_run.status.success());
 
+    let no_local_source = root.join("no-local-source");
+    fs::create_dir_all(&no_local_source).unwrap();
+    let github_default = Command::new(binary)
+        .env_remove("ALUCARD_TASKS_FILE")
+        .args(["queue", no_local_source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!github_default.status.success());
+    assert!(
+        String::from_utf8_lossy(&github_default.stderr).contains("GitHub queue is not implemented")
+    );
+
+    let github_overrides_environment = Command::new(binary)
+        .env("ALUCARD_TASKS_FILE", &detected)
+        .args(["queue", "--github"])
+        .output()
+        .unwrap();
+    assert!(!github_overrides_environment.status.success());
+    assert!(
+        String::from_utf8_lossy(&github_overrides_environment.stderr)
+            .contains("GitHub queue is not implemented")
+    );
+
     let conflict = Command::new(binary)
         .args(["queue", "--tasks", detected.to_str().unwrap(), "--github"])
         .output()
