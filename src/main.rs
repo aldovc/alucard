@@ -1511,11 +1511,91 @@ fn feedback_findings(repository: &Path, pr_number: i64, findings: &str) -> Resul
         })
         .collect::<Vec<_>>()
         .join("\n\n");
+    let findings = strip_nonactionable_sections(findings);
     if human.is_empty() {
-        Ok(findings.to_string())
+        Ok(findings)
     } else {
         Ok(format!("{findings}\n\n---\n\n## Additional human PR comments\n\nTreat each as an additional finding when actionable and on-topic. Off-topic or out-of-scope comments should be acknowledged via `gh pr comment --body-file <file>` rather than silently ignored.\n\n{human}"))
     }
+}
+
+fn strip_nonactionable_sections(findings: &str) -> String {
+    let lines = findings.lines().collect::<Vec<_>>();
+    let mut fenced = vec![false; lines.len()];
+    let mut index = 0;
+    while index < lines.len() {
+        let Some((marker, length)) = fence_opener(lines[index]) else {
+            index += 1;
+            continue;
+        };
+        let mut closing = index + 1;
+        while closing < lines.len() && !fence_closer(lines[closing], marker, length) {
+            closing += 1;
+        }
+        if closing < lines.len() {
+            fenced[index..=closing].fill(true);
+            index = closing + 1;
+        } else {
+            index += 1;
+        }
+    }
+
+    let mut skipped = false;
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if !fenced[index] {
+                if matches_nonactionable_heading(line) {
+                    skipped = true;
+                    return None;
+                }
+                if top_level_heading(line).is_some() {
+                    skipped = false;
+                }
+            }
+            (!skipped).then_some(*line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn fence_opener(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let marker = trimmed.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let length = trimmed
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (length >= 3).then_some((marker, length))
+}
+
+fn fence_closer(line: &str, marker: char, length: usize) -> bool {
+    let trimmed = line.trim_start();
+    let count = trimmed
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    count >= length && trimmed[count..].trim().is_empty()
+}
+
+fn matches_nonactionable_heading(line: &str) -> bool {
+    matches!(
+        top_level_heading(line),
+        Some("Out of scope (follow-up)") | Some("Too large for this loop") | Some("Non-blocking")
+    )
+}
+
+fn top_level_heading(line: &str) -> Option<&str> {
+    let content = line.strip_prefix("##")?;
+    content
+        .chars()
+        .next()
+        .filter(|character| character.is_whitespace())?;
+    Some(content.trim())
 }
 
 fn remote_branch_sha(repository: &Path, branch: &str) -> Option<String> {
@@ -4163,6 +4243,15 @@ printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blocker
         assert_eq!(
             feedback_prompt(tools, 17, "feature/test", status, findings, policy).unwrap(),
             String::from_utf8(bash.stdout).unwrap()
+        );
+    }
+
+    #[test]
+    fn feedback_findings_strip_only_nonactionable_top_level_sections() {
+        let findings = "## Findings\n\nKEEP\n\n```markdown\n## Too large for this loop\n```\n\n## Too large for this loop\n\nDROP\n\n## Expected fix\n\nKEEP-AFTER\n\n## Non-blocking\n\nDROP-TOO\n";
+        assert_eq!(
+            strip_nonactionable_sections(findings),
+            "## Findings\n\nKEEP\n\n```markdown\n## Too large for this loop\n```\n\n## Expected fix\n\nKEEP-AFTER\n"
         );
     }
 
