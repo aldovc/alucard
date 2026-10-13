@@ -246,6 +246,7 @@ cat > "$MOCK_BIN/gh" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
 case "$1 $2" in
+  "api user")   printf 'bot\n' ;;
   "pr checks") echo "no checks reported" >&2; exit 1 ;;
   "pr list")   printf '77\n' ;;
   "pr view")

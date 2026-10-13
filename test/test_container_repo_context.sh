@@ -216,6 +216,7 @@ set -euo pipefail
 { printf 'gh'; printf ' %q' "$@"; printf '\n'; } >> "$ALUCARD_TEST_GH_TRACE"
 has_jq=false; for _a in "$@"; do [ "$_a" = "--jq" ] && has_jq=true; done
 case "$1 $2" in
+  "api user")     printf 'bot\n' ;;
   "repo view")   echo "example/api" ;;
   "api graphql") echo "[]" ;;
   "issue list")

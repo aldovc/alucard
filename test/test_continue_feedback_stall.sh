@@ -117,6 +117,7 @@ cat > "$MOCK_BIN/gh" <<'MOCK'
 set -euo pipefail
 printf '%s\n' "$*" >> "$ALUCARD_TEST_GH_TRACE"
 case "$1 $2" in
+  "api user")   printf 'bot\n' ;;
   "pr checks")
     echo "no checks reported on the '$ALUCARD_TEST_BRANCH' branch" >&2
     exit 1 ;;
