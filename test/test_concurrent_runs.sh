@@ -332,7 +332,7 @@ fi
 [ "$WT_PARENT" != "$RUN_ID_2" ] && pass "so it differs from the log dir name this time" \
   || fail "so it differs from the log dir name this time"
 all_kept=true
-for d in "$TAKEN"; do [ -f "$d/iter-1/keep" ] || all_kept=false; done
+[ -f "$TAKEN/iter-1/keep" ] || all_kept=false
 [ "$all_kept" = true ] && pass "every other run's worktree is untouched" \
   || fail "every other run's worktree is untouched"
 
