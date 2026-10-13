@@ -15,7 +15,10 @@ fn main() -> ExitCode {
             println!("{}", version());
             ExitCode::SUCCESS
         }
-        Some("db") => database_command(&commands[1..], database_path(db_path)),
+        Some("db") => match database_path(db_path) {
+            Ok(path) => database_command(&commands[1..], path),
+            Err(error) => fail(&format!("alucard: {error}")),
+        },
         Some(cmd) => fail(&format!("alucard: unknown command: {cmd}")),
         None => fail("usage: alucard [--db-path PATH] {version|db migrate|db status}"),
     }

@@ -14,7 +14,7 @@ pub struct DatabaseStatus {
     pub pending_migrations: usize,
 }
 
-pub fn database_path(override_path: Option<PathBuf>) -> PathBuf {
+pub fn database_path(override_path: Option<PathBuf>) -> io::Result<PathBuf> {
     override_path
         .or_else(|| env::var_os("ALUCARD_DB_PATH").map(PathBuf::from))
         .or_else(|| {
@@ -27,7 +27,12 @@ pub fn database_path(override_path: Option<PathBuf>) -> PathBuf {
                 .map(PathBuf::from)
                 .map(|path| path.join(".local/state/alucard/alucard.db"))
         })
-        .unwrap_or_else(|| PathBuf::from(".local/state/alucard/alucard.db"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "database path is not set; use --db-path or ALUCARD_DB_PATH",
+            )
+        })
 }
 
 pub fn migrate(path: &Path) -> Result<DatabaseStatus, DatabaseError> {
@@ -106,50 +111,28 @@ fn prepare_directory(path: &Path) -> io::Result<()> {
     else {
         return Ok(());
     };
-    if create_directory(parent)? {
-        restrict_directory_permissions(parent)?;
+    if let Some(grandparent) = parent
+        .parent()
+        .filter(|grandparent| !grandparent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(grandparent)?;
+    }
+    match fs::create_dir(parent) {
+        Ok(()) => restrict_directory_permissions(parent)?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
     }
     Ok(())
 }
 
-fn create_directory(path: &Path) -> io::Result<bool> {
-    match fs::create_dir(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            else {
-                return Err(error);
-            };
-            create_directory(parent)?;
-            create_directory(path)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(unix)]
 fn restrict_directory_permissions(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(not(unix))]
-fn restrict_directory_permissions(_: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn restrict_file_permissions(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn restrict_file_permissions(_: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[derive(Debug)]
