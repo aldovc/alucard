@@ -1,8 +1,8 @@
 use alucard::{
-    github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue,
-    local_queue_with_open_issues, migrate, open, parse_tasks, resolve_pinned_issue,
-    start_task_retry_run, start_task_run, task_id, write_task_headings, GithubPullRequest,
-    GithubTask, TaskHeadingUpdate, TaskState,
+    begin_operation, begin_operation_with_payload, github_queue, github_ticket_blockers,
+    import_github_tasks, import_local_tasks, local_queue, local_queue_with_open_issues, migrate,
+    open, parse_tasks, resolve_pinned_issue, start_task_retry_run, start_task_run, task_id,
+    write_task_headings, GithubPullRequest, GithubTask, TaskHeadingUpdate, TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -670,6 +670,229 @@ esac
         }
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn startup_replays_pending_recovery_operations_idempotently() {
+    let root = temporary_path("replay-recovery-operations");
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "main",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "branch",
+        "recovery-crash",
+    ]));
+
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\n[ \"$1 $2\" = 'image inspect' ] && echo stamp\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$ALUCARD_REPLAY_TRACE"
+case "$1 $2" in
+  'pr list')
+    if [ -f "$ALUCARD_REPLAY_PR" ]; then echo '[{"number":91,"headRefName":"recovery-crash","headRefOid":"abc"}]'; else echo '[]'; fi ;;
+  'pr create') : > "$ALUCARD_REPLAY_PR" ;;
+  'pr view')
+    printf '{"labels":['
+    if [ -f "$ALUCARD_REPLAY_ALUCARD" ]; then printf '{"name":"alucard"}'; fi
+    if [ -f "$ALUCARD_REPLAY_ALUCARD" ] && [ -f "$ALUCARD_REPLAY_HUMAN" ]; then printf ','; fi
+    if [ -f "$ALUCARD_REPLAY_HUMAN" ]; then printf '{"name":"needs-human"}'; fi
+    printf '],"comments":['
+    if [ -f "$ALUCARD_REPLAY_MARKER" ]; then printf '%s' '{"body":"**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket'"'"'s."}' ; fi
+    printf ']}\n' ;;
+  'pr edit')
+    case "$*" in *'--add-label alucard'*) : > "$ALUCARD_REPLAY_ALUCARD" ;; *'--add-label needs-human'*) : > "$ALUCARD_REPLAY_HUMAN" ;; esac ;;
+  'pr comment')
+    : > "$ALUCARD_REPLAY_MARKER"
+    if [ "$ALUCARD_REPLAY_FAIL_MARKER" = 1 ]; then echo 'marker response lost' >&2; exit 1; fi ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let database = root.join("ledger.db");
+    migrate(&database).unwrap();
+    let repository_id = repository
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    open(&database)
+        .unwrap()
+        .execute(
+            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, 'owner', 'name', 'now')",
+            [&repository_id],
+        )
+        .unwrap();
+    let target = "recovery:recovery-crash";
+    begin_operation_with_payload(
+        &database,
+        &repository_id,
+        target,
+        "push",
+        Some(&serde_json::json!({ "checkout": repository }).to_string()),
+    )
+    .unwrap();
+    begin_operation_with_payload(
+        &database,
+        &repository_id,
+        target,
+        "create_recovery_pr",
+        Some(r#"{"base":"main","title":"Recovery","body":"Ledger link"}"#),
+    )
+    .unwrap();
+    for operation in ["alucard-label", "needs-human-label", "recovery_marker"] {
+        begin_operation(&database, &repository_id, "recovery-pr:91", operation).unwrap();
+    }
+    open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE operations SET created_at = CASE operation_type
+             WHEN 'push' THEN '2026-01-01 00:00:01'
+             WHEN 'create_recovery_pr' THEN '2026-01-01 00:00:02'
+             WHEN 'alucard-label' THEN '2026-01-01 00:00:03'
+             WHEN 'needs-human-label' THEN '2026-01-01 00:00:04'
+             WHEN 'recovery_marker' THEN '2026-01-01 00:00:05'
+             END",
+            [],
+        )
+        .unwrap();
+
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "# Tasks\n").unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+    )
+    .unwrap();
+    let invoke = |fail_marker: bool| {
+        Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("ALUCARD_REPLAY_TRACE", root.join("trace"))
+            .env("ALUCARD_REPLAY_PR", root.join("pr"))
+            .env("ALUCARD_REPLAY_ALUCARD", root.join("alucard"))
+            .env("ALUCARD_REPLAY_HUMAN", root.join("needs-human"))
+            .env("ALUCARD_REPLAY_MARKER", root.join("marker"))
+            .env(
+                "ALUCARD_REPLAY_FAIL_MARKER",
+                if fail_marker { "1" } else { "0" },
+            )
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .args([
+                "--db-path",
+                database.to_str().unwrap(),
+                "run",
+                "--iterations",
+                "1",
+                "--tasks",
+                tasks.to_str().unwrap(),
+                "--env-file",
+                environment.to_str().unwrap(),
+                "--logs-root",
+                root.join("logs").to_str().unwrap(),
+                "--no-build",
+                repository.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+
+    assert!(!invoke(true).status.success());
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT phase FROM operations WHERE operation_type = 'recovery_marker'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "pending"
+    );
+    drop(connection);
+    assert!(root.join("pr").exists());
+    assert!(root.join("marker").exists());
+
+    assert!(invoke(false).status.success());
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM operations WHERE phase != 'done'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    let trace = fs::read_to_string(root.join("trace")).unwrap();
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.starts_with("pr create"))
+            .count(),
+        1,
+        "{trace}"
+    );
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.starts_with("pr comment"))
+            .count(),
+        1,
+        "{trace}"
+    );
+    assert!(root.join("alucard").exists());
+    assert!(root.join("needs-human").exists());
+
+    assert!(invoke(false).status.success());
+    let replay_calls = |trace: &str| {
+        trace
+            .lines()
+            .filter(|line| line.starts_with("pr "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        replay_calls(&fs::read_to_string(root.join("trace")).unwrap()),
+        replay_calls(&trace)
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn run_github_recovery_case(root: &Path, scenario: &str) {
