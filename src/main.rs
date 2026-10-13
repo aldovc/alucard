@@ -710,10 +710,10 @@ struct QueueOptions {
 impl QueueOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut options = Self {
-            repository: nonempty_environment("ALUCARD_TARGET_REPO")
+            repository: std::env::var_os("ALUCARD_TARGET_REPO")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().expect("current directory")),
-            tasks: nonempty_environment("ALUCARD_TASKS_FILE").map(PathBuf::from),
+            tasks: std::env::var_os("ALUCARD_TASKS_FILE").map(PathBuf::from),
             repository_set: false,
             tasks_from_flag: false,
             github: false,
