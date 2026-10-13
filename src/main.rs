@@ -2093,21 +2093,18 @@ fn fetch_open_local_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, Str
     let output = gh_output(
         repository,
         &[
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            "100",
-            "--json",
-            "number,title,body",
+            "api",
+            "--paginate",
+            "--slurp",
+            "repos/{owner}/{repo}/pulls?state=open&per_page=100",
         ],
         "could not list open pull requests",
     )?;
     if output.iter().all(u8::is_ascii_whitespace) {
         return Ok(Vec::new());
     }
-    serde_json::from_slice(&output)
+    serde_json::from_slice::<Vec<Vec<GithubPullRequest>>>(&output)
+        .map(|pages| pages.into_iter().flatten().collect())
         .map_err(|error| format!("could not parse open pull requests: {error}"))
 }
 

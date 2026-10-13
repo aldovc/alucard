@@ -911,7 +911,7 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     let gh = gh_root.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr list') printf '%s\\n' '[]' ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') printf '%s\\n' '[[]]' ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1086,7 +1086,7 @@ fn queue_does_not_fetch_issues_for_locally_blocked_tasks() {
 }
 
 #[test]
-fn queue_excludes_reset_task_with_matching_open_pr() {
+fn queue_excludes_reset_task_with_matching_open_pr_on_later_page() {
     let root = temporary_path("reset-task-open-pr");
     fs::create_dir_all(&root).unwrap();
     let tasks = root.join("tasks.md");
@@ -1094,7 +1094,7 @@ fn queue_excludes_reset_task_with_matching_open_pr() {
     let gh = root.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr list') printf '%s\\n' '[{\"number\":12,\"title\":\"Open work\",\"body\":\"Task: task\"}]' ;;\n  *) exit 1 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') printf '%s\\n' '[[],[{\"number\":12,\"title\":\"Open work\",\"body\":\"Task: task\"}]]' ;;\n  *) exit 1 ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1257,7 +1257,7 @@ fn run_leaves_in_flight_task_unchanged_when_pr_lookup_fails() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr view') echo 'lookup failed' >&2; exit 1 ;;\n  'pr list') echo '[]' ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr view') echo 'lookup failed' >&2; exit 1 ;;\n  'api --paginate') echo '[[]]' ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1335,7 +1335,7 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list')\n    if mkdir \"$ALUCARD_SELECTION/lock\" 2>/dev/null; then : > \"$ALUCARD_SELECTION/first\"; fi\n    : > \"$ALUCARD_SELECTION/$$\"\n    while [ \"$(find \"$ALUCARD_SELECTION\" -maxdepth 1 -type f ! -name first | wc -l)\" -lt 2 ]; do sleep 0.01; done\n    echo '[]' ;;\n  'pr list') echo '[]' ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list')\n    if mkdir \"$ALUCARD_SELECTION/lock\" 2>/dev/null; then : > \"$ALUCARD_SELECTION/first\"; fi\n    : > \"$ALUCARD_SELECTION/$$\"\n    while [ \"$(find \"$ALUCARD_SELECTION\" -maxdepth 1 -type f ! -name first | wc -l)\" -lt 2 ]; do sleep 0.01; done\n    echo '[]' ;;\n  'api --paginate') echo '[[]]' ;;\n  'pr list') echo '[]' ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
