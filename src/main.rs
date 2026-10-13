@@ -1048,8 +1048,6 @@ fn recover_worker_changes(
             &prepared.branch,
             "--base",
             &options.base,
-            "--label",
-            "alucard",
             "--draft",
             "--title",
             &title,
@@ -1166,6 +1164,24 @@ fn record_recovery(
     )
     .map_err(|error| error.to_string())?;
     let target = format!("recovery-pr:{number}");
+    let alucard_label = begin_operation(
+        database,
+        &prepared.run.repository_id,
+        &target,
+        "alucard-label",
+    )
+    .map_err(|error| error.to_string())?;
+    let alucard_labelled = gh_output(
+        &prepared.clone,
+        &["pr", "edit", &number.to_string(), "--add-label", "alucard"],
+        "could not label recovery PR",
+    );
+    let alucard_label_error = alucard_labelled.err();
+    finish_operation(database, &alucard_label, alucard_label_error.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = alucard_label_error {
+        return Err(error);
+    }
     let marker = begin_operation(
         database,
         &prepared.run.repository_id,

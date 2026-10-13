@@ -197,7 +197,7 @@ esac
 
 #[test]
 fn recovery_publication_failures_are_retained_and_parked_for_humans() {
-    for scenario in ["push", "pr", "marker", "label", "success"] {
+    for scenario in ["push", "pr", "marker", "label", "alucard_label", "success"] {
         let root = temporary_path(&format!("recovery-{scenario}"));
         let repository = root.join("repository");
         let remote = root.join("remote.git");
@@ -265,7 +265,10 @@ case "$1 $2" in
   'pr comment')
     if [ "$ALUCARD_RECOVERY_SCENARIO" = marker ]; then echo 'marker denied' >&2; exit 1; fi ;;
   'pr edit')
-    if [ "$ALUCARD_RECOVERY_SCENARIO" = label ]; then echo 'label denied' >&2; exit 1; fi ;;
+    for argument in "$@"; do
+      if [ "$ALUCARD_RECOVERY_SCENARIO" = label ] && [ "$argument" = needs-human ]; then echo 'label denied' >&2; exit 1; fi
+      if [ "$ALUCARD_RECOVERY_SCENARIO" = alucard_label ] && [ "$argument" = alucard ]; then echo 'alucard label denied' >&2; exit 1; fi
+    done ;;
 esac
 "#,
         )
@@ -326,6 +329,16 @@ esac
             let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
             assert!(trace.contains("pr comment"), "{scenario}: {trace}");
             assert!(trace.contains("pr edit"), "{scenario}: {trace}");
+        }
+        if scenario == "alucard_label" {
+            let phase: String = connection
+                .query_row(
+                    "SELECT phase FROM operations WHERE target = 'recovery-pr:91' AND operation_type = 'alucard-label'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(phase, "failed");
         }
         if scenario == "success" {
             let body = fs::read_to_string(root.join("recovery-body")).unwrap();
