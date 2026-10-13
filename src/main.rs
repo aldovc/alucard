@@ -1761,6 +1761,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             clone: repository.clone(),
             branch: pull.branch.clone(),
         };
+        let mut previous_stage_sha = pull.head_sha.clone();
         let task = SelectedRunTask {
             ledger_id: continued.task_id,
             issue: None,
@@ -1840,9 +1841,15 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             &prepared,
             &pull.branch,
             pr_number,
-            1,
-            0,
+            GateStage {
+                iteration: 1,
+                cycle: 0,
+            },
             &mut checks_available,
+            &mut StageProgress {
+                base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                previous_sha: &mut previous_stage_sha,
+            },
         ) {
             Ok(result) => {
                 record_task_pr_gate_state(
@@ -1872,6 +1879,10 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             ci_result,
             1,
             &toolchain_status,
+            &mut StageProgress {
+                base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                previous_sha: &mut previous_stage_sha,
+            },
         ) {
             eprintln!("alucard: review gate for PR #{pr_number}: {error}");
         }
