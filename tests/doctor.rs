@@ -133,3 +133,32 @@ fn doctor_github_mode_ignores_environment_tasks_file_and_accepts_zero_timeout() 
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn doctor_accepts_shared_run_options() {
+    let directory = temp_dir();
+    let binary = copy_tool_installation(&directory);
+    let repository = directory.join("repository");
+    fs::create_dir_all(&repository).unwrap();
+
+    let output = Command::new(binary)
+        .args([
+            "doctor",
+            repository.to_str().unwrap(),
+            "-n",
+            "0",
+            "--iterations",
+            "0",
+            "--base",
+            "main",
+            "--max-review-cycles",
+            "0",
+            "--no-build",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("unknown option"));
+
+    fs::remove_dir_all(directory).unwrap();
+}

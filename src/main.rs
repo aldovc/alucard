@@ -82,6 +82,31 @@ impl DoctorOptions {
                         return Err("timeout must be a positive integer".to_string());
                     }
                 }
+                "-n" | "--iterations" => {
+                    let iterations = values
+                        .next()
+                        .ok_or_else(|| format!("{value} requires a number"))?;
+                    if iterations.is_empty()
+                        || !iterations.bytes().all(|byte| byte.is_ascii_digit())
+                    {
+                        return Err("iterations must be a positive integer".to_string());
+                    }
+                }
+                "--base" => {
+                    let base = values.next().ok_or("--base requires a branch name")?;
+                    if base.is_empty() {
+                        return Err("--base requires a branch name".to_string());
+                    }
+                }
+                "--max-review-cycles" => {
+                    let cycles = values
+                        .next()
+                        .ok_or("--max-review-cycles requires a number")?;
+                    if cycles.is_empty() || !cycles.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err("max-review-cycles must be a positive integer".to_string());
+                    }
+                }
+                "--no-build" => {}
                 "--logs-root" => {
                     values
                         .next()
