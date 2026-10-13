@@ -2,8 +2,9 @@ use alucard::{
     abandoned_task_claims, acquire_pr, acquire_task, begin_operation, begin_operation_with_payload,
     defer_operation, finish_operation, heartbeat, migrate, open, pending_operations, prepare_run,
     record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
-    release_abandoned_task_claim, run_command, start_retry_run, start_task_retry_run, status,
-    task_claim_attempts, transition_task, AbandonedTaskClaim, ClaimError, RunOptions, TaskStatus,
+    release_abandoned_task_claim, run_command, start_continue_run, start_retry_run,
+    start_task_retry_run, status, task_claim_attempts, transition_task, AbandonedTaskClaim,
+    ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,52 @@ fn insert_run(path: &Path, run_id: &str) {
             [run_id],
         )
         .unwrap();
+}
+
+#[test]
+fn continue_run_adopts_an_unrecorded_recovery_pull_request() {
+    let directory = database_path().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("ledger.db");
+    let repository = directory.join("repository");
+    let logs = directory.join("logs");
+    fs::create_dir(&repository).unwrap();
+
+    let continued = start_continue_run(
+        &path,
+        &repository,
+        &logs,
+        "image:test",
+        42,
+        "alucard/recovery",
+        "head",
+        "recovery title",
+        true,
+    )
+    .unwrap();
+    let connection = open(&path).unwrap();
+    assert_eq!(continued.run.command, "continue");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT kind FROM pull_requests WHERE number = 42",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "recovery"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [&continued.task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "in_flight"
+    );
+    fs::remove_dir_all(directory).unwrap();
 }
 
 fn seed_repository(path: &Path) {

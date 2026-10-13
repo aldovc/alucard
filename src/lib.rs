@@ -2859,7 +2859,7 @@ pub struct DatabaseStatus {
     pub journal_mode: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
     pub id: String,
     pub repository_id: String,
@@ -2875,6 +2875,12 @@ pub struct PreparedRun {
     pub directory: PathBuf,
     pub clone: PathBuf,
     pub branch: String,
+}
+
+/// A continue run and the task row associated with its pull request.
+pub struct ContinueRun {
+    pub run: Run,
+    pub task_id: String,
 }
 
 pub struct RunOptions<'a> {
@@ -3245,6 +3251,80 @@ pub fn start_merge_run(
         base_sha: None,
         image: None,
         logs_path: Some(logs_path),
+    })
+}
+
+/// Creates a continue run and adopts a pull request that predates the ledger when needed.
+#[allow(clippy::too_many_arguments)]
+pub fn start_continue_run(
+    path: &Path,
+    repository: &Path,
+    logs_root: &Path,
+    image: &str,
+    number: i64,
+    branch: &str,
+    head_sha: &str,
+    title: &str,
+    recovery: bool,
+) -> Result<ContinueRun, DatabaseError> {
+    migrate(path)?;
+    let repository = repository.canonicalize()?;
+    let repository_name = repository
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
+    let repository_id = repository.to_string_lossy().to_string();
+    let run_id = Uuid::new_v4().to_string();
+    let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
+         VALUES (?1, '', ?2, '', datetime('now'))",
+        params![repository_id, repository_name],
+    )?;
+    let task_id: Option<String> = transaction
+        .query_row(
+            "SELECT task_id FROM pull_requests WHERE repository_id = ?1 AND number = ?2",
+            (&repository_id, number),
+            |row| row.get(0),
+        )
+        .optional()?;
+    let task_id = match task_id {
+        Some(task_id) => task_id,
+        None => {
+            let task_id = Uuid::new_v4().to_string();
+            transaction.execute(
+                "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, pr_number, updated_at)
+                 VALUES (?1, ?2, 'local', 'continue', ?3, ?4, 'in_flight', '[]', ?5, datetime('now'))",
+                (&task_id, &repository_id, format!("pr:{number}"), title, number),
+            )?;
+            task_id
+        }
+    };
+    transaction.execute(
+        "INSERT INTO pull_requests (id, task_id, repository_id, number, branch, head_sha, kind, remote_state, gate_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', 'pending')
+         ON CONFLICT(repository_id, number) DO UPDATE SET branch = excluded.branch, head_sha = excluded.head_sha, remote_state = 'open'",
+        (Uuid::new_v4().to_string(), &task_id, &repository_id, number, branch, head_sha, if recovery { "recovery" } else { "normal" }),
+    )?;
+    transaction.execute(
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, branch, pid, hostname)
+         VALUES (?1, ?2, 'continue', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
+        params![run_id, repository_id, image, logs_path, branch, std::process::id(), hostname()?],
+    )?;
+    transaction.commit()?;
+    Ok(ContinueRun {
+        run: Run {
+            id: run_id,
+            repository_id,
+            command: "continue".to_string(),
+            status: "running".to_string(),
+            base_sha: None,
+            image: Some(image.to_string()),
+            logs_path: Some(logs_path),
+        },
+        task_id,
     })
 }
 
