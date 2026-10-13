@@ -655,7 +655,38 @@ mod agent_tests {
             .status()
             .unwrap();
 
+        Command::new("git")
+            .args(["checkout", "-b", "preflight-base"])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        fs::write(repository.join("package-lock.json"), "non-default").unwrap();
+        Command::new("git")
+            .args(["add", "package-lock.json"])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Alucard Test",
+                "-c",
+                "user.email=alucard@example.test",
+                "commit",
+                "-m",
+                "non-default base",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+
         let trace = dir.join("trace");
+        let non_default_ran = dir.join("non-default-ran");
         fs::write(
             bin.join("timeout"),
             format!(
@@ -667,8 +698,9 @@ mod agent_tests {
         fs::write(
             bin.join("docker"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\n[ \"$1\" = run ] && exit 23\n",
-                trace.display()
+                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; exit 0; fi\n  exit 23\nfi\n",
+                trace.display(),
+                non_default_ran.display()
             ),
         )
         .unwrap();
@@ -686,7 +718,6 @@ mod agent_tests {
         let status =
             super::toolchain_preflight(&repository, "main", "alucard:test", &env_file, 7).unwrap();
 
-        env::set_var("PATH", path);
         let trace = fs::read_to_string(trace).unwrap();
         assert!(
             trace.contains("timeout --kill-after 30s 7m docker run --rm --name alucard-preflight-")
@@ -719,6 +750,12 @@ mod agent_tests {
         )));
         assert!(trace.find("docker run").unwrap() < trace.find("docker rm -f").unwrap());
         assert!(status.contains("`npm ci` at the repo root fails inside the container (rc=23)"));
+        let non_default_status =
+            super::toolchain_preflight(&repository, "preflight-base", "alucard:test", &env_file, 7);
+        env::set_var("PATH", path);
+        let status = non_default_status.unwrap();
+        assert!(status.contains("`npm ci` at the repo root completes in the container"));
+        assert!(non_default_ran.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
