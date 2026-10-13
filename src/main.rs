@@ -17,7 +17,7 @@ use alucard::{
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
 
@@ -415,22 +415,16 @@ fn merge_checkout(
             true,
         )
     };
-    let check = execute_command(
-        "bash",
-        &["-c", check_command],
+    let check_log_path = checkout.parent().unwrap().join("check.log");
+    let check = run_merge_check(
         checkout,
-        Some(Duration::from_secs(options.timeout_minutes * 60)),
-    )
-    .map_err(|error| error.to_string())?;
-    let check_log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-    fs::write(checkout.parent().unwrap().join("check.log"), &check_log)
-        .map_err(|error| error.to_string())?;
-    let evidence = format!("**🤖 Alucard merge: checks {}**\n\nRan `{}` on `{}`: exit {}.\n\n<details><summary>Last lines of output</summary>\n\n```\n{}\n```\n\n</details>", if check.status.success() { "passed" } else { "failed — not merged" }, check_command, new_head, check.status.code().unwrap_or(1), check_log.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
-    if !check.status.success() {
+        check_command,
+        options.timeout_minutes,
+        &check_log_path,
+    )?;
+    let check_log = fs::read_to_string(&check_log_path).unwrap_or_default();
+    let evidence = format!("**🤖 Alucard merge: checks {}**\n\nRan `{}` on `{}`: exit {}.\n\n<details><summary>Last lines of output</summary>\n\n```\n{}\n```\n\n</details>", if check.success() { "passed" } else { "failed — not merged" }, check_command, new_head, check.code().unwrap_or(1), check_log.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+    if !check.success() {
         merge_post(checkout, options.pr_number, &evidence, options.dry_run);
         return Err(format!(
             "checks failed; see {}/check.log",
@@ -502,6 +496,31 @@ fn merge_checkout(
     );
     println!("PR #{} merged.", options.pr_number);
     Ok(())
+}
+
+fn run_merge_check(
+    checkout: &Path,
+    check_command: &str,
+    timeout_minutes: u64,
+    log_path: &Path,
+) -> Result<ExitStatus, String> {
+    let log = fs::File::create(log_path).map_err(|error| error.to_string())?;
+    Command::new("timeout")
+        .args([
+            "--kill-after",
+            "30s",
+            &format!("{timeout_minutes}m"),
+            "bash",
+            "-c",
+            check_command,
+        ])
+        .current_dir(checkout)
+        .stdout(Stdio::from(
+            log.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(log))
+        .status()
+        .map_err(|error| error.to_string())
 }
 
 fn merge_post(repository: &Path, number: i64, body: &str, dry_run: bool) {

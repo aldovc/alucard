@@ -92,12 +92,16 @@ setup_repos() {
 }
 
 run_merge() {
+  local -a command=("$ALUCARD" merge 9 "$TARGET" --env-file "$TEST_DIR/alucard.env" \
+    --logs-root "$TEST_DIR/logs" "$@")
+  if [ -n "${MERGE_TIMEOUT:-}" ]; then
+    command=(timeout --kill-after 1s "$MERGE_TIMEOUT" "${command[@]}")
+  fi
   set +e
   PATH="$MOCK_BIN:$PATH" \
   ALUCARD_TEST_STATE="$STATE" ALUCARD_TEST_REMOTE="$REMOTE" \
   ALUCARD_TEST_BRANCH="$BRANCH" ALUCARD_TEST_COMMENTS="$COMMENTS" \
-    "$ALUCARD" merge 9 "$TARGET" --env-file "$TEST_DIR/alucard.env" \
-      --logs-root "$TEST_DIR/logs" "$@" > "$TEST_DIR/out" 2>&1
+    "${command[@]}" > "$TEST_DIR/out" 2>&1
   RC=$?
   set -e
   OUT=$(<"$TEST_DIR/out")
@@ -154,6 +158,13 @@ assert_eq "nothing is pushed" "$PR_SHA" "$REMOTE_HEAD"
 assert_contains "the failure summary is posted" "checks failed — not merged" "$POSTED"
 assert_contains "with the failing output" "FAILED tests/db/test_x.py" "$POSTED"
 assert_not_contains "nothing is merged" "pr merge" "$TRACE"
+
+echo ""
+echo "── background check child ──"
+setup_repos current
+MERGE_TIMEOUT=5s run_merge --check-command 'sleep 10 & echo "check completed"'
+assert_eq "merge returns after its foreground check completes" "0" "$RC"
+assert_contains "the foreground check output is recorded" "check completed" "$POSTED"
 
 echo ""
 echo "── refusals ──"
