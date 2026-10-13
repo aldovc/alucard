@@ -1914,6 +1914,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("../migrations/0004_reconciliation.sql")),
     (5, include_str!("../migrations/0005_run_branch.sql")),
     (6, include_str!("../migrations/0006_retry_owner.sql")),
+    (7, include_str!("../migrations/0007_operation_payload.sql")),
 ];
 
 pub struct DatabaseStatus {
@@ -1973,6 +1974,15 @@ pub struct Recovery {
     pub pull_request_number: Option<i64>,
     pub checkout_path: Option<String>,
     pub failure_reason: Option<String>,
+}
+
+/// A remote side effect that must be reconciled after an interrupted run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PendingOperation {
+    pub id: String,
+    pub target: String,
+    pub operation_type: String,
+    pub payload: Option<String>,
 }
 
 /// An active task claim whose owning process is no longer alive on this host.
@@ -2458,18 +2468,67 @@ pub fn begin_operation(
     target: &str,
     operation_type: &str,
 ) -> Result<String, DatabaseError> {
+    begin_operation_with_payload(path, repository_id, target, operation_type, None)
+}
+
+/// Creates a durable remote-operation intent, including any data needed to replay it.
+pub fn begin_operation_with_payload(
+    path: &Path,
+    repository_id: &str,
+    target: &str,
+    operation_type: &str,
+    payload: Option<&str>,
+) -> Result<String, DatabaseError> {
     let connection = open(path)?;
     let id = Uuid::new_v4().to_string();
     connection.execute(
-        "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', 0, datetime('now'), datetime('now'))
-         ON CONFLICT(repository_id, target, operation_type) DO NOTHING",
-        (&id, repository_id, target, operation_type),
+        "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, payload, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, datetime('now'), datetime('now'))
+         ON CONFLICT(repository_id, target, operation_type) DO UPDATE SET
+           payload = COALESCE(operations.payload, excluded.payload),
+           phase = CASE WHEN operations.phase = 'failed' THEN 'pending' ELSE operations.phase END,
+           updated_at = datetime('now')",
+        (&id, repository_id, target, operation_type, payload),
     )?;
     Ok(connection.query_row(
         "SELECT id FROM operations WHERE repository_id = ?1 AND target = ?2 AND operation_type = ?3",
         (repository_id, target, operation_type), |row| row.get(0),
     )?)
+}
+
+/// Lists unfinished operations for one repository.
+pub fn pending_operations(
+    path: &Path,
+    repository_id: &str,
+) -> Result<Vec<PendingOperation>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, target, operation_type, payload FROM operations
+         WHERE repository_id = ?1 AND phase != 'done' ORDER BY created_at, id",
+    )?;
+    let operations = statement
+        .query_map([repository_id], |row| {
+            Ok(PendingOperation {
+                id: row.get(0)?,
+                target: row.get(1)?,
+                operation_type: row.get(2)?,
+                payload: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)?;
+    Ok(operations)
+}
+
+/// Keeps a failed replay eligible for the next startup attempt.
+pub fn defer_operation(path: &Path, operation_id: &str, error: &str) -> Result<(), DatabaseError> {
+    let connection = open(path)?;
+    connection.execute(
+        "UPDATE operations SET phase = 'pending', attempt_count = attempt_count + 1,
+         last_error = ?1, updated_at = datetime('now') WHERE id = ?2",
+        (error, operation_id),
+    )?;
+    Ok(())
 }
 
 /// Completes or records the failure of a journaled remote operation.

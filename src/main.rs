@@ -1,17 +1,18 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    abandoned_task_claims, begin_operation, build_image, compose_role_prompt, database_path,
-    find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
-    import_github_tasks, import_local_tasks, local_queue_with_open_issues,
-    local_queue_with_open_prs, mark_claim_needs_reconciliation, migrate, open, parse_tasks,
-    prepare_run, recent_runs, record_recovery_failure, record_recovery_pr, record_task_pr,
-    record_task_pr_gate_state, release, release_abandoned_task_claim, run_claims,
-    run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
-    start_task_retry_run, start_task_run, status, task_claim_attempts, task_id, task_is_pending,
-    toolchain_preflight, transition_task, warn_if_stale_image, write_task_headings,
-    AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider,
-    RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
+    abandoned_task_claims, begin_operation, begin_operation_with_payload, build_image,
+    compose_role_prompt, database_path, defer_operation, find_run, finish_operation, finish_run,
+    github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
+    local_queue_with_open_issues, local_queue_with_open_prs, mark_claim_needs_reconciliation,
+    migrate, open, parse_tasks, pending_operations, prepare_run, recent_runs,
+    record_recovery_failure, record_recovery_pr, record_task_pr, record_task_pr_gate_state,
+    release, release_abandoned_task_claim, run_claims, run_command as execute_command,
+    run_pull_requests, run_reconciliation_reason, run_recovery, start_task_retry_run,
+    start_task_run, status, task_claim_attempts, task_id, task_is_pending, toolchain_preflight,
+    transition_task, warn_if_stale_image, write_task_headings, AgentInvocation, AgentRole,
+    AgentSettings, GithubPullRequest, GithubTask, Provider, RecoveryPullRequest, RunOptions,
+    TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -987,6 +988,7 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .to_string_lossy()
         .to_string();
+    replay_recovery_operations(database, repository, &repository_id)?;
     let mut actions = Vec::new();
     for claim in
         abandoned_task_claims(database, &repository_id).map_err(|error| error.to_string())?
@@ -1076,6 +1078,166 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryPushPayload {
+    checkout: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryPullRequestPayload {
+    base: String,
+    title: String,
+    body: String,
+}
+
+fn replay_recovery_operations(
+    database: &Path,
+    repository: &Path,
+    repository_id: &str,
+) -> Result<(), String> {
+    for operation in
+        pending_operations(database, repository_id).map_err(|error| error.to_string())?
+    {
+        let replay = match (
+            operation.target.strip_prefix("recovery:"),
+            operation.operation_type.as_str(),
+        ) {
+            (Some(branch), "push") => {
+                replay_recovery_push(repository, branch, operation.payload.as_deref())
+            }
+            (Some(branch), "create_recovery_pr") => {
+                replay_recovery_pr(repository, branch, operation.payload.as_deref())
+            }
+            (None, "alucard-label" | "needs-human-label" | "recovery_marker") => {
+                replay_recovery_annotation(repository, &operation.target, &operation.operation_type)
+            }
+            _ => continue,
+        };
+        match replay {
+            Ok(()) => finish_operation(database, &operation.id, None)
+                .map_err(|error| error.to_string())?,
+            Err(error) => {
+                defer_operation(database, &operation.id, &error)
+                    .map_err(|database_error| database_error.to_string())?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replay_recovery_push(
+    repository: &Path,
+    branch: &str,
+    payload: Option<&str>,
+) -> Result<(), String> {
+    if remote_branch_exists(repository, branch)? {
+        return Ok(());
+    }
+    let payload: RecoveryPushPayload =
+        serde_json::from_str(payload.ok_or("recovery push has no replay payload")?)
+            .map_err(|error| format!("could not parse recovery push payload: {error}"))?;
+    let output = execute_command(
+        "git",
+        &["push", "-u", "origin", branch],
+        &payload.checkout,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn replay_recovery_pr(
+    repository: &Path,
+    branch: &str,
+    payload: Option<&str>,
+) -> Result<(), String> {
+    if find_open_pr(repository, branch)?.is_some() {
+        return Ok(());
+    }
+    let payload: RecoveryPullRequestPayload =
+        serde_json::from_str(payload.ok_or("recovery PR has no replay payload")?)
+            .map_err(|error| format!("could not parse recovery PR payload: {error}"))?;
+    gh_output(
+        repository,
+        &[
+            "pr",
+            "create",
+            "--head",
+            branch,
+            "--base",
+            &payload.base,
+            "--draft",
+            "--title",
+            &payload.title,
+            "--body",
+            &payload.body,
+        ],
+        "could not create recovery pull request",
+    )?;
+    find_open_pr(repository, branch)?
+        .ok_or_else(|| "recovery PR was created but cannot be discovered".to_string())?;
+    Ok(())
+}
+
+fn replay_recovery_annotation(
+    repository: &Path,
+    target: &str,
+    operation_type: &str,
+) -> Result<(), String> {
+    let number = target
+        .strip_prefix("recovery-pr:")
+        .ok_or_else(|| "recovery annotation has an invalid target".to_string())?;
+    let view = gh_output(
+        repository,
+        &["pr", "view", number, "--json", "labels,comments"],
+        "could not inspect recovery pull request",
+    )?;
+    let view: serde_json::Value = serde_json::from_slice(&view)
+        .map_err(|error| format!("could not parse recovery pull request: {error}"))?;
+    let labels = view["labels"]
+        .as_array()
+        .ok_or("recovery PR labels are missing")?;
+    let labelled = |name| {
+        labels
+            .iter()
+            .any(|label| label["name"].as_str() == Some(name))
+    };
+    let marked = view["comments"]
+        .as_array()
+        .ok_or("recovery PR comments are missing")?
+        .iter()
+        .any(|comment| comment["body"].as_str() == Some(RECOVERY_MARKER_BODY));
+    match operation_type {
+        "alucard-label" if labelled("alucard") => Ok(()),
+        "needs-human-label" if labelled("needs-human") => Ok(()),
+        "recovery_marker" if marked => Ok(()),
+        "alucard-label" => gh_output(
+            repository,
+            &["pr", "edit", number, "--add-label", "alucard"],
+            "could not label recovery PR",
+        )
+        .map(|_| ()),
+        "needs-human-label" => gh_output(
+            repository,
+            &["pr", "edit", number, "--add-label", "needs-human"],
+            "could not label recovery PR",
+        )
+        .map(|_| ()),
+        "recovery_marker" => gh_output(
+            repository,
+            &["pr", "comment", number, "--body", RECOVERY_MARKER_BODY],
+            "could not post recovery marker",
+        )
+        .map(|_| ()),
+        _ => Ok(()),
+    }
 }
 
 fn abandoned_branch(attempt: &alucard::TaskClaimAttempt) -> Option<String> {
@@ -1667,8 +1829,15 @@ fn recover_worker_changes(
         }
     }
     let target = format!("recovery:{}", prepared.branch);
-    let push = begin_operation(database, &prepared.run.repository_id, &target, "push")
-        .map_err(|error| error.to_string())?;
+    let push_payload = serde_json::json!({ "checkout": prepared.clone }).to_string();
+    let push = begin_operation_with_payload(
+        database,
+        &prepared.run.repository_id,
+        &target,
+        "push",
+        Some(&push_payload),
+    )
+    .map_err(|error| error.to_string())?;
     let pushed = execute_command(
         "git",
         &["push", "-u", "origin", &prepared.branch],
@@ -1728,11 +1897,18 @@ fn recover_worker_changes(
         commit_count,
         handoff.as_deref(),
     );
-    let pr = begin_operation(
+    let pr_payload = serde_json::json!({
+        "base": options.base,
+        "title": title,
+        "body": body,
+    })
+    .to_string();
+    let pr = begin_operation_with_payload(
         database,
         &prepared.run.repository_id,
         &target,
         "create_recovery_pr",
+        Some(&pr_payload),
     )
     .map_err(|error| error.to_string())?;
     let output = execute_command(
