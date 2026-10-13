@@ -1485,6 +1485,107 @@ fn run_leaves_in_flight_task_unchanged_when_pr_lookup_fails() {
 }
 
 #[test]
+fn run_reports_worker_usage_when_pr_lookup_fails_after_invocation() {
+    let root = temporary_path("run-post-invocation-pr-lookup-failure");
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let bin = root.join("bin");
+    fs::create_dir_all(repository.join(".alucard")).unwrap();
+    fs::create_dir(&bin).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    fs::write(
+        repository.join(".alucard/tasks.md"),
+        "# Usage test\n\n## [ ] 1: A queued task\n\nBlocked by: none\n",
+    )
+    .unwrap();
+    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "task",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "main",
+    ]));
+    for (name, script) in [
+        (
+            "docker",
+            "#!/bin/sh\ncase \"$1\" in\n  image) exit 0 ;;\n  run) touch \"$ALUCARD_TEST_WORKER_RAN\"; printf '%s\\n' '{\"type\":\"result\",\"modelUsage\":{\"claude\":{\"inputTokens\":12,\"outputTokens\":34}},\"num_turns\":1,\"total_cost_usd\":0.01}'; exit 0 ;;\n  rm|kill) exit 0 ;;\nesac\n",
+        ),
+        (
+            "timeout",
+            "#!/bin/sh\n[ \"$1\" = --kill-after ] && shift 2\nshift\nexec \"$@\"\n",
+        ),
+        (
+            "gh",
+            "#!/bin/sh\nif [ ! -f \"$ALUCARD_TEST_WORKER_RAN\" ]; then printf '[]\\n'; exit 0; fi\nprintf 'GitHub unavailable\\n' >&2\nexit 1\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let environment = root.join("alucard.env");
+    fs::write(
+        &environment,
+        "GITHUB_TOKEN=gh_test\nANTHROPIC_API_KEY=sk-ant-test\nOPENAI_API_KEY=sk-openai-test\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .env("ALUCARD_TEST_WORKER_RAN", root.join("worker-ran"))
+        .args([
+            "--db-path",
+            root.join("alucard.db").to_str().unwrap(),
+            "run",
+            repository.to_str().unwrap(),
+            "--iterations",
+            "1",
+            "--no-build",
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(shown.contains("=== Alucard Token Usage:"), "{shown}");
+    assert!(shown.contains("worker 1"), "{shown}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     let root = temporary_path("run-local");
     let repository = root.join("repository");
