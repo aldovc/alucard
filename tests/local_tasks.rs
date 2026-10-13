@@ -197,7 +197,7 @@ esac
 
 #[test]
 fn recovery_publication_failures_are_retained_and_parked_for_humans() {
-    for scenario in ["push", "pr", "marker", "label"] {
+    for scenario in ["push", "pr", "marker", "label", "success"] {
         let root = temporary_path(&format!("recovery-{scenario}"));
         let repository = root.join("repository");
         let remote = root.join("remote.git");
@@ -257,6 +257,10 @@ case "$1 $2" in
     if [ -f "$ALUCARD_RECOVERY_CREATED" ]; then echo '[{"number":91,"headRefName":"recovery","headRefOid":"abc"}]'; else echo '[]'; fi ;;
   'pr create')
     if [ "$ALUCARD_RECOVERY_SCENARIO" = pr ]; then echo 'create denied' >&2; exit 1; fi
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --body ]; then printf '%s' "$2" > "$ALUCARD_RECOVERY_BODY"; break; fi
+      shift
+    done
     : > "$ALUCARD_RECOVERY_CREATED" ;;
   'pr comment')
     if [ "$ALUCARD_RECOVERY_SCENARIO" = marker ]; then echo 'marker denied' >&2; exit 1; fi ;;
@@ -284,6 +288,7 @@ esac
             .env("ALUCARD_REAL_GIT", "/usr/bin/git")
             .env("ALUCARD_RECOVERY_SCENARIO", scenario)
             .env("ALUCARD_RECOVERY_CREATED", root.join("recovery-created"))
+            .env("ALUCARD_RECOVERY_BODY", root.join("recovery-body"))
             .env("ALUCARD_RECOVERY_TRACE", root.join("recovery-trace"))
             .env("ALUCARD_CACHE_DIR", root.join("cache"))
             .args([
@@ -310,13 +315,34 @@ esac
                 .query_row("SELECT status FROM tasks", [], |row| row
                     .get::<_, String>(0))
                 .unwrap(),
-            "human",
+            if scenario == "success" {
+                "in_flight"
+            } else {
+                "human"
+            },
             "{scenario}"
         );
         if matches!(scenario, "marker" | "label") {
             let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
             assert!(trace.contains("pr comment"), "{scenario}: {trace}");
             assert!(trace.contains("pr edit"), "{scenario}: {trace}");
+        }
+        if scenario == "success" {
+            let body = fs::read_to_string(root.join("recovery-body")).unwrap();
+            assert!(body.starts_with("Task: 1\n\n"), "{body}");
+            assert!(body.contains("This is not a finished change."), "{body}");
+            assert!(
+                body.contains("the harness flips the task to `[x]` when this PR merges."),
+                "{body}"
+            );
+            assert!(
+                body.contains("task flips back to `[ ]` at the next queue build"),
+                "{body}"
+            );
+            assert!(
+                body.contains("It does not resume implementation."),
+                "{body}"
+            );
         }
         let run_id: String = connection
             .query_row("SELECT id FROM runs", [], |row| row.get(0))

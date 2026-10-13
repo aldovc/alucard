@@ -1202,12 +1202,41 @@ fn recovery_body(
     status: Option<i32>,
     commits: usize,
 ) -> String {
-    let reference = task
-        .issue
-        .as_ref()
-        .map(|issue| format!("Refs #{}\n\n", issue.number))
-        .unwrap_or_default();
-    format!("{reference}**🤖 Alucard recovery PR** — the worker stopped ({classification:?}, rc={}) before opening a PR. Its {commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.\n\nFinish the task, run the required checks, then mark this draft ready for review.", status.unwrap_or(1))
+    let (reference, finish, handback) = match (&task.issue, &task.local_id) {
+        (Some(issue), _) => (
+            format!("Refs #{}", issue.number),
+            "when every acceptance criterion is met, change the `Refs` line above to `Closes` so the ticket closes on merge.",
+            "close this PR and the ticket rejoins the queue on the next run — its `in-progress` label is already off, and this attempt is noted in its comments. `alucard run --issue <N>` starts a fresh attempt on it right away.",
+        ),
+        (None, Some(id)) => (
+            format!("Task: {id}"),
+            "the harness flips the task to `[x]` when this PR merges.",
+            "close this PR and the task flips back to `[ ]` at the next queue build, with this attempt noted in its heading.",
+        ),
+        (None, None) => (String::new(), "", ""),
+    };
+    let stop = match classification {
+        alucard::AgentExit::Exhausted | alucard::AgentExit::Timeout => {
+            "ran out of turns or hit its time limit"
+        }
+        alucard::AgentExit::Wedged => {
+            "wedged its shell (every tool call failed after /work went missing)"
+        }
+        alucard::AgentExit::Transport => "lost its provider connection",
+        alucard::AgentExit::NoWorktree => {
+            "never started: its checkout was empty when the container mounted it"
+        }
+        _ => "failed",
+    };
+    let reference = if reference.is_empty() {
+        String::new()
+    } else {
+        format!("{reference}\n\n")
+    };
+    format!(
+        "{reference}**🤖 Alucard recovery PR** — the worker {stop} (rc={}) before opening a PR. Its {commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.\n\nThis is not a finished change. What each next step does:\n\n- **Finish it here** — {finish}\n- **Hand it back** — {handback}\n- **`alucard continue <PR_NUM>`** runs the CI and review gates on what is here. It does not resume implementation.",
+        status.unwrap_or(1)
+    )
 }
 
 fn release_without_pr(
@@ -2252,5 +2281,41 @@ printf '%s' "$FULL_PROMPT""#,
             .unwrap(),
             bash_prompt("file", &local_queue, commits, &local_instructions, &tasks)
         );
+    }
+
+    #[test]
+    fn recovery_body_attributes_tasks_by_source() {
+        let github_task = SelectedRunTask {
+            ledger_id: "github".to_string(),
+            issue: Some(GithubTask {
+                number: 42,
+                title: String::new(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: None,
+            }),
+            local_id: None,
+            local_title: String::new(),
+            local_body: String::new(),
+            parent_context: String::new(),
+        };
+        let local_task = SelectedRunTask {
+            ledger_id: "local".to_string(),
+            issue: None,
+            local_id: Some("7".to_string()),
+            local_title: String::new(),
+            local_body: String::new(),
+            parent_context: String::new(),
+        };
+
+        let github = recovery_body(&github_task, alucard::AgentExit::Exhausted, Some(1), 2);
+        assert!(github.starts_with("Refs #42\n\n"));
+        assert!(github.contains("change the `Refs` line above to `Closes`"));
+        assert!(github.contains("`alucard run --issue <N>`"));
+
+        let local = recovery_body(&local_task, alucard::AgentExit::Exhausted, Some(1), 2);
+        assert!(local.starts_with("Task: 7\n\n"));
+        assert!(local.contains("the harness flips the task to `[x]` when this PR merges."));
+        assert!(local.contains("task flips back to `[ ]` at the next queue build"));
     }
 }
