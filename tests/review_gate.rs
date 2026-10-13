@@ -301,7 +301,7 @@ esac
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+        "ALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER=codex\nANTHROPIC_API_KEY=test\n",
     )
     .unwrap();
     let review_args = root.join("review-args");
