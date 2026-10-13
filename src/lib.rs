@@ -335,19 +335,30 @@ fn warn_if_stale_image_with_docker(
         return Err(format!("Docker image not found: {image}"));
     }
     let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if found == wanted {
-        return Ok(());
+    if let Some(warning) = stale_image_warning(image, tool_dir, &found, &wanted) {
+        eprintln!("{warning}");
     }
-    if found.is_empty() || found == "<no value>" {
-        eprintln!("Warning: {image} carries no build-input stamp — it predates this check and may be stale.");
-    } else {
-        eprintln!("Warning: {image} was built from different Dockerfile/entrypoint.sh content than {} holds now.", tool_dir.display());
-    }
-    eprintln!(
-        "         Rebuild with 'docker build -t {image} {}', or drop --no-build.",
-        tool_dir.display()
-    );
     Ok(())
+}
+
+fn stale_image_warning(image: &str, tool_dir: &Path, found: &str, wanted: &str) -> Option<String> {
+    if found == wanted {
+        return None;
+    }
+    let first_line = if found.is_empty() || found == "<no value>" {
+        format!(
+            "Warning: {image} carries no build-input stamp — it predates this check and may be stale."
+        )
+    } else {
+        format!(
+            "Warning: {image} was built from different Dockerfile/entrypoint.sh content than {} holds now.",
+            tool_dir.display()
+        )
+    };
+    Some(format!(
+        "{first_line}\n         Rebuild with 'docker build -t {image} {}', or drop --no-build.",
+        tool_dir.display()
+    ))
 }
 
 fn build_image_with_docker(tool_dir: &Path, image: &str, docker: &Path) -> Result<(), String> {
@@ -418,8 +429,7 @@ fn docker_image_tag_count(docker: &Path, image: &str) -> Option<usize> {
 #[cfg(test)]
 mod agent_tests {
     use super::{
-        build_image_with_docker, warn_if_stale_image_with_docker, AgentInvocation, AgentRole,
-        AgentSettings,
+        build_image_with_docker, stale_image_warning, AgentInvocation, AgentRole, AgentSettings,
     };
     use std::collections::BTreeMap;
     use std::env;
@@ -482,26 +492,32 @@ mod agent_tests {
     }
 
     #[test]
-    fn no_build_freshness_accepts_current_stamps_and_warns_for_stale_ones() {
+    fn no_build_freshness_warning_matches_bash_contract() {
         let dir =
             std::env::temp_dir().join(format!("alucard-image-stamp-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
         fs::write(dir.join("entrypoint.sh"), "#!/bin/sh\n").unwrap();
-        let docker = dir.join("docker");
-        fs::write(
-            &docker,
-            "#!/bin/sh\nprintf '%s\\n' \"$ALUCARD_TEST_STAMP\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
-
         let stamp = super::build_inputs_hash(&dir).unwrap();
-        env::set_var("ALUCARD_TEST_STAMP", &stamp);
-        assert!(warn_if_stale_image_with_docker(&dir, "alucard:test", &docker).is_ok());
-        env::set_var("ALUCARD_TEST_STAMP", "stale");
-        assert!(warn_if_stale_image_with_docker(&dir, "alucard:test", &docker).is_ok());
-        env::remove_var("ALUCARD_TEST_STAMP");
+        assert_eq!(
+            stale_image_warning("alucard:test", &dir, &stamp, &stamp),
+            None
+        );
+        assert_eq!(
+            stale_image_warning("alucard:test", &dir, "stale", &stamp),
+            Some(format!(
+                "Warning: alucard:test was built from different Dockerfile/entrypoint.sh content than {} holds now.\n         Rebuild with 'docker build -t alucard:test {}', or drop --no-build.",
+                dir.display(),
+                dir.display()
+            ))
+        );
+        assert_eq!(
+            stale_image_warning("alucard:test", &dir, "", &stamp),
+            Some(format!(
+                "Warning: alucard:test carries no build-input stamp — it predates this check and may be stale.\n         Rebuild with 'docker build -t alucard:test {}', or drop --no-build.",
+                dir.display()
+            ))
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

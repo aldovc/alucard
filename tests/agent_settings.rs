@@ -92,43 +92,125 @@ fn role_settings_and_docker_arguments_match_bash_contract() {
 fn role_mounts_and_extra_environment_match_bash_contract() {
     let agent_settings = settings("ALUCARD_PROVIDER=claude\n");
     let output = Path::new("/tmp/output");
-    let invocation = AgentInvocation {
-        worktree_read_only: true,
-        output_dir: Some(output),
-        extra_env: &[("ALUCARD_ITER", "7-review-2")],
-        ..invocation(AgentRole::Reviewer)
-    };
-    let args = invocation.docker_args(&agent_settings).unwrap();
-    assert!(args.iter().any(|arg| arg == "/tmp/worktree:/work:ro"));
-    assert!(args.iter().any(|arg| arg == "/tmp/output:/work-output:rw"));
-    assert!(args.iter().any(|arg| arg == "ALUCARD_ITER=7-review-2"));
+    for role in [
+        AgentRole::Worker,
+        AgentRole::CiFix,
+        AgentRole::Reviewer,
+        AgentRole::Feedback,
+        AgentRole::Wrapup,
+    ] {
+        let invocation = AgentInvocation {
+            worktree_read_only: true,
+            output_dir: Some(output),
+            extra_env: &[("ALUCARD_ITER", "7-review-2")],
+            ..invocation(role)
+        };
+        let args = invocation.docker_args(&agent_settings).unwrap();
+        assert!(args.iter().any(|arg| arg == "/tmp/worktree:/work:ro"));
+        assert!(args.iter().any(|arg| arg == "/tmp/output:/work-output:rw"));
+        assert!(args.iter().any(|arg| arg == "ALUCARD_ITER=7-review-2"));
+    }
 }
 
 #[test]
 fn toolchain_manifests_and_status_match_bash_contract() {
     let repository = std::env::temp_dir().join(format!("alucard-preflight-{}", Uuid::new_v4()));
-    fs::create_dir_all(repository.join("backend")).unwrap();
-    fs::create_dir_all(repository.join("frontend")).unwrap();
-    fs::write(repository.join("backend/pyproject.toml"), "").unwrap();
-    fs::write(repository.join("frontend/package-lock.json"), "").unwrap();
-    let installs = detect_dependency_installs(&repository).unwrap();
+    let cases = [
+        ("none", &[][..], vec![]),
+        (
+            "root",
+            &["pyproject.toml", "package-lock.json"],
+            vec![
+                DependencyInstall {
+                    command: "uv sync",
+                    directory: "".into(),
+                },
+                DependencyInstall {
+                    command: "npm ci",
+                    directory: "".into(),
+                },
+            ],
+        ),
+        (
+            "root-suppresses-children",
+            &[
+                "pyproject.toml",
+                "package-lock.json",
+                "backend/pyproject.toml",
+                "frontend/package-lock.json",
+                "web/package-lock.json",
+            ],
+            vec![
+                DependencyInstall {
+                    command: "uv sync",
+                    directory: "".into(),
+                },
+                DependencyInstall {
+                    command: "npm ci",
+                    directory: "".into(),
+                },
+            ],
+        ),
+        (
+            "mixed-ordering-and-depth",
+            &[
+                "package-lock.json",
+                "api/pyproject.toml",
+                ".git/pyproject.toml",
+                "deep/er/pyproject.toml",
+            ],
+            vec![
+                DependencyInstall {
+                    command: "npm ci",
+                    directory: "".into(),
+                },
+                DependencyInstall {
+                    command: "uv sync",
+                    directory: "api".into(),
+                },
+            ],
+        ),
+        (
+            "split",
+            &["backend/pyproject.toml", "frontend/package-lock.json"],
+            vec![
+                DependencyInstall {
+                    command: "uv sync",
+                    directory: "backend".into(),
+                },
+                DependencyInstall {
+                    command: "npm ci",
+                    directory: "frontend".into(),
+                },
+            ],
+        ),
+    ];
+    for (name, manifests, expected) in cases {
+        let root = repository.join(name);
+        fs::create_dir_all(&root).unwrap();
+        for manifest in manifests {
+            let path = root.join(manifest);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        assert_eq!(detect_dependency_installs(&root).unwrap(), expected);
+    }
+
+    let split = detect_dependency_installs(&repository.join("split")).unwrap();
     assert_eq!(
-        installs,
-        vec![
-            DependencyInstall {
-                command: "uv sync",
-                directory: "backend".into()
-            },
-            DependencyInstall {
-                command: "npm ci",
-                directory: "frontend".into()
-            },
-        ]
+        toolchain_status(&[]),
+        "No Python or Node manifest found — dependency preflight skipped."
     );
-    let status = toolchain_status(&[(installs[0].clone(), 0), (installs[1].clone(), 3)]);
-    assert!(status.starts_with("BROKEN — `npm ci` in frontend/ fails inside the container (rc=3)"));
-    assert!(status.contains("`uv sync` in backend/ completes"));
-    assert!(status.contains("For the rest of the repo, run the documented local checks"));
+    let healthy = toolchain_status(&[(split[0].clone(), 0), (split[1].clone(), 0)]);
+    assert!(healthy
+        .starts_with("OK — `uv sync` in backend/ completes; `npm ci` in frontend/ completes"));
+    let partial = toolchain_status(&[(split[0].clone(), 0), (split[1].clone(), 3)]);
+    assert!(partial.starts_with("BROKEN — `npm ci` in frontend/ fails inside the container (rc=3)"));
+    assert!(partial.contains("`uv sync` in backend/ completes"));
+    assert!(partial.contains("For the rest of the repo, run the documented local checks"));
+    let broken = toolchain_status(&[(split[0].clone(), 2), (split[1].clone(), 3)]);
+    assert!(broken.starts_with("BROKEN — `uv sync` in backend/ fails inside the container (rc=2); `npm ci` in frontend/ fails inside the container (rc=3)"));
+    assert!(!broken.contains("For the rest of the repo"));
     fs::remove_dir_all(repository).unwrap();
 }
 
