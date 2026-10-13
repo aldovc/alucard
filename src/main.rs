@@ -970,6 +970,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
 enum ReconciliationAction {
     Record {
         claim: alucard::AbandonedTaskClaim,
+        attempts: Vec<alucard::TaskClaimAttempt>,
         number: i64,
         branch: String,
         sha: String,
@@ -1020,6 +1021,7 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         {
             actions.push(ReconciliationAction::Record {
                 claim,
+                attempts,
                 number: *number,
                 branch: branch.clone(),
                 sha: sha.clone(),
@@ -1048,6 +1050,7 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         match action {
             ReconciliationAction::Record {
                 claim,
+                attempts,
                 number,
                 branch,
                 sha,
@@ -1060,13 +1063,14 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
                 )
                 .map_err(|error| error.to_string())?;
                 if recovery {
-                    let checkout_path = find_run(database, &claim.run_id)
-                        .map_err(|error| error.to_string())?
-                        .and_then(|run| run.logs_path)
+                    let checkout_path = attempts
+                        .iter()
+                        .find(|attempt| attempt.branch.as_deref() == Some(&branch))
+                        .and_then(|attempt| attempt.logs_path.as_deref())
                         .map(PathBuf::from)
                         .map(|path| path.join("repository"))
                         .ok_or_else(|| {
-                            format!("recovery run {} has no recorded checkout", claim.run_id)
+                            format!("recovery branch {branch} has no recorded checkout")
                         })?;
                     record_recovery_pr(
                         database,

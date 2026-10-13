@@ -1921,6 +1921,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
     for scenario in [
         "active-retry",
         "open-pr",
+        "recovery-pr",
         "lookup-failure",
         "no-remote-trace",
         "remote-branch",
@@ -1974,7 +1975,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
         let gh = bin.join("gh");
         fs::write(
             &gh,
-            "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list') echo '[]' ;;\n  'pr list')\n    calls=$(cat \"$ALUCARD_GH_CALLS\" 2>/dev/null || echo 0)\n    calls=$((calls + 1))\n    printf '%s' \"$calls\" > \"$ALUCARD_GH_CALLS\"\n    if [ \"$ALUCARD_SCENARIO\" = lookup-failure ] && [ \"$calls\" -eq 2 ]; then echo 'lookup failed' >&2; exit 1; fi\n    case \"$ALUCARD_SCENARIO:$*\" in\n      open-pr:*retry-branch*) echo '[{\"number\":77,\"headRefName\":\"retry-branch\",\"headRefOid\":\"abc\"}]' ;;\n      lookup-failure:*) echo '[{\"number\":77,\"headRefName\":\"first-branch\",\"headRefOid\":\"abc\"}]' ;;\n      *) echo '[]' ;;\n    esac ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list') echo '[]' ;;\n  'pr list')\n    calls=$(cat \"$ALUCARD_GH_CALLS\" 2>/dev/null || echo 0)\n    calls=$((calls + 1))\n    printf '%s' \"$calls\" > \"$ALUCARD_GH_CALLS\"\n    if [ \"$ALUCARD_SCENARIO\" = lookup-failure ] && [ \"$calls\" -eq 2 ]; then echo 'lookup failed' >&2; exit 1; fi\n    case \"$ALUCARD_SCENARIO:$*\" in\n      open-pr:*retry-branch*|recovery-pr:*retry-branch*) echo '[{\"number\":77,\"headRefName\":\"retry-branch\",\"headRefOid\":\"abc\"}]' ;;\n      lookup-failure:*) echo '[{\"number\":77,\"headRefName\":\"first-branch\",\"headRefOid\":\"abc\"}]' ;;\n      *) echo '[]' ;;\n    esac ;;\n  'pr view') echo '{\"labels\":[{\"name\":\"alucard\"},{\"name\":\"needs-human\"}],\"comments\":[]}' ;;\nesac\n",
         )
         .unwrap();
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1989,6 +1990,14 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                 Some("retry-branch"),
             ),
             "open-pr" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "owner-branch",
+                Some("retry-branch"),
+            ),
+            "recovery-pr" => seed_abandoned_task(
                 &database,
                 &repository,
                 &tasks,
@@ -2022,6 +2031,17 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
             ),
             _ => unreachable!(),
         };
+        if scenario == "recovery-pr" {
+            let operation = begin_operation_with_payload(
+                &database,
+                &repository.display().to_string(),
+                "recovery:retry-branch",
+                "create_recovery_pr",
+                None,
+            )
+            .unwrap();
+            finish_operation(&database, &operation, None).unwrap();
+        }
         if scenario == "remote-branch" {
             fs::write(&tasks, "## [h] first: First task\n\nBody\n").unwrap();
         }
@@ -2122,6 +2142,26 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                         )
                         .unwrap(),
                     77
+                );
+            }
+            "recovery-pr" => {
+                assert!(output.status.success(), "{output:?}");
+                let retry_logs: String = connection
+                    .query_row(
+                        "SELECT logs_path FROM runs WHERE id = ?1",
+                        [retry.as_deref().unwrap()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT checkout_path FROM recovery WHERE original_run_id = (SELECT run_id FROM claims WHERE id = ?1)",
+                            [&first_claim],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    format!("{retry_logs}/repository")
                 );
             }
             "lookup-failure" => {
