@@ -743,7 +743,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
         }
         if case.name == "findings-handoff" {
             let feedback = fs::read_to_string(root.join("prompts/feedback-1.txt")).unwrap();
-            assert!(feedback.contains("KEEP-FINDING"));
+            assert!(feedback.contains("KEEP-FINDING"), "{feedback}");
             assert!(feedback.contains("HUMAN-COMMENT"));
             assert!(!feedback.contains("DROP-TOO-LARGE"));
             assert!(!feedback.contains("DROP-NON-BLOCKING"));
