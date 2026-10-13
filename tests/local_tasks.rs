@@ -1295,7 +1295,12 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
 
 #[test]
 fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
-    for scenario in ["active-retry", "open-pr", "lookup-failure"] {
+    for scenario in [
+        "active-retry",
+        "open-pr",
+        "lookup-failure",
+        "no-remote-trace",
+    ] {
         let root = temporary_path(&format!("reconciliation-{scenario}"));
         let repository = root.join("repository");
         let bin = root.join("bin");
@@ -1304,10 +1309,24 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
         let tasks = root.join("tasks.md");
         let task_contents = if scenario == "lookup-failure" {
             "## [ ] first: First task\n\nBody\n\n## [ ] second: Second task\n\nBody\n"
+        } else if scenario == "no-remote-trace" {
+            "## [ ] first: First task\n\nBlocked by: second\n\n## [ ] second: Second task\n\nBlocked by: first\n"
         } else {
             "## [ ] first: First task\n\nBody\n"
         };
         fs::write(&tasks, task_contents).unwrap();
+        if scenario == "no-remote-trace" {
+            let remote = root.join("remote.git");
+            run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+            run(Command::new("git").args([
+                "-C",
+                repository.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().unwrap(),
+            ]));
+        }
         let database = root.join("ledger.db");
         let docker_trace = root.join("docker-trace");
         let gh_calls = root.join("gh-calls");
@@ -1344,6 +1363,14 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                 Some("retry-branch"),
             ),
             "lookup-failure" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "first-branch",
+                None,
+            ),
+            "no-remote-trace" => seed_abandoned_task(
                 &database,
                 &repository,
                 &tasks,
@@ -1482,6 +1509,57 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                         )
                         .unwrap(),
                     2
+                );
+            }
+            "no-remote-trace" => {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "pending"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT state FROM claims WHERE id = ?1",
+                            [&first_claim],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "released"
+                );
+                let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+                    .env("ALUCARD_DOCKER_TRACE", &docker_trace)
+                    .env("ALUCARD_GH_CALLS", &gh_calls)
+                    .env("ALUCARD_SCENARIO", scenario)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let connection = open(&database).unwrap();
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "pending"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT state FROM claims WHERE id = ?1",
+                            [&first_claim],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "released"
                 );
             }
             _ => unreachable!(),
