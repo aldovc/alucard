@@ -287,6 +287,10 @@ xml_escape() {
   sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
 }
 
+hex_encode() {
+  LC_ALL=C od -An -v -tx1 | tr -d ' \n'
+}
+
 # Extracts "owner/repo" from a GitHub ref, or returns empty for local paths.
 is_github_ref() {
   local input="${1%.git}"  # strip trailing .git before matching
@@ -2859,11 +2863,11 @@ Review continues, but an approval will not mark this PR ready to merge. Run the 
     _fix_prompt="<instructions>
 $(<"$TOOL_DIR/alucard-ci-fix-prompt.md")
 </instructions>
-<pr_num>${pr_num}</pr_num>
-<branch>${branch}</branch>
-<failure_log>
-$(printf '%s' "$failure_log" | xml_escape)
-</failure_log>"
+<untrusted_github_data encoding=\"hex\">
+<pr_num>$(printf '%.*s' 4096 "$pr_num" | hex_encode)</pr_num>
+<branch>$(printf '%.*s' 4096 "$branch" | hex_encode)</branch>
+<failure_log>$(printf '%.*s' 32768 "$failure_log" | hex_encode)</failure_log>
+</untrusted_github_data>"
 
     set +e
     invoke_agent \

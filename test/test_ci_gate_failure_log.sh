@@ -1,7 +1,7 @@
 #!/bin/bash
 # ci_gate must resolve the failed run ID via a real jq pipeline (not
 # `gh ... --arg`, which gh rejects and silently swallows) and hand the
-# fix agent the actual failure text, not an empty <failure_log> block.
+# fix agent bounded failure diagnostics, not an empty payload.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +20,7 @@ PR_NUM=77
 HEAD_SHA="deadbeefcafef00d"
 RUN_ID=123456789
 FAILURE_TEXT="FAILED test_thing.py::test_widget — AssertionError: expected 1 got 2"
+FAILURE_HEX=$(printf '%s' "$FAILURE_TEXT" | LC_ALL=C od -An -v -tx1 | tr -d ' \n')
 
 git init -q --bare "$REMOTE"
 mkdir -p "$REPO"
@@ -139,7 +140,9 @@ else
   fail "docker run capture file was written"
 fi
 
-assert_contains "fix agent prompt carries the real failure text" \
+assert_contains "fix agent prompt carries encoded failure diagnostics" \
+  "<failure_log>$FAILURE_HEX</failure_log>" "$docker_args"
+assert_not_contains "fix agent prompt does not expose raw failure text" \
   "$FAILURE_TEXT" "$docker_args"
 assert_not_contains "ci_gate does not log the empty-failure-log warning when the lookup succeeds" \
   "could not resolve a failed run ID" "$out"
