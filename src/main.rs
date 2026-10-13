@@ -1886,10 +1886,13 @@ fn continue_feedback_findings(comments: &[ContinueComment]) -> String {
             && (comment.body.contains(": CHANGES_REQUESTED") || comment.body.contains(": APPROVED"))
     });
     let (findings, since) = latest
-        .filter(|comment| comment.body.contains(": CHANGES_REQUESTED"))
         .map(|comment| {
             (
-                strip_nonactionable_sections(&comment.body),
+                if comment.body.contains(": CHANGES_REQUESTED") {
+                    strip_nonactionable_sections(&comment.body)
+                } else {
+                    String::new()
+                },
                 Some(comment.created_at.as_str()),
             )
         })
@@ -6061,7 +6064,7 @@ printf '%s' "$prompt""#,
     }
 
     #[test]
-    fn continue_feedback_uses_only_the_latest_unresolved_review_request() {
+    fn continue_feedback_uses_only_comments_after_the_latest_review_cycle() {
         let comments = serde_json::from_str::<Vec<ContinueComment>>(
             r#"[
                 {"body":"**🤖 Alucard review cycle 1/2: CHANGES_REQUESTED**\n\nold finding", "createdAt":"2026-01-01", "author":{"login":"alucard"}},
@@ -6073,7 +6076,7 @@ printf '%s' "$prompt""#,
         .unwrap();
         assert_eq!(
             continue_feedback_findings(&comments),
-            "- @dev at 2026-01-02:\nfixed\n\n- @reviewer at 2026-01-04:\nplease add coverage"
+            "- @reviewer at 2026-01-04:\nplease add coverage"
         );
     }
 }
