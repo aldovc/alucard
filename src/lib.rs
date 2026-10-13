@@ -1735,6 +1735,7 @@ pub fn import_github_tasks(
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_run_owners.sql")),
+    (3, include_str!("../migrations/0003_recovery_checkout.sql")),
 ];
 
 pub struct DatabaseStatus {
@@ -1779,6 +1780,14 @@ pub struct Claim {
     pub resource_kind: ClaimResource,
     pub resource_key: String,
     pub run_id: String,
+}
+
+pub struct RecoveryPullRequest<'a> {
+    pub number: i64,
+    pub branch: &'a str,
+    pub head_sha: &'a str,
+    pub reason: &'a str,
+    pub checkout_path: &'a Path,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2145,6 +2154,85 @@ pub fn record_task_pr(
         (number, task_id),
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+/// Records a recovery PR and moves its task to the same in-flight state as a normal PR.
+pub fn record_recovery_pr(
+    path: &Path,
+    task_id: &str,
+    lease_id: &str,
+    run_id: &str,
+    recovery: RecoveryPullRequest<'_>,
+) -> Result<(), ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let repository_id: String = transaction
+        .query_row(
+            "SELECT repository_id FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => ClaimError::TaskNotEligible,
+            other => ClaimError::Database(other.into()),
+        })?;
+    let active: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM claims WHERE id = ?1 AND run_id = ?2 AND resource_kind = 'task' AND resource_key = ?3 AND state = 'active')",
+        (lease_id, run_id, task_id), |row| row.get(0),
+    )?;
+    if !active {
+        return Err(ClaimError::LeaseNotActive);
+    }
+    transaction.execute(
+        "INSERT INTO pull_requests (id, task_id, repository_id, number, branch, head_sha, kind, remote_state, gate_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'recovery', 'open', 'recovery_parked')
+         ON CONFLICT(repository_id, number) DO UPDATE SET task_id = excluded.task_id, branch = excluded.branch, head_sha = excluded.head_sha, kind = 'recovery', remote_state = 'open', gate_state = 'recovery_parked'",
+        (Uuid::new_v4().to_string(), task_id, &repository_id, recovery.number, recovery.branch, recovery.head_sha),
+    )?;
+    transaction.execute(
+        "INSERT INTO recovery (id, task_id, original_run_id, branch, pull_request_number, reason, checkout_path, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+         ON CONFLICT(original_run_id) DO UPDATE SET pull_request_number = excluded.pull_request_number, branch = excluded.branch, reason = excluded.reason, checkout_path = excluded.checkout_path",
+        (Uuid::new_v4().to_string(), task_id, run_id, recovery.branch, recovery.number, recovery.reason, recovery.checkout_path.to_string_lossy()),
+    )?;
+    transaction.execute("UPDATE tasks SET status = 'in_flight', pr_number = ?1, updated_at = datetime('now') WHERE id = ?2", (recovery.number, task_id))?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Creates a durable intent before a remote side effect and returns its identifier.
+pub fn begin_operation(
+    path: &Path,
+    repository_id: &str,
+    target: &str,
+    operation_type: &str,
+) -> Result<String, DatabaseError> {
+    let connection = open(path)?;
+    let id = Uuid::new_v4().to_string();
+    connection.execute(
+        "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', 0, datetime('now'), datetime('now'))
+         ON CONFLICT(repository_id, target, operation_type) DO NOTHING",
+        (&id, repository_id, target, operation_type),
+    )?;
+    Ok(connection.query_row(
+        "SELECT id FROM operations WHERE repository_id = ?1 AND target = ?2 AND operation_type = ?3",
+        (repository_id, target, operation_type), |row| row.get(0),
+    )?)
+}
+
+/// Completes or records the failure of a journaled remote operation.
+pub fn finish_operation(
+    path: &Path,
+    operation_id: &str,
+    error: Option<&str>,
+) -> Result<(), DatabaseError> {
+    let connection = open(path)?;
+    connection.execute(
+        "UPDATE operations SET phase = ?1, attempt_count = attempt_count + 1, last_error = ?2, updated_at = datetime('now') WHERE id = ?3",
+        (if error.is_some() { "failed" } else { "done" }, error, operation_id),
+    )?;
     Ok(())
 }
 
