@@ -11,6 +11,7 @@ use alucard::{
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 use std::{collections::BTreeMap, fs};
 
 fn main() -> ExitCode {
@@ -754,6 +755,17 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     let _ = finish_run(&database, &prepared.run.id, "failed");
                     return fail(&format!("alucard: {error}"));
                 }
+                if let Err(error) = (CiGate {
+                    tools: &tools,
+                    settings: &settings,
+                    options: &options,
+                    playwright_cache: playwright_cache.as_deref(),
+                    github_repo: github_repo.as_deref(),
+                })
+                .run(&prepared, &branch, number, iteration)
+                {
+                    eprintln!("alucard: CI gate for PR #{number}: {error}");
+                }
                 let _ = release(&database, &claim.id, &prepared.run.id);
                 let _ = finish_run(&database, &prepared.run.id, "completed");
             }
@@ -804,6 +816,266 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         iteration += 1;
     }
     ExitCode::SUCCESS
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CiResult {
+    Green,
+    Failed,
+    Missing,
+}
+
+struct CiGate<'a> {
+    tools: &'a Path,
+    settings: &'a AgentSettings,
+    options: &'a RunCommandOptions,
+    playwright_cache: Option<&'a Path>,
+    github_repo: Option<&'a str>,
+}
+
+impl CiGate<'_> {
+    fn run(
+        &self,
+        prepared: &alucard::PreparedRun,
+        branch: &str,
+        pr_number: i64,
+        iteration: usize,
+    ) -> Result<(), String> {
+        let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
+        let remote = remote.trim();
+        let mut checks_available = true;
+        for attempt in 1..=3 {
+            let head = gh_text(
+                &prepared.clone,
+                &[
+                    "pr",
+                    "view",
+                    &pr_number.to_string(),
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+            )?;
+            match probe_ci(
+                &prepared.clone,
+                pr_number,
+                branch,
+                head.trim(),
+                &mut checks_available,
+            )? {
+                CiResult::Green => {
+                    println!("CI gate: PR #{pr_number} green — ready for review.");
+                    return Ok(());
+                }
+                CiResult::Missing => {
+                    eprintln!("CI gate: no CI ran for PR #{pr_number} — not green; review must not treat this PR as ready to merge.");
+                    return Ok(());
+                }
+                CiResult::Failed if attempt == 3 => {
+                    eprintln!("CI gate: PR #{pr_number} still failing after 3 check attempts.");
+                    return Ok(());
+                }
+                CiResult::Failed => {}
+            }
+
+            let failure_log =
+                failed_run_log(&prepared.clone, branch, head.trim()).unwrap_or_default();
+            let checkout = prepared.directory.join(format!("fix-{attempt}"));
+            let checkout_text = checkout.display().to_string();
+            let clone = execute_command(
+                "git",
+                &[
+                    "clone",
+                    "--quiet",
+                    "--branch",
+                    branch,
+                    remote,
+                    &checkout_text,
+                ],
+                &prepared.directory,
+                Some(Duration::from_secs(120)),
+            )
+            .map_err(|error| error.to_string())?;
+            if !clone.status.success() {
+                return Err(String::from_utf8_lossy(&clone.stderr).trim().to_string());
+            }
+            let prompt = format!(
+            "<instructions>{}</instructions>\n<pr_num>{pr_number}</pr_num>\n<branch>{branch}</branch>\n<failure_log>{}</failure_log>",
+            fs::read_to_string(self.tools.join("alucard-ci-fix-prompt.md")).map_err(|error| error.to_string())?,
+            xml_escape(&failure_log),
+        );
+            let log = prepared
+                .directory
+                .join(format!("iter-{iteration}-fix-{attempt}.jsonl"));
+            let name = format!("alucard-fix-{}-{attempt}", prepared.run.id);
+            let _ = AgentInvocation {
+                role: AgentRole::CiFix,
+                name: &name,
+                image: &self.options.image,
+                env_file: &self.options.env_file,
+                worktree: &checkout,
+                prompt: &prompt,
+                timeout_minutes: self.options.timeout_minutes,
+                network: None,
+                playwright_cache: self.playwright_cache,
+                database_url: None,
+                github_repo: self.github_repo,
+                worktree_read_only: false,
+                output_dir: None,
+                extra_env: &[],
+            }
+            .invoke(self.settings, &log);
+        }
+        Ok(())
+    }
+}
+
+fn probe_ci(
+    repository: &Path,
+    pr_number: i64,
+    branch: &str,
+    head: &str,
+    checks_available: &mut bool,
+) -> Result<CiResult, String> {
+    if !*checks_available {
+        return poll_ci_run_list(repository, pr_number, branch, head);
+    }
+    let checks = execute_command(
+        "gh",
+        &[
+            "pr",
+            "checks",
+            &pr_number.to_string(),
+            "--watch",
+            "--interval",
+            "30",
+        ],
+        repository,
+        Some(Duration::from_secs(2700)),
+    )
+    .map_err(|error| error.to_string())?;
+    if checks.status.success() {
+        return Ok(CiResult::Green);
+    }
+    let error = String::from_utf8_lossy(&checks.stderr);
+    if error.contains("no checks reported") {
+        return Ok(CiResult::Missing);
+    }
+    if !error.contains("Resource not accessible") {
+        return Ok(CiResult::Failed);
+    }
+    *checks_available = false;
+    poll_ci_run_list(repository, pr_number, branch, head)
+}
+
+fn poll_ci_run_list(
+    repository: &Path,
+    pr_number: i64,
+    branch: &str,
+    head: &str,
+) -> Result<CiResult, String> {
+    for probe in 0..4 {
+        let output = gh_text(
+            repository,
+            &[
+                "run",
+                "list",
+                "--branch",
+                branch,
+                "--json",
+                "status,conclusion,databaseId,headSha",
+            ],
+        )?;
+        let runs: Vec<serde_json::Value> = serde_json::from_str(&output)
+            .map_err(|error| format!("invalid gh run list response: {error}"))?;
+        let branch_has_runs = !runs.is_empty();
+        if let Some(result) = current_head_ci_result(&runs, head) {
+            return Ok(result);
+        }
+        if runs.iter().all(|run| run["headSha"].as_str() != Some(head)) {
+            let limit = if branch_has_runs { 2 } else { 4 };
+            if probe + 1 >= limit {
+                if branch_has_runs {
+                    eprintln!("CI gate: no run for current HEAD {head}; older SHAs on this branch did run.");
+                } else {
+                    eprintln!("CI gate: no CI runs visible for PR #{pr_number}.");
+                }
+                return Ok(CiResult::Missing);
+            }
+        }
+        std::thread::sleep(Duration::from_secs(30));
+    }
+    Ok(CiResult::Missing)
+}
+
+fn current_head_ci_result(runs: &[serde_json::Value], head: &str) -> Option<CiResult> {
+    let current = runs
+        .iter()
+        .filter(|run| run["headSha"].as_str() == Some(head))
+        .collect::<Vec<_>>();
+    if current.is_empty()
+        || current
+            .iter()
+            .any(|run| run["status"].as_str() != Some("completed"))
+    {
+        return None;
+    }
+    if current
+        .iter()
+        .any(|run| matches!(run["conclusion"].as_str(), Some("failure" | "timed_out")))
+    {
+        Some(CiResult::Failed)
+    } else {
+        Some(CiResult::Green)
+    }
+}
+
+fn failed_run_log(repository: &Path, branch: &str, head: &str) -> Result<String, String> {
+    let output = gh_text(
+        repository,
+        &[
+            "run",
+            "list",
+            "--branch",
+            branch,
+            "--json",
+            "databaseId,conclusion,headSha",
+        ],
+    )?;
+    let runs: Vec<serde_json::Value> = serde_json::from_str(&output)
+        .map_err(|error| format!("invalid gh run list response: {error}"))?;
+    let Some(id) = runs.iter().find_map(|run| {
+        (run["conclusion"].as_str() == Some("failure") && run["headSha"].as_str() == Some(head))
+            .then(|| run["databaseId"].as_i64())
+            .flatten()
+    }) else {
+        return Ok(String::new());
+    };
+    gh_text(
+        repository,
+        &["run", "view", &id.to_string(), "--log-failed"],
+    )
+}
+
+fn gh_text(repository: &Path, args: &[&str]) -> Result<String, String> {
+    let output = execute_command("gh", args, repository, Some(Duration::from_secs(2700)))
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn git_output(repository: &Path, args: &[&str]) -> Result<String, String> {
+    let output = execute_command("git", args, repository, Some(Duration::from_secs(120)))
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 fn release_without_pr(
@@ -1752,6 +2024,22 @@ printf '%s' "$FULL_PROMPT""#,
             )
             .unwrap(),
             bash_prompt("file", &local_queue, commits, &local_instructions, &tasks)
+        );
+    }
+
+    #[test]
+    fn ci_run_list_uses_only_the_current_head() {
+        let runs = serde_json::json!([
+            {"headSha": "old", "status": "completed", "conclusion": "failure"},
+            {"headSha": "head", "status": "completed", "conclusion": "success"}
+        ]);
+        assert_eq!(
+            current_head_ci_result(runs.as_array().unwrap(), "head"),
+            Some(CiResult::Green)
+        );
+        assert_eq!(
+            current_head_ci_result(runs.as_array().unwrap(), "other"),
+            None
         );
     }
 }
