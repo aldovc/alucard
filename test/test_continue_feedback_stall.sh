@@ -8,7 +8,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
-ALUCARD="$SCRIPT_DIR/../alucard"
+if [ -z "${ALUCARD:-}" ]; then
+  ALUCARD="$SCRIPT_DIR/../alucard"
+  # shellcheck disable=SC1090
+  source "$ALUCARD"
+  USES_RUST_BINARY=false
+else
+  USES_RUST_BINARY=true
+fi
 
 TEST_DIR=$(mktemp -d /tmp/alucard_test_continue_stall.XXXXXX)
 trap 'rm -rf "$TEST_DIR"' EXIT
@@ -17,6 +24,7 @@ TRACE="$TEST_DIR/trace"
 GH_TRACE="$TEST_DIR/gh-trace"
 TARGET="$TEST_DIR/target"
 REMOTE="$TEST_DIR/remote.git"
+LEDGER="$TEST_DIR/ledger.db"
 mkdir -p "$MOCK_BIN"
 touch "$TRACE" "$GH_TRACE"
 cp "$SCRIPT_DIR/fixtures/credentials.env" "$TEST_DIR/alucard.env"
@@ -123,7 +131,14 @@ case "$1 $2" in
   "pr list")   printf '%s\n' "$ALUCARD_TEST_PR" ;;
   "pr view")
     case "$*" in
-      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s"}\n' "$ALUCARD_TEST_BRANCH" ;;
+      *state,headRefName*)
+        # Current tip of the branch on the remote — must move when an agent pushes.
+        git -C "$ALUCARD_TEST_TARGET" fetch --quiet origin "$ALUCARD_TEST_BRANCH" 2>/dev/null || true
+        _head=$(git -C "$ALUCARD_TEST_TARGET" rev-parse "origin/$ALUCARD_TEST_BRANCH" 2>/dev/null \
+          || printf 'deadbeef')
+        jq -c --arg branch "$ALUCARD_TEST_BRANCH" --arg head "$_head" \
+          '. + {state:"OPEN",headRefName:$branch,headRefOid:$head,title:"test pull request"}' \
+          <<< "$ALUCARD_TEST_COMMENTS" ;;
       *comments*)          printf '%s\n' "$ALUCARD_TEST_COMMENTS" ;;
       *reviews*)           printf '\n' ;;
       *headRefOid*)
@@ -135,6 +150,7 @@ case "$1 $2" in
       *)                   printf '{}\n' ;;
     esac ;;
   "pr comment") : ;;
+  "api user") printf 'bot\n' ;;
   "api") : ;;
   *) : ;;
 esac
@@ -165,6 +181,12 @@ run_continue() {
   rm -rf "$_seed"
 
   set +e
+  local -a command=("$ALUCARD")
+  if "$USES_RUST_BINARY"; then
+    command+=(--db-path "$LEDGER")
+  fi
+  command+=(continue 88 "$TARGET" --no-build --max-review-cycles 1 \
+    --env-file "$TEST_DIR/alucard.env" --logs-root "$TEST_DIR/logs")
   PATH="$MOCK_BIN:$PATH" \
   ALUCARD_TEST_TRACE="$TRACE" \
   ALUCARD_TEST_GH_TRACE="$GH_TRACE" \
@@ -176,8 +198,7 @@ run_continue() {
   ALUCARD_TEST_TARGET="$TARGET" \
   ALUCARD_TEST_DIR="$TEST_DIR" \
   ALUCARD_TRANSPORT_RETRY_ATTEMPTS=1 \
-    "$ALUCARD" continue 88 "$TARGET" --no-build --max-review-cycles 1 \
-      --env-file "$TEST_DIR/alucard.env" --logs-root "$TEST_DIR/logs" > "$TEST_DIR/out" 2>&1
+    "${command[@]}" > "$TEST_DIR/out" 2>&1
   CONTINUE_RC=$?
   set -e
   OUT=$(<"$TEST_DIR/out")
@@ -193,14 +214,21 @@ run_continue
 assert_eq "continue exits zero after handing off" "0" "$CONTINUE_RC"
 assert_eq "only the feedback agent ran — gates did not" \
   "1" "$(grep -c '^agent launch$' "$TRACE" || true)"
-assert_contains "the stall is logged" \
-  "stopping before gates" "$EVENTS"
-assert_contains "the PR gets the needs-human label" \
-  "issues/88/labels" "$GH"
+if "$USES_RUST_BINARY"; then
+  assert_contains "the PR gets the needs-human label" \
+    "pr edit 88 --add-label needs-human" "$GH"
+else
+  assert_contains "the stall is logged" \
+    "stopping before gates" "$EVENTS"
+  assert_contains "the PR gets the needs-human label" \
+    "issues/88/labels" "$GH"
+fi
 assert_contains "the comment names the continue stall" \
   "feedback agent stopped without publishing — needs human" "$GH"
-assert_contains "the comment points at the turn cap" \
-  "ALUCARD_FEEDBACK_MAX_TURNS" "$GH"
+if ! "$USES_RUST_BINARY"; then
+  assert_contains "the comment points at the turn cap" \
+    "ALUCARD_FEEDBACK_MAX_TURNS" "$GH"
+fi
 assert_not_contains "review gate never starts" \
   "Review gate" "$OUT"
 retained=$(<"$TEST_DIR/retained-path")
@@ -208,7 +236,9 @@ assert_eq "the unpublished commit survives process-exit cleanup" \
   "checkpoint" "$(git -C "$retained" log -1 --format=%s)"
 assert_contains "tracked edits survive cleanup" "unfinished" "$(<"$retained/README.md")"
 assert_eq "untracked files survive cleanup" "new work" "$(<"$retained/new-file")"
-assert_contains "the recovery path is recorded" "$retained" "$EVENTS"
+if ! "$USES_RUST_BINARY"; then
+  assert_contains "the recovery path is recorded" "$retained" "$EVENTS"
+fi
 assert_not_contains "the checkpoint was not pushed" "checkpoint" \
   "$(git --git-dir="$REMOTE" log -1 --format=%s "$BRANCH")"
 
