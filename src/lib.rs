@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -227,9 +227,11 @@ fn docker_image_tag_count(docker: &Path, image: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_image_with_docker;
+    use super::{build_image_with_docker, AgentInvocation, AgentRole, AgentSettings};
+    use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     fn run_build(
         previous: &str,
@@ -283,6 +285,57 @@ mod tests {
         let (result, trace) = run_build(old, new, 0, 0, 1);
         assert!(result.is_ok());
         assert!(trace.contains(&format!("rmi {old}")));
+    }
+
+    #[test]
+    fn invoke_cleans_up_when_codex_stdin_closes_early() {
+        let dir = env::temp_dir().join(format!("alucard-invoke-cleanup-{}", uuid::Uuid::new_v4()));
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let trace = dir.join("trace");
+        let timeout = bin.join("timeout");
+        let docker = bin.join("docker");
+        fs::write(&timeout, "#!/bin/sh\nexec 0<&-\nsleep 1\n").unwrap();
+        fs::write(
+            &docker,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n", trace.display()),
+        )
+        .unwrap();
+        for command in [&timeout, &docker] {
+            fs::set_permissions(command, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env_file = dir.join("alucard.env");
+        fs::write(&env_file, "ALUCARD_PROVIDER=codex\n").unwrap();
+        let settings = AgentSettings::from_environment(Some(&env_file)).unwrap();
+        let path = env::var_os("PATH").unwrap_or_default();
+        env::set_var(
+            "PATH",
+            format!("{}:{}", bin.display(), path.to_string_lossy()),
+        );
+
+        let prompt = "x".repeat(8 * 1024 * 1024);
+        let invocation = AgentInvocation {
+            role: AgentRole::Worker,
+            name: "alucard-test-cleanup",
+            image: "alucard:test",
+            env_file: &env_file,
+            worktree: Path::new(&dir),
+            prompt: &prompt,
+            timeout_minutes: 1,
+            network: None,
+            playwright_cache: None,
+            database_url: None,
+            github_repo: None,
+        };
+        let result = invocation.invoke(&settings, &dir.join("agent.log"));
+
+        env::set_var("PATH", path);
+        assert!(matches!(result, Err(error) if error.contains("cannot send prompt to codex")));
+        assert_eq!(
+            fs::read_to_string(&trace).unwrap(),
+            "rm -f alucard-test-cleanup\n"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -441,21 +494,23 @@ impl AgentInvocation<'_> {
         let mut child = command
             .spawn()
             .map_err(|error| format!("cannot start docker: {error}"))?;
-        if provider == Provider::Codex {
-            use std::io::Write;
+        let status = (|| {
+            if provider == Provider::Codex {
+                child
+                    .stdin
+                    .take()
+                    .expect("codex stdin is piped")
+                    .write_all(self.prompt.as_bytes())
+                    .map_err(|error| format!("cannot send prompt to codex: {error}"))?;
+            }
             child
-                .stdin
-                .take()
-                .expect("codex stdin is piped")
-                .write_all(self.prompt.as_bytes())
-                .map_err(|error| format!("cannot send prompt to codex: {error}"))?;
-        }
-        let status = child
-            .wait()
-            .map_err(|error| format!("cannot wait for docker: {error}"))?;
+                .wait()
+                .map_err(|error| format!("cannot wait for docker: {error}"))
+        })();
         let _ = Command::new("docker")
             .args(["rm", "-f", self.name])
             .status();
+        let status = status?;
         let log = fs::read_to_string(log_file)
             .unwrap_or_default()
             .to_ascii_lowercase();
