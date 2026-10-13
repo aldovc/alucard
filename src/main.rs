@@ -1,8 +1,9 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    database_path, import_local_tasks, local_queue_with_open_issues, migrate, open, parse_tasks,
-    status,
+    database_path, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
+    local_queue_with_open_issues, migrate, open, parse_tasks, status, GithubPullRequest,
+    GithubTask,
 };
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -35,7 +36,7 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     };
     let task_file = match options.task_file() {
         Ok(Some(path)) => path,
-        Ok(None) => return fail("alucard: GitHub queue is not implemented"),
+        Ok(None) => return github_queue_command(&options, db_path),
         Err(message) => return fail(&format!("alucard: {message}")),
     };
     let contents = match std::fs::read_to_string(&task_file) {
@@ -90,6 +91,234 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     }
 }
 
+fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> ExitCode {
+    let issues = match options.issue {
+        Some(number) => match fetch_pinned_issue(&options.repository, number) {
+            Ok(issue) => vec![issue],
+            Err(error) => return fail(&format!("alucard: {error}")),
+        },
+        None => match fetch_github_issues(&options.repository) {
+            Ok(issues) => issues,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        },
+    };
+    let needs_blockers = issues
+        .iter()
+        .any(|issue| !github_ticket_blockers(&issue.body).is_empty());
+    let open_issues = if needs_blockers {
+        match fetch_open_issue_numbers_required(&options.repository) {
+            Ok(numbers) => numbers,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        }
+    } else {
+        Vec::new()
+    };
+    let open_prs = match fetch_open_prs(&options.repository) {
+        Ok(prs) => prs,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let imported_tasks = issues.clone();
+    let queue = if options.issue.is_some() {
+        match validate_pinned_issue(
+            &options.repository,
+            issues.into_iter().next().expect("pinned issue"),
+            &open_issues,
+            &open_prs,
+        ) {
+            Ok(issue) => vec![issue],
+            Err(error) => return fail(&format!("alucard: {error}")),
+        }
+    } else {
+        github_queue(issues, &open_issues, &open_prs)
+    };
+    let path = match database_path(db_path) {
+        Ok(path) => path,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    if let Err(error) = migrate(&path).and_then(|_| {
+        let mut connection = open(&path)?;
+        import_github_tasks(
+            &mut connection,
+            &options.repository.display().to_string(),
+            &imported_tasks,
+        )
+    }) {
+        return fail(&format!("alucard: database error: {error}"));
+    }
+    match serde_json::to_string_pretty(&queue) {
+        Ok(queue) => {
+            println!("{queue}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(&format!("alucard: cannot serialize queue: {error}")),
+    }
+}
+
+fn gh_output(repository: &PathBuf, args: &[&str], context: &str) -> Result<Vec<u8>, String> {
+    let output = Command::new("gh")
+        .current_dir(repository)
+        .args(args)
+        .output()
+        .map_err(|error| format!("{context}: {error}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if error.is_empty() {
+            context.to_string()
+        } else {
+            format!("{context}: {error}")
+        })
+    }
+}
+
+fn fetch_github_issues(repository: &PathBuf) -> Result<Vec<GithubTask>, String> {
+    serde_json::from_slice(&gh_output(
+        repository,
+        &[
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            "ready-for-agent",
+            "--limit",
+            "500",
+            "--json",
+            "number,title,body,labels",
+        ],
+        "could not list GitHub issues",
+    )?)
+    .map_err(|error| format!("could not parse GitHub issues: {error}"))
+}
+
+fn fetch_open_issue_numbers_required(repository: &PathBuf) -> Result<Vec<i64>, String> {
+    let values: Vec<serde_json::Value> = serde_json::from_slice(&gh_output(
+        repository,
+        &[
+            "issue", "list", "--state", "open", "--json", "number", "--limit", "1000",
+        ],
+        "could not list open issues while checking blockers",
+    )?)
+    .map_err(|error| format!("could not parse open issues: {error}"))?;
+    values
+        .into_iter()
+        .map(|issue| {
+            issue
+                .get("number")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| "could not parse open issue number".to_string())
+        })
+        .collect()
+}
+
+fn fetch_open_prs(repository: &PathBuf) -> Result<Vec<GithubPullRequest>, String> {
+    let owner = String::from_utf8(gh_output(
+        repository,
+        &[
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ],
+        "could not list open pull requests",
+    )?)
+    .map_err(|error| format!("could not parse repository name: {error}"))?;
+    let owner = owner.trim();
+    let (owner, name) = owner
+        .split_once('/')
+        .ok_or_else(|| "could not list open pull requests".to_string())?;
+    let query = "query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){pullRequests(states:OPEN,first:100){nodes{number,title,body,closingIssuesReferences(first:25){nodes{number}}}}}}}";
+    let output = gh_output(
+        repository,
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("repo={name}"),
+            "--jq",
+            ".data.repository.pullRequests.nodes",
+        ],
+        "could not list open pull requests",
+    )?;
+    serde_json::from_slice(&output)
+        .map_err(|error| format!("could not parse open pull requests: {error}"))
+}
+
+fn fetch_pinned_issue(repository: &PathBuf, number: i64) -> Result<GithubTask, String> {
+    let output = gh_output(
+        repository,
+        &[
+            "issue",
+            "view",
+            &number.to_string(),
+            "--json",
+            "number,title,body,labels,state",
+        ],
+        &format!("issue #{number} not found in target repo"),
+    )?;
+    serde_json::from_slice(&output)
+        .map_err(|error| format!("could not parse issue #{number}: {error}"))
+}
+
+fn validate_pinned_issue(
+    repository: &PathBuf,
+    issue: GithubTask,
+    open_issues: &[i64],
+    open_prs: &[GithubPullRequest],
+) -> Result<GithubTask, String> {
+    if issue.state.as_deref() != Some("OPEN") {
+        return Err(format!("issue #{} is closed", issue.number));
+    }
+    let issue_number = issue.number.to_string();
+    if Command::new("gh")
+        .current_dir(repository)
+        .args(["pr", "view", &issue_number])
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not check whether issue #{} is a pull request: {error}",
+                issue.number
+            )
+        })?
+        .status
+        .success()
+    {
+        return Err(format!(
+            "issue #{} is a pull request; use alucard continue {}",
+            issue.number, issue.number
+        ));
+    }
+    let open_blockers: Vec<_> = github_ticket_blockers(&issue.body)
+        .into_iter()
+        .filter(|number| open_issues.contains(number))
+        .collect();
+    if !open_blockers.is_empty() {
+        return Err(format!(
+            "issue #{} is blocked by {}",
+            issue.number,
+            open_blockers
+                .iter()
+                .map(|number| format!("#{number}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(pr) = open_prs.iter().find(|pr| pr.covers(issue.number)) {
+        return Err(format!(
+            "issue #{} is occupied by PR #{}; use alucard continue {}",
+            issue.number, pr.number, pr.number
+        ));
+    }
+    Ok(issue)
+}
+
 fn fetch_open_issue_numbers(repository: &PathBuf) -> Option<Vec<i64>> {
     let output = Command::new("gh")
         .current_dir(repository)
@@ -114,6 +343,7 @@ struct QueueOptions {
     tasks: Option<PathBuf>,
     tasks_from_flag: bool,
     github: bool,
+    issue: Option<i64>,
 }
 
 impl QueueOptions {
@@ -126,6 +356,7 @@ impl QueueOptions {
             repository_set: false,
             tasks_from_flag: false,
             github: false,
+            issue: None,
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -136,6 +367,15 @@ impl QueueOptions {
                     options.tasks_from_flag = true;
                 }
                 "--github" => options.github = true,
+                "--issue" => {
+                    let value = args.next().ok_or("--issue requires a number")?;
+                    let number = value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|number| *number > 0)
+                        .ok_or("--issue requires a positive integer")?;
+                    options.issue = Some(number);
+                }
                 "-C" | "--repo" => {
                     options.repository =
                         PathBuf::from(args.next().ok_or("--repo requires a path")?);
@@ -149,8 +389,13 @@ impl QueueOptions {
                 value => return Err(format!("unexpected argument: {value}")),
             }
         }
-        if options.github && options.tasks_from_flag {
-            return Err("--tasks and --github are mutually exclusive".to_string());
+        if options.tasks_from_flag && (options.github || options.issue.is_some()) {
+            return Err(if options.issue.is_some() {
+                "--tasks and --issue are mutually exclusive"
+            } else {
+                "--tasks and --github are mutually exclusive"
+            }
+            .to_string());
         }
         options.repository = options
             .repository
@@ -160,7 +405,7 @@ impl QueueOptions {
     }
 
     fn task_file(&self) -> Result<Option<PathBuf>, String> {
-        if self.github {
+        if self.github || self.issue.is_some() {
             return Ok(None);
         }
         if let Some(path) = &self.tasks {
