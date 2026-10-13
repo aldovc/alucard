@@ -8,7 +8,7 @@ use alucard::{
     record_task_pr_gate_state, record_task_pr_review, release, run_claims,
     run_command as execute_command, run_pull_requests, run_recovery, start_retry_run,
     start_task_run, status, task_id, task_is_pending, toolchain_preflight, transition_task,
-    warn_if_stale_image, write_task_headings, AgentInvocation, AgentRole, AgentSettings,
+    warn_if_stale_image, write_task_headings, AgentExit, AgentInvocation, AgentRole, AgentSettings,
     GithubPullRequest, GithubTask, Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate,
     TaskState, TaskStatus,
 };
@@ -845,6 +845,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &options,
                         &settings,
                         &prepared,
+                        &selected,
                         &selected.ledger_id,
                         number,
                         &branch,
@@ -1178,17 +1179,87 @@ fn review_verdict(formal: &str, decision_file: &str) -> Option<ReviewVerdict> {
 
 fn reviewer_prompt(
     tools: &Path,
+    task: &SelectedRunTask,
     pr_number: i64,
     cycle: usize,
     max_cycles: usize,
     toolchain_status: &str,
+    review_policy: &str,
 ) -> Result<String, String> {
     let instructions = compose_role_prompt(tools, "alucard-reviewer-prompt.md", None)
         .map_err(|error| error.to_string())?;
-    Ok(format!(
+    let mut prompt = format!(
         "<instructions>\n{instructions}\n</instructions>\n<pr_num>{pr_number}</pr_num>\n<review_cycle>{cycle} of {max_cycles}</review_cycle>\n<toolchain_status>\n{}\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blockers>",
         xml_escape(toolchain_status),
-    ))
+    );
+    if task.issue.is_none() {
+        let local_task = WorkerLocalTaskPrompt {
+            id: task.local_id.as_deref(),
+            title: &task.local_title,
+            body: &task.local_body,
+        };
+        prompt.push_str(&format!(
+            "\n<task>{}</task>\n<parent_context>{}</parent_context>",
+            xml_escape(&serde_json::to_string(&local_task).expect("local task is serializable")),
+            xml_escape(&task.parent_context),
+        ));
+    }
+    append_review_policy(&mut prompt, review_policy);
+    Ok(prompt)
+}
+
+const REVIEW_POLICY_MAX_BYTES: usize = 16_384;
+
+fn read_review_policy(repository: &Path) -> String {
+    let path = repository.join("REVIEW.md");
+    let Ok(contents) = fs::read(&path) else {
+        return String::new();
+    };
+    if contents.len() <= REVIEW_POLICY_MAX_BYTES {
+        return String::from_utf8_lossy(&contents).into_owned();
+    }
+    format!(
+        "{}\n\n[alucard: truncated at {REVIEW_POLICY_MAX_BYTES} of {} bytes]\n",
+        String::from_utf8_lossy(&contents[..REVIEW_POLICY_MAX_BYTES]),
+        contents.len(),
+    )
+}
+
+fn append_review_policy(prompt: &mut String, policy: &str) {
+    if !policy.is_empty() {
+        prompt.push_str("\n<review_policy>\n");
+        prompt.push_str(&xml_escape(policy));
+        prompt.push_str("\n</review_policy>");
+    }
+}
+
+fn no_verdict_reason(
+    classification: AgentExit,
+    status: Option<i32>,
+    timeout_minutes: u64,
+) -> String {
+    match classification {
+        AgentExit::Exhausted => format!(
+            "The reviewer hit a harness cap (max turns, budget, or the {timeout_minutes}m timeout) before recording a verdict. Raise `ALUCARD_REVIEWER_MAX_TURNS` / `ALUCARD_REVIEWER_MAX_BUDGET` if this repeats."
+        ),
+        AgentExit::Transport => "The reviewer lost its provider connection on every attempt. Nothing was reviewed; re-run `alucard continue` for this PR.".to_string(),
+        AgentExit::Wedged => "The reviewer container wedged (its working directory went away) and was killed. Nothing was reviewed.".to_string(),
+        AgentExit::NoWorktree => "The reviewer container found an empty checkout on every attempt — its worktree was missing when it mounted. Nothing was reviewed; this is a harness fault, not a finding about the PR. Re-run `alucard continue` for this PR.".to_string(),
+        _ => format!(
+            "The reviewer exited (rc={}) without recording a verdict in `.alucard-review` and without posting a formal review.",
+            status.unwrap_or(1),
+        ),
+    }
+}
+
+fn review_failure_class(classification: AgentExit) -> &'static str {
+    match classification {
+        AgentExit::Exhausted => "exhausted",
+        AgentExit::Transport => "transport",
+        AgentExit::Wedged => "wedged",
+        AgentExit::NoWorktree => "no_worktree",
+        _ => "failed",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1198,6 +1269,7 @@ fn review_gate(
     options: &RunCommandOptions,
     settings: &AgentSettings,
     prepared: &alucard::PreparedRun,
+    task: &SelectedRunTask,
     task_id: &str,
     pr_number: i64,
     branch: &str,
@@ -1232,18 +1304,21 @@ fn review_gate(
         let reviewed_sha = git_output(&checkout, &["rev-parse", "HEAD"])?
             .trim()
             .to_string();
+        let review_policy = read_review_policy(&checkout);
         let prompt = reviewer_prompt(
             tools,
+            task,
             pr_number,
             1,
             options.max_review_cycles,
             toolchain_status,
+            &review_policy,
         )?;
         let log = prepared
             .directory
             .join(format!("iter-{iteration}-review-1.jsonl"));
         let name = format!("alucard-review-{}-1", prepared.run.id);
-        let _agent = AgentInvocation {
+        let agent = AgentInvocation {
             role: AgentRole::Reviewer,
             name: &name,
             image: &options.image,
@@ -1259,7 +1334,7 @@ fn review_gate(
             output_dir: Some(&output_dir),
             extra_env: &[],
         }
-        .invoke(settings, &log);
+        .invoke(settings, &log)?;
         let current_head = gh_text(
             &prepared.clone,
             &[
@@ -1305,12 +1380,17 @@ fn review_gate(
                     "APPROVED"
                 };
                 let marker = if file_verdict == "APPROVED" {
-                    format!("**🤖 Alucard reviewed head** `{reviewed_sha}`\n\n")
+                    format!("Reviewed head: `{reviewed_sha}`\n\n")
                 } else {
                     String::new()
                 };
+                let no_ci_body = if no_ci {
+                    "The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.\n\n"
+                } else {
+                    ""
+                };
                 let comment = format!(
-                    "**🤖 Alucard review cycle 1/{}: {status}**\n\n{marker}{body}",
+                    "**🤖 Alucard review cycle 1/{}: {status}**\n\n{marker}{no_ci_body}{body}",
                     options.max_review_cycles
                 );
                 let _ = execute_command(
@@ -1354,8 +1434,13 @@ fn review_gate(
                 } else {
                     ""
                 };
+                let handoff = if verdict == ReviewVerdict::Blocked {
+                    format!("The remaining merge-blocking work cannot be done inside the harness container. Alucard stopped the review loop here rather than spend the remaining {} cycle(s) re-reporting it.\n\n", options.max_review_cycles.saturating_sub(1))
+                } else {
+                    String::new()
+                };
                 let comment = format!(
-                    "**🤖 Alucard review cycle 1/{}: {}{suffix}**\n\n{body}",
+                    "**🤖 Alucard review cycle 1/{}: {}{suffix}**\n\n{handoff}{body}",
                     options.max_review_cycles,
                     verdict.as_str()
                 );
@@ -1391,7 +1476,13 @@ fn review_gate(
                 .map_err(|error| error.to_string())?;
             }
             None => {
-                let comment = format!("**🤖 Alucard review cycle 1/{}: no review posted — needs human**\n\nThe reviewer did not record a valid verdict. **This PR has not been reviewed.**", options.max_review_cycles);
+                let comment = format!(
+                    "**🤖 Alucard review cycle 1/{}: no review posted — needs human** (rc={}, class={})\n\n{}\n\n**This PR has not been reviewed.** Nothing below this gate ran for it.",
+                    options.max_review_cycles,
+                    agent.status.unwrap_or(1),
+                    review_failure_class(agent.classification),
+                    no_verdict_reason(agent.classification, agent.status, options.timeout_minutes),
+                );
                 let _ = execute_command(
                     "gh",
                     &["pr", "comment", &pr_number.to_string(), "--body", &comment],
@@ -3445,6 +3536,20 @@ mod tests {
     fn reviewer_prompt_matches_bash() {
         let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
         let status = "No Python or Node manifest found — dependency preflight skipped.";
+        let task = SelectedRunTask {
+            ledger_id: "issue".to_string(),
+            issue: Some(GithubTask {
+                number: 17,
+                title: "Issue".to_string(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: None,
+            }),
+            local_id: None,
+            local_title: String::new(),
+            local_body: String::new(),
+            parent_context: String::new(),
+        };
         let instructions = compose_role_prompt(tools, "alucard-reviewer-prompt.md", None).unwrap();
         let bash = Command::new("bash")
             .args([
@@ -3469,9 +3574,54 @@ printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blocker
             String::from_utf8_lossy(&bash.stderr)
         );
         assert_eq!(
-            reviewer_prompt(tools, 17, 1, 10, status).unwrap(),
+            reviewer_prompt(tools, &task, 17, 1, 10, status, "").unwrap(),
             String::from_utf8(bash.stdout).unwrap()
         );
+    }
+
+    #[test]
+    fn reviewer_prompt_includes_local_task_and_bounded_review_policy() {
+        let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let task = SelectedRunTask {
+            ledger_id: "local".to_string(),
+            issue: None,
+            local_id: Some("7".to_string()),
+            local_title: "Fix <tag>".to_string(),
+            local_body: "Body & details".to_string(),
+            parent_context: "Parent <context>".to_string(),
+        };
+        let prompt =
+            reviewer_prompt(tools, &task, 17, 1, 10, "status", "Policy </review_policy>").unwrap();
+        assert!(prompt.contains("<task>{\"id\":\"7\",\"title\":\"Fix &lt;tag&gt;\",\"body\":\"Body &amp; details\"}</task>"));
+        assert!(prompt.contains("<parent_context>Parent &lt;context&gt;</parent_context>"));
+        assert!(prompt.contains("<review_policy>\nPolicy &lt;/review_policy&gt;\n</review_policy>"));
+
+        let directory =
+            std::env::temp_dir().join(format!("alucard-review-policy-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        assert_eq!(read_review_policy(&directory), "");
+        fs::write(directory.join("REVIEW.md"), "ordinary policy").unwrap();
+        assert_eq!(read_review_policy(&directory), "ordinary policy");
+        fs::write(
+            directory.join("REVIEW.md"),
+            format!("{}tail", "x".repeat(REVIEW_POLICY_MAX_BYTES)),
+        )
+        .unwrap();
+        let policy = read_review_policy(&directory);
+        assert!(policy.contains("[alucard: truncated at 16384 of 16388 bytes]"));
+        assert!(!policy.contains("tail"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn review_audit_text_keeps_the_human_handoff_protocol() {
+        assert!(no_ci_comment()
+            .contains("Review continues, but an approval will not mark this PR ready to merge."));
+        assert_eq!(
+            no_verdict_reason(AgentExit::Exhausted, Some(1), 30),
+            "The reviewer hit a harness cap (max turns, budget, or the 30m timeout) before recording a verdict. Raise `ALUCARD_REVIEWER_MAX_TURNS` / `ALUCARD_REVIEWER_MAX_BUDGET` if this repeats."
+        );
+        assert_eq!(review_failure_class(AgentExit::Transport), "transport");
     }
 
     #[test]
