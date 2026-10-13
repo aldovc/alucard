@@ -225,3 +225,18 @@ fn provider_result_classification_matches_bash_contract() {
         assert_eq!(classify_agent_output(provider, status, fixture), expected);
     }
 }
+
+#[test]
+fn classifier_preserves_wedge_and_no_worktree_outcomes() {
+    let wedge = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Shell cwd was reset to /work (deleted)"}}}"#;
+    assert_eq!(
+        classify_agent_output(Provider::Claude, Some(137), wedge),
+        AgentExit::Wedged
+    );
+    for provider in [Provider::Claude, Provider::Codex] {
+        assert_eq!(
+            classify_agent_output(provider, Some(78), ""),
+            AgentExit::NoWorktree
+        );
+    }
+}

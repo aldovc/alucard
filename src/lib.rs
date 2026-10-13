@@ -486,6 +486,8 @@ pub struct AgentInvocation<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentExit {
     Clean,
+    Wedged,
+    NoWorktree,
     Timeout,
     Exhausted,
     Transport,
@@ -501,6 +503,14 @@ pub struct AgentResult {
 
 /// Classifies an agent process exit from its final provider result record.
 pub fn classify_agent_output(provider: Provider, status: Option<i32>, log: &str) -> AgentExit {
+    if log.contains("Shell cwd was reset to /work (deleted)") {
+        return AgentExit::Wedged;
+    }
+
+    if status == Some(78) {
+        return AgentExit::NoWorktree;
+    }
+
     if matches!(status, Some(124 | 137)) {
         return AgentExit::Timeout;
     }
