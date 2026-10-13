@@ -127,3 +127,42 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     drop(connection);
     fs::remove_dir_all(database.parent().unwrap()).unwrap();
 }
+
+#[test]
+fn queue_resolves_explicit_environment_and_detected_task_sources() {
+    let root = temporary_path("task-source");
+    let task_directory = root.join(".alucard");
+    fs::create_dir_all(&task_directory).unwrap();
+    let detected = task_directory.join("tasks.md");
+    fs::copy("test/fixtures/contracts/local-tasks.md", &detected).unwrap();
+    let binary = env!("CARGO_BIN_EXE_alucard");
+
+    let detected_run = Command::new(binary)
+        .args([
+            "--db-path",
+            root.join("detected.db").to_str().unwrap(),
+            "queue",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(detected_run.status.success());
+
+    let environment_run = Command::new(binary)
+        .env("ALUCARD_TASKS_FILE", &detected)
+        .args([
+            "--db-path",
+            root.join("environment.db").to_str().unwrap(),
+            "queue",
+        ])
+        .output()
+        .unwrap();
+    assert!(environment_run.status.success());
+
+    let conflict = Command::new(binary)
+        .args(["queue", "--tasks", detected.to_str().unwrap(), "--github"])
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("--tasks and --github"));
+}
