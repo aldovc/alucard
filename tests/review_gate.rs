@@ -155,6 +155,7 @@ if [ -n "$output" ]; then
   if [ "$role" = feedback ]; then
     case "$ALUCARD_CASE" in
       feedback-stall) outcome=stall-fail ;;
+      feedback-retained) outcome=retained ;;
     esac
   fi
   prompt=
@@ -180,6 +181,7 @@ if [ -n "$output" ]; then
         git -C "$work" commit -qm feedback
         git -C "$work" push -q origin "HEAD:$(git -C "$work" branch --show-current)"
         ;;
+      retained) printf 'uncommitted feedback\n' > "$work/retained.txt" ;;
     esac
     case "$outcome" in
       *fail*) printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500}'; exit 1 ;;
@@ -590,6 +592,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             expected_state: "review_changes_requested",
         },
         ReviewCase {
+            name: "feedback-retained",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
             name: "feedback-toolchain-ok",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
@@ -777,7 +792,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             assert_eq!(heads.len(), 2);
             assert_ne!(heads[0], heads[1]);
         }
-        if case.name == "feedback-stall" {
+        if matches!(case.name, "feedback-stall" | "feedback-retained") {
             assert!(trace.contains("feedback agent stopped without publishing"));
             assert_eq!(
                 fs::read_to_string(root.join("review-attempts"))
