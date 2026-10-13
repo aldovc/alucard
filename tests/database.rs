@@ -1,7 +1,12 @@
-use alucard::{migrate, open, status};
+use alucard::{
+    acquire_pr, acquire_task, heartbeat, migrate, open, release, status, transition_task,
+    ClaimError, TaskStatus,
+};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -15,6 +20,260 @@ fn database_path() -> PathBuf {
     std::env::temp_dir()
         .join(format!("alucard-test-{}-{unique}", std::process::id()))
         .join("ledger.db")
+}
+
+fn prepare_claims(path: &Path, task_ids: &[&str]) {
+    migrate(path).unwrap();
+    let connection = open(path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repo', 'owner', 'name', 'now')",
+            [],
+        )
+        .unwrap();
+    for task_id in task_ids {
+        connection
+            .execute(
+                "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+                 VALUES (?1, 'repo', 'github', ?1, 'task', 'pending', '[]', 'now')",
+                [task_id],
+            )
+            .unwrap();
+    }
+}
+
+fn insert_run(path: &Path, run_id: &str) {
+    open(path)
+        .unwrap()
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+             VALUES (?1, 'repo', 'run', 'running', 'now', 'now')",
+            [run_id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn claim_process() {
+    let Ok(path) = std::env::var("ALUCARD_CLAIM_TEST_PATH") else {
+        return;
+    };
+    let resource = std::env::var("ALUCARD_CLAIM_TEST_RESOURCE").unwrap();
+    let run_id = std::env::var("ALUCARD_CLAIM_TEST_RUN").unwrap();
+    let path = PathBuf::from(path);
+    let result = if let Some(pr_number) = resource.strip_prefix("pr:") {
+        acquire_pr(&path, "repo", pr_number.parse().unwrap(), &run_id)
+    } else {
+        acquire_task(&path, &resource, &run_id)
+    };
+    match result {
+        Ok(_) => println!("acquired"),
+        Err(ClaimError::ClaimedBy { run_id }) => println!("claimed by run {run_id}"),
+        Err(error) => panic!("claim failed: {error}"),
+    }
+}
+
+fn run_claim_processes(path: &Path, resources: Vec<String>) -> Vec<String> {
+    let executable = std::env::current_exe().unwrap();
+    let barrier = Arc::new(Barrier::new(resources.len()));
+    let handles = resources
+        .into_iter()
+        .enumerate()
+        .map(|(number, task_id)| {
+            let executable = executable.clone();
+            let path = path.to_path_buf();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let output = Command::new(executable)
+                    .args(["--exact", "claim_process", "--nocapture"])
+                    .env("ALUCARD_CLAIM_TEST_PATH", path)
+                    .env("ALUCARD_CLAIM_TEST_RESOURCE", task_id)
+                    .env("ALUCARD_CLAIM_TEST_RUN", format!("run-{number}"))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{:?}", output);
+                String::from_utf8(output.stdout).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect()
+}
+
+#[test]
+fn concurrent_processes_get_one_task_claim_without_lock_errors() {
+    let path = database_path();
+    prepare_claims(&path, &["task"]);
+    for number in 0..8 {
+        insert_run(&path, &format!("run-{number}"));
+    }
+
+    let output = run_claim_processes(&path, vec!["task".to_string(); 8]);
+    assert_eq!(
+        output
+            .iter()
+            .filter(|line| line.contains("acquired"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        output
+            .iter()
+            .filter(|line| line.contains("claimed by run run-"))
+            .count(),
+        7
+    );
+    assert!(!output
+        .iter()
+        .any(|line| line.contains("database is locked")));
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn concurrent_processes_claim_different_tasks() {
+    let path = database_path();
+    prepare_claims(&path, &["first", "second"]);
+    insert_run(&path, "run-0");
+    insert_run(&path, "run-1");
+
+    let output = run_claim_processes(&path, vec!["first".to_string(), "second".to_string()]);
+    assert_eq!(
+        output
+            .iter()
+            .filter(|line| line.contains("acquired"))
+            .count(),
+        2
+    );
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn pr_claims_are_exclusive_and_releases_require_the_owning_lease() {
+    let path = database_path();
+    prepare_claims(&path, &[]);
+    insert_run(&path, "run-0");
+    insert_run(&path, "run-1");
+
+    let output = run_claim_processes(&path, vec!["pr:42".to_string(), "pr:42".to_string()]);
+    assert_eq!(
+        output
+            .iter()
+            .filter(|line| line.contains("acquired"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        output
+            .iter()
+            .filter(|line| line.contains("claimed by run"))
+            .count(),
+        1
+    );
+
+    let (claim, owner) = open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT id, run_id FROM claims WHERE state = 'active'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    heartbeat(&path, &claim, &owner).unwrap();
+    let other_run = if owner == "run-0" { "run-1" } else { "run-0" };
+    assert_eq!(
+        release(&path, "other-lease", &owner),
+        Err(ClaimError::LeaseNotActive)
+    );
+    assert_eq!(
+        acquire_pr(&path, "repo", 42, other_run),
+        Err(ClaimError::ClaimedBy {
+            run_id: owner.clone()
+        })
+    );
+    assert_eq!(
+        release(&path, &claim, other_run),
+        Err(ClaimError::LeaseNotActive)
+    );
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn runs_cannot_acquire_claims_for_another_repository() {
+    let path = database_path();
+    migrate(&path).unwrap();
+    let connection = open(&path).unwrap();
+    for repository_id in ["source", "target"] {
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, 'owner', ?1, 'now')",
+                [repository_id],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+             VALUES ('target-task', 'target', 'github', 'target-task', 'task', 'pending', '[]', 'now')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+             VALUES ('source-run', 'source', 'run', 'running', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        acquire_task(&path, "target-task", "source-run"),
+        Err(ClaimError::RunNotInRepository)
+    );
+    assert_eq!(
+        acquire_pr(&path, "target", 42, "source-run"),
+        Err(ClaimError::RunNotInRepository)
+    );
+
+    let connection = open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'target-task'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM claims", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn pending_task_can_be_reacquired_after_its_lease_is_released() {
+    let path = database_path();
+    prepare_claims(&path, &["task"]);
+    insert_run(&path, "run-0");
+    insert_run(&path, "run-1");
+
+    let claim = acquire_task(&path, "task", "run-0").unwrap();
+    transition_task(&path, "task", &claim.id, "run-0", TaskStatus::Pending).unwrap();
+    release(&path, &claim.id, "run-0").unwrap();
+
+    let reacquired = acquire_task(&path, "task", "run-1").unwrap();
+    assert_eq!(reacquired.run_id, "run-1");
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
 #[test]

@@ -1,12 +1,13 @@
 //! SQLite ledger support for the Alucard orchestrator.
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalTask {
@@ -265,6 +266,265 @@ const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_init.s
 pub struct DatabaseStatus {
     pub schema_version: i64,
     pub pending_migrations: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Claim {
+    pub id: String,
+    pub repository_id: String,
+    pub resource_kind: ClaimResource,
+    pub resource_key: String,
+    pub run_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimResource {
+    Task,
+    PullRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskStatus {
+    Pending,
+    Claimed,
+    InFlight,
+    Done,
+    Human,
+}
+
+impl TaskStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::InFlight => "in_flight",
+            Self::Done => "done",
+            Self::Human => "human",
+        }
+    }
+}
+
+impl ClaimResource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::PullRequest => "pr",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ClaimError {
+    Database(DatabaseError),
+    ClaimedBy { run_id: String },
+    RunNotInRepository,
+    TaskNotEligible,
+    LeaseNotActive,
+}
+
+impl std::fmt::Display for ClaimError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => error.fmt(formatter),
+            Self::ClaimedBy { run_id } => write!(formatter, "claimed by run {run_id}"),
+            Self::RunNotInRepository => write!(formatter, "run does not belong to the repository"),
+            Self::TaskNotEligible => write!(formatter, "task is not eligible for a claim"),
+            Self::LeaseNotActive => write!(formatter, "lease is not active"),
+        }
+    }
+}
+
+impl std::error::Error for ClaimError {}
+
+impl PartialEq for ClaimError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ClaimedBy { run_id: left }, Self::ClaimedBy { run_id: right }) => left == right,
+            (Self::RunNotInRepository, Self::RunNotInRepository)
+            | (Self::TaskNotEligible, Self::TaskNotEligible)
+            | (Self::LeaseNotActive, Self::LeaseNotActive) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ClaimError {}
+
+impl From<DatabaseError> for ClaimError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<rusqlite::Error> for ClaimError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.into())
+    }
+}
+
+pub fn acquire_task(path: &Path, task_id: &str, run_id: &str) -> Result<Claim, ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (repository_id, status): (String, String) = transaction
+        .query_row(
+            "SELECT repository_id, status FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => ClaimError::TaskNotEligible,
+            other => ClaimError::Database(other.into()),
+        })?;
+    if let Some(run_id) = active_claim(&transaction, &repository_id, ClaimResource::Task, task_id)?
+    {
+        return Err(ClaimError::ClaimedBy { run_id });
+    }
+    if status != "pending" {
+        return Err(ClaimError::TaskNotEligible);
+    }
+    let claim = acquire(
+        &transaction,
+        &repository_id,
+        ClaimResource::Task,
+        task_id,
+        run_id,
+    )?;
+    let changed = transaction.execute(
+        "UPDATE tasks SET status = 'claimed', updated_at = datetime('now') WHERE id = ?1",
+        (task_id,),
+    )?;
+    if changed != 1 {
+        return Err(ClaimError::TaskNotEligible);
+    }
+    transaction.commit()?;
+    Ok(claim)
+}
+
+pub fn acquire_pr(
+    path: &Path,
+    repository_id: &str,
+    pr_number: i64,
+    run_id: &str,
+) -> Result<Claim, ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let claim = acquire(
+        &transaction,
+        repository_id,
+        ClaimResource::PullRequest,
+        &pr_number.to_string(),
+        run_id,
+    )?;
+    transaction.commit()?;
+    Ok(claim)
+}
+
+pub fn heartbeat(path: &Path, lease_id: &str, run_id: &str) -> Result<(), ClaimError> {
+    update_active_claim(path, lease_id, run_id, "heartbeat_at = datetime('now')")
+}
+
+pub fn release(path: &Path, lease_id: &str, run_id: &str) -> Result<(), ClaimError> {
+    update_active_claim(
+        path,
+        lease_id,
+        run_id,
+        "state = 'released', heartbeat_at = datetime('now')",
+    )
+}
+
+pub fn transition_task(
+    path: &Path,
+    task_id: &str,
+    lease_id: &str,
+    run_id: &str,
+    status: TaskStatus,
+) -> Result<(), ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE tasks SET status = ?1, updated_at = datetime('now')
+         WHERE id = ?2 AND EXISTS (
+             SELECT 1 FROM claims
+             WHERE id = ?3 AND run_id = ?4 AND resource_kind = 'task'
+               AND resource_key = ?2 AND state = 'active'
+         )",
+        (status.as_str(), task_id, lease_id, run_id),
+    )?;
+    if changed != 1 {
+        return Err(ClaimError::LeaseNotActive);
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn acquire(
+    transaction: &rusqlite::Transaction<'_>,
+    repository_id: &str,
+    resource_kind: ClaimResource,
+    resource_key: &str,
+    run_id: &str,
+) -> Result<Claim, ClaimError> {
+    let run_belongs_to_repository: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE id = ?1 AND repository_id = ?2)",
+        (run_id, repository_id),
+        |row| row.get(0),
+    )?;
+    if !run_belongs_to_repository {
+        return Err(ClaimError::RunNotInRepository);
+    }
+    if let Some(run_id) = active_claim(transaction, repository_id, resource_kind, resource_key)? {
+        return Err(ClaimError::ClaimedBy { run_id });
+    }
+    let claim = Claim {
+        id: Uuid::new_v4().to_string(),
+        repository_id: repository_id.to_string(),
+        resource_kind,
+        resource_key: resource_key.to_string(),
+        run_id: run_id.to_string(),
+    };
+    transaction.execute(
+        "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', datetime('now'), datetime('now'))",
+        (&claim.id, &claim.repository_id, resource_kind.as_str(), &claim.resource_key, &claim.run_id),
+    )?;
+    Ok(claim)
+}
+
+fn active_claim(
+    transaction: &rusqlite::Transaction<'_>,
+    repository_id: &str,
+    resource_kind: ClaimResource,
+    resource_key: &str,
+) -> Result<Option<String>, ClaimError> {
+    transaction
+        .query_row(
+            "SELECT run_id FROM claims
+             WHERE repository_id = ?1 AND resource_kind = ?2 AND resource_key = ?3 AND state = 'active'",
+            (repository_id, resource_kind.as_str(), resource_key),
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn update_active_claim(
+    path: &Path,
+    lease_id: &str,
+    run_id: &str,
+    assignment: &str,
+) -> Result<(), ClaimError> {
+    let connection = open(path)?;
+    let changed = connection.execute(
+        &format!(
+            "UPDATE claims SET {assignment} WHERE id = ?1 AND run_id = ?2 AND state = 'active'"
+        ),
+        (lease_id, run_id),
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(ClaimError::LeaseNotActive)
+    }
 }
 
 pub fn database_path(override_path: Option<PathBuf>) -> io::Result<PathBuf> {
