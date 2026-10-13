@@ -3,10 +3,10 @@ use alucard::{
 };
 use std::fs;
 use std::path::Path;
+use uuid::Uuid;
 
 fn settings(contents: &str) -> AgentSettings {
-    let path =
-        std::env::temp_dir().join(format!("alucard-agent-settings-{}.env", std::process::id()));
+    let path = std::env::temp_dir().join(format!("alucard-agent-settings-{}.env", Uuid::new_v4()));
     fs::write(&path, contents).unwrap();
     let settings = AgentSettings::from_environment(Some(&path)).unwrap();
     fs::remove_file(path).unwrap();
