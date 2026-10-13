@@ -41,14 +41,16 @@ fn main() -> ExitCode {
 }
 
 fn build_command(args: &[String]) -> ExitCode {
-    let mut image = std::env::var("ALUCARD_IMAGE")
-        .unwrap_or_else(|_| "ghcr.io/aldovc/alucard:latest".to_string());
+    let mut image = nonempty_environment("ALUCARD_IMAGE")
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| "ghcr.io/aldovc/alucard:latest".to_string());
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--image" => match args.next() {
-                Some(value) => image = value.clone(),
+                Some(value) if !value.is_empty() => image = value.clone(),
                 None => return fail("alucard: --image requires an image name"),
+                Some(_) => return fail("alucard: --image requires an image name"),
             },
             "-h" | "--help" => {
                 println!("usage: alucard build [--image IMAGE]");
