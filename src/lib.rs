@@ -138,12 +138,18 @@ impl AgentSettings {
     }
 
     pub fn provider(&self, role: AgentRole) -> Result<Provider, String> {
+        Provider::parse(self.provider_name(role))
+    }
+
+    pub fn provider_name(&self, role: AgentRole) -> &str {
         let key = format!("ALUCARD_{}_PROVIDER", role.setting_name());
-        Provider::parse(
-            self.get(&key)
-                .or_else(|| self.get("ALUCARD_PROVIDER"))
-                .unwrap_or("claude"),
-        )
+        self.get(&key)
+            .or_else(|| self.get("ALUCARD_PROVIDER"))
+            .unwrap_or("claude")
+    }
+
+    pub fn has_value(&self, key: &str) -> bool {
+        self.get(key).is_some()
     }
 
     pub fn setting(&self, role: AgentRole, suffix: &str, default: &str) -> String {

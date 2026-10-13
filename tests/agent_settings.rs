@@ -192,6 +192,12 @@ fn provider_result_classification_matches_bash_contract() {
         (
             Provider::Claude,
             Some(1),
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"ratelimit exceeded."}"#,
+            AgentExit::Transport,
+        ),
+        (
+            Provider::Claude,
+            Some(1),
             r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}"#,
             AgentExit::Exhausted,
         ),
@@ -205,6 +211,12 @@ fn provider_result_classification_matches_bash_contract() {
             Provider::Codex,
             Some(1),
             r#"{"type":"item.completed","item":{"type":"error","message":"provider ratelimit exceeded"}}"#,
+            AgentExit::Transport,
+        ),
+        (
+            Provider::Codex,
+            Some(1),
+            r#"{"type":"item.completed","item":{"type":"error","message":"provider rate/limit exceeded"}}"#,
             AgentExit::Transport,
         ),
     ];
