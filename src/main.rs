@@ -1035,8 +1035,9 @@ where
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
         let output = String::from_utf8_lossy(&output.stdout);
-        let runs: Vec<serde_json::Value> = serde_json::from_str(&output)
+        let mut runs: Vec<serde_json::Value> = serde_json::from_str(&output)
             .map_err(|error| format!("invalid gh run list response: {error}"))?;
+        runs.retain(|run| run["status"].as_str() != Some("queued"));
         let branch_has_runs = !runs.is_empty();
         if let Some(result) = current_head_ci_result(&runs, head) {
             return Ok(result);
@@ -2250,6 +2251,36 @@ printf '%s' "$FULL_PROMPT""#,
             )
             .unwrap(),
             CiResult::Green
+        );
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn ci_run_list_treats_a_queued_current_head_as_missing() {
+        let queued = r#"[{"headSha":"head","status":"queued","conclusion":null}]"#;
+        let mut outputs = VecDeque::from([
+            command_output(queued, "", 0),
+            command_output(queued, "", 0),
+            command_output(queued, "", 0),
+            command_output(queued, "", 0),
+        ]);
+        let clock = Cell::new(Instant::now());
+        let mut command = |_args: &[&str], _timeout| Ok(outputs.pop_front().unwrap());
+        let mut now = || clock.get();
+        let mut sleep = |duration| clock.set(clock.get() + duration);
+
+        assert_eq!(
+            poll_ci_run_list_with(
+                Path::new("."),
+                1,
+                "branch",
+                "head",
+                &mut command,
+                &mut now,
+                &mut sleep,
+            )
+            .unwrap(),
+            CiResult::Missing
         );
         assert!(outputs.is_empty());
     }
