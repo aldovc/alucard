@@ -1,10 +1,10 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    database_path, find_run, github_queue, github_ticket_blockers, import_github_tasks,
-    import_local_tasks, local_queue_with_open_issues, migrate, open, parse_tasks, recent_runs,
-    run_claims, run_command as execute_command, run_pull_requests, status, GithubPullRequest,
-    GithubTask,
+    build_image, database_path, find_run, github_queue, github_ticket_blockers,
+    import_github_tasks, import_local_tasks, local_queue_with_open_issues, migrate, open,
+    parse_tasks, recent_runs, run_claims, run_command as execute_command, run_pull_requests,
+    status, GithubPullRequest, GithubTask,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -25,12 +25,41 @@ fn main() -> ExitCode {
             Err(error) => fail(&format!("alucard: {error}")),
         },
         Some("queue") => queue_command(&commands[1..], db_path),
+        Some("build") => build_command(&commands[1..]),
         Some("runs") => match database_path(db_path) {
             Ok(path) => runs_command(&commands[1..], &path),
             Err(error) => fail(&format!("alucard: {error}")),
         },
         Some(cmd) => fail(&format!("alucard: unknown command: {cmd}")),
-        None => fail("usage: alucard [--db-path PATH] {version|queue|runs|db migrate|db status}"),
+        None => {
+            fail("usage: alucard [--db-path PATH] {version|build|queue|runs|db migrate|db status}")
+        }
+    }
+}
+
+fn build_command(args: &[String]) -> ExitCode {
+    let mut image = std::env::var("ALUCARD_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/aldovc/alucard:latest".to_string());
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--image" => match args.next() {
+                Some(value) => image = value.clone(),
+                None => return fail("alucard: --image requires an image name"),
+            },
+            "-h" | "--help" => {
+                println!("usage: alucard build [--image IMAGE]");
+                return ExitCode::SUCCESS;
+            }
+            _ => return fail(&format!("alucard: unknown build option: {arg}")),
+        }
+    }
+    let Some(dir) = tool_dir().or_else(|| std::env::current_dir().ok()) else {
+        return fail("alucard: cannot find tool directory");
+    };
+    match build_image(&dir, &image) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(&format!("alucard: {error}")),
     }
 }
 

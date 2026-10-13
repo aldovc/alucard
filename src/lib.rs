@@ -14,6 +14,367 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// The provider selected for an agent role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Claude,
+    Codex,
+}
+
+impl Provider {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            _ => Err(format!(
+                "unrecognized provider '{value}': must be 'claude' or 'codex'"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    Worker,
+    CiFix,
+    Reviewer,
+    Feedback,
+    Wrapup,
+}
+
+impl AgentRole {
+    pub fn setting_name(self) -> &'static str {
+        match self {
+            Self::Worker | Self::Wrapup => "WORKER",
+            Self::CiFix => "CI_FIX",
+            Self::Reviewer => "REVIEWER",
+            Self::Feedback => "FEEDBACK",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSettings {
+    values: std::collections::BTreeMap<String, String>,
+}
+
+impl AgentSettings {
+    pub fn from_environment(env_file: Option<&Path>) -> Result<Self, String> {
+        let mut values: std::collections::BTreeMap<_, _> = env::vars().collect();
+        if let Some(path) = env_file {
+            let contents = fs::read_to_string(path)
+                .map_err(|error| format!("cannot read env file {}: {error}", path.display()))?;
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let line = line.strip_prefix("export ").unwrap_or(line);
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                let value = value.trim().trim_matches(['\'', '"']);
+                values.insert(key.trim().to_string(), value.to_string());
+            }
+        }
+        Ok(Self { values })
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.values.get(key).map(String::as_str)
+    }
+
+    pub fn provider(&self, role: AgentRole) -> Result<Provider, String> {
+        let key = format!("ALUCARD_{}_PROVIDER", role.setting_name());
+        Provider::parse(
+            self.get(&key)
+                .or_else(|| self.get("ALUCARD_PROVIDER"))
+                .unwrap_or("claude"),
+        )
+    }
+
+    pub fn setting(&self, role: AgentRole, suffix: &str, default: &str) -> String {
+        let role_key = format!("ALUCARD_{}_{}", role.setting_name(), suffix);
+        self.get(&role_key)
+            .or_else(|| self.get(&format!("ALUCARD_{suffix}")))
+            .unwrap_or(default)
+            .to_string()
+    }
+
+    pub fn turns(&self, role: AgentRole) -> String {
+        let default = match role {
+            AgentRole::Worker => "180",
+            AgentRole::CiFix => "30",
+            AgentRole::Reviewer => "45",
+            AgentRole::Feedback => "50",
+            AgentRole::Wrapup => "12",
+        };
+        self.setting(role, "MAX_TURNS", default)
+    }
+
+    pub fn budget(&self, role: AgentRole) -> String {
+        let default = match role {
+            AgentRole::Worker => "10",
+            AgentRole::CiFix => "2",
+            AgentRole::Reviewer => "2",
+            AgentRole::Feedback => "2",
+            AgentRole::Wrapup => "1",
+        };
+        self.setting(role, "MAX_BUDGET", default)
+    }
+}
+
+pub fn compose_role_prompt(
+    tool_dir: &Path,
+    role_file: &str,
+    trailer_file: Option<&str>,
+) -> io::Result<String> {
+    let mut prompt = fs::read_to_string(tool_dir.join(role_file))?;
+    prompt.push_str("\n\n");
+    prompt.push_str(&fs::read_to_string(
+        tool_dir.join("alucard-engineering-policy.md"),
+    )?);
+    if let Some(trailer) = trailer_file {
+        prompt.push_str("\n\n");
+        prompt.push_str(&fs::read_to_string(tool_dir.join(trailer))?);
+    }
+    Ok(prompt)
+}
+
+pub fn build_inputs_hash(tool_dir: &Path) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    for name in ["Dockerfile", "entrypoint.sh"] {
+        let path = tool_dir.join(name);
+        if path.is_file() {
+            hasher.update(format!("=== {name}\n").as_bytes());
+            hasher.update(fs::read(path)?);
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn build_image(tool_dir: &Path, image: &str) -> Result<(), String> {
+    let hash = build_inputs_hash(tool_dir).map_err(|error| error.to_string())?;
+    let status = Command::new("docker")
+        .args([
+            "build",
+            "--label",
+            &format!("alucard.build-inputs={hash}"),
+            "-t",
+            image,
+        ])
+        .arg(tool_dir)
+        .status()
+        .map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("docker build failed with {status}"))
+    }
+}
+
+pub struct AgentInvocation<'a> {
+    pub role: AgentRole,
+    pub name: &'a str,
+    pub image: &'a str,
+    pub env_file: &'a Path,
+    pub worktree: &'a Path,
+    pub prompt: &'a str,
+    pub timeout_minutes: u64,
+    pub network: Option<&'a str>,
+    pub playwright_cache: Option<&'a Path>,
+    pub database_url: Option<&'a str>,
+    pub github_repo: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentExit {
+    Clean,
+    Timeout,
+    Transport,
+    Billing,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentResult {
+    pub status: Option<i32>,
+    pub classification: AgentExit,
+}
+
+impl AgentInvocation<'_> {
+    pub fn docker_args(&self, settings: &AgentSettings) -> Result<Vec<String>, String> {
+        let provider = settings.provider(self.role)?;
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let mut args = vec![
+            "run".into(),
+            "--rm".into(),
+            "--name".into(),
+            self.name.into(),
+            "--network".into(),
+            self.network.unwrap_or("bridge").into(),
+            "--memory".into(),
+            "4g".into(),
+            "--cpus".into(),
+            "2".into(),
+            "--read-only".into(),
+            "--tmpfs".into(),
+            "/tmp:exec,size=2g".into(),
+            "--tmpfs".into(),
+            format!("/home/alucard:size=2g,uid={uid},gid={gid}"),
+            "--ulimit".into(),
+            "nofile=8192:8192".into(),
+            "--user".into(),
+            format!("{uid}:{gid}"),
+            "--security-opt".into(),
+            "no-new-privileges".into(),
+            "--cap-drop".into(),
+            "ALL".into(),
+            "--env-file".into(),
+            self.env_file.display().to_string(),
+            "-e".into(),
+            "HOME=/home/alucard".into(),
+            "-e".into(),
+            "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig".into(),
+            "-e".into(),
+            "GH_CONFIG_DIR=/tmp/gh".into(),
+            "-v".into(),
+            format!("{}:/work:rw", self.worktree.display()),
+        ];
+        if provider == Provider::Codex {
+            args.insert(2, "-i".into());
+        }
+        if let Some(cache) = self.playwright_cache {
+            args.extend([
+                "-v".into(),
+                format!("{}:/opt/alucard-browsers:rw", cache.display()),
+                "-e".into(),
+                "PLAYWRIGHT_BROWSERS_PATH=/opt/alucard-browsers".into(),
+                "-e".into(),
+                "PLAYWRIGHT_SKIP_BROWSER_GC=1".into(),
+            ]);
+        }
+        if let Some(url) = self.database_url {
+            args.extend(["-e".into(), format!("DATABASE_URL={url}")]);
+        }
+        if let Some(repo) = self.github_repo {
+            args.extend(["-e".into(), format!("GH_REPO={repo}")]);
+        }
+        args.push(self.image.into());
+        match provider {
+            Provider::Codex => args.extend([
+                "codex".into(),
+                "exec".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--json".into(),
+                "--ephemeral".into(),
+                "-m".into(),
+                settings.setting(self.role, "CODEX_MODEL", "gpt-5.6-terra"),
+                "-".into(),
+            ]),
+            Provider::Claude => {
+                args.extend([
+                    "claude".into(),
+                    "-p".into(),
+                    "--verbose".into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--include-partial-messages".into(),
+                    "--permission-mode".into(),
+                    "bypassPermissions".into(),
+                    "--max-turns".into(),
+                    settings.turns(self.role),
+                    "--max-budget-usd".into(),
+                    settings.budget(self.role),
+                    "--model".into(),
+                    settings.setting(self.role, "CLAUDE_MODEL", "sonnet"),
+                    "--fallback-model".into(),
+                    settings.setting(self.role, "CLAUDE_FALLBACK_MODEL", "haiku"),
+                ]);
+                let effort = settings.setting(self.role, "EFFORT", "");
+                if !effort.is_empty() {
+                    args.extend(["--effort".into(), effort]);
+                }
+                args.extend(["--disallowedTools".into(), "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)".into(), "--".into(), self.prompt.into()]);
+            }
+        }
+        Ok(args)
+    }
+
+    /// Runs Docker with direct file output so a descendant cannot block pipe draining after timeout.
+    pub fn invoke(&self, settings: &AgentSettings, log_file: &Path) -> Result<AgentResult, String> {
+        let provider = settings.provider(self.role)?;
+        let docker_args = self.docker_args(settings)?;
+        let log = File::create(log_file)
+            .map_err(|error| format!("cannot create {}: {error}", log_file.display()))?;
+        let mut command = Command::new("timeout");
+        command
+            .args([
+                "--kill-after",
+                "30s",
+                &format!("{}m", self.timeout_minutes),
+                "docker",
+            ])
+            .args(&docker_args)
+            .current_dir(self.worktree)
+            .stdout(Stdio::from(
+                log.try_clone().map_err(|error| error.to_string())?,
+            ))
+            .stderr(Stdio::from(log));
+        if provider == Provider::Codex {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot start docker: {error}"))?;
+        if provider == Provider::Codex {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("codex stdin is piped")
+                .write_all(self.prompt.as_bytes())
+                .map_err(|error| format!("cannot send prompt to codex: {error}"))?;
+        }
+        let status = child
+            .wait()
+            .map_err(|error| format!("cannot wait for docker: {error}"))?;
+        let _ = Command::new("docker")
+            .args(["rm", "-f", self.name])
+            .status();
+        let log = fs::read_to_string(log_file)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let classification = match status.code() {
+            Some(0) => AgentExit::Clean,
+            Some(124 | 137) => AgentExit::Timeout,
+            _ if log.contains("billing") || log.contains("credit") || log.contains("quota") => {
+                AgentExit::Billing
+            }
+            _ if [
+                "connection",
+                "network error",
+                "overloaded",
+                "rate limit",
+                "gateway",
+                "econnreset",
+                "api error",
+            ]
+            .iter()
+            .any(|marker| log.contains(marker)) =>
+            {
+                AgentExit::Transport
+            }
+            _ => AgentExit::Failed,
+        };
+        Ok(AgentResult {
+            status: status.code(),
+            classification,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalTask {
     pub id: String,
