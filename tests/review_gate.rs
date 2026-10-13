@@ -332,7 +332,7 @@ case "$1 $2" in
         fi ;;
       *comments*isDraft*)
         case "$ALUCARD_CASE" in
-          recovery-unpark|recovery-old-head)
+          recovery-unpark|recovery-old-head|recovery-missing-ci)
             printf '%s\n' '{"comments":[{"author":{"login":"alucard-bot"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft"}],"author":{"login":"alucard-bot"},"isDraft":true,"labels":[{"name":"needs-human"}],"title":"wip: alucard recovery — iter 1","body":"Refs #77\n\nunfinished"}' ;;
           recovery-untrusted)
             printf '%s\n' '{"comments":[{"author":{"login":"other"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft"}],"author":{"login":"other"},"isDraft":true,"labels":[{"name":"needs-human"}],"title":"wip: alucard recovery — iter 1","body":"Refs #77\n\nunfinished"}' ;;
@@ -492,6 +492,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             advance_head: false,
             expected_verdict: "APPROVED",
             expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "recovery-missing-ci",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
         },
         ReviewCase {
             name: "recovery-old-head",
@@ -953,6 +966,14 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                 "{trace}"
             );
             assert!(trace.contains("Marked ready for review"), "{trace}");
+        }
+        if case.name == "recovery-missing-ci" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(
+                !trace.contains("DELETE repos/{owner}/{repo}/issues/77/labels/needs-human"),
+                "{trace}"
+            );
+            assert!(!trace.contains("pr edit 77 --title"), "{trace}");
         }
         if case.name == "recovery-old-head" {
             assert!(!trace.contains("pr ready 77"), "{trace}");
