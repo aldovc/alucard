@@ -4192,6 +4192,9 @@ command_run() {
     # Minted after dispatch so a pinned issue or local task is in the name.
     BRANCH=$(mint_branch "$i")
     git -C "$WT_HOST" checkout -b "$BRANCH"
+    # The worker's `gh pr create` passes no --base, so without this a --base
+    # run opens its PR against the default branch. gh reads this config.
+    git -C "$WT_HOST" config "branch.$BRANCH.gh-merge-base" "$BASE_BRANCH"
     if [ "$TASK_SOURCE" = "file" ]; then
       echo "Dispatching task ${DISPATCHED_TASK_ID}: $(echo "$issues" | jq -r '.[0].title')"
     elif [ -n "${PIN_ISSUE:-}" ]; then
@@ -4231,6 +4234,7 @@ command_run() {
         git -C "$WT_HOST" reset --hard "$(git -C "$REPO_ABS" rev-parse "origin/$BASE_BRANCH")"
         _base_sha="$(git -C "$WT_HOST" rev-parse HEAD)"
         git -C "$WT_HOST" checkout -b "$BRANCH"
+        git -C "$WT_HOST" config "branch.$BRANCH.gh-merge-base" "$BASE_BRANCH"
         log_file="$LOG_DIR/iter-${i}-attempt-${_attempt}.jsonl"
       fi
 
