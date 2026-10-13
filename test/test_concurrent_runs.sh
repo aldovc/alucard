@@ -288,25 +288,32 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 # ── End to end: the worktree name is already taken under the repository ─────
-# Another run, with a different --logs-root, holds this second's name under
-# .alucard-worktrees. Pre-take the next few seconds' names so the run under
-# test is certain to find its own taken, whichever second it lands in.
+# Another run, with a different --logs-root, holds this run's name under
+# .alucard-worktrees. Pin the run's timestamp through the local date mock so
+# the test does not race the wall clock while arranging that collision.
 echo ""
 echo "── continue when another run holds this second's worktree name ──"
 
-TAKEN=()
-for off in 0 1 2 3 4 5 6 7; do
-  d="$CACHE/example/api/.alucard-worktrees/alucard-$(date -d "+${off} sec" +%Y%m%d-%H%M%S)"
-  mkdir -p "$d/iter-1"
-  printf 'another run\n' > "$d/iter-1/keep"
-  TAKEN+=("$d")
-done
+FIXTURE_STAMP=20260914-101500
+TAKEN="$CACHE/example/api/.alucard-worktrees/alucard-$FIXTURE_STAMP"
+mkdir -p "$TAKEN/iter-1"
+printf 'another run\n' > "$TAKEN/iter-1/keep"
+cat > "$MOCK_BIN/date" <<'MOCK'
+#!/bin/bash
+if [ "$#" -eq 1 ] && [ "$1" = "+%Y%m%d-%H%M%S" ]; then
+  printf '%s\n' "$ALUCARD_TEST_STAMP"
+else
+  exec /usr/bin/date "$@"
+fi
+MOCK
+chmod +x "$MOCK_BIN/date"
 : > "$TEST_DIR/argv"
 set +e
 (
   cd "$CWD" && \
   PATH="$MOCK_BIN:$PATH" ALUCARD_CACHE_DIR="$CACHE" \
   ALUCARD_TEST_BRANCH="$BRANCH" ALUCARD_TEST_ARGV="$TEST_DIR/argv" \
+  ALUCARD_TEST_STAMP="$FIXTURE_STAMP" \
   "$ALUCARD" continue 77 example/api --no-build --max-review-cycles 1 \
     --env-file "$TEST_DIR/alucard.env" --logs-root "$TEST_DIR/run-logs-2"
 ) > "$TEST_DIR/out2" 2>&1
@@ -325,7 +332,7 @@ fi
 [ "$WT_PARENT" != "$RUN_ID_2" ] && pass "so it differs from the log dir name this time" \
   || fail "so it differs from the log dir name this time"
 all_kept=true
-for d in "${TAKEN[@]}"; do [ -f "$d/iter-1/keep" ] || all_kept=false; done
+for d in "$TAKEN"; do [ -f "$d/iter-1/keep" ] || all_kept=false; done
 [ "$all_kept" = true ] && pass "every other run's worktree is untouched" \
   || fail "every other run's worktree is untouched"
 
