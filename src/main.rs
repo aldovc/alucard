@@ -997,6 +997,7 @@ impl CiGate<'_> {
                 failed_run_log(&prepared.clone, branch, head.trim()).unwrap_or_default();
             let checkout = prepared.directory.join(format!("fix-{attempt}"));
             let checkout_text = checkout.display().to_string();
+            let mut agent_invoked = false;
             let repair = (|| {
                 let clone = execute_command(
                     "git",
@@ -1021,6 +1022,7 @@ impl CiGate<'_> {
                     .join(format!("iter-{iteration}-fix-{attempt}.jsonl"));
                 let name = format!("alucard-fix-{}-{attempt}", prepared.run.id);
                 let fix_iteration = format!("{iteration}-fix-{attempt}");
+                agent_invoked = true;
                 let _ = AgentInvocation {
                     role: AgentRole::CiFix,
                     name: &name,
@@ -1040,7 +1042,11 @@ impl CiGate<'_> {
                 .invoke(self.settings, &log);
                 Ok(())
             })();
-            let _ = fs::remove_dir_all(&checkout);
+            if agent_invoked {
+                cleanup_repair_checkout(&checkout);
+            } else {
+                let _ = fs::remove_dir_all(&checkout);
+            }
             repair?;
         }
         Ok(CiResult::Failed)
@@ -1294,6 +1300,39 @@ fn git_output(repository: &Path, args: &[&str]) -> Result<String, String> {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn cleanup_repair_checkout(checkout: &Path) {
+    if !checkout.is_dir() {
+        return;
+    }
+    let dirty = git_output(
+        checkout,
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
+    let unpublished = git_output(
+        checkout,
+        &[
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--branches",
+            "--not",
+            "--remotes=origin",
+        ],
+    );
+    let stashes = git_output(checkout, &["stash", "list"]);
+    let clean = dirty.is_ok_and(|value| value.is_empty())
+        && unpublished.is_ok_and(|value| value.trim() == "0")
+        && stashes.is_ok_and(|value| value.is_empty());
+    if clean {
+        let _ = fs::remove_dir_all(checkout);
+    } else {
+        eprintln!(
+            "CI gate: unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
+            checkout.display()
+        );
     }
 }
 
@@ -2490,6 +2529,64 @@ printf '%s' "$_fix_prompt""#,
             ci_fix_prompt(tools, 17, "agent/test", failure_log).unwrap(),
             String::from_utf8(bash.stdout).unwrap()
         );
+    }
+
+    #[test]
+    fn ci_fix_cleanup_retains_dirty_and_unpublished_checkouts() {
+        let root =
+            std::env::temp_dir().join(format!("alucard-ci-cleanup-{}", uuid::Uuid::new_v4()));
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let checkout = root.join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        let git = |directory: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(directory)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&root, &["init", "--bare", remote.to_str().unwrap()]);
+        git(&root, &["init", seed.to_str().unwrap()]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        git(&seed, &["config", "user.name", "Test"]);
+        fs::write(seed.join("tracked"), "initial\n").unwrap();
+        git(&seed, &["add", "tracked"]);
+        git(&seed, &["commit", "-m", "initial"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "HEAD:main"]);
+        git(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        fs::write(checkout.join("tracked"), "dirty\n").unwrap();
+        cleanup_repair_checkout(&checkout);
+        assert!(checkout.is_dir());
+
+        fs::write(checkout.join("tracked"), "committed locally\n").unwrap();
+        git(&checkout, &["config", "user.email", "test@example.com"]);
+        git(&checkout, &["config", "user.name", "Test"]);
+        git(&checkout, &["add", "tracked"]);
+        git(&checkout, &["commit", "-m", "unpublished"]);
+        cleanup_repair_checkout(&checkout);
+        assert!(checkout.is_dir());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
