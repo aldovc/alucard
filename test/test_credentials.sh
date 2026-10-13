@@ -145,6 +145,17 @@ assert_output_contains "doctor mixed: ok OPENAI_API_KEY present"                
 assert_output_contains "doctor codex-only missing key: reports missing OPENAI"     "missing: OPENAI_API_KEY value" td_codex_none
 assert_output_absent   "doctor codex-only missing key: ANTHROPIC not checked"      "ANTHROPIC_API_KEY"             td_codex_none
 
+td_missing_manifest() {
+  TOOL_DIR="$TEST_TMPDIR/missing-tools"
+  REQUIRED_TOOL_FILES_FILE="$TOOL_DIR/required-tool-files.txt"
+  command_doctor --env-file "$CODEX_ENV"
+}
+
+assert_output_contains "doctor missing manifest: reports manifest path" \
+  "missing: $TEST_TMPDIR/missing-tools/required-tool-files.txt" td_missing_manifest
+assert_output_absent "doctor missing manifest: does not report tool files healthy" \
+  "ok: tool files in $TEST_TMPDIR/missing-tools" td_missing_manifest
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 finish
