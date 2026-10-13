@@ -2011,7 +2011,10 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     let open_prs = if locally_eligible.is_empty() {
         Vec::new()
     } else {
-        fetch_open_local_prs(&options.repository).unwrap_or_default()
+        match fetch_open_local_prs(&options.repository) {
+            Ok(pull_requests) => pull_requests,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        }
     };
     match serde_json::to_string_pretty(&local_queue_with_open_prs(
         &parsed.tasks,
@@ -2087,7 +2090,7 @@ fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>,
 }
 
 fn fetch_open_local_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
-    let output = match gh_output(
+    let output = gh_output(
         repository,
         &[
             "pr",
@@ -2100,11 +2103,7 @@ fn fetch_open_local_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, Str
             "number,title,body",
         ],
         "could not list open pull requests",
-    ) {
-        Ok(output) => output,
-        Err(error) if error.contains("No such file") => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
+    )?;
     if output.iter().all(u8::is_ascii_whitespace) {
         return Ok(Vec::new());
     }

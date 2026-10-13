@@ -992,7 +992,7 @@ fn queue_resolves_explicit_environment_and_detected_task_sources() {
     let detected = task_directory.join("tasks.md");
     fs::copy("test/fixtures/contracts/local-tasks.md", &detected).unwrap();
     let gh = root.join("gh");
-    fs::write(&gh, "#!/bin/sh\necho 'gh unavailable' >&2\nexit 1\n").unwrap();
+    fs::write(&gh, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     let binary = env!("CARGO_BIN_EXE_alucard");
 
