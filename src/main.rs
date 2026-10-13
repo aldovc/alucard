@@ -3,23 +3,26 @@
 use alucard::{
     abandoned_task_claims, archive_prompt, begin_operation, build_image, compose_role_prompt,
     database_path, find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
-    import_github_tasks, import_local_tasks, iteration_usage_comment, local_queue_with_open_issues,
-    local_queue_with_open_prs, log_event, mark_claim_needs_reconciliation, migrate, open,
-    parse_tasks, prepare_run, recent_runs, record_recovery_failure, record_recovery_pr,
-    record_task_pr, record_task_pr_gate_state, release, release_abandoned_task_claim, run_claims,
-    run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
-    start_task_retry_run, start_task_run, status, task_claim_attempts, task_id, task_is_pending,
-    toolchain_preflight, transition_task, usage_report, warn_if_stale_image,
-    write_iteration_measurement, write_run_measurement, write_stage_measurement,
-    write_task_headings, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask,
-    IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState,
-    TaskStatus,
+    import_github_tasks, import_local_tasks, iteration_usage_comment_for_dirs,
+    local_queue_with_open_issues, local_queue_with_open_prs, log_event,
+    mark_claim_needs_reconciliation, migrate, open, parse_tasks, prepare_run, recent_runs,
+    record_recovery_failure, record_recovery_pr, record_task_pr, record_task_pr_gate_state,
+    release, release_abandoned_task_claim, run_claims, run_command as execute_command,
+    run_pull_requests, run_reconciliation_reason, run_recovery, start_task_retry_run,
+    start_task_run, status, task_claim_attempts, task_id, task_is_pending, toolchain_preflight,
+    transition_task, usage_report_for_dirs, warn_if_stale_image, write_iteration_measurement,
+    write_run_measurement, write_stage_measurement, write_task_headings, AgentInvocation,
+    AgentRole, AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
+    RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
+
+#[cfg(test)]
+use alucard::usage_report;
 
 const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's.";
 
@@ -667,6 +670,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     return fail(&format!("alucard: {error}"));
                 }
             };
+        let mut usage_log_dirs = vec![prepared.directory.clone()];
         if let Some(issue) = selected.issue.as_ref() {
             if let Err(error) = gh_output(
                 &options.queue.repository,
@@ -885,7 +889,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     }
                     report_iteration_usage(
                         &options.queue.repository,
-                        &prepared.directory,
+                        &usage_log_dirs,
                         iteration,
                         number,
                         iteration_started.elapsed().as_secs(),
@@ -896,7 +900,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 }
                 Ok(None) => {
                     if classification == alucard::AgentExit::Billing {
-                        print!("{}", usage_report(&prepared.directory));
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
                         release_without_pr(
                             &database,
                             &selected,
@@ -954,6 +958,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
+                        usage_log_dirs.push(prepared.directory.clone());
                         continue;
                     }
                     match recover_worker_changes(
@@ -972,7 +977,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     ) {
                         Ok(Some(number)) => post_iteration_usage(
                             &options.queue.repository,
-                            &prepared.directory,
+                            &usage_log_dirs,
                             iteration,
                             number,
                             iteration_started.elapsed().as_secs(),
@@ -989,7 +994,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             );
                         }
                     }
-                    print!("{}", usage_report(&prepared.directory));
+                    print!("{}", usage_report_for_dirs(&usage_log_dirs));
                     let _ = release(&database, &claim.id, &owner_run_id);
                     if let Some(issue) = selected.issue.as_ref() {
                         if let Ok(operation) = begin_operation(
@@ -3010,12 +3015,12 @@ fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>,
 
 fn post_iteration_usage(
     repository: &Path,
-    log_dir: &Path,
+    log_dirs: &[PathBuf],
     iteration: usize,
     pr: i64,
     duration: u64,
 ) {
-    let Some(body) = iteration_usage_comment(log_dir, iteration, Some(duration)) else {
+    let Some(body) = iteration_usage_comment_for_dirs(log_dirs, iteration, Some(duration)) else {
         return;
     };
     let pr_number = pr.to_string();
@@ -3037,19 +3042,21 @@ fn post_iteration_usage(
         &[command, "comment", &target, "--body", &body],
         "could not post token usage",
     ) {
-        log_event(log_dir, &format!("Measurement: {error} — continuing."));
+        if let Some(log_dir) = log_dirs.last() {
+            log_event(log_dir, &format!("Measurement: {error} — continuing."));
+        }
     }
 }
 
 fn report_iteration_usage(
     repository: &Path,
-    log_dir: &Path,
+    log_dirs: &[PathBuf],
     iteration: usize,
     pr: i64,
     duration: u64,
 ) {
-    print!("{}", usage_report(log_dir));
-    post_iteration_usage(repository, log_dir, iteration, pr, duration);
+    print!("{}", usage_report_for_dirs(log_dirs));
+    post_iteration_usage(repository, log_dirs, iteration, pr, duration);
 }
 
 fn closing_issue_number(body: &str) -> Option<i64> {

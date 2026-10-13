@@ -1,6 +1,7 @@
 use alucard::{
-    archive_prompt, extract_agent_usage, iteration_usage_comment, log_event, usage_report,
-    write_iteration_measurement, write_stage_measurement, IterationMeasurement,
+    archive_prompt, extract_agent_usage, iteration_usage_comment, iteration_usage_comment_for_dirs,
+    log_event, usage_report, usage_report_for_dirs, write_iteration_measurement,
+    write_stage_measurement, IterationMeasurement,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -85,6 +86,45 @@ fn formats_bash_compatible_usage_table_and_iteration_comment() {
         iteration_usage_comment(&root, 1, Some(754)).unwrap(),
         "**🤖 Alucard token usage (iteration 1)**\n\nDuration: 12m 34s · Review rounds: 1 · Feedback rounds: 1\n\n<details><summary>Per-agent breakdown</summary>\n\n| Agent | Input | Output | Cache Read | Cache Write | Turns | Cost |\n|-------|------:|-------:|-----------:|------------:|------:|-----:|\n| worker attempt 1 | 1000 | 2000 | 50000 | 9000 | 42 | $1.234 |\n| review 1.2 | 1000 | 2000 | 50000 | 9000 | 42 | $1.234 |\n| review 1.2-attempt-2 | 1000 | 2000 | 50000 | 9000 | 42 | $1.234 |\n| **TOTAL** | **3000** | **6000** | **150000** | **27000** | **126** | **$3.702** |\n\n</details>"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn transport_retry_usage_includes_every_attempt_in_table_and_comment() {
+    let root = temporary_path("transport-retry-usage");
+    let first = root.join("first-attempt");
+    let final_attempt = root.join("final-attempt");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&final_attempt).unwrap();
+    fs::write(
+        first.join("iter-1-attempt-1.jsonl"),
+        r#"{"type":"result","num_turns":1,"total_cost_usd":0.1,"modelUsage":{"m":{"inputTokens":10,"outputTokens":4}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        final_attempt.join("iter-1-attempt-2.jsonl"),
+        r#"{"type":"result","num_turns":2,"total_cost_usd":0.2,"modelUsage":{"m":{"inputTokens":20,"outputTokens":5}}}"#,
+    )
+    .unwrap();
+    let logs = vec![first, final_attempt];
+
+    let table = usage_report_for_dirs(&logs);
+    assert!(table.contains("worker 1-attempt-1"));
+    assert!(table.contains("worker 1-attempt-2"));
+    let total = table
+        .lines()
+        .find(|line| line.starts_with("TOTAL"))
+        .unwrap();
+    assert_eq!(
+        total.split_whitespace().collect::<Vec<_>>(),
+        ["TOTAL", "30", "9", "0", "0", "3", "$0.300"]
+    );
+
+    let comment = iteration_usage_comment_for_dirs(&logs, 1, None).unwrap();
+    assert!(comment.contains("| worker attempt 1 | 10 | 4 | 0 | 0 | 1 | $0.100 |"));
+    assert!(comment.contains("| worker attempt 2 | 20 | 5 | 0 | 0 | 2 | $0.200 |"));
+    assert!(comment.contains("| **TOTAL** | **30** | **9** | **0** | **0** | **3** | **$0.300** |"));
+
     fs::remove_dir_all(root).unwrap();
 }
 

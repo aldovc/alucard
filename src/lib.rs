@@ -1084,7 +1084,12 @@ pub struct Usage {
 
 /// Formats the end-of-run token table emitted by the Bash orchestrator.
 pub fn usage_report(log_dir: &Path) -> String {
-    let mut rows = usage_rows(log_dir, None);
+    usage_report_for_dirs(&[log_dir.to_path_buf()])
+}
+
+/// Formats the end-of-run token table from all logs belonging to one run.
+pub fn usage_report_for_dirs(log_dirs: &[PathBuf]) -> String {
+    let mut rows = usage_rows(log_dirs, None);
     if rows.is_empty() {
         return String::new();
     }
@@ -1093,7 +1098,10 @@ pub fn usage_report(log_dir: &Path) -> String {
     let separator = "-".repeat(86);
     let mut report = format!(
         "\n=== Alucard Token Usage: {} ===\n",
-        log_dir
+        log_dirs
+            .last()
+            .map(PathBuf::as_path)
+            .unwrap_or_else(|| Path::new(""))
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default()
@@ -1115,14 +1123,23 @@ pub fn iteration_usage_comment(
     iteration: usize,
     duration: Option<u64>,
 ) -> Option<String> {
-    let rows = usage_rows(log_dir, Some(iteration));
+    iteration_usage_comment_for_dirs(&[log_dir.to_path_buf()], iteration, duration)
+}
+
+/// Builds the Bash-compatible token-usage comment from all logs belonging to one iteration.
+pub fn iteration_usage_comment_for_dirs(
+    log_dirs: &[PathBuf],
+    iteration: usize,
+    duration: Option<u64>,
+) -> Option<String> {
+    let rows = usage_rows(log_dirs, Some(iteration));
     if rows.is_empty() {
         return None;
     }
     let totals = usage_totals(&rows);
     let mut review_rounds = std::collections::BTreeSet::new();
     let mut feedback_rounds = std::collections::BTreeSet::new();
-    for name in jsonl_names(log_dir) {
+    for name in log_dirs.iter().flat_map(|log_dir| jsonl_names(log_dir)) {
         let name = name.strip_suffix(".jsonl").unwrap_or(&name);
         let prefix = format!("iter-{iteration}-");
         if let Some(rest) = name.strip_prefix(&prefix) {
@@ -1178,14 +1195,16 @@ struct UsageRow {
     usage: Usage,
 }
 
-fn usage_rows(log_dir: &Path, iteration: Option<usize>) -> Vec<UsageRow> {
+fn usage_rows(log_dirs: &[PathBuf], iteration: Option<usize>) -> Vec<UsageRow> {
     let mut rows = Vec::new();
-    for name in jsonl_names(log_dir) {
-        let Some(label) = usage_label(&name, iteration) else {
-            continue;
-        };
-        if let Some(usage) = extract_agent_usage(&log_dir.join(&name)) {
-            rows.push(UsageRow { name, label, usage });
+    for log_dir in log_dirs {
+        for name in jsonl_names(log_dir) {
+            let Some(label) = usage_label(&name, iteration) else {
+                continue;
+            };
+            if let Some(usage) = extract_agent_usage(&log_dir.join(&name)) {
+                rows.push(UsageRow { name, label, usage });
+            }
         }
     }
     rows
