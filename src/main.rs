@@ -2011,10 +2011,7 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     let open_prs = if locally_eligible.is_empty() {
         Vec::new()
     } else {
-        match fetch_open_local_prs(&options.repository) {
-            Ok(prs) => prs,
-            Err(error) => return fail(&format!("alucard: {error}")),
-        }
+        fetch_open_local_prs(&options.repository).unwrap_or_default()
     };
     match serde_json::to_string_pretty(&local_queue_with_open_prs(
         &parsed.tasks,

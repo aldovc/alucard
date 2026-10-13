@@ -968,9 +968,13 @@ fn queue_resolves_explicit_environment_and_detected_task_sources() {
     fs::create_dir_all(&task_directory).unwrap();
     let detected = task_directory.join("tasks.md");
     fs::copy("test/fixtures/contracts/local-tasks.md", &detected).unwrap();
+    let gh = root.join("gh");
+    fs::write(&gh, "#!/bin/sh\necho 'gh unavailable' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     let binary = env!("CARGO_BIN_EXE_alucard");
 
     let detected_run = Command::new(binary)
+        .env("PATH", &root)
         .args([
             "--db-path",
             root.join("detected.db").to_str().unwrap(),
@@ -983,6 +987,7 @@ fn queue_resolves_explicit_environment_and_detected_task_sources() {
 
     let environment_run = Command::new(binary)
         .env("ALUCARD_TASKS_FILE", &detected)
+        .env("PATH", &root)
         .args([
             "--db-path",
             root.join("environment.db").to_str().unwrap(),
