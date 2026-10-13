@@ -56,6 +56,24 @@ fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (Option<S
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir(&repository).unwrap();
     git_repository(&repository);
+    if matches!(
+        case.name,
+        "feedback-toolchain-ok" | "feedback-toolchain-broken"
+    ) {
+        fs::write(repository.join("package-lock.json"), "{}\n").unwrap();
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "manifest",
+        ]));
+    }
     if let Some(policy) = case.review_policy {
         fs::write(
             repository.join("REVIEW.md"),
@@ -109,6 +127,9 @@ if [ "${1:-} ${2:-}" = "image inspect" ]; then
   echo stamp
   exit 0
 fi
+case " $* " in
+  *" --name alucard-preflight-"*) exit "${ALUCARD_PREFLIGHT_RC:-0}" ;;
+esac
 work= output=
 for argument in "$@"; do
   case "$argument" in
@@ -116,14 +137,97 @@ for argument in "$@"; do
     *:/work-output:rw) output=${argument%:/work-output:rw} ;;
   esac
 done
+case " $* " in
+  *" --name alucard-fix-"*)
+    if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
+      previous=
+      for argument in "$@"; do
+        if [ "$previous" = --name ]; then
+          printf '%s\n' "$argument" >> "$ALUCARD_CI_FIX_ATTEMPTS"
+          break
+        fi
+        previous=$argument
+      done
+      printf 'uncommitted ci repair\n' > "$work/ci-repair.txt"
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+      exit 0
+    fi
+    ;;
+esac
 if [ -n "$output" ]; then
   printf '%s\n' "$@" >> "$ALUCARD_REVIEW_ARGS"
-  attempt=$(($(wc -l < "$ALUCARD_REVIEW_ATTEMPTS") + 1))
-  printf '%s\n' "$attempt" >> "$ALUCARD_REVIEW_ATTEMPTS"
-  outcome=$(printf '%s\n' "$ALUCARD_REVIEW_OUTCOMES" | sed -n "${attempt}p")
+  role=review
+  case " $* " in *" --name alucard-feedback-"*) role=feedback ;; esac
+  attempts="$ALUCARD_REVIEW_ATTEMPTS"
+  outcomes="$ALUCARD_REVIEW_OUTCOMES"
+  if [ "$role" = feedback ]; then
+    attempts="$ALUCARD_FEEDBACK_ATTEMPTS"
+    outcomes="$ALUCARD_FEEDBACK_OUTCOMES"
+  fi
+  attempt=$(($(wc -l < "$attempts") + 1))
+  printf '%s\n' "$attempt" >> "$attempts"
+  outcome=$(printf '%s\n' "$outcomes" | sed -n "${attempt}p")
+  if [ "$role" = feedback ] && [ -z "$outcome" ]; then outcome=push; fi
+  if [ "$role" = review ] && [ -z "$outcome" ]; then outcome=verdict; fi
+  if [ "$role" = feedback ]; then
+    case "$ALUCARD_CASE" in
+      feedback-stall) outcome=stall-fail ;;
+      feedback-retained) outcome=retained ;;
+    esac
+  fi
+  prompt=
+  if [ "$role" = feedback ]; then
+    prompt=$(cat)
+  else
+    for argument in "$@"; do prompt=$argument; done
+  fi
+  printf '%s' "$prompt" > "$ALUCARD_PROMPTS/$role-$attempt.txt"
+  if [ "$role" = review ]; then
+    git -C "$work" rev-parse HEAD >> "$ALUCARD_REVIEW_HEADS"
+  fi
+  if [ "$role" = feedback ]; then
+    case "$outcome" in
+      *blocked*) printf '%s\n' 'blocked finding' > "$output/.alucard-blocked" ;;
+    esac
+    case "$outcome" in
+      push*|*push*)
+        git -C "$work" config user.email test@example.com
+        git -C "$work" config user.name Test
+        printf 'feedback %s\n' "$attempt" > "$work/feedback-$attempt.txt"
+        git -C "$work" add "feedback-$attempt.txt"
+        git -C "$work" commit -qm feedback
+        git -C "$work" push -q origin "HEAD:$(git -C "$work" branch --show-current)"
+        ;;
+      retained) printf 'uncommitted feedback\n' > "$work/retained.txt" ;;
+    esac
+    case "$outcome" in
+      *fail*) printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500}'; exit 1 ;;
+    esac
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+    exit 0
+  fi
   if [ "$outcome" = verdict ] || [ "$outcome" = transport-verdict ]; then
-    printf '%s\n' "$ALUCARD_REVIEW_VERDICT" > "$output/.alucard-review"
-    printf 'review body\n' > "$output/.alucard-review-body"
+    verdict="$ALUCARD_REVIEW_VERDICT"
+    body='review body'
+    case "$ALUCARD_CASE:$attempt" in
+      findings-handoff:1)
+        verdict=CHANGES_REQUESTED
+        body='## Findings
+
+KEEP-FINDING
+
+## Too large for this loop
+
+DROP-TOO-LARGE
+
+## Non-blocking
+
+DROP-NON-BLOCKING' ;;
+      feedback-stall:1) verdict=CHANGES_REQUESTED ;;
+      feedback-ci-missing-after-push:1) verdict=CHANGES_REQUESTED ;;
+    esac
+    printf '%s\n' "$verdict" > "$output/.alucard-review"
+    printf '%s\n' "$body" > "$output/.alucard-review-body"
   fi
   if [ "$ALUCARD_ADVANCE_HEAD" = 1 ] && [ "$attempt" = 1 ]; then
     advance="$ALUCARD_ADVANCE_CHECKOUT"
@@ -159,6 +263,33 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
 
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        r#"#!/bin/sh
+set -eu
+if [ "${ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP:-0}" = 1 ] && [ "${1:-}" = clone ] && [ "${2:-}" = --quiet ] && [ "${3:-}" = --branch ]; then
+  case "${6:-}" in
+    *alucard-feedback-*/checkout)
+      advance="$ALUCARD_ADVANCE_CHECKOUT"
+      /usr/bin/git clone -q "$ALUCARD_REMOTE" "$advance"
+      /usr/bin/git -C "$advance" checkout -q "$(cat "$ALUCARD_BRANCH_FILE")"
+      /usr/bin/git -C "$advance" config user.email test@example.com
+      /usr/bin/git -C "$advance" config user.name Test
+      printf 'feedback setup advance\n' > "$advance/feedback-setup-advance.txt"
+      /usr/bin/git -C "$advance" add feedback-setup-advance.txt
+      /usr/bin/git -C "$advance" commit -qm advance
+      /usr/bin/git -C "$advance" push -q origin "HEAD:$(cat "$ALUCARD_BRANCH_FILE")"
+      export ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP=0
+      ;;
+  esac
+fi
+exec /usr/bin/git "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+
     let gh = bin.join("gh");
     fs::write(
         &gh,
@@ -169,11 +300,31 @@ branch=$(cat "$ALUCARD_BRANCH_FILE" 2>/dev/null || true)
 sha() { git --git-dir="$ALUCARD_REMOTE" rev-parse "refs/heads/$branch"; }
 case "$1 $2" in
   'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
-  'pr checks') echo "no checks reported" >&2; exit 1 ;;
+  'pr checks')
+    if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
+      feedback_attempts=$(wc -l < "$ALUCARD_FEEDBACK_ATTEMPTS")
+      repair_attempts=$(wc -l < "$ALUCARD_CI_FIX_ATTEMPTS")
+      if [ "$repair_attempts" -eq $(((feedback_attempts + 1) * 2)) ]; then
+        exit 0
+      fi
+      echo "checks failed" >&2
+      exit 1
+    fi
+    if [ "$ALUCARD_CASE" = feedback-ci-missing-after-push ] && [ ! -s "$ALUCARD_FEEDBACK_ATTEMPTS" ]; then
+      exit 0
+    fi
+    echo "no checks reported" >&2
+    exit 1
+    ;;
   'pr view')
     case "$*" in
       *headRefOid*) sha ;;
-      *--json\ comments*) printf '%s\n' "$ALUCARD_PR_COMMENTS" ;;
+      *--json\ comments*)
+        if [ "$ALUCARD_CASE" = feedback-blocked ] && [ -s "$ALUCARD_FEEDBACK_ATTEMPTS" ]; then
+          printf '%s\n' '{"comments":[{"body":"**🤖 Alucard blocked findings** (cycle 1/2)\n\nblocked finding"}]}'
+        else
+          printf '%s\n' "$ALUCARD_PR_COMMENTS"
+        fi ;;
       *reviews*'.body'*) printf '%s\n' "$ALUCARD_FORMAL_BODY" ;;
       *reviews*) printf '%s\n' "$ALUCARD_FORMAL_VERDICT" ;;
     esac ;;
@@ -189,12 +340,23 @@ esac
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+        format!(
+            "ALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER={}\nANTHROPIC_API_KEY=test\n",
+            if case.name == "feedback-invocation-failure" {
+                "unsupported"
+            } else {
+                "codex"
+            }
+        ),
     )
     .unwrap();
     let review_args = root.join("review-args");
     let review_attempts = root.join("review-attempts");
     fs::write(&review_attempts, "").unwrap();
+    fs::write(root.join("feedback-attempts"), "").unwrap();
+    fs::write(root.join("ci-fix-attempts"), "").unwrap();
+    let review_heads = root.join("review-heads");
+    fs::write(&review_heads, "").unwrap();
     let branch_file = root.join("branch");
     let gh_trace = root.join("gh-trace");
     let database = root.join("ledger.db");
@@ -208,8 +370,17 @@ esac
         .env("ALUCARD_BRANCH_FILE", &branch_file)
         .env("ALUCARD_REVIEW_ARGS", &review_args)
         .env("ALUCARD_REVIEW_ATTEMPTS", &review_attempts)
+        .env("ALUCARD_REVIEW_HEADS", &review_heads)
+        .env("ALUCARD_FEEDBACK_ATTEMPTS", root.join("feedback-attempts"))
+        .env("ALUCARD_CI_FIX_ATTEMPTS", root.join("ci-fix-attempts"))
+        .env("ALUCARD_PROMPTS", {
+            let prompts = root.join("prompts");
+            fs::create_dir(&prompts).unwrap();
+            prompts
+        })
         .env("ALUCARD_GH_TRACE", &gh_trace)
         .env("ALUCARD_REVIEW_VERDICT", case.file_verdict)
+        .env("ALUCARD_CASE", case.name)
         .env("ALUCARD_FORMAL_VERDICT", case.formal_verdict)
         .env("ALUCARD_FORMAL_BODY", "formal body")
         .env("ALUCARD_PR_COMMENTS", case.comments_json)
@@ -219,8 +390,33 @@ esac
         )
         .env("ALUCARD_REVIEW_OUTCOMES", case.reviewer_outcomes)
         .env(
+            "ALUCARD_FEEDBACK_OUTCOMES",
+            match case.name {
+                "feedback-blocked" => "push-blocked",
+                "feedback-fails-after-push" => "push-fail",
+                "feedback-setup-advance" => "stall",
+                _ => "push",
+            },
+        )
+        .env(
+            "ALUCARD_PREFLIGHT_RC",
+            if case.name == "feedback-toolchain-broken" {
+                "23"
+            } else {
+                "0"
+            },
+        )
+        .env(
             "ALUCARD_ADVANCE_HEAD",
             if case.advance_head { "1" } else { "0" },
+        )
+        .env(
+            "ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP",
+            if case.name == "feedback-setup-advance" {
+                "1"
+            } else {
+                "0"
+            },
         )
         .env("ALUCARD_ADVANCE_CHECKOUT", root.join("advance"))
         .args([
@@ -236,6 +432,8 @@ esac
             "--logs-root",
             root.join("logs").to_str().unwrap(),
             "--no-build",
+            "--max-review-cycles",
+            "2",
             repository.to_str().unwrap(),
         ])
         .output()
@@ -249,8 +447,8 @@ esac
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?)),
         )
         .unwrap();
-    assert_eq!(result.0, case.expected_verdict);
-    assert_eq!(result.1, case.expected_state);
+    assert_eq!(result.0, case.expected_verdict, "{}", case.name);
+    assert_eq!(result.1, case.expected_state, "{}", case.name);
     drop(connection);
     (
         root,
@@ -445,6 +643,162 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             expected_verdict: "APPROVED",
             expected_state: "review_needs_human",
         },
+        ReviewCase {
+            name: "findings-handoff",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "CHANGES_REQUESTED",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[{\"body\":\"HUMAN-COMMENT\",\"author\":{\"login\":\"person\"},\"createdAt\":\"now\"}]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-stall",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-retained",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-invocation-failure",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-toolchain-ok",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-toolchain-broken",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-blocked",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-fails-after-push",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-ci-repair-after-push",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-setup-advance",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-ci-missing-after-push",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "feedback-cycle-exhaustion",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
     ];
 
     for case in &cases {
@@ -516,6 +870,93 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
         if case.name == "review-formal-approved-only" {
             assert!(!trace.contains("Reviewed head:"));
             assert_eq!(shas.0, None);
+        }
+        if case.name == "findings-handoff" {
+            let feedback = fs::read_to_string(root.join("prompts/feedback-1.txt")).unwrap();
+            assert!(feedback.contains("KEEP-FINDING"), "{feedback}");
+            assert!(feedback.contains("HUMAN-COMMENT"));
+            assert!(!feedback.contains("DROP-TOO-LARGE"));
+            assert!(!feedback.contains("DROP-NON-BLOCKING"));
+            assert!(feedback.contains("No Python or Node manifest found"));
+        }
+        if matches!(
+            case.name,
+            "feedback-toolchain-ok" | "feedback-toolchain-broken"
+        ) {
+            let feedback = fs::read_to_string(root.join("prompts/feedback-1.txt")).unwrap();
+            let expected = if case.name == "feedback-toolchain-ok" {
+                "OK — `npm ci` at the repo root completes"
+            } else {
+                "BROKEN — `npm ci` at the repo root fails inside the container (rc=23)"
+            };
+            assert!(feedback.contains(expected));
+        }
+        if case.name == "feedback-blocked" {
+            let second_review = fs::read_to_string(root.join("prompts/review-2.txt")).unwrap();
+            assert!(trace.contains("Alucard blocked findings"));
+            assert!(second_review.contains("blocked finding"));
+        }
+        if case.name == "feedback-fails-after-push" {
+            assert!(trace.contains("feedback agent failed after pushing"));
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+        if case.name == "feedback-ci-repair-after-push" {
+            let repairs = fs::read_to_string(root.join("ci-fix-attempts")).unwrap();
+            assert_eq!(repairs.lines().count(), 4);
+            assert!(repairs.contains("-0-1"), "{repairs}");
+            assert!(repairs.contains("-0-2"), "{repairs}");
+            assert!(repairs.contains("-1-1"), "{repairs}");
+            assert!(repairs.contains("-1-2"), "{repairs}");
+        }
+        if case.name == "feedback-setup-advance" {
+            assert!(!trace.contains("feedback agent stopped without publishing"));
+            assert_eq!(trace.matches("pr checks").count(), 2);
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+        if case.name == "feedback-cycle-exhaustion" {
+            assert!(trace.contains("gave up after 2/2 review cycles — needs human"));
+            assert_eq!(
+                fs::read_to_string(root.join("feedback-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        if case.name == "feedback-ci-missing-after-push" {
+            assert!(trace.contains("APPROVED — no CI ran, needs human"));
+            assert!(!trace.contains("Alucard review cycle 2/2: APPROVED**"));
+        }
+        if case.name == "feedback-toolchain-ok" {
+            let heads = fs::read_to_string(root.join("review-heads")).unwrap();
+            let heads = heads.lines().collect::<Vec<_>>();
+            assert_eq!(heads.len(), 2);
+            assert_ne!(heads[0], heads[1]);
+        }
+        if matches!(
+            case.name,
+            "feedback-stall" | "feedback-retained" | "feedback-invocation-failure"
+        ) {
+            assert!(trace.contains("feedback agent stopped without publishing"));
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
         }
         match case.expected_state {
             "review_blocked" => assert!(trace.contains("pr edit 77 --add-label needs-human")),
