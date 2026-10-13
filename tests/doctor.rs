@@ -108,6 +108,27 @@ fn doctor_uses_checkout_root_and_checks_installed_manifest() {
 }
 
 #[test]
+fn doctor_reports_missing_locator_files_from_installed_directory() {
+    for file in ["Dockerfile", "alucard-engineering-policy.md"] {
+        let directory = temp_dir();
+        let binary = copy_tool_installation(&directory);
+        let repository = directory.join("repository");
+        fs::create_dir(&repository).unwrap();
+        fs::remove_file(directory.join("tools").join(file)).unwrap();
+
+        let output = doctor(&binary, &repository, &directory.join("bin"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&format!(
+            "missing: {}",
+            directory.join("tools").join(file).display()
+        )));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("could not locate tool files"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
 fn doctor_github_mode_ignores_environment_tasks_file_and_accepts_zero_timeout() {
     let directory = temp_dir();
     let binary = copy_tool_installation(&directory);

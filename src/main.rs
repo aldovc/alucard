@@ -883,14 +883,13 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// The checkout holding the prompts and Dockerfile: the nearest ancestor of the executable that has them.
+/// The checkout or installed tool directory containing the executable's supporting files.
 fn tool_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     exe.ancestors()
-        .find(|d| {
-            d.join("Dockerfile").is_file() && d.join("alucard-engineering-policy.md").is_file()
-        })
+        .find(|d| d.join("Cargo.toml").is_file())
         .map(PathBuf::from)
+        .or_else(|| exe.parent()?.parent().map(PathBuf::from))
 }
 
 fn version() -> String {
