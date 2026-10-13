@@ -6,8 +6,8 @@ use alucard::{
     run_claims, run_command as execute_command, run_pull_requests, status, GithubPullRequest,
     GithubTask,
 };
-use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -144,11 +144,8 @@ fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> Exi
     }
 }
 
-fn gh_output(repository: &PathBuf, args: &[&str], context: &str) -> Result<Vec<u8>, String> {
-    let output = Command::new("gh")
-        .current_dir(repository)
-        .args(args)
-        .output()
+fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>, String> {
+    let output = execute_command("gh", args, repository, None)
         .map_err(|error| format!("{context}: {error}"))?;
     if output.status.success() {
         Ok(output.stdout)
@@ -162,7 +159,7 @@ fn gh_output(repository: &PathBuf, args: &[&str], context: &str) -> Result<Vec<u
     }
 }
 
-fn fetch_github_issues(repository: &PathBuf) -> Result<Vec<GithubTask>, String> {
+fn fetch_github_issues(repository: &Path) -> Result<Vec<GithubTask>, String> {
     serde_json::from_slice(&gh_output(
         repository,
         &[
@@ -182,7 +179,7 @@ fn fetch_github_issues(repository: &PathBuf) -> Result<Vec<GithubTask>, String> 
     .map_err(|error| format!("could not parse GitHub issues: {error}"))
 }
 
-fn fetch_open_issue_numbers_required(repository: &PathBuf) -> Result<Vec<i64>, String> {
+fn fetch_open_issue_numbers_required(repository: &Path) -> Result<Vec<i64>, String> {
     let values: Vec<serde_json::Value> = serde_json::from_slice(&gh_output(
         repository,
         &[
@@ -202,7 +199,7 @@ fn fetch_open_issue_numbers_required(repository: &PathBuf) -> Result<Vec<i64>, S
         .collect()
 }
 
-fn fetch_open_prs(repository: &PathBuf) -> Result<Vec<GithubPullRequest>, String> {
+fn fetch_open_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
     let owner = String::from_utf8(gh_output(
         repository,
         &[
@@ -241,14 +238,16 @@ fn fetch_open_prs(repository: &PathBuf) -> Result<Vec<GithubPullRequest>, String
         .map_err(|error| format!("could not parse open pull requests: {error}"))
 }
 
-fn fetch_open_issue_numbers(repository: &PathBuf) -> Option<Vec<i64>> {
-    let output = Command::new("gh")
-        .current_dir(repository)
-        .args([
+fn fetch_open_issue_numbers(repository: &Path) -> Option<Vec<i64>> {
+    let output = execute_command(
+        "gh",
+        &[
             "issue", "list", "--state", "open", "--json", "number", "--limit", "1000",
-        ])
-        .output()
-        .ok()?;
+        ],
+        repository,
+        None,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
