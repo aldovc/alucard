@@ -1,6 +1,6 @@
 use alucard::{
-    acquire_pr, acquire_task, heartbeat, migrate, open, release, status, transition_task,
-    ClaimError, TaskStatus,
+    acquire_pr, acquire_task, heartbeat, interrupt_running_runs, migrate, open, prepare_run,
+    release, status, transition_task, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,6 +51,112 @@ fn insert_run(path: &Path, run_id: &str) {
             [run_id],
         )
         .unwrap();
+}
+
+fn seed_repository(path: &Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::create_dir(path).unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.invalid"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    fs::write(path.join("README.md"), "seed\n").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-qm", "seed"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+}
+
+#[test]
+fn prepared_runs_have_isolated_clones_branches_and_directories() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let repository = root.join("source");
+    seed_repository(&repository);
+    let logs = root.join("logs");
+    let cache = root.join("cache");
+
+    let first = prepare_run(
+        &path,
+        RunOptions {
+            repository: &repository,
+            logs_root: &logs,
+            cache_root: &cache,
+            base: "HEAD",
+            image: None,
+            task: Some("alpha"),
+            issue: None,
+        },
+    )
+    .unwrap();
+    let second = prepare_run(
+        &path,
+        RunOptions {
+            repository: &repository,
+            logs_root: &logs,
+            cache_root: &cache,
+            base: "HEAD",
+            image: None,
+            task: None,
+            issue: Some(42),
+        },
+    )
+    .unwrap();
+
+    assert_ne!(first.directory, second.directory);
+    assert_ne!(first.branch, second.branch);
+    assert!(first.clone.join(".git").is_dir());
+    assert!(second.clone.join(".git").is_dir());
+    assert!(first.branch.ends_with("-task-alpha"));
+    assert!(second.branch.ends_with("-issue-42"));
+    assert_eq!(
+        open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                [&first.run.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "running"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn startup_interrupts_unfinished_runs() {
+    let path = database_path();
+    prepare_claims(&path, &[]);
+    insert_run(&path, "stopped");
+
+    assert_eq!(interrupt_running_runs(&path).unwrap(), 1);
+    assert_eq!(
+        open(&path)
+            .unwrap()
+            .query_row("SELECT status FROM runs WHERE id = 'stopped'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "interrupted"
+    );
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
 #[test]

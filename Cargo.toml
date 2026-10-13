@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+fs2 = "0.4.3"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 uuid = { version = "=1.11.0", features = ["v4"] }
 
