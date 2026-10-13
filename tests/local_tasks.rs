@@ -454,12 +454,26 @@ fn run_github_recovery_case(root: &Path, scenario: &str) {
 case "$1 $2" in
   'image inspect') echo stamp ;;
   'run '*)
-    printf x >> "$ALUCARD_GITHUB_RECOVERY_DOCKER_TRACE"
-    for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; esac; done
+    for argument in "$@"; do case "$argument" in alucard-*) printf '%s\n' "$argument" >> "$ALUCARD_GITHUB_RECOVERY_DOCKER_TRACE" ;; *:/work:rw) worktree=${argument%:/work:rw} ;; *:/work-output:rw) output=${argument%:/work-output:rw} ;; esac; done
+    if [ -n "$output" ]; then
+      if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = wrapup_timeout ]; then
+        exit 124
+      fi
+      printf '%s\n' '## Done' > "$output/.alucard-handoff"
+      printf '%s\n' 'Recovery handoff.' >> "$output/.alucard-handoff"
+      if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = wrapup_dirty ]; then
+        printf 'wrap-up fix\n' > "$worktree/wrapup.txt"
+      fi
+      exit 1
+    fi
     case "$ALUCARD_GITHUB_RECOVERY_SCENARIO" in
       timeout)
         printf 'unfinished\n' > "$worktree/recovery.txt"
         exit 124 ;;
+      wrapup_timeout)
+        printf 'unfinished\n' > "$worktree/recovery.txt"
+        printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"failed"}'
+        exit 1 ;;
       *)
         printf 'unfinished\n' > "$worktree/recovery.txt"
         git -C "$worktree" add recovery.txt
@@ -519,6 +533,7 @@ esac
     .unwrap();
     let database = root.join("ledger.db");
     let logs = root.join("logs");
+    fs::create_dir_all(logs.join("wrapup-output")).unwrap();
     let arguments = [
         "--db-path",
         database.to_str().unwrap(),
@@ -577,8 +592,11 @@ esac
     let output = invoke();
     assert!(output.status.success(), "{scenario}: {output:?}");
     assert_eq!(
-        fs::read_to_string(root.join("docker-trace")).unwrap().len(),
-        1,
+        fs::read_to_string(root.join("docker-trace"))
+            .unwrap()
+            .lines()
+            .count(),
+        if scenario == "timeout" { 1 } else { 2 },
         "{scenario}"
     );
 }
@@ -591,6 +609,12 @@ fn test_worker_recovery() {
     assert!(fs::read_to_string(root.join("body"))
         .unwrap()
         .starts_with("Refs #134\n\n"));
+    assert!(fs::read_to_string(root.join("body"))
+        .unwrap()
+        .contains("## Handoff from the wrap-up agent\n\n## Done\nRecovery handoff."));
+    assert!(fs::read_to_string(root.join("docker-trace"))
+        .unwrap()
+        .contains("alucard-wrapup-1-"));
     assert_eq!(
         fs::read_to_string(root.join("marker")).unwrap(),
         "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."
@@ -604,6 +628,38 @@ fn test_worker_recovery() {
         trace.contains("issue edit 134 --remove-label in-progress"),
         "{trace}"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn wrapup_changes_are_committed_to_the_recovery_branch() {
+    let root = temporary_path("github-wrapup-recovery");
+    fs::create_dir(&root).unwrap();
+    run_github_recovery_case(&root, "wrapup_dirty");
+    let branch = Command::new("git")
+        .args([
+            "--git-dir",
+            root.join("remote.git").to_str().unwrap(),
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/alucard/",
+        ])
+        .output()
+        .unwrap();
+    let branch = String::from_utf8(branch.stdout).unwrap();
+    let branch = branch.trim();
+    assert!(!branch.is_empty());
+    let file = Command::new("git")
+        .args([
+            "--git-dir",
+            root.join("remote.git").to_str().unwrap(),
+            "show",
+            &format!("{branch}:wrapup.txt"),
+        ])
+        .output()
+        .unwrap();
+    assert!(file.status.success(), "{file:?}");
+    assert_eq!(String::from_utf8(file.stdout).unwrap(), "wrap-up fix\n");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -629,6 +685,29 @@ fn test_timeout_recovery() {
     assert!(String::from_utf8(commits.stdout)
         .unwrap()
         .contains("wip: alucard recovery — uncommitted worker state"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn wrapup_timeout_still_creates_a_recovery_pr() {
+    let root = temporary_path("github-wrapup-timeout-recovery");
+    fs::create_dir(&root).unwrap();
+    run_github_recovery_case(&root, "wrapup_timeout");
+    let commits = Command::new("git")
+        .args([
+            "--git-dir",
+            root.join("remote.git").to_str().unwrap(),
+            "log",
+            "--all",
+            "--format=%s",
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8(commits.stdout)
+        .unwrap()
+        .contains("wip: alucard recovery — uncommitted worker state"));
+    let trace = fs::read_to_string(root.join("gh-trace")).unwrap();
+    assert!(trace.contains("pr create ") && trace.contains(" --draft "));
     fs::remove_dir_all(root).unwrap();
 }
 
