@@ -966,6 +966,10 @@ fn recover_worker_changes(
         let commit = execute_command(
             "git",
             &[
+                "-c",
+                "user.email=alucard@noreply.local",
+                "-c",
+                "user.name=alucard",
                 "commit",
                 "-m",
                 "wip: alucard recovery — uncommitted worker state",
