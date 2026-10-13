@@ -6042,7 +6042,7 @@ printf '%s' "$prompt""#,
         .unwrap();
         assert_eq!(
             continue_feedback_findings(&comments, "alucard"),
-            "**🤖 Alucard review cycle 1/2: CHANGES_REQUESTED**\n\nfix the thing\n"
+            "**🤖 Alucard review cycle 1/2: CHANGES_REQUESTED**\n\nfix the thing"
         );
     }
 
