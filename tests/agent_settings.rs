@@ -1,5 +1,6 @@
 use alucard::{
-    build_inputs_hash, compose_role_prompt, AgentInvocation, AgentRole, AgentSettings, Provider,
+    build_inputs_hash, classify_agent_output, compose_role_prompt, AgentExit, AgentInvocation,
+    AgentRole, AgentSettings, Provider,
 };
 use std::fs;
 use std::path::Path;
@@ -159,4 +160,44 @@ fn prompt_and_image_stamp_match_bash_inputs() {
     );
     assert_eq!(prompt, expected);
     assert_eq!(build_inputs_hash(root).unwrap().len(), 64);
+}
+
+#[test]
+fn provider_result_classification_matches_bash_contract() {
+    let cases = [
+        (
+            Provider::Claude,
+            Some(1),
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"The billing connection was updated."}"#,
+            AgentExit::Failed,
+        ),
+        (
+            Provider::Claude,
+            Some(0),
+            r#"{"type":"result","subtype":"success","is_error":false,"api_error_status":429,"result":"Completed."}"#,
+            AgentExit::Transport,
+        ),
+        (
+            Provider::Claude,
+            Some(1),
+            r#"{"type":"result","subtype":"error","is_error":true,"api_error_status":503,"result":"Unavailable."}"#,
+            AgentExit::Transport,
+        ),
+        (
+            Provider::Claude,
+            Some(1),
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}"#,
+            AgentExit::Exhausted,
+        ),
+        (
+            Provider::Codex,
+            Some(1),
+            r#"{"type":"item.completed","item":{"type":"error","message":"stream error: connection closed"}}"#,
+            AgentExit::Transport,
+        ),
+    ];
+
+    for (provider, status, fixture, expected) in cases {
+        assert_eq!(classify_agent_output(provider, status, fixture), expected);
+    }
 }

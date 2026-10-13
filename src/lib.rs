@@ -3,6 +3,7 @@
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::CStr;
@@ -480,6 +481,7 @@ pub struct AgentInvocation<'a> {
 pub enum AgentExit {
     Clean,
     Timeout,
+    Exhausted,
     Transport,
     Billing,
     Failed,
@@ -489,6 +491,112 @@ pub enum AgentExit {
 pub struct AgentResult {
     pub status: Option<i32>,
     pub classification: AgentExit,
+}
+
+/// Classifies an agent process exit from its final provider result record.
+pub fn classify_agent_output(provider: Provider, status: Option<i32>, log: &str) -> AgentExit {
+    if matches!(status, Some(124 | 137)) {
+        return AgentExit::Timeout;
+    }
+
+    let record = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| match provider {
+            Provider::Claude => record.get("type").and_then(Value::as_str) == Some("result"),
+            Provider::Codex => {
+                record.get("type").and_then(Value::as_str) == Some("item.completed")
+                    && record
+                        .get("item")
+                        .and_then(|item| item.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("error")
+            }
+        })
+        .last();
+
+    let Some(record) = record else {
+        return if status == Some(0) {
+            AgentExit::Clean
+        } else {
+            AgentExit::Failed
+        };
+    };
+
+    if record.get("error").and_then(Value::as_str) == Some("billing_error") {
+        return AgentExit::Billing;
+    }
+
+    match provider {
+        Provider::Codex => {
+            let message = record
+                .get("item")
+                .and_then(|item| item.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if has_transport_error(message, false) {
+                AgentExit::Transport
+            } else {
+                AgentExit::Failed
+            }
+        }
+        Provider::Claude => {
+            let subtype = record
+                .get("subtype")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if subtype == "error_max_turns" {
+                return AgentExit::Exhausted;
+            }
+            let api_status = record.get("api_error_status").and_then(Value::as_i64);
+            if api_status == Some(429) || matches!(api_status, Some(500..=599)) {
+                return AgentExit::Transport;
+            }
+            let is_error = record
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if subtype == "success" && !is_error && status == Some(0) {
+                return AgentExit::Clean;
+            }
+            if subtype == "success" && is_error {
+                return AgentExit::Transport;
+            }
+            let result = record
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if is_error && has_transport_error(result, true) {
+                AgentExit::Transport
+            } else {
+                AgentExit::Failed
+            }
+        }
+    }
+}
+
+fn has_transport_error(message: &str, anchored: bool) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "connection closed",
+        "network error",
+        "overloaded",
+        "rate limit",
+        "rate-limit",
+        "gateway",
+        "reset by peer",
+        "econnreset",
+        "timed out waiting",
+        "api error",
+    ]
+    .iter()
+    .any(|marker| {
+        if anchored {
+            message.starts_with(marker)
+        } else {
+            message.contains(marker)
+        }
+    })
 }
 
 impl AgentInvocation<'_> {
@@ -639,31 +747,8 @@ impl AgentInvocation<'_> {
             .args(["rm", "-f", self.name])
             .status();
         let status = status?;
-        let log = fs::read_to_string(log_file)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let classification = match status.code() {
-            Some(0) => AgentExit::Clean,
-            Some(124 | 137) => AgentExit::Timeout,
-            _ if log.contains("billing") || log.contains("credit") || log.contains("quota") => {
-                AgentExit::Billing
-            }
-            _ if [
-                "connection",
-                "network error",
-                "overloaded",
-                "rate limit",
-                "gateway",
-                "econnreset",
-                "api error",
-            ]
-            .iter()
-            .any(|marker| log.contains(marker)) =>
-            {
-                AgentExit::Transport
-            }
-            _ => AgentExit::Failed,
-        };
+        let log = fs::read_to_string(log_file).unwrap_or_default();
+        let classification = classify_agent_output(provider, status.code(), &log);
         Ok(AgentResult {
             status: status.code(),
             classification,
