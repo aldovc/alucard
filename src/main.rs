@@ -1785,6 +1785,7 @@ fn review_gate(
     let root = std::env::temp_dir().join(format!("alucard-review-{}", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut cycle = 1;
+        let mut ci_result = ci_result;
         let mut feedback_checks_available = true;
         'cycles: while cycle <= options.max_review_cycles {
             for attempt in 1..=options.transport_attempts {
@@ -1895,24 +1896,30 @@ fn review_gate(
                 };
                 match verdict {
                     Some(ReviewVerdict::Approved) => {
-                        let no_ci = ci_result == Some(CiResult::Missing);
-                        let status = if no_ci {
-                            "APPROVED — no CI ran, needs human"
-                        } else {
-                            "APPROVED"
+                        let ci_handoff = match ci_result {
+                            Some(CiResult::Green) => None,
+                            Some(CiResult::Missing) => Some((
+                                "APPROVED — no CI ran, needs human",
+                                "The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.\n\n",
+                            )),
+                            Some(CiResult::Failed) => Some((
+                                "APPROVED — CI is failing, needs human",
+                                "The reviewer approved the code, but CI is failing on the current head, so it is not ready to merge. Fix the failing checks before merging.\n\n",
+                            )),
+                            None => Some((
+                                "APPROVED — CI result unavailable, needs human",
+                                "The reviewer approved the code, but Alucard could not determine CI status for the current head, so it is not ready to merge. Verify the repository's full checks before merging.\n\n",
+                            )),
                         };
+                        let status = ci_handoff.map_or("APPROVED", |(status, _)| status);
                         let marker = if file_verdict == "APPROVED" {
                             format!("Reviewed head: `{reviewed_sha}`\n\n")
                         } else {
                             String::new()
                         };
-                        let no_ci_body = if no_ci {
-                            "The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.\n\n"
-                        } else {
-                            ""
-                        };
+                        let ci_handoff_body = ci_handoff.map_or("", |(_, body)| body);
                         let comment = format!(
-                        "**🤖 Alucard review cycle {cycle}/{}: {status}**\n\n{marker}{no_ci_body}{body}",
+                        "**🤖 Alucard review cycle {cycle}/{}: {status}**\n\n{marker}{ci_handoff_body}{body}",
                         options.max_review_cycles
                     );
                         let _ = execute_command(
@@ -1921,7 +1928,7 @@ fn review_gate(
                             &prepared.clone,
                             None,
                         );
-                        if no_ci {
+                        if ci_handoff.is_some() {
                             let _ = execute_command(
                                 "gh",
                                 &[
@@ -1940,7 +1947,7 @@ fn review_gate(
                             task_id,
                             pr_number,
                             ReviewVerdict::Approved.as_str(),
-                            if no_ci {
+                            if ci_handoff.is_some() {
                                 "review_needs_human"
                             } else {
                                 ReviewVerdict::Approved.gate_state()
@@ -2074,7 +2081,7 @@ fn review_gate(
                                     None,
                                 );
                             }
-                            let _ = (CiGate {
+                            ci_result = (CiGate {
                                 tools,
                                 settings,
                                 options,
@@ -2087,7 +2094,8 @@ fn review_gate(
                                 pr_number,
                                 iteration,
                                 &mut feedback_checks_available,
-                            );
+                            )
+                            .ok();
                             cycle += 1;
                             continue 'cycles;
                         }

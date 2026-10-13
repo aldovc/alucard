@@ -207,6 +207,7 @@ DROP-TOO-LARGE
 
 DROP-NON-BLOCKING' ;;
       feedback-stall:1) verdict=CHANGES_REQUESTED ;;
+      feedback-ci-missing-after-push:1) verdict=CHANGES_REQUESTED ;;
     esac
     printf '%s\n' "$verdict" > "$output/.alucard-review"
     printf '%s\n' "$body" > "$output/.alucard-review-body"
@@ -255,7 +256,13 @@ branch=$(cat "$ALUCARD_BRANCH_FILE" 2>/dev/null || true)
 sha() { git --git-dir="$ALUCARD_REMOTE" rev-parse "refs/heads/$branch"; }
 case "$1 $2" in
   'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
-  'pr checks') echo "no checks reported" >&2; exit 1 ;;
+  'pr checks')
+    if [ "$ALUCARD_CASE" = feedback-ci-missing-after-push ] && [ ! -s "$ALUCARD_FEEDBACK_ATTEMPTS" ]; then
+      exit 0
+    fi
+    echo "no checks reported" >&2
+    exit 1
+    ;;
   'pr view')
     case "$*" in
       *headRefOid*) sha ;;
@@ -657,6 +664,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             expected_state: "review_changes_requested",
         },
         ReviewCase {
+            name: "feedback-ci-missing-after-push",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
             name: "feedback-cycle-exhaustion",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
@@ -785,6 +805,10 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                     .count(),
                 1
             );
+        }
+        if case.name == "feedback-ci-missing-after-push" {
+            assert!(trace.contains("APPROVED — no CI ran, needs human"));
+            assert!(!trace.contains("Alucard review cycle 2/2: APPROVED**"));
         }
         if case.name == "feedback-toolchain-ok" {
             let heads = fs::read_to_string(root.join("review-heads")).unwrap();
