@@ -971,8 +971,6 @@ fn fetch_pinned_issue(repository: &Path, number: i64) -> Result<(GithubTask, boo
     struct PinnedIssue {
         #[serde(flatten)]
         task: GithubTask,
-        #[serde(rename = "isPullRequest")]
-        is_pull_request: bool,
     }
     let issue: PinnedIssue = serde_json::from_slice(&gh_output(
         repository,
@@ -981,12 +979,21 @@ fn fetch_pinned_issue(repository: &Path, number: i64) -> Result<(GithubTask, boo
             "view",
             &number.to_string(),
             "--json",
-            "number,title,body,labels,state,isPullRequest",
+            "number,title,body,labels,state",
         ],
         "could not view GitHub issue",
     )?)
     .map_err(|error| format!("could not parse GitHub issue: {error}"))?;
-    Ok((issue.task, issue.is_pull_request))
+    let is_pull_request = execute_command(
+        "gh",
+        &["pr", "view", &number.to_string(), "--json", "number"],
+        repository,
+        None,
+    )
+    .map_err(|error| format!("could not check whether GitHub issue is a pull request: {error}"))?
+    .status
+    .success();
+    Ok((issue.task, is_pull_request))
 }
 
 fn xml_escape(value: &str) -> String {
