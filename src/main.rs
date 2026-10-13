@@ -1,14 +1,16 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    begin_operation, build_image, compose_role_prompt, database_path, find_run, finish_operation,
-    finish_run, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
-    local_queue_with_open_issues, migrate, open, parse_tasks, prepare_run, recent_runs,
-    record_recovery_failure, record_recovery_pr, record_task_pr, release, run_claims,
-    run_command as execute_command, run_pull_requests, run_recovery, start_retry_run,
-    start_task_run, status, task_id, task_is_pending, toolchain_preflight, transition_task,
-    warn_if_stale_image, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask,
-    Provider, RecoveryPullRequest, RunOptions, TaskStatus,
+    abandoned_task_claims, begin_operation, build_image, compose_role_prompt, database_path,
+    find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
+    import_github_tasks, import_local_tasks, local_queue_with_open_issues,
+    mark_claim_needs_reconciliation, migrate, open, parse_tasks, prepare_run, recent_runs,
+    record_recovery_failure, record_recovery_pr, record_task_pr, release,
+    release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
+    run_reconciliation_reason, run_recovery, start_retry_run, start_task_run, status, task_id,
+    task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image, AgentInvocation,
+    AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider, RecoveryPullRequest,
+    RunOptions, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -593,6 +595,9 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
+    if let Err(error) = reconcile_startup(&database, &options.queue.repository) {
+        return fail(&format!("alucard: reconciliation failed: {error}"));
+    }
     if !options.env_file.is_file() {
         return fail(&format!(
             "alucard: env file not found: {}",
@@ -903,6 +908,111 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         iteration += 1;
     }
     ExitCode::SUCCESS
+}
+
+fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
+    migrate(database).map_err(|error| error.to_string())?;
+    for claim in abandoned_task_claims(database).map_err(|error| error.to_string())? {
+        if docker_run_is_active(&claim.run_id) {
+            continue;
+        }
+        let branch = claim
+            .branch
+            .clone()
+            .or_else(|| abandoned_branch(database, &claim.run_id));
+        let remote = match branch.as_deref() {
+            Some(branch) => reconcile_remote_pr(repository, branch)?,
+            None => None,
+        };
+        match (branch, remote) {
+            (_, Some((number, branch, sha))) => {
+                record_task_pr(
+                    database,
+                    &claim.task_id,
+                    &claim.lease_id,
+                    &claim.run_id,
+                    number,
+                    &branch,
+                    &sha,
+                )
+                .map_err(|error| error.to_string())?;
+                release(database, &claim.lease_id, &claim.run_id)
+                    .map_err(|error| error.to_string())?;
+                finish_run(database, &claim.run_id, "interrupted")
+                    .map_err(|error| error.to_string())?;
+            }
+            (Some(branch), None) => {
+                if remote_branch_exists(repository, &branch)? {
+                    mark_claim_needs_reconciliation(
+                        database,
+                        &claim,
+                        &format!("branch {branch} exists without an open pull request"),
+                    )
+                    .map_err(|error| error.to_string())?;
+                } else {
+                    release_abandoned_task_claim(database, &claim)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            (None, None) => {
+                release_abandoned_task_claim(database, &claim).map_err(|error| error.to_string())?
+            }
+        }
+    }
+    Ok(())
+}
+
+fn abandoned_branch(database: &Path, run_id: &str) -> Option<String> {
+    let run = find_run(database, run_id).ok().flatten()?;
+    let clone = PathBuf::from(run.logs_path?).join("repository");
+    execute_command("git", &["branch", "--show-current"], &clone, None)
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|branch| !branch.is_empty())
+}
+
+fn docker_run_is_active(run_id: &str) -> bool {
+    execute_command(
+        "docker",
+        &["ps", "--format", "{{.Names}}"],
+        Path::new("."),
+        None,
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .is_some_and(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|name| name.starts_with(&format!("alucard-worker-{run_id}-")))
+    })
+}
+
+fn reconcile_remote_pr(
+    repository: &Path,
+    branch: &str,
+) -> Result<Option<(i64, String, String)>, String> {
+    find_open_pr(repository, branch)
+}
+
+fn remote_branch_exists(repository: &Path, branch: &str) -> Result<bool, String> {
+    let output = execute_command(
+        "git",
+        &[
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ],
+        repository,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if output.status.success() || output.status.code() == Some(2) {
+        Ok(output.status.success())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2157,13 +2267,21 @@ fn runs_command(args: &[String], path: &std::path::Path) -> ExitCode {
         return match recent_runs(path) {
             Ok(runs) => {
                 for run in runs {
-                    println!(
+                    let mut line = format!(
                         "{}\t{}\t{}\t{}",
                         run.id,
                         run.status,
                         run.command,
                         run.logs_path.unwrap_or_default()
                     );
+                    match run_reconciliation_reason(path, &run.id) {
+                        Ok(Some(reason)) => {
+                            line.push_str(&format!("\tneeds reconciliation: {reason}"))
+                        }
+                        Ok(None) => {}
+                        Err(error) => return fail(&format!("alucard: database error: {error}")),
+                    }
+                    println!("{line}");
                 }
                 ExitCode::SUCCESS
             }
@@ -2180,6 +2298,11 @@ fn runs_command(args: &[String], path: &std::path::Path) -> ExitCode {
                 println!("base sha: {}", run.base_sha.unwrap_or_default());
                 println!("image: {}", run.image.unwrap_or_default());
                 println!("logs: {}", run.logs_path.unwrap_or_default());
+                match run_reconciliation_reason(path, &run.id) {
+                    Ok(Some(reason)) => println!("needs reconciliation: {reason}"),
+                    Ok(None) => {}
+                    Err(error) => return fail(&format!("alucard: database error: {error}")),
+                }
                 let claims = match run_claims(path, &run.id) {
                     Ok(claims) => claims,
                     Err(error) => return fail(&format!("alucard: database error: {error}")),

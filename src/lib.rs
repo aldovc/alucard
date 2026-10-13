@@ -1736,6 +1736,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_run_owners.sql")),
     (3, include_str!("../migrations/0003_recovery_checkout.sql")),
+    (4, include_str!("../migrations/0004_reconciliation.sql")),
 ];
 
 pub struct DatabaseStatus {
@@ -1795,6 +1796,16 @@ pub struct Recovery {
     pub pull_request_number: Option<i64>,
     pub checkout_path: Option<String>,
     pub failure_reason: Option<String>,
+}
+
+/// An active task claim whose owning process is no longer alive on this host.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AbandonedTaskClaim {
+    pub lease_id: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub repository_id: String,
+    pub branch: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2272,6 +2283,90 @@ pub fn finish_run(path: &Path, run_id: &str, status: &str) -> Result<(), Databas
     Ok(())
 }
 
+/// Lists task claims whose local owner process has exited.
+pub fn abandoned_task_claims(path: &Path) -> Result<Vec<AbandonedTaskClaim>, DatabaseError> {
+    let connection = open(path)?;
+    let hostname = hostname()?;
+    let mut statement = connection.prepare(
+        "SELECT claims.id, claims.run_id, claims.resource_key, claims.repository_id,
+                COALESCE(recovery.branch, pull_requests.branch)
+         FROM claims
+         JOIN runs ON runs.id = claims.run_id
+         LEFT JOIN recovery ON recovery.original_run_id = runs.id
+         LEFT JOIN pull_requests ON pull_requests.task_id = claims.resource_key
+             AND pull_requests.repository_id = claims.repository_id
+         WHERE claims.state = 'active' AND claims.resource_kind = 'task'
+             AND runs.hostname = ?1 AND runs.pid IS NOT NULL",
+    )?;
+    let claims = statement
+        .query_map([hostname], |row| {
+            Ok(AbandonedTaskClaim {
+                lease_id: row.get(0)?,
+                run_id: row.get(1)?,
+                task_id: row.get(2)?,
+                repository_id: row.get(3)?,
+                branch: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|claim| {
+            connection
+                .query_row(
+                    "SELECT pid FROM runs WHERE id = ?1",
+                    [&claim.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok_and(|pid| !process_is_alive(pid))
+        })
+        .collect();
+    Ok(claims)
+}
+
+/// Returns a safely abandoned task to the queue and releases its claim.
+pub fn release_abandoned_task_claim(
+    path: &Path,
+    claim: &AbandonedTaskClaim,
+) -> Result<(), ClaimError> {
+    transition_task(
+        path,
+        &claim.task_id,
+        &claim.lease_id,
+        &claim.run_id,
+        TaskStatus::Pending,
+    )?;
+    release(path, &claim.lease_id, &claim.run_id)?;
+    finish_run(path, &claim.run_id, "interrupted")?;
+    Ok(())
+}
+
+/// Keeps an ambiguous claim out of dispatch and makes its reason visible in runs output.
+pub fn mark_claim_needs_reconciliation(
+    path: &Path,
+    claim: &AbandonedTaskClaim,
+    reason: &str,
+) -> Result<(), ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE tasks SET status = 'human', updated_at = datetime('now')
+         WHERE id = ?1 AND EXISTS (
+             SELECT 1 FROM claims WHERE id = ?2 AND run_id = ?3 AND state = 'active'
+         )",
+        (&claim.task_id, &claim.lease_id, &claim.run_id),
+    )?;
+    if changed != 1 {
+        return Err(ClaimError::LeaseNotActive);
+    }
+    transaction.execute(
+        "UPDATE runs SET status = 'interrupted', ended_at = datetime('now'), reconciliation_reason = ?1
+         WHERE id = ?2",
+        (reason, &claim.run_id),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn acquire(
     transaction: &rusqlite::Transaction<'_>,
     repository_id: &str,
@@ -2626,6 +2721,23 @@ pub fn find_run(path: &Path, run_id: &str) -> Result<Option<Run>, DatabaseError>
             run_from_row,
         )
         .optional()
+        .map_err(Into::into)
+}
+
+/// Returns the recorded reason a crashed run still needs human reconciliation.
+pub fn run_reconciliation_reason(
+    path: &Path,
+    run_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT reconciliation_reason FROM runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|reason| reason.flatten())
         .map_err(Into::into)
 }
 
