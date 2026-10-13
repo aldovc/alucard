@@ -16,7 +16,7 @@ use alucard::{
     usage_report_for_dirs, warn_if_stale_image, write_iteration_measurement, write_run_measurement,
     write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentResult,
     AgentRole, AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
-    RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
+    RecoveryPullRequest, RunOptions, StageMeasurement, TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -28,6 +28,8 @@ use std::{collections::BTreeMap, fs};
 use alucard::usage_report;
 
 const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's.";
+const RECOVERY_MARKER_PREFIX: &str = "**🤖 Alucard recovery PR parked**";
+const RECOVERY_TITLE_PREFIX: &str = "wip: alucard recovery";
 const BLOCKED_FINDINGS_MARKER: &str = "**🤖 Alucard blocked findings**";
 
 fn main() -> ExitCode {
@@ -1284,7 +1286,6 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             &format!("Iteration {iteration}/{} start", options.iterations),
         );
         loop {
-            let started = std::time::Instant::now();
             let name = format!("alucard-worker-{}-{attempt}", attempt_run.id);
             let log = prepared
                 .directory
@@ -1316,21 +1317,17 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &prepared.directory,
                         &prepared.clone,
                         &options.base,
-                        iteration,
-                        Some(number),
-                        prepared.run.base_sha.as_deref().unwrap_or_default(),
-                        &sha,
+                        StageMeasurement {
+                            iteration,
+                            pr: Some(number),
+                            stage: "worker",
+                            cycle: 0,
+                            base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            prev_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            head_sha: &sha,
+                        },
                     );
-                    write_iteration_measurement(IterationMeasurement {
-                        database: &database,
-                        run_id: &attempt_run.id,
-                        log_dir: &prepared.directory,
-                        iteration,
-                        pr: Some(number),
-                        base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
-                        status: result.as_ref().ok().and_then(|value| value.status),
-                        duration: started.elapsed().as_secs(),
-                    });
+                    let mut previous_stage_sha = sha.clone();
                     log_event(
                         &prepared.directory,
                         &format!(
@@ -1396,9 +1393,15 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &prepared,
                         &branch,
                         number,
-                        iteration,
-                        0,
+                        GateStage {
+                            iteration,
+                            cycle: 0,
+                        },
                         &mut checks_available,
+                        &mut StageProgress {
+                            base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            previous_sha: &mut previous_stage_sha,
+                        },
                     ) {
                         Ok(result) => {
                             if let Err(error) = record_task_pr_gate_state(
@@ -1418,7 +1421,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             None
                         }
                     };
-                    if let Err(error) = review_gate(
+                    let review = match review_gate(
                         &database,
                         &tools,
                         &options,
@@ -1431,9 +1434,44 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         ci_result,
                         iteration,
                         &toolchain_status,
+                        &mut StageProgress {
+                            base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            previous_sha: &mut previous_stage_sha,
+                        },
                     ) {
-                        eprintln!("alucard: review gate for PR #{number}: {error}");
-                    }
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            eprintln!("alucard: review gate for PR #{number}: {error}");
+                            ReviewOutcome {
+                                ci_result,
+                                verdict: None,
+                                cycles: 0,
+                            }
+                        }
+                    };
+                    write_iteration_measurement(IterationMeasurement {
+                        database: &database,
+                        run_id: &attempt_run.id,
+                        log_dir: &prepared.directory,
+                        log_dirs: &usage_log_dirs
+                            .iter()
+                            .map(PathBuf::as_path)
+                            .collect::<Vec<_>>(),
+                        iteration,
+                        pr: Some(number),
+                        base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        status: result.as_ref().ok().and_then(|value| value.status),
+                        duration: iteration_started.elapsed().as_secs(),
+                        ci_result: review
+                            .ci_result
+                            .map(CiResult::measurement_value)
+                            .unwrap_or_default(),
+                        review_verdict: review
+                            .verdict
+                            .map(ReviewVerdict::as_str)
+                            .unwrap_or_default(),
+                        review_cycles: review.cycles,
+                    });
                     report_iteration_usage(
                         &options.queue.repository,
                         &usage_log_dirs,
@@ -1510,7 +1548,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         usage_log_dirs.push(prepared.directory.clone());
                         continue;
                     }
-                    match recover_worker_changes(
+                    let recovery_pr = match recover_worker_changes(
                         &database,
                         &tools,
                         &options,
@@ -1524,14 +1562,17 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         result.as_ref().ok().and_then(|value| value.status),
                         &log,
                     ) {
-                        Ok(Some(number)) => post_iteration_usage(
-                            &options.queue.repository,
-                            &usage_log_dirs,
-                            iteration,
-                            number,
-                            iteration_started.elapsed().as_secs(),
-                        ),
-                        Ok(None) => {}
+                        Ok(Some(number)) => {
+                            post_iteration_usage(
+                                &options.queue.repository,
+                                &usage_log_dirs,
+                                iteration,
+                                number,
+                                iteration_started.elapsed().as_secs(),
+                            );
+                            Some(number)
+                        }
+                        Ok(None) => None,
                         Err(error) => {
                             eprintln!("alucard: recovery requires human attention: {error}");
                             let _ = transition_task(
@@ -1541,8 +1582,26 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                 &owner_run_id,
                                 TaskStatus::Human,
                             );
+                            None
                         }
-                    }
+                    };
+                    write_iteration_measurement(IterationMeasurement {
+                        database: &database,
+                        run_id: &attempt_run.id,
+                        log_dir: &prepared.directory,
+                        log_dirs: &usage_log_dirs
+                            .iter()
+                            .map(PathBuf::as_path)
+                            .collect::<Vec<_>>(),
+                        iteration,
+                        pr: recovery_pr,
+                        base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        status: result.as_ref().ok().and_then(|value| value.status),
+                        duration: iteration_started.elapsed().as_secs(),
+                        ci_result: "",
+                        review_verdict: "",
+                        review_cycles: 0,
+                    });
                     print!("{}", usage_report_for_dirs(&usage_log_dirs));
                     let _ = release(&database, &claim.id, &owner_run_id);
                     if let Some(issue) = selected.issue.as_ref() {
@@ -2323,6 +2382,14 @@ enum CiResult {
 }
 
 impl CiResult {
+    fn measurement_value(self) -> &'static str {
+        match self {
+            Self::Green => "green",
+            Self::Failed => "failed",
+            Self::Missing => "none",
+        }
+    }
+
     fn gate_state(self) -> &'static str {
         match self {
             Self::Green => "ci_green",
@@ -2330,6 +2397,13 @@ impl CiResult {
             Self::Missing => "ci_missing",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReviewOutcome {
+    ci_result: Option<CiResult>,
+    verdict: Option<ReviewVerdict>,
+    cycles: usize,
 }
 
 struct CiGate<'a> {
@@ -2340,15 +2414,25 @@ struct CiGate<'a> {
     github_repo: Option<&'a str>,
 }
 
+struct StageProgress<'a> {
+    base_sha: &'a str,
+    previous_sha: &'a mut String,
+}
+
+struct GateStage {
+    iteration: usize,
+    cycle: usize,
+}
+
 impl CiGate<'_> {
     fn run(
         &self,
         prepared: &alucard::PreparedRun,
         branch: &str,
         pr_number: i64,
-        iteration: usize,
-        gate_cycle: usize,
+        gate_stage: GateStage,
         checks_available: &mut bool,
+        stage_progress: &mut StageProgress<'_>,
     ) -> Result<CiResult, String> {
         let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
         let remote = remote.trim();
@@ -2403,7 +2487,7 @@ impl CiGate<'_> {
                 failed_run_log(&prepared.clone, branch, head.trim()).unwrap_or_default();
             let checkout = prepared
                 .directory
-                .join(format!("fix-{gate_cycle}-{attempt}"));
+                .join(format!("fix-{}-{attempt}", gate_stage.cycle));
             let checkout_text = checkout.display().to_string();
             let mut agent_invoked = false;
             let repair = (|| {
@@ -2425,11 +2509,18 @@ impl CiGate<'_> {
                     return Err(String::from_utf8_lossy(&clone.stderr).trim().to_string());
                 }
                 let prompt = ci_fix_prompt(self.tools, pr_number, branch, &failure_log)?;
-                let log = prepared
-                    .directory
-                    .join(format!("iter-{iteration}-fix-{gate_cycle}-{attempt}.jsonl"));
-                let name = format!("alucard-fix-{}-{gate_cycle}-{attempt}", prepared.run.id);
-                let fix_iteration = format!("{iteration}-fix-{gate_cycle}-{attempt}");
+                let log = prepared.directory.join(format!(
+                    "iter-{}-fix-{}-{attempt}.jsonl",
+                    gate_stage.iteration, gate_stage.cycle
+                ));
+                let name = format!(
+                    "alucard-fix-{}-{}-{attempt}",
+                    prepared.run.id, gate_stage.cycle
+                );
+                let fix_iteration = format!(
+                    "{}-fix-{}-{attempt}",
+                    gate_stage.iteration, gate_stage.cycle
+                );
                 agent_invoked = true;
                 let _ = AgentInvocation {
                     role: AgentRole::CiFix,
@@ -2452,6 +2543,23 @@ impl CiGate<'_> {
             })();
             if agent_invoked {
                 cleanup_repair_checkout(&checkout);
+                if let Some(head_sha) = remote_branch_sha(&prepared.clone, branch) {
+                    write_stage_measurement(
+                        &prepared.directory,
+                        &prepared.clone,
+                        &self.options.base,
+                        StageMeasurement {
+                            iteration: gate_stage.iteration,
+                            pr: Some(pr_number),
+                            stage: "cifix",
+                            cycle: attempt,
+                            base_sha: stage_progress.base_sha,
+                            prev_sha: stage_progress.previous_sha,
+                            head_sha: &head_sha,
+                        },
+                    );
+                    *stage_progress.previous_sha = head_sha;
+                }
             } else {
                 let _ = fs::remove_dir_all(&checkout);
             }
@@ -2499,6 +2607,201 @@ fn review_verdict(formal: &str, decision_file: &str) -> Option<ReviewVerdict> {
             _ => None,
         },
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryPullRequestMetadata {
+    comments: Vec<RecoveryComment>,
+    author: RecoveryAuthor,
+    is_draft: bool,
+    labels: Vec<RecoveryLabel>,
+    title: String,
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryComment {
+    author: RecoveryAuthor,
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryAuthor {
+    login: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryLabel {
+    name: String,
+}
+
+fn unpark_recovery_pr(
+    repository: &Path,
+    pr_number: i64,
+    reviewed_sha: &str,
+    current_head: &str,
+) -> String {
+    if reviewed_sha != current_head {
+        eprintln!(
+            "Review gate: the approval on PR #{pr_number} is not an approval of its current head — leaving it parked."
+        );
+        return String::new();
+    }
+    let Ok(login) = gh_text(repository, &["api", "user", "--jq", ".login"]) else {
+        eprintln!("Review gate: could not read the harness's GitHub login — a parked recovery PR stays parked.");
+        return String::new();
+    };
+    let login = login.trim();
+    let Ok(metadata) = gh_text(
+        repository,
+        &[
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--json",
+            "comments,author,isDraft,labels,title,body",
+        ],
+    ) else {
+        return String::new();
+    };
+    let Ok(mut pull_request) = serde_json::from_str::<RecoveryPullRequestMetadata>(&metadata)
+    else {
+        return String::new();
+    };
+    let marked = pull_request.comments.iter().any(|comment| {
+        comment.author.login == login && comment.body.starts_with(RECOVERY_MARKER_PREFIX)
+    });
+    let stub = pull_request.author.login == login
+        && pull_request.is_draft
+        && pull_request.title.starts_with(RECOVERY_TITLE_PREFIX)
+        && pull_request
+            .labels
+            .iter()
+            .any(|label| label.name.eq_ignore_ascii_case("needs-human"));
+    if !marked && !stub {
+        return String::new();
+    }
+
+    let mut notes = Vec::<String>::new();
+    if pull_request.is_draft {
+        let ready = execute_command(
+            "gh",
+            &["pr", "ready", &pr_number.to_string()],
+            repository,
+            None,
+        )
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+        if ready {
+            pull_request.is_draft = false;
+            println!("Review gate: PR #{pr_number} marked ready for review — it was a draft.");
+            notes
+                .push("- Marked ready for review: recovery opened this PR as a draft.".to_string());
+        } else {
+            eprintln!("Review gate: could not mark PR #{pr_number} ready — it is still a draft; needs-human stays on it.");
+            notes.push(format!("- Could not mark this PR ready for review, so it is still a draft and `needs-human` stays on it. Run `gh pr ready {pr_number}` and remove the label by hand."));
+        }
+    }
+    if !pull_request.is_draft
+        && pull_request
+            .labels
+            .iter()
+            .any(|label| label.name.eq_ignore_ascii_case("needs-human"))
+    {
+        let removed = execute_command(
+            "gh",
+            &[
+                "api",
+                "--silent",
+                "-X",
+                "DELETE",
+                &format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/labels/needs-human"),
+            ],
+            repository,
+            None,
+        )
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+        if removed {
+            notes.push("- Removed `needs-human`: the step it asked of a human — finishing this recovery PR — is done by this approval.".to_string());
+        } else {
+            notes.push("- Could not remove `needs-human`; take it off by hand, nothing is waiting on a human here.".to_string());
+        }
+    }
+
+    let first_line = pull_request.body.lines().next().unwrap_or_default();
+    let ticket: Option<i64> = first_line
+        .strip_prefix("Refs #")
+        .or_else(|| first_line.strip_prefix("Closes #"))
+        .and_then(|value| {
+            value
+                .chars()
+                .take_while(|value| value.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        });
+    let Some(ticket) = ticket else {
+        return notes.join("\n");
+    };
+    let new_body = if first_line.starts_with("Refs #") {
+        format!("Closes #{ticket}{}", &pull_request.body[first_line.len()..])
+    } else {
+        pull_request.body.clone()
+    };
+    let new_title = if pull_request.title.starts_with(RECOVERY_TITLE_PREFIX) {
+        gh_text(
+            repository,
+            &[
+                "issue",
+                "view",
+                &ticket.to_string(),
+                "--json",
+                "title",
+                "--jq",
+                ".title",
+            ],
+        )
+        .ok()
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| pull_request.title.clone())
+    } else {
+        pull_request.title.clone()
+    };
+    if new_title != pull_request.title || new_body != pull_request.body {
+        let edited = execute_command(
+            "gh",
+            &[
+                "pr",
+                "edit",
+                &pr_number.to_string(),
+                "--title",
+                &new_title,
+                "--body",
+                &new_body,
+            ],
+            repository,
+            None,
+        )
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+        if edited {
+            if new_body != pull_request.body {
+                println!("Review gate: PR #{pr_number} body now closes #{ticket}.");
+                notes.push(format!("- Changed `Refs #{ticket}` to `Closes #{ticket}`: the ticket closes when this merges."));
+            }
+            if new_title != pull_request.title {
+                println!("Review gate: PR #{pr_number} stub title replaced with the ticket's.");
+                notes.push("- Replaced the recovery stub title with the ticket's.".to_string());
+            }
+        } else {
+            eprintln!("Review gate: could not edit PR #{pr_number} title/body.");
+            notes.push("- Could not edit the title or body: the `Refs` line and the stub title are still there.".to_string());
+        }
+    }
+    notes.join("\n")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2686,14 +2989,10 @@ fn top_level_heading(line: &str) -> Option<&str> {
 }
 
 fn remote_branch_sha(repository: &Path, branch: &str) -> Option<String> {
-    git_output(
-        repository,
-        &["ls-remote", "origin", &format!("refs/heads/{branch}")],
-    )
-    .ok()?
-    .split_whitespace()
-    .next()
-    .map(str::to_string)
+    git_output(repository, &["fetch", "--quiet", "origin", branch]).ok()?;
+    git_output(repository, &["rev-parse", "FETCH_HEAD"])
+        .ok()
+        .map(|sha| sha.trim().to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2870,11 +3169,12 @@ fn review_gate(
     ci_result: Option<CiResult>,
     iteration: usize,
     toolchain_status: &str,
-) -> Result<(), String> {
+    stage_progress: &mut StageProgress<'_>,
+) -> Result<ReviewOutcome, String> {
     println!("Review gate: PR #{pr_number} on {branch}.");
     let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
     let root = std::env::temp_dir().join(format!("alucard-review-{}", uuid::Uuid::new_v4()));
-    let result = (|| {
+    let result = (|| -> Result<ReviewOutcome, String> {
         let mut cycle = 1;
         let mut ci_result = ci_result;
         let mut feedback_checks_available = true;
@@ -3009,8 +3309,21 @@ fn review_gate(
                             String::new()
                         };
                         let ci_handoff_body = ci_handoff.map_or("", |(_, body)| body);
+                        let unpark_note = if ci_handoff.is_none() && file_verdict == "APPROVED" {
+                            unpark_recovery_pr(
+                                &prepared.clone,
+                                pr_number,
+                                &reviewed_sha,
+                                &current_head,
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let unpark_note = (!unpark_note.is_empty())
+                            .then(|| format!("\n\n{unpark_note}"))
+                            .unwrap_or_default();
                         let comment = format!(
-                        "**🤖 Alucard review cycle {cycle}/{}: {status}**\n\n{marker}{ci_handoff_body}{body}",
+                        "**🤖 Alucard review cycle {cycle}/{}: {status}**\n\n{marker}{ci_handoff_body}{body}{unpark_note}",
                         options.max_review_cycles
                     );
                         let _ = execute_command(
@@ -3115,7 +3428,11 @@ fn review_gate(
                                     &prepared.clone,
                                     None,
                                 );
-                                return Ok(());
+                                return Ok(ReviewOutcome {
+                                    ci_result,
+                                    verdict: Some(verdict),
+                                    cycles: cycle,
+                                });
                             }
                             let findings = feedback_findings(&prepared.clone, pr_number, &body)?;
                             let (feedback, blocked, advanced, retained) = run_feedback_once(
@@ -3130,6 +3447,23 @@ fn review_gate(
                                 iteration,
                                 toolchain_status,
                             )?;
+                            if let Some(head_sha) = remote_branch_sha(&prepared.clone, branch) {
+                                write_stage_measurement(
+                                    &prepared.directory,
+                                    &prepared.clone,
+                                    &options.base,
+                                    StageMeasurement {
+                                        iteration,
+                                        pr: Some(pr_number),
+                                        stage: "feedback",
+                                        cycle,
+                                        base_sha: stage_progress.base_sha,
+                                        prev_sha: stage_progress.previous_sha,
+                                        head_sha: &head_sha,
+                                    },
+                                );
+                                *stage_progress.previous_sha = head_sha;
+                            }
                             let stalled = advanced == Some(false)
                                 && (feedback.status.unwrap_or(1) != 0 || retained);
                             if stalled {
@@ -3152,7 +3486,11 @@ fn review_gate(
                                     &prepared.clone,
                                     None,
                                 );
-                                return Ok(());
+                                return Ok(ReviewOutcome {
+                                    ci_result,
+                                    verdict: Some(verdict),
+                                    cycles: cycle,
+                                });
                             }
                             if feedback.status.unwrap_or(0) != 0 {
                                 let comment = format!("**🤖 Alucard cycle {cycle}/{}: feedback agent failed after pushing** (rc={}, branch advanced={})", options.max_review_cycles, feedback.status.unwrap_or(1), advanced.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()));
@@ -3183,9 +3521,9 @@ fn review_gate(
                                 prepared,
                                 branch,
                                 pr_number,
-                                iteration,
-                                cycle,
+                                GateStage { iteration, cycle },
                                 &mut feedback_checks_available,
+                                stage_progress,
                             )
                             .ok();
                             cycle += 1;
@@ -3230,11 +3568,19 @@ fn review_gate(
                         .map_err(|error| error.to_string())?;
                     }
                 }
-                return Ok(());
+                return Ok(ReviewOutcome {
+                    ci_result,
+                    verdict,
+                    cycles: cycle,
+                });
             }
             unreachable!("reviewer attempt budget is non-zero")
         }
-        Ok(())
+        Ok(ReviewOutcome {
+            ci_result,
+            verdict: None,
+            cycles: 0,
+        })
     })();
     let _ = fs::remove_dir_all(root);
     result

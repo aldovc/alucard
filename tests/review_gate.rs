@@ -299,8 +299,14 @@ printf '%s\n' "$*" >> "$ALUCARD_GH_TRACE"
 branch=$(cat "$ALUCARD_BRANCH_FILE" 2>/dev/null || true)
 sha() { git --git-dir="$ALUCARD_REMOTE" rev-parse "refs/heads/$branch"; }
 case "$1 $2" in
+  'api user') printf '%s\n' alucard-bot ;;
+  'pr ready') : ;;
+  'issue view') printf '%s\n' 'Recovered task' ;;
+  'pr edit') : ;;
+  'api --silent') : ;;
   'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
   'pr checks')
+    case "$ALUCARD_CASE" in recovery-unpark|recovery-old-head|recovery-untrusted|recovery-formal-approved) exit 0 ;; esac
     if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
       feedback_attempts=$(wc -l < "$ALUCARD_FEEDBACK_ATTEMPTS")
       repair_attempts=$(wc -l < "$ALUCARD_CI_FIX_ATTEMPTS")
@@ -318,7 +324,20 @@ case "$1 $2" in
     ;;
   'pr view')
     case "$*" in
-      *headRefOid*) sha ;;
+      *headRefOid*)
+        if [ "$ALUCARD_CASE" = recovery-old-head ]; then
+          printf '%s\n' 0000000000000000000000000000000000000000
+        else
+          sha
+        fi ;;
+      *comments*isDraft*)
+        case "$ALUCARD_CASE" in
+          recovery-unpark|recovery-old-head|recovery-missing-ci)
+            printf '%s\n' '{"comments":[{"author":{"login":"alucard-bot"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft"}],"author":{"login":"alucard-bot"},"isDraft":true,"labels":[{"name":"needs-human"}],"title":"wip: alucard recovery — iter 1","body":"Refs #77\n\nunfinished"}' ;;
+          recovery-untrusted)
+            printf '%s\n' '{"comments":[{"author":{"login":"other"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft"}],"author":{"login":"other"},"isDraft":true,"labels":[{"name":"needs-human"}],"title":"wip: alucard recovery — iter 1","body":"Refs #77\n\nunfinished"}' ;;
+          *) printf '%s\n' "$ALUCARD_PR_COMMENTS" ;;
+        esac ;;
       *--json\ comments*)
         if [ "$ALUCARD_CASE" = feedback-blocked ] && [ -s "$ALUCARD_FEEDBACK_ATTEMPTS" ]; then
           printf '%s\n' '{"comments":[{"body":"**🤖 Alucard blocked findings** (cycle 1/2)\n\nblocked finding"}]}'
@@ -461,6 +480,71 @@ esac
 #[test]
 fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
     let cases = [
+        ReviewCase {
+            name: "recovery-unpark",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "recovery-missing-ci",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "recovery-old-head",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "recovery-untrusted",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "recovery-formal-approved",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "",
+            formal_verdict: "APPROVED",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
         ReviewCase {
             name: "review-formal-precedence",
             review_policy: Some("Review policy from the target repository.\n"),
@@ -871,6 +955,55 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             assert!(!trace.contains("Reviewed head:"));
             assert_eq!(shas.0, None);
         }
+        if case.name == "recovery-unpark" {
+            assert!(trace.contains("pr ready 77"), "{trace}");
+            assert!(
+                trace.contains("DELETE repos/{owner}/{repo}/issues/77/labels/needs-human"),
+                "{trace}"
+            );
+            assert!(
+                trace.contains("pr edit 77 --title Recovered task --body Closes #77"),
+                "{trace}"
+            );
+            assert!(trace.contains("Marked ready for review"), "{trace}");
+        }
+        if case.name == "review-missing-ci" {
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let measurement = fs::read_to_string(log_dir.join("measurements.jsonl")).unwrap();
+            let iteration: serde_json::Value = measurement
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .find(|record: &serde_json::Value| record["record"] == "iteration")
+                .unwrap();
+            assert_eq!(iteration["ci_result"], "none");
+            assert_eq!(iteration["review_verdict"], "APPROVED");
+            assert_eq!(iteration["review_cycles"], 1);
+        }
+        if case.name == "recovery-missing-ci" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(
+                !trace.contains("DELETE repos/{owner}/{repo}/issues/77/labels/needs-human"),
+                "{trace}"
+            );
+            assert!(!trace.contains("pr edit 77 --title"), "{trace}");
+        }
+        if case.name == "recovery-old-head" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(!trace.contains("labels/needs-human"), "{trace}");
+        }
+        if case.name == "recovery-untrusted" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(!trace.contains("labels/needs-human"), "{trace}");
+        }
+        if case.name == "recovery-formal-approved" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(!trace.contains("labels/needs-human"), "{trace}");
+        }
         if case.name == "findings-handoff" {
             let feedback = fs::read_to_string(root.join("prompts/feedback-1.txt")).unwrap();
             assert!(feedback.contains("KEEP-FINDING"), "{feedback}");
@@ -913,6 +1046,33 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             assert!(repairs.contains("-0-2"), "{repairs}");
             assert!(repairs.contains("-1-1"), "{repairs}");
             assert!(repairs.contains("-1-2"), "{repairs}");
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let records = fs::read_to_string(log_dir.join("measurements.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let stages = records
+                .iter()
+                .filter(|record| record["record"] == "stage")
+                .collect::<Vec<_>>();
+            assert_eq!(stages[0]["stage"], "worker");
+            assert_eq!(stages[1]["stage"], "cifix");
+            assert_eq!(stages[3]["stage"], "feedback");
+            assert_eq!(stages[4]["stage"], "cifix");
+            assert_eq!(stages[0]["head_sha"], stages[1]["prev_sha"]);
+            assert_eq!(stages[3]["head_sha"], stages[4]["prev_sha"]);
+            let iteration = records
+                .iter()
+                .find(|record| record["record"] == "iteration")
+                .unwrap();
+            assert_eq!(iteration["roles"]["cifix"]["invocations"], 4);
+            assert_eq!(iteration["roles"]["feedback"]["invocations"], 1);
         }
         if case.name == "feedback-setup-advance" {
             assert!(!trace.contains("feedback agent stopped without publishing"));
@@ -972,6 +1132,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                 }));
                 assert!(trace.contains("no review posted — needs human"));
             }
+            "review_approved" => assert!(trace.contains("APPROVED")),
             _ => assert!(trace.contains("CHANGES_REQUESTED")),
         }
         fs::remove_dir_all(root).unwrap();
