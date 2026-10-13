@@ -50,6 +50,151 @@ fn git_repository(root: &Path) {
     ]));
 }
 
+fn run_transport_case(root: &Path, scenario: &str, retries: usize) -> std::process::Output {
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&repository).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "main",
+    ]));
+    let foreign_head = if scenario == "foreign" {
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "switch",
+            "-q",
+            "-c",
+            "foreign",
+        ]));
+        fs::write(repository.join("foreign.txt"), "foreign\n").unwrap();
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "foreign",
+        ]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "push",
+            "-q",
+            "origin",
+            "foreign",
+        ]));
+        let head = Command::new("git")
+            .args(["-C", repository.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "switch", "-q", "main"]));
+        String::from_utf8(head.stdout).unwrap().trim().to_string()
+    } else {
+        String::new()
+    };
+    let trace = root.join("trace");
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        r#"#!/bin/sh
+case "$1 $2" in
+  'image inspect') echo stamp ;;
+  'run '*)
+    for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; esac; done
+    printf '%s|%s\n' "$(git -C "$worktree" branch --show-current)" "$worktree" >> "$ALUCARD_TRACE"
+    case "$ALUCARD_SCENARIO" in
+      billing) printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"error":"billing_error"}' ;;
+      *) printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"API Error: Connection closed"}' ;;
+    esac
+    [ "$ALUCARD_SCENARIO" = foreign ] && exit 0
+    exit 1 ;;
+  'rm -f') ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$ALUCARD_GH_TRACE"
+case "$1 $2" in
+  'pr list')
+    case "$*" in
+      *--head*)
+        if [ "$ALUCARD_SCENARIO" = pr ]; then
+          printf '%s\n' '[{"number":59,"headRefName":"attempt","headRefOid":"attempt"}]'
+        else echo '[]'; fi ;;
+      *--label*)
+        if [ "$ALUCARD_SCENARIO" = foreign ]; then
+          printf '[{"number":60,"headRefName":"foreign","headRefOid":"%s"}]\n' "$ALUCARD_FOREIGN_HEAD"
+        else echo '[]'; fi ;;
+    esac ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "## [ ] 1: Transport task\n\nBody\n").unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+    )
+    .unwrap();
+    Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_TRACE", &trace)
+        .env("ALUCARD_GH_TRACE", root.join("gh-trace"))
+        .env("ALUCARD_SCENARIO", scenario)
+        .env("ALUCARD_FOREIGN_HEAD", foreign_head)
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .env("ALUCARD_TRANSPORT_RETRY_ATTEMPTS", retries.to_string())
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "run",
+            "--iterations",
+            "1",
+            "--tasks",
+            tasks.to_str().unwrap(),
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            repository.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn parser_preserves_task_structure_and_queue_eligibility() {
     let contents = fs::read_to_string("test/fixtures/tasks-basic.md").unwrap();
@@ -737,4 +882,111 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
         2
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_transport_pr_retry() {
+    let retry_root = temporary_path("transport-retry");
+    let retry = run_transport_case(&retry_root, "transport", 1);
+    assert!(retry.status.success(), "{retry:?}");
+    let attempts = fs::read_to_string(retry_root.join("trace")).unwrap();
+    let attempts = attempts.lines().collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(attempts[0], attempts[1]);
+    assert_ne!(
+        attempts[0].split_once('|').unwrap().0,
+        attempts[1].split_once('|').unwrap().0
+    );
+    assert_ne!(
+        attempts[0].split_once('|').unwrap().1,
+        attempts[1].split_once('|').unwrap().1
+    );
+    fs::remove_dir_all(&retry_root).unwrap();
+
+    let pr_root = temporary_path("transport-pr");
+    let pr = run_transport_case(&pr_root, "pr", 1);
+    assert!(pr.status.success(), "{pr:?}");
+    assert_eq!(
+        fs::read_to_string(pr_root.join("trace"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    let connection = open(&pr_root.join("ledger.db")).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM pull_requests", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT number FROM pull_requests", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        59
+    );
+    drop(connection);
+    fs::remove_dir_all(pr_root).unwrap();
+}
+
+#[test]
+fn test_pr_binding() {
+    let root = temporary_path("foreign-pr");
+    let output = run_transport_case(&root, "foreign", 0);
+    assert!(output.status.success(), "{output:?}");
+    let connection = open(&root.join("ledger.db")).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT status FROM tasks", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM pull_requests", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_transport_recovery() {
+    let billing_root = temporary_path("transport-billing");
+    let billing = run_transport_case(&billing_root, "billing", 2);
+    assert!(!billing.status.success(), "{billing:?}");
+    assert_eq!(
+        fs::read_to_string(billing_root.join("trace"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    fs::remove_dir_all(&billing_root).unwrap();
+
+    let clean_root = temporary_path("transport-clean");
+    let clean = run_transport_case(&clean_root, "transport", 0);
+    assert!(clean.status.success(), "{clean:?}");
+    let attempt = fs::read_to_string(clean_root.join("trace")).unwrap();
+    let (_, clone) = attempt.trim().split_once('|').unwrap();
+    assert!(Path::new(clone).join(".git").is_dir());
+    let connection = open(&clean_root.join("ledger.db")).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM pull_requests", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    assert!(!fs::read_to_string(clean_root.join("gh-trace"))
+        .unwrap_or_default()
+        .contains("pr create"));
+    fs::remove_dir_all(clean_root).unwrap();
 }
