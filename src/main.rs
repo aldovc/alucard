@@ -1415,6 +1415,7 @@ fn review_verdict(formal: &str, decision_file: &str) -> Option<ReviewVerdict> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reviewer_prompt(
     tools: &Path,
     task: &SelectedRunTask,
