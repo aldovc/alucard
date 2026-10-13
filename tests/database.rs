@@ -1,6 +1,6 @@
 use alucard::{
-    acquire_pr, acquire_task, heartbeat, migrate, open, prepare_run, release, run_command, status,
-    transition_task, ClaimError, RunOptions, TaskStatus,
+    acquire_pr, acquire_task, heartbeat, migrate, open, prepare_run, record_task_pr, release,
+    run_command, status, transition_task, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -133,6 +133,7 @@ fn prepared_runs_with_matching_repository_names_use_separate_caches() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -146,6 +147,7 @@ fn prepared_runs_with_matching_repository_names_use_separate_caches() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -193,6 +195,7 @@ fn prepared_runs_with_long_canonical_paths_use_a_bounded_cache_key() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -207,6 +210,24 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
     let root = path.parent().unwrap();
     let repository = root.join("source");
     seed_repository(&repository);
+    assert!(Command::new("git")
+        .args(["branch", "release"])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            repository.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:example/source.git",
+        ])
+        .status()
+        .unwrap()
+        .success());
     let logs = root.join("logs");
     let cache = root.join("cache");
 
@@ -216,10 +237,11 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
             repository: &repository,
             logs_root: &logs,
             cache_root: &cache,
-            base: "HEAD",
+            base: "release",
             image: None,
             task: Some("alpha"),
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -229,10 +251,11 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
             repository: &repository,
             logs_root: &logs,
             cache_root: &cache,
-            base: "HEAD",
+            base: "release",
             image: None,
             task: None,
             issue: Some(42),
+            run_id: None,
         },
     )
     .unwrap();
@@ -243,6 +266,36 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
     assert!(second.clone.join(".git").is_dir());
     assert!(first.branch.ends_with("-task-alpha"));
     assert!(second.branch.ends_with("-issue-42"));
+    assert_eq!(
+        String::from_utf8(
+            Command::new("git")
+                .args([
+                    "config",
+                    "--get",
+                    &format!("branch.{}.gh-merge-base", first.branch),
+                ])
+                .current_dir(&first.clone)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim(),
+        "release"
+    );
+    assert_eq!(
+        String::from_utf8(
+            Command::new("git")
+                .args(["remote", "get-url", "origin"])
+                .current_dir(&first.clone)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim(),
+        "https://github.com/example/source.git"
+    );
     assert_eq!(
         open(&path)
             .unwrap()
@@ -276,6 +329,7 @@ fn prepared_run_uses_the_refreshed_remote_head() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -307,6 +361,7 @@ fn prepared_run_uses_the_refreshed_remote_head() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -351,6 +406,7 @@ fn concurrent_preparation_keeps_working_clones_usable() {
                         image: None,
                         task: None,
                         issue: None,
+                        run_id: None,
                     },
                 )
             })
@@ -393,6 +449,7 @@ fn preparing_a_run_reconciles_abandoned_owners() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -425,6 +482,7 @@ fn preparing_a_run_reconciles_abandoned_owners() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -671,6 +729,36 @@ fn pending_task_can_be_reacquired_after_its_lease_is_released() {
     let reacquired = acquire_task(&path, "task", "run-1").unwrap();
     assert_eq!(reacquired.run_id, "run-1");
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn opened_pr_moves_the_claimed_task_to_in_flight() {
+    let path = database_path();
+    prepare_claims(&path, &["task"]);
+    insert_run(&path, "run");
+    let claim = acquire_task(&path, "task", "run").unwrap();
+
+    record_task_pr(&path, "task", &claim.id, "run", 42, "agent/task", "abc123").unwrap();
+
+    let connection = open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT status FROM tasks WHERE id = 'task'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "in_flight"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT number FROM pull_requests WHERE task_id = 'task'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        42
+    );
 }
 
 #[test]

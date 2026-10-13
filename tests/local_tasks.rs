@@ -5,9 +5,9 @@ use alucard::{
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temporary_path(name: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -15,6 +15,39 @@ fn temporary_path(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("alucard-{name}-{}-{unique}", std::process::id()))
+}
+
+fn run(command: &mut Command) {
+    assert!(command.status().unwrap().success());
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn git_repository(root: &Path) {
+    run(Command::new("git").args(["init", "-q", "-b", "main", root.to_str().unwrap()]));
+    fs::write(root.join("README.md"), "test\n").unwrap();
+    run(Command::new("git").args(["-C", root.to_str().unwrap(), "add", "README.md"]));
+    run(Command::new("git").args([
+        "-C",
+        root.to_str().unwrap(),
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "initial",
+    ]));
 }
 
 #[test]
@@ -436,4 +469,272 @@ fn pinned_issue_resolution_rejects_ineligible_issues() {
         resolve_pinned_issue(issue(""), false, &[], &open_prs),
         Err("issue #42 is occupied by PR #5; use alucard continue 5".to_string())
     );
+}
+
+#[test]
+fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
+    let root = temporary_path("run-local");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&repository).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        "git@github.com:example/repo.git",
+    ]));
+    let tasks = root.join("tasks.md");
+    fs::write(
+        &tasks,
+        "Shared context\n\n## [ ] first: First task\n\nFirst body\n\n## [ ] second: Second task\n\nSecond body\n",
+    )
+    .unwrap();
+    let prompts = root.join("prompts");
+    fs::create_dir(&prompts).unwrap();
+    let docker_args = root.join("docker-args");
+    fs::create_dir(&docker_args).unwrap();
+    let selection = root.join("selection");
+    fs::create_dir(&selection).unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'run '*)\n    printf '%s\\n' \"$@\" > \"$ALUCARD_DOCKER_ARGS/$$\"\n    cat > \"$ALUCARD_PROMPTS/$$\" ;;\n  'rm -f') ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list')\n    if mkdir \"$ALUCARD_SELECTION/lock\" 2>/dev/null; then : > \"$ALUCARD_SELECTION/first\"; fi\n    : > \"$ALUCARD_SELECTION/$$\"\n    while [ \"$(find \"$ALUCARD_SELECTION\" -maxdepth 1 -type f ! -name first | wc -l)\" -lt 2 ]; do sleep 0.01; done\n    echo '[]' ;;\n  'pr list') echo '[]' ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let database = root.join("ledger.db");
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+        command
+            .env("PATH", &path)
+            .env("ALUCARD_PROMPTS", &prompts)
+            .env("ALUCARD_DOCKER_ARGS", &docker_args)
+            .env("ALUCARD_SELECTION", &selection)
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .args([
+                "--db-path",
+                database.to_str().unwrap(),
+                "run",
+                "--iterations",
+                "1",
+                "--tasks",
+                tasks.to_str().unwrap(),
+                "--env-file",
+                environment.to_str().unwrap(),
+                "--logs-root",
+                root.join("logs").to_str().unwrap(),
+                "--no-build",
+                repository.to_str().unwrap(),
+            ]);
+        command
+    };
+    let mut first = command().spawn().unwrap();
+    wait_for_file(&selection.join("first"));
+    let mut second = command().spawn().unwrap();
+    let first = first.wait().unwrap();
+    assert!(first.success(), "{first:?}");
+    let second = second.wait().unwrap();
+    assert!(second.success(), "{second:?}");
+    let prompts = fs::read_dir(prompts)
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts.iter().any(|prompt| prompt.contains("First task")));
+    assert!(prompts.iter().any(|prompt| prompt.contains("Second task")));
+    let docker_arguments = fs::read_dir(docker_args)
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(docker_arguments
+        .iter()
+        .all(|arguments| arguments.contains("GH_REPO=example/repo")));
+    for entry in fs::read_dir(root.join("logs")).unwrap() {
+        let clone = entry.unwrap().path().join("repository");
+        let origin = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(clone)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&origin.stdout).trim(),
+            "https://github.com/example/repo.git"
+        );
+    }
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE state = 'active'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
+    let root = temporary_path("run-pinned");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&repository).unwrap();
+    git_repository(&repository);
+    let docker_trace = root.join("docker-trace");
+    let gh_trace = root.join("gh-trace");
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'run '*)\n    if mkdir \"$ALUCARD_DOCKER_HOLD_LOCK\" 2>/dev/null; then\n      : > \"$ALUCARD_DOCKER_STARTED\"\n      while [ ! -f \"$ALUCARD_DOCKER_RELEASE\" ]; do sleep 0.01; done\n    fi ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_GH_TRACE\"\ncase \"$1 $2\" in\n  'issue view') echo '{\"number\":42,\"title\":\"Eligible\",\"body\":\"\",\"labels\":[{\"name\":\"ready-for-agent\"}],\"state\":\"OPEN\"}' ;;\n  'issue list') echo '[]' ;;\n  'repo view') echo 'owner/repo' ;;\n  'api graphql')\n    case \"$*\" in\n      *issueOrPullRequest*)\n        if [ -f \"$ALUCARD_TYPE_LOOKUP_FAIL\" ]; then echo 'lookup failed' >&2; exit 1; elif [ -f \"$ALUCARD_PINNED_PR\" ]; then echo PullRequest; else echo Issue; fi ;;\n      *) if [ -f \"$ALUCARD_RETURN_PR\" ]; then echo '[{\"number\":77,\"title\":\"\",\"body\":\"\",\"headRefName\":\"agent/task\",\"headRefOid\":\"abc\"}]'; else echo '[]'; fi ;;\n    esac ;;\n  'pr list') if [ -f \"$ALUCARD_RETURN_PR\" ]; then echo '[{\"number\":77,\"title\":\"\",\"body\":\"\",\"headRefName\":\"agent/task\",\"headRefOid\":\"abc\"}]'; else echo '[]'; fi ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let database = root.join("ledger.db");
+    let logs = root.join("logs");
+    let return_pr = root.join("return-pr");
+    let pinned_pr = root.join("pinned-pr");
+    let type_lookup_fail = root.join("type-lookup-fail");
+    let docker_started = root.join("docker-started");
+    let docker_release = root.join("docker-release");
+    let docker_hold_lock = root.join("docker-hold-lock");
+    let arguments = [
+        "--db-path",
+        database.to_str().unwrap(),
+        "run",
+        "--github",
+        "--issue",
+        "42",
+        "--env-file",
+        environment.to_str().unwrap(),
+        "--logs-root",
+        logs.to_str().unwrap(),
+        "--no-build",
+        repository.to_str().unwrap(),
+    ];
+    let run = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+        command
+            .env("PATH", &path)
+            .env("ALUCARD_DOCKER_TRACE", &docker_trace)
+            .env("ALUCARD_GH_TRACE", &gh_trace)
+            .env("ALUCARD_RETURN_PR", &return_pr)
+            .env("ALUCARD_PINNED_PR", &pinned_pr)
+            .env("ALUCARD_TYPE_LOOKUP_FAIL", &type_lookup_fail)
+            .env("ALUCARD_DOCKER_STARTED", &docker_started)
+            .env("ALUCARD_DOCKER_RELEASE", &docker_release)
+            .env("ALUCARD_DOCKER_HOLD_LOCK", &docker_hold_lock)
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .args(arguments);
+        command
+    };
+    let mut first = run().spawn().unwrap();
+    wait_for_file(&docker_started);
+    let second = run().output().unwrap();
+    assert!(second.status.success(), "{second:?}");
+    fs::write(&docker_release, "").unwrap();
+    let first = first.wait().unwrap();
+    assert!(first.success(), "{first:?}");
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT status FROM tasks", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE state = 'active'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    fs::write(&return_pr, "").unwrap();
+    let output = run().output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let output = run().output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    fs::write(&pinned_pr, "").unwrap();
+    let output = run().output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("issue #42 is a pull request; use alucard continue 42"));
+    let docker_trace_contents = fs::read_to_string(&docker_trace).unwrap();
+    assert_eq!(
+        docker_trace_contents
+            .lines()
+            .filter(|line| line.starts_with("run "))
+            .count(),
+        2
+    );
+    let gh_trace_contents = fs::read_to_string(&gh_trace).unwrap();
+    assert!(gh_trace_contents.contains("issue view 42 --json number,title,body,labels,state"));
+    assert!(gh_trace_contents.contains("issueOrPullRequest"));
+    assert!(gh_trace_contents.contains("issue edit 42 --add-label in-progress"));
+    assert!(gh_trace_contents.contains("issue edit 42 --remove-label in-progress"));
+    fs::remove_file(&pinned_pr).unwrap();
+    fs::write(&type_lookup_fail, "").unwrap();
+    let output = run().output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("could not check whether GitHub issue is a pull request: lookup failed"));
+    let docker_trace_contents = fs::read_to_string(&docker_trace).unwrap();
+    assert_eq!(
+        docker_trace_contents
+            .lines()
+            .filter(|line| line.starts_with("run "))
+            .count(),
+        2
+    );
+    fs::remove_dir_all(root).unwrap();
 }

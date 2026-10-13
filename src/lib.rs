@@ -343,25 +343,18 @@ pub fn toolchain_preflight(
     env_file: &Path,
     timeout_minutes: u64,
 ) -> Result<String, String> {
-    let installs = detect_dependency_installs(repository).map_err(|error| error.to_string())?;
-    if installs.is_empty() {
-        return Ok(toolchain_status(&[]));
-    }
-
     let clone = env::temp_dir().join(format!("alucard-preflight-{}", Uuid::new_v4()));
     let cloned = Command::new("git")
-        .args([
-            "clone",
-            "--local",
-            "--no-tags",
-            "--single-branch",
-            "--branch",
-            base_branch,
-        ])
+        .args(["clone", "--local", "--no-tags"])
         .arg(repository)
         .arg(&clone)
         .status()
-        .is_ok_and(|status| status.success());
+        .is_ok_and(|status| status.success())
+        && Command::new("git")
+            .args(["reset", "--hard", &format!("origin/{base_branch}")])
+            .current_dir(&clone)
+            .status()
+            .is_ok_and(|status| status.success());
     if !cloned {
         let _ = fs::remove_dir_all(clone);
         return Ok(format!(
@@ -371,6 +364,11 @@ pub fn toolchain_preflight(
     }
 
     let result = (|| {
+        let installs = detect_dependency_installs(&clone).map_err(|error| error.to_string())?;
+        if installs.is_empty() {
+            return Ok(toolchain_status(&[]));
+        }
+
         let name = format!("alucard-preflight-{}", std::process::id());
         let mut results = Vec::new();
         for install in installs {
@@ -632,7 +630,7 @@ mod agent_tests {
         let bin = dir.join("bin");
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&repository).unwrap();
-        fs::write(repository.join("package-lock.json"), "{}").unwrap();
+        fs::write(repository.join("README.md"), "main").unwrap();
         Command::new("git")
             .args(["init", "--initial-branch", "main"])
             .current_dir(&repository)
@@ -657,7 +655,38 @@ mod agent_tests {
             .status()
             .unwrap();
 
+        Command::new("git")
+            .args(["checkout", "-b", "preflight-base"])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        fs::write(repository.join("package-lock.json"), "non-default").unwrap();
+        Command::new("git")
+            .args(["add", "package-lock.json"])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Alucard Test",
+                "-c",
+                "user.email=alucard@example.test",
+                "commit",
+                "-m",
+                "non-default base",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+
         let trace = dir.join("trace");
+        let non_default_ran = dir.join("non-default-ran");
         fs::write(
             bin.join("timeout"),
             format!(
@@ -669,8 +698,9 @@ mod agent_tests {
         fs::write(
             bin.join("docker"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\n[ \"$1\" = run ] && exit 23\n",
-                trace.display()
+                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  exit 23\nfi\n",
+                trace.display(),
+                non_default_ran.display()
             ),
         )
         .unwrap();
@@ -686,9 +716,9 @@ mod agent_tests {
         );
 
         let status =
-            super::toolchain_preflight(&repository, "main", "alucard:test", &env_file, 7).unwrap();
+            super::toolchain_preflight(&repository, "preflight-base", "alucard:test", &env_file, 7)
+                .unwrap();
 
-        env::set_var("PATH", path);
         let trace = fs::read_to_string(trace).unwrap();
         assert!(
             trace.contains("timeout --kill-after 30s 7m docker run --rm --name alucard-preflight-")
@@ -721,6 +751,8 @@ mod agent_tests {
         )));
         assert!(trace.find("docker run").unwrap() < trace.find("docker rm -f").unwrap());
         assert!(status.contains("`npm ci` at the repo root fails inside the container (rc=23)"));
+        env::set_var("PATH", path);
+        assert!(non_default_ran.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1733,6 +1765,7 @@ pub struct RunOptions<'a> {
     pub image: Option<&'a str>,
     pub task: Option<&'a str>,
     pub issue: Option<i64>,
+    pub run_id: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1832,6 +1865,16 @@ impl From<rusqlite::Error> for ClaimError {
 pub fn acquire_task(path: &Path, task_id: &str, run_id: &str) -> Result<Claim, ClaimError> {
     let mut connection = open(path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let claim = acquire_task_in_transaction(&transaction, task_id, run_id)?;
+    transaction.commit()?;
+    Ok(claim)
+}
+
+fn acquire_task_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    run_id: &str,
+) -> Result<Claim, ClaimError> {
     let (repository_id, status): (String, String) = transaction
         .query_row(
             "SELECT repository_id, status FROM tasks WHERE id = ?1",
@@ -1842,15 +1885,14 @@ pub fn acquire_task(path: &Path, task_id: &str, run_id: &str) -> Result<Claim, C
             rusqlite::Error::QueryReturnedNoRows => ClaimError::TaskNotEligible,
             other => ClaimError::Database(other.into()),
         })?;
-    if let Some(run_id) = active_claim(&transaction, &repository_id, ClaimResource::Task, task_id)?
-    {
+    if let Some(run_id) = active_claim(transaction, &repository_id, ClaimResource::Task, task_id)? {
         return Err(ClaimError::ClaimedBy { run_id });
     }
     if status != "pending" {
         return Err(ClaimError::TaskNotEligible);
     }
     let claim = acquire(
-        &transaction,
+        transaction,
         &repository_id,
         ClaimResource::Task,
         task_id,
@@ -1863,8 +1905,63 @@ pub fn acquire_task(path: &Path, task_id: &str, run_id: &str) -> Result<Claim, C
     if changed != 1 {
         return Err(ClaimError::TaskNotEligible);
     }
-    transaction.commit()?;
     Ok(claim)
+}
+
+/// Creates a run and claims its task before preparing the worker checkout.
+pub fn start_task_run(
+    path: &Path,
+    repository: &Path,
+    logs_root: &Path,
+    cache_root: &Path,
+    image: Option<&str>,
+    task_id: &str,
+) -> Result<(Run, Claim), ClaimError> {
+    migrate(path)?;
+    interrupt_running_runs(path)?;
+    let repository = repository.canonicalize().map_err(DatabaseError::from)?;
+    let repository_name = repository
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))
+        .map_err(DatabaseError::from)?;
+    let repository_id = repository.to_string_lossy().to_string();
+    let cache = cache_root.join(repository_cache_key(&repository));
+    let run_id = Uuid::new_v4().to_string();
+    let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
+         VALUES (?1, '', ?2, ?3, datetime('now'))",
+        params![repository_id, repository_name, cache.to_string_lossy()],
+    )?;
+    transaction.execute(
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, pid, hostname)
+         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6)",
+        params![
+            run_id,
+            repository_id,
+            image,
+            logs_path,
+            std::process::id(),
+            hostname().map_err(DatabaseError::from)?,
+        ],
+    )?;
+    let claim = acquire_task_in_transaction(&transaction, task_id, &run_id)?;
+    transaction.commit()?;
+    Ok((
+        Run {
+            id: run_id,
+            repository_id,
+            command: "run".to_string(),
+            status: "running".to_string(),
+            base_sha: None,
+            image: image.map(str::to_string),
+            logs_path: Some(logs_path),
+        },
+        claim,
+    ))
 }
 
 pub fn acquire_pr(
@@ -1921,6 +2018,93 @@ pub fn transition_task(
         return Err(ClaimError::LeaseNotActive);
     }
     transaction.commit()?;
+    Ok(())
+}
+
+/// Returns the ledger id for a task imported from the selected source.
+pub fn task_id(
+    path: &Path,
+    repository_id: &str,
+    source: &str,
+    source_path: &str,
+    external_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT id FROM tasks WHERE repository_id = ?1 AND source = ?2 AND source_path = ?3 AND external_id = ?4",
+            (repository_id, source, source_path, external_id),
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Reports whether an imported task remains available for a new lease.
+pub fn task_is_pending(path: &Path, task_id: &str) -> Result<bool, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT status = 'pending' FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|status| status.unwrap_or(false))
+        .map_err(Into::into)
+}
+
+/// Records an opened PR and moves the claimed task into flight.
+pub fn record_task_pr(
+    path: &Path,
+    task_id: &str,
+    lease_id: &str,
+    run_id: &str,
+    number: i64,
+    branch: &str,
+    head_sha: &str,
+) -> Result<(), ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let repository_id: String = transaction
+        .query_row(
+            "SELECT repository_id FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => ClaimError::TaskNotEligible,
+            other => ClaimError::Database(other.into()),
+        })?;
+    let active: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM claims WHERE id = ?1 AND run_id = ?2 AND resource_kind = 'task' AND resource_key = ?3 AND state = 'active')",
+        (lease_id, run_id, task_id),
+        |row| row.get(0),
+    )?;
+    if !active {
+        return Err(ClaimError::LeaseNotActive);
+    }
+    transaction.execute(
+        "INSERT INTO pull_requests (id, task_id, repository_id, number, branch, head_sha, kind, remote_state, gate_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'normal', 'open', 'pending')
+         ON CONFLICT(repository_id, number) DO UPDATE SET task_id = excluded.task_id, branch = excluded.branch, head_sha = excluded.head_sha, remote_state = 'open'",
+        (Uuid::new_v4().to_string(), task_id, repository_id, number, branch, head_sha),
+    )?;
+    transaction.execute(
+        "UPDATE tasks SET status = 'in_flight', pr_number = ?1, updated_at = datetime('now') WHERE id = ?2",
+        (number, task_id),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Marks a run terminal after its worker loop has returned.
+pub fn finish_run(path: &Path, run_id: &str, status: &str) -> Result<(), DatabaseError> {
+    let connection = open(path)?;
+    connection.execute(
+        "UPDATE runs SET status = ?1, heartbeat_at = datetime('now'), ended_at = datetime('now') WHERE id = ?2",
+        (status, run_id),
+    )?;
     Ok(())
 }
 
@@ -2073,6 +2257,12 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
     let repository_id = repository.to_string_lossy().to_string();
+    let origin_url = run_command("git", &["remote", "get-url", "origin"], &repository, None)
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|url| !url.is_empty())
+        .map(|url| github_https_url(&url));
     let cache_key = repository_cache_key(&repository);
     let cache = options.cache_root.join(&cache_key);
     fs::create_dir_all(options.cache_root)?;
@@ -2098,7 +2288,10 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
             .trim()
             .to_string();
 
-    let run_id = Uuid::new_v4().to_string();
+    let run_id = options
+        .run_id
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let directory = options.logs_root.join(&run_id);
     fs::create_dir_all(&directory)?;
     let clone = directory.join("repository");
@@ -2112,6 +2305,9 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         ],
         &directory,
     )?;
+    if let Some(origin_url) = origin_url.as_deref() {
+        run_checked("git", &["remote", "set-url", "origin", origin_url], &clone)?;
+    }
     FileExt::unlock(&lock)?;
     if !clone.join(".git").is_dir() {
         return Err(RunError::InvalidClone);
@@ -2129,6 +2325,15 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         &["switch", "--quiet", "-c", &branch, &base_sha],
         &clone,
     )?;
+    run_checked(
+        "git",
+        &[
+            "config",
+            &format!("branch.{branch}.gh-merge-base"),
+            options.base,
+        ],
+        &clone,
+    )?;
 
     let mut connection = open(path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2137,19 +2342,26 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
          VALUES (?1, '', ?2, ?3, datetime('now'))",
         params![repository_id, repository_name, cache.to_string_lossy()],
     )?;
-    transaction.execute(
-        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, pid, hostname)
-         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
-        params![
-            run_id,
-            repository_id,
-            base_sha,
-            options.image,
-            directory.to_string_lossy(),
-            std::process::id(),
-            hostname()?,
-        ],
-    )?;
+    if options.run_id.is_some() {
+        transaction.execute(
+            "UPDATE runs SET base_sha = ?1, image = ?2, logs_path = ?3, heartbeat_at = datetime('now') WHERE id = ?4",
+            params![base_sha, options.image, directory.to_string_lossy(), run_id],
+        )?;
+    } else {
+        transaction.execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, pid, hostname)
+             VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
+            params![
+                run_id,
+                repository_id,
+                base_sha,
+                options.image,
+                directory.to_string_lossy(),
+                std::process::id(),
+                hostname()?,
+            ],
+        )?;
+    }
     transaction.commit()?;
     Ok(PreparedRun {
         run: Run {
@@ -2165,6 +2377,10 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         clone,
         branch,
     })
+}
+
+fn github_https_url(url: &str) -> String {
+    url.replacen("git@github.com:", "https://github.com/", 1)
 }
 
 fn repository_cache_key(repository: &Path) -> String {
