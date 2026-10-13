@@ -1010,7 +1010,7 @@ fn event_timestamp() -> String {
         .unwrap_or_default()
         .as_secs() as libc::time_t;
     let mut utc = unsafe { std::mem::zeroed::<libc::tm>() };
-    let mut formatted = [0_i8; 21];
+    let mut formatted = [0 as libc::c_char; 21];
     unsafe {
         if libc::gmtime_r(&seconds, &mut utc).is_null()
             || libc::strftime(
