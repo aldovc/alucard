@@ -67,7 +67,41 @@ pub struct AgentSettings {
 
 impl AgentSettings {
     pub fn from_environment(env_file: Option<&Path>) -> Result<Self, String> {
-        let mut values: std::collections::BTreeMap<_, _> = env::vars().collect();
+        Self::from_values(env::vars().collect(), env_file)
+    }
+
+    fn from_values(
+        mut values: std::collections::BTreeMap<String, String>,
+        env_file: Option<&Path>,
+    ) -> Result<Self, String> {
+        let startup_defaults = [
+            ("ALUCARD_WORKER_MAX_TURNS", "180"),
+            ("ALUCARD_WORKER_MAX_BUDGET", "10"),
+            ("ALUCARD_CI_FIX_MAX_TURNS", "30"),
+            ("ALUCARD_CI_FIX_MAX_BUDGET", "2"),
+            ("ALUCARD_REVIEWER_MAX_TURNS", "45"),
+            ("ALUCARD_REVIEWER_MAX_BUDGET", "2"),
+            ("ALUCARD_FEEDBACK_MAX_TURNS", "50"),
+            ("ALUCARD_FEEDBACK_MAX_BUDGET", "2"),
+            ("ALUCARD_WRAPUP_MAX_TURNS", "12"),
+            ("ALUCARD_WRAPUP_MAX_BUDGET", "1"),
+            ("ALUCARD_CLAUDE_MODEL", "sonnet"),
+            ("ALUCARD_CLAUDE_FALLBACK_MODEL", "haiku"),
+            ("ALUCARD_CODEX_MODEL", "gpt-5.6-terra"),
+        ]
+        .into_iter()
+        .map(|(key, default)| {
+            (
+                key,
+                values
+                    .get(key)
+                    .filter(|value| !value.is_empty())
+                    .map(String::as_str)
+                    .unwrap_or(default)
+                    .to_string(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
         if let Some(path) = env_file {
             let contents = fs::read_to_string(path)
                 .map_err(|error| format!("cannot read env file {}: {error}", path.display()))?;
@@ -80,8 +114,16 @@ impl AgentSettings {
                 let Some((key, value)) = line.split_once('=') else {
                     continue;
                 };
+                let key = key.trim();
                 let value = value.trim().trim_matches(['\'', '"']);
-                values.insert(key.trim().to_string(), value.to_string());
+                values.insert(
+                    key.to_string(),
+                    if value.is_empty() {
+                        startup_defaults.get(key).cloned().unwrap_or_default()
+                    } else {
+                        value.to_string()
+                    },
+                );
             }
         }
         Ok(Self { values })
@@ -245,6 +287,7 @@ fn docker_image_tag_count(docker: &Path, image: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{build_image_with_docker, AgentInvocation, AgentRole, AgentSettings};
+    use std::collections::BTreeMap;
     use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -352,6 +395,69 @@ mod tests {
             fs::read_to_string(&trace).unwrap(),
             "rm -f alucard-test-cleanup\n"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn blank_env_settings_keep_inherited_startup_defaults() {
+        let dir = env::temp_dir().join(format!("alucard-agent-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let env_file = dir.join("alucard.env");
+        fs::write(
+            &env_file,
+            "ALUCARD_CLAUDE_MODEL=\nALUCARD_CLAUDE_FALLBACK_MODEL=\nALUCARD_CODEX_MODEL=\nALUCARD_WORKER_MAX_TURNS=\nALUCARD_WORKER_MAX_BUDGET=\n",
+        )
+        .unwrap();
+        let values = [
+            ("ALUCARD_PROVIDER", "claude"),
+            ("ALUCARD_CI_FIX_PROVIDER", "codex"),
+            ("ALUCARD_CLAUDE_MODEL", "inherited-claude"),
+            ("ALUCARD_CLAUDE_FALLBACK_MODEL", "inherited-fallback"),
+            ("ALUCARD_CODEX_MODEL", "inherited-codex"),
+            ("ALUCARD_WORKER_MAX_TURNS", "181"),
+            ("ALUCARD_WORKER_MAX_BUDGET", "11"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<BTreeMap<_, _>>();
+        let settings = AgentSettings::from_values(values, Some(&env_file)).unwrap();
+
+        let invocation = AgentInvocation {
+            role: AgentRole::Worker,
+            name: "alucard-test",
+            image: "alucard:test",
+            env_file: &env_file,
+            worktree: Path::new(&dir),
+            prompt: "prompt",
+            timeout_minutes: 1,
+            network: None,
+            playwright_cache: None,
+            database_url: None,
+            github_repo: None,
+        };
+        let worker_args = invocation.docker_args(&settings).unwrap();
+        assert!(worker_args
+            .windows(2)
+            .any(|pair| pair == ["--max-turns", "181"]));
+        assert!(worker_args
+            .windows(2)
+            .any(|pair| pair == ["--max-budget-usd", "11"]));
+        assert!(worker_args
+            .windows(2)
+            .any(|pair| pair == ["--model", "inherited-claude"]));
+        assert!(worker_args
+            .windows(2)
+            .any(|pair| pair == ["--fallback-model", "inherited-fallback"]));
+
+        let codex_args = AgentInvocation {
+            role: AgentRole::CiFix,
+            ..invocation
+        }
+        .docker_args(&settings)
+        .unwrap();
+        assert!(codex_args
+            .windows(2)
+            .any(|pair| pair == ["-m", "inherited-codex"]));
         fs::remove_dir_all(dir).unwrap();
     }
 }

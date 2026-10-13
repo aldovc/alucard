@@ -104,7 +104,7 @@ fn blank_settings_fall_back_like_bash_parameter_expansion() {
     assert_eq!(defaults.provider(AgentRole::Worker), Ok(Provider::Claude));
     assert_eq!(
         defaults.setting(AgentRole::Worker, "CODEX_MODEL", "default"),
-        "default"
+        "gpt-5.6-terra"
     );
     assert_eq!(defaults.turns(AgentRole::Worker), "180");
     assert_eq!(defaults.budget(AgentRole::Worker), "10");
