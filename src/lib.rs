@@ -996,16 +996,36 @@ pub struct AgentResult {
 
 /// Appends a Bash-compatible event line without allowing log failures to affect a run.
 pub fn log_event(log_dir: &Path, message: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let timestamp = format!("{now}");
+    let timestamp = event_timestamp();
     let _ = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_dir.join("events.log"))
         .and_then(|mut file| writeln!(file, "{timestamp}\t{message}"));
+}
+
+fn event_timestamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    let mut utc = unsafe { std::mem::zeroed::<libc::tm>() };
+    let mut formatted = [0_i8; 21];
+    unsafe {
+        if libc::gmtime_r(&seconds, &mut utc).is_null()
+            || libc::strftime(
+                formatted.as_mut_ptr(),
+                formatted.len(),
+                c"%Y-%m-%dT%H:%M:%SZ".as_ptr(),
+                &utc,
+            ) == 0
+        {
+            return "1970-01-01T00:00:00Z".to_owned();
+        }
+        CStr::from_ptr(formatted.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 /// Extracts the provider-independent usage fields written by Claude and Codex JSONL streams.
@@ -1219,7 +1239,7 @@ fn repository_id(repository: &Path) -> String {
 fn diff_measurement(repository: &Path, base: &str, head: &str) -> Value {
     let Ok(output) = run_command(
         "git",
-        &["diff", "--numstat", "--find-renames", base, head],
+        &["diff", "--numstat", "--find-renames", "-z", base, head],
         repository,
         None,
     ) else {
@@ -1228,22 +1248,101 @@ fn diff_measurement(repository: &Path, base: &str, head: &str) -> Value {
     if !output.status.success() {
         return json!({"unavailable": true, "reason": "unavailable ref"});
     }
-    let mut added = 0_u64;
-    let mut deleted = 0_u64;
+    let mut buckets = [[0_u64; 3]; 4];
     let mut files = 0_u64;
+    let mut binary_files = 0_u64;
+    let mut renames = 0_u64;
     let mut paths = Vec::new();
-    let output = String::from_utf8_lossy(&output.stdout);
-    for line in output.lines() {
-        let fields = line.splitn(3, '\t').collect::<Vec<_>>();
-        if fields.len() != 3 {
+    let mut entries = output.stdout.split(|byte| *byte == b'\0');
+    while let Some(entry) = entries.next() {
+        let mut fields = entry.splitn(3, |byte| *byte == b'\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             continue;
-        }
+        };
+        let path = if path.is_empty() {
+            let _ = entries.next();
+            renames += 1;
+            match entries.next() {
+                Some(destination) => destination,
+                None => continue,
+            }
+        } else {
+            path
+        };
+        let path = String::from_utf8_lossy(path).into_owned();
+        let bucket = diff_bucket(&path);
         files += 1;
-        paths.push(fields[2]);
-        added += fields[0].parse::<u64>().unwrap_or(0);
-        deleted += fields[1].parse::<u64>().unwrap_or(0);
+        paths.push(path);
+        if added == b"-" || deleted == b"-" {
+            binary_files += 1;
+            buckets[bucket][2] += 1;
+        } else {
+            buckets[bucket][0] += std::str::from_utf8(added)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            buckets[bucket][1] += std::str::from_utf8(deleted)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
     }
-    json!({"files":files,"added":added,"deleted":deleted,"binary_files":0,"renames":0,"paths":paths,"impl":{"added":added,"deleted":deleted,"binary_files":0},"tests":{"added":0,"deleted":0,"binary_files":0},"confdoc":{"added":0,"deleted":0,"binary_files":0},"generated":{"added":0,"deleted":0,"binary_files":0}})
+    json!({"files":files,"added":buckets.iter().map(|bucket| bucket[0]).sum::<u64>(),"deleted":buckets.iter().map(|bucket| bucket[1]).sum::<u64>(),"binary_files":binary_files,"renames":renames,"paths":paths,"impl":{"added":buckets[0][0],"deleted":buckets[0][1],"binary_files":buckets[0][2]},"tests":{"added":buckets[1][0],"deleted":buckets[1][1],"binary_files":buckets[1][2]},"confdoc":{"added":buckets[2][0],"deleted":buckets[2][1],"binary_files":buckets[2][2]},"generated":{"added":buckets[3][0],"deleted":buckets[3][1],"binary_files":buckets[3][2]}})
+}
+
+fn diff_bucket(path: &str) -> usize {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if path
+        .split('/')
+        .any(|part| matches!(part, "test" | "tests" | "__tests__"))
+        || ["test", "spec"].iter().any(|kind| {
+            ["ts", "tsx", "js", "jsx"]
+                .iter()
+                .any(|extension| name.ends_with(&format!(".{kind}.{extension}")))
+        })
+        || (name.starts_with("test_") && (name.ends_with(".py") || name.ends_with(".sh")))
+    {
+        return 1;
+    }
+    if [
+        "package-lock.json",
+        "uv.lock",
+        "poetry.lock",
+        "yarn.lock",
+        "Cargo.lock",
+        "go.sum",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
+        || path
+            .split('/')
+            .any(|part| matches!(part, "dist" | "build" | "node_modules" | "vendor"))
+    {
+        return 3;
+    }
+    if path.starts_with("docs/")
+        || [
+            "md",
+            "json",
+            "yaml",
+            "yml",
+            "toml",
+            "sql",
+            "css",
+            "ini",
+            "cfg",
+            "properties",
+            "gradle",
+            "xml",
+        ]
+        .iter()
+        .any(|extension| name.ends_with(&format!(".{extension}")))
+    {
+        return 2;
+    }
+    0
 }
 
 /// Classifies an agent process exit from its final provider result record.

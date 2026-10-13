@@ -1,9 +1,10 @@
 use alucard::{
     archive_prompt, extract_agent_usage, log_event, write_iteration_measurement,
-    IterationMeasurement,
+    write_stage_measurement, IterationMeasurement,
 };
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temporary_path(name: &str) -> PathBuf {
@@ -12,6 +13,16 @@ fn temporary_path(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("alucard-{name}-{}-{stamp}", std::process::id()))
+}
+
+fn git(repository: &PathBuf, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repository)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 #[test]
@@ -51,9 +62,25 @@ fn events_prompts_and_usage_summary_are_local_artifacts() {
         status: Some(0),
         duration: 1,
     });
-    assert!(fs::read_to_string(root.join("events.log"))
-        .unwrap()
-        .contains("worker started"));
+    let event = fs::read_to_string(root.join("events.log")).unwrap();
+    let (timestamp, message) = event.trim_end().split_once('\t').unwrap();
+    assert_eq!(message, "worker started");
+    assert_eq!(timestamp.len(), 20);
+    assert!(timestamp
+        .bytes()
+        .enumerate()
+        .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()));
+    assert_eq!(
+        [
+            timestamp.as_bytes()[4],
+            timestamp.as_bytes()[7],
+            timestamp.as_bytes()[10],
+            timestamp.as_bytes()[13],
+            timestamp.as_bytes()[16],
+            timestamp.as_bytes()[19],
+        ],
+        [b'-', b'-', b'T', b':', b':', b'Z']
+    );
     assert_eq!(
         fs::read_to_string(root.join("prompts/iter-1.txt")).unwrap(),
         "prompt body"
@@ -61,5 +88,42 @@ fn events_prompts_and_usage_summary_are_local_artifacts() {
     let measurements = fs::read_to_string(root.join("measurements.jsonl")).unwrap();
     assert!(measurements.contains("\"usage_missing\":0"));
     assert!(measurements.contains("\"cost_complete\":false"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stage_measurement_buckets_test_paths_and_renames() {
+    let root = temporary_path("diff");
+    fs::create_dir_all(root.join("tests")).unwrap();
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.email", "test@example.com"]);
+    git(&root, &["config", "user.name", "Test User"]);
+    fs::write(root.join("tests/original.rs"), "fn original() {}\n").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "base"]);
+    let base = git(&root, &["rev-parse", "HEAD"]);
+    fs::rename(
+        root.join("tests/original.rs"),
+        root.join("tests/renamed.rs"),
+    )
+    .unwrap();
+    fs::write(root.join("tests/new.rs"), "fn new_test() {}\n").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "changes"]);
+    let head = git(&root, &["rev-parse", "HEAD"]);
+
+    write_stage_measurement(&root, &root, 1, None, &base, &head);
+
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())
+            .unwrap();
+    let diff = &record["from_base"];
+    assert_eq!(diff["tests"]["added"], 1);
+    assert_eq!(diff["renames"], 1);
+    assert!(diff["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path == "tests/renamed.rs"));
     fs::remove_dir_all(root).unwrap();
 }
