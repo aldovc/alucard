@@ -184,12 +184,18 @@ fn pr_claims_are_exclusive_and_releases_require_the_owning_lease() {
     heartbeat(&path, &claim, &owner).unwrap();
     let other_run = if owner == "run-0" { "run-1" } else { "run-0" };
     assert_eq!(
-        release(&path, &claim, other_run),
+        release(&path, "other-lease", &owner),
         Err(ClaimError::LeaseNotActive)
     );
     assert_eq!(
         acquire_pr(&path, "repo", 42, other_run),
-        Err(ClaimError::ClaimedBy { run_id: owner })
+        Err(ClaimError::ClaimedBy {
+            run_id: owner.clone()
+        })
+    );
+    assert_eq!(
+        release(&path, &claim, other_run),
+        Err(ClaimError::LeaseNotActive)
     );
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
