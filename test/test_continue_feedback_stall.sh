@@ -7,13 +7,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ALUCARD_BIN=${ALUCARD:-}
 source "$SCRIPT_DIR/lib.sh"
-if [ -z "${ALUCARD:-}" ]; then
+if [ -z "$ALUCARD_BIN" ]; then
   ALUCARD="$SCRIPT_DIR/../alucard"
   # shellcheck disable=SC1090
   source "$ALUCARD"
   USES_RUST_BINARY=false
 else
+  ALUCARD="$ALUCARD_BIN"
   USES_RUST_BINARY=true
 fi
 
@@ -24,7 +26,7 @@ TRACE="$TEST_DIR/trace"
 GH_TRACE="$TEST_DIR/gh-trace"
 TARGET="$TEST_DIR/target"
 REMOTE="$TEST_DIR/remote.git"
-LEDGER="$TEST_DIR/ledger.db"
+LEDGER="${CONTINUE_TEST_LEDGER:-$TEST_DIR/ledger.db}"
 mkdir -p "$MOCK_BIN"
 touch "$TRACE" "$GH_TRACE"
 cp "$SCRIPT_DIR/fixtures/credentials.env" "$TEST_DIR/alucard.env"
@@ -275,5 +277,20 @@ run_continue
 
 assert_eq "only the reviewer ran" "1" "$(grep -c '^agent launch$' "$TRACE" || true)"
 assert_contains "the review gate started without feedback" "Review gate" "$OUT"
+
+# ── Scenario 4: an authenticated recovery PR with no ledger row is adopted ──
+echo ""
+echo "── continue: recovery PR adoption ──"
+if "$USES_RUST_BINARY"; then
+  rm -f "$LEDGER"
+fi
+COMMENTS_JSON=$(jq -n --arg marker '**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket'"'"'s.' \
+  '{comments:[{body:$marker,createdAt:"2026-01-01T00:00:00Z",author:{login:"bot"}}]}')
+printf '1 %s\n' "$MAX_TURNS_RESULT" > "$TEST_DIR/script"
+run_continue
+
+assert_eq "only the reviewer runs for a recovery PR without findings" \
+  "1" "$(grep -c '^agent launch$' "$TRACE" || true)"
+assert_contains "the adopted recovery PR reaches the review gate" "Review gate" "$OUT"
 
 finish
