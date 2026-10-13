@@ -479,6 +479,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
 pub struct DatabaseStatus {
     pub schema_version: i64,
     pub pending_migrations: usize,
+    pub journal_mode: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1147,6 +1148,7 @@ pub fn migrate(path: &Path) -> Result<DatabaseStatus, DatabaseError> {
 
 pub fn status(path: &Path) -> Result<DatabaseStatus, DatabaseError> {
     let connection = open(path)?;
+    let journal_mode = journal_mode(&connection)?;
     let applied = applied_versions(&connection)?;
     let schema_version = applied.iter().copied().max().unwrap_or(0);
     let pending_migrations = MIGRATIONS
@@ -1156,7 +1158,12 @@ pub fn status(path: &Path) -> Result<DatabaseStatus, DatabaseError> {
     Ok(DatabaseStatus {
         schema_version,
         pending_migrations,
+        journal_mode,
     })
+}
+
+fn journal_mode(connection: &Connection) -> Result<String, rusqlite::Error> {
+    connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))
 }
 
 pub fn open(path: &Path) -> Result<Connection, DatabaseError> {
@@ -1251,3 +1258,17 @@ impl std::fmt::Display for DatabaseError {
 }
 
 impl std::error::Error for DatabaseError {}
+
+#[cfg(test)]
+mod tests {
+    use super::journal_mode;
+    use rusqlite::Connection;
+
+    #[test]
+    fn journal_mode_reports_non_wal_for_in_memory_databases() {
+        assert_ne!(
+            journal_mode(&Connection::open_in_memory().unwrap()).unwrap(),
+            "wal"
+        );
+    }
+}
