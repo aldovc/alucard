@@ -133,6 +133,7 @@ fn prepared_runs_with_matching_repository_names_use_separate_caches() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -146,6 +147,7 @@ fn prepared_runs_with_matching_repository_names_use_separate_caches() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -193,6 +195,7 @@ fn prepared_runs_with_long_canonical_paths_use_a_bounded_cache_key() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -238,6 +241,7 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
             image: None,
             task: Some("alpha"),
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -251,6 +255,7 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
             image: None,
             task: None,
             issue: Some(42),
+            run_id: None,
         },
     )
     .unwrap();
@@ -324,6 +329,7 @@ fn prepared_run_uses_the_refreshed_remote_head() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -355,6 +361,7 @@ fn prepared_run_uses_the_refreshed_remote_head() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -399,6 +406,7 @@ fn concurrent_preparation_keeps_working_clones_usable() {
                         image: None,
                         task: None,
                         issue: None,
+                        run_id: None,
                     },
                 )
             })
@@ -441,6 +449,7 @@ fn preparing_a_run_reconciles_abandoned_owners() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();
@@ -473,6 +482,7 @@ fn preparing_a_run_reconciles_abandoned_owners() {
             image: None,
             task: None,
             issue: None,
+            run_id: None,
         },
     )
     .unwrap();

@@ -1,13 +1,12 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    acquire_task, build_image, compose_role_prompt, database_path, find_run, finish_run,
-    github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
-    local_queue_with_open_issues, migrate, open, parse_tasks, prepare_run, recent_runs,
-    record_task_pr, release, run_claims, run_command as execute_command, run_pull_requests, status,
-    task_id, task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image,
-    AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider, RunOptions,
-    TaskStatus,
+    build_image, compose_role_prompt, database_path, find_run, finish_run, github_queue,
+    github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue_with_open_issues,
+    migrate, open, parse_tasks, prepare_run, recent_runs, record_task_pr, release, run_claims,
+    run_command as execute_command, run_pull_requests, start_task_run, status, task_id,
+    task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image, AgentInvocation,
+    AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider, RunOptions, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -604,10 +603,23 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(file) => file,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
-    for iteration in 1..=options.iterations {
+    let mut iteration = 1;
+    while iteration <= options.iterations {
         let selected = match select_run_task(&options.queue, task_file.as_deref(), &database) {
             Ok(Some(task)) => task,
             Ok(None) => break,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        };
+        let (run, claim) = match start_task_run(
+            &database,
+            &options.queue.repository,
+            &options.logs_root,
+            &cache,
+            Some(&options.image),
+            &selected.ledger_id,
+        ) {
+            Ok(run) => run,
+            Err(alucard::ClaimError::ClaimedBy { .. }) => continue,
             Err(error) => return fail(&format!("alucard: {error}")),
         };
         let prepared = match prepare_run(
@@ -620,20 +632,20 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 image: Some(&options.image),
                 task: selected.local_id.as_deref(),
                 issue: selected.issue.as_ref().map(|issue| issue.number),
+                run_id: Some(&run.id),
             },
         ) {
-            Ok(run) => run,
-            Err(error) => return fail(&format!("alucard: {error}")),
-        };
-        let claim = match acquire_task(&database, &selected.ledger_id, &prepared.run.id) {
-            Ok(claim) => claim,
-            Err(alucard::ClaimError::ClaimedBy { .. }) => {
-                let _ = finish_run(&database, &prepared.run.id, "failed");
-                continue;
-            }
+            Ok(prepared) => prepared,
             Err(error) => {
-                let _ = finish_run(&database, &prepared.run.id, "failed");
-                return fail(&format!("alucard: cannot claim task: {error}"));
+                release_without_pr(
+                    &database,
+                    &selected,
+                    &claim.id,
+                    &run.id,
+                    &options.queue.repository,
+                );
+                let _ = finish_run(&database, &run.id, "failed");
+                return fail(&format!("alucard: {error}"));
             }
         };
         if let Some(issue) = selected.issue.as_ref() {
@@ -789,6 +801,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 return fail(&format!("alucard: {error}"));
             }
         }
+        iteration += 1;
     }
     ExitCode::SUCCESS
 }

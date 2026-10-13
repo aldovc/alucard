@@ -1765,6 +1765,7 @@ pub struct RunOptions<'a> {
     pub image: Option<&'a str>,
     pub task: Option<&'a str>,
     pub issue: Option<i64>,
+    pub run_id: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1864,6 +1865,16 @@ impl From<rusqlite::Error> for ClaimError {
 pub fn acquire_task(path: &Path, task_id: &str, run_id: &str) -> Result<Claim, ClaimError> {
     let mut connection = open(path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let claim = acquire_task_in_transaction(&transaction, task_id, run_id)?;
+    transaction.commit()?;
+    Ok(claim)
+}
+
+fn acquire_task_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    run_id: &str,
+) -> Result<Claim, ClaimError> {
     let (repository_id, status): (String, String) = transaction
         .query_row(
             "SELECT repository_id, status FROM tasks WHERE id = ?1",
@@ -1874,15 +1885,14 @@ pub fn acquire_task(path: &Path, task_id: &str, run_id: &str) -> Result<Claim, C
             rusqlite::Error::QueryReturnedNoRows => ClaimError::TaskNotEligible,
             other => ClaimError::Database(other.into()),
         })?;
-    if let Some(run_id) = active_claim(&transaction, &repository_id, ClaimResource::Task, task_id)?
-    {
+    if let Some(run_id) = active_claim(transaction, &repository_id, ClaimResource::Task, task_id)? {
         return Err(ClaimError::ClaimedBy { run_id });
     }
     if status != "pending" {
         return Err(ClaimError::TaskNotEligible);
     }
     let claim = acquire(
-        &transaction,
+        transaction,
         &repository_id,
         ClaimResource::Task,
         task_id,
@@ -1895,8 +1905,63 @@ pub fn acquire_task(path: &Path, task_id: &str, run_id: &str) -> Result<Claim, C
     if changed != 1 {
         return Err(ClaimError::TaskNotEligible);
     }
-    transaction.commit()?;
     Ok(claim)
+}
+
+/// Creates a run and claims its task before preparing the worker checkout.
+pub fn start_task_run(
+    path: &Path,
+    repository: &Path,
+    logs_root: &Path,
+    cache_root: &Path,
+    image: Option<&str>,
+    task_id: &str,
+) -> Result<(Run, Claim), ClaimError> {
+    migrate(path)?;
+    interrupt_running_runs(path)?;
+    let repository = repository.canonicalize().map_err(DatabaseError::from)?;
+    let repository_name = repository
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))
+        .map_err(DatabaseError::from)?;
+    let repository_id = repository.to_string_lossy().to_string();
+    let cache = cache_root.join(repository_cache_key(&repository));
+    let run_id = Uuid::new_v4().to_string();
+    let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
+         VALUES (?1, '', ?2, ?3, datetime('now'))",
+        params![repository_id, repository_name, cache.to_string_lossy()],
+    )?;
+    transaction.execute(
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, pid, hostname)
+         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6)",
+        params![
+            run_id,
+            repository_id,
+            image,
+            logs_path,
+            std::process::id(),
+            hostname().map_err(DatabaseError::from)?,
+        ],
+    )?;
+    let claim = acquire_task_in_transaction(&transaction, task_id, &run_id)?;
+    transaction.commit()?;
+    Ok((
+        Run {
+            id: run_id,
+            repository_id,
+            command: "run".to_string(),
+            status: "running".to_string(),
+            base_sha: None,
+            image: image.map(str::to_string),
+            logs_path: Some(logs_path),
+        },
+        claim,
+    ))
 }
 
 pub fn acquire_pr(
@@ -2223,7 +2288,10 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
             .trim()
             .to_string();
 
-    let run_id = Uuid::new_v4().to_string();
+    let run_id = options
+        .run_id
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let directory = options.logs_root.join(&run_id);
     fs::create_dir_all(&directory)?;
     let clone = directory.join("repository");
@@ -2274,19 +2342,26 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
          VALUES (?1, '', ?2, ?3, datetime('now'))",
         params![repository_id, repository_name, cache.to_string_lossy()],
     )?;
-    transaction.execute(
-        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, pid, hostname)
-         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
-        params![
-            run_id,
-            repository_id,
-            base_sha,
-            options.image,
-            directory.to_string_lossy(),
-            std::process::id(),
-            hostname()?,
-        ],
-    )?;
+    if options.run_id.is_some() {
+        transaction.execute(
+            "UPDATE runs SET base_sha = ?1, image = ?2, logs_path = ?3, heartbeat_at = datetime('now') WHERE id = ?4",
+            params![base_sha, options.image, directory.to_string_lossy(), run_id],
+        )?;
+    } else {
+        transaction.execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, pid, hostname)
+             VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
+            params![
+                run_id,
+                repository_id,
+                base_sha,
+                options.image,
+                directory.to_string_lossy(),
+                std::process::id(),
+                hostname()?,
+            ],
+        )?;
+    }
     transaction.commit()?;
     Ok(PreparedRun {
         run: Run {
