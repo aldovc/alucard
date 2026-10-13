@@ -64,6 +64,7 @@ impl ClaimResource {
 pub enum ClaimError {
     Database(DatabaseError),
     ClaimedBy { run_id: String },
+    RunNotInRepository,
     TaskNotEligible,
     LeaseNotActive,
 }
@@ -73,6 +74,7 @@ impl std::fmt::Display for ClaimError {
         match self {
             Self::Database(error) => error.fmt(formatter),
             Self::ClaimedBy { run_id } => write!(formatter, "claimed by run {run_id}"),
+            Self::RunNotInRepository => write!(formatter, "run does not belong to the repository"),
             Self::TaskNotEligible => write!(formatter, "task is not eligible for a claim"),
             Self::LeaseNotActive => write!(formatter, "lease is not active"),
         }
@@ -85,7 +87,8 @@ impl PartialEq for ClaimError {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::ClaimedBy { run_id: left }, Self::ClaimedBy { run_id: right }) => left == right,
-            (Self::TaskNotEligible, Self::TaskNotEligible)
+            (Self::RunNotInRepository, Self::RunNotInRepository)
+            | (Self::TaskNotEligible, Self::TaskNotEligible)
             | (Self::LeaseNotActive, Self::LeaseNotActive) => true,
             _ => false,
         }
@@ -208,6 +211,14 @@ fn acquire(
     resource_key: &str,
     run_id: &str,
 ) -> Result<Claim, ClaimError> {
+    let run_belongs_to_repository: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE id = ?1 AND repository_id = ?2)",
+        (run_id, repository_id),
+        |row| row.get(0),
+    )?;
+    if !run_belongs_to_repository {
+        return Err(ClaimError::RunNotInRepository);
+    }
     if let Some(run_id) = active_claim(transaction, repository_id, resource_kind, resource_key)? {
         return Err(ClaimError::ClaimedBy { run_id });
     }

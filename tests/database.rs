@@ -201,6 +201,66 @@ fn pr_claims_are_exclusive_and_releases_require_the_owning_lease() {
 }
 
 #[test]
+fn runs_cannot_acquire_claims_for_another_repository() {
+    let path = database_path();
+    migrate(&path).unwrap();
+    let connection = open(&path).unwrap();
+    for repository_id in ["source", "target"] {
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, 'owner', ?1, 'now')",
+                [repository_id],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+             VALUES ('target-task', 'target', 'github', 'target-task', 'task', 'pending', '[]', 'now')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+             VALUES ('source-run', 'source', 'run', 'running', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        acquire_task(&path, "target-task", "source-run"),
+        Err(ClaimError::RunNotInRepository)
+    );
+    assert_eq!(
+        acquire_pr(&path, "target", 42, "source-run"),
+        Err(ClaimError::RunNotInRepository)
+    );
+
+    let connection = open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'target-task'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM claims", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn pending_task_can_be_reacquired_after_its_lease_is_released() {
     let path = database_path();
     prepare_claims(&path, &["task"]);
