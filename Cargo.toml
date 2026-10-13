@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 rusqlite = { version = "0.32.1", features = ["bundled"] }
+uuid = { version = "=1.11.0", features = ["v4"] }
 
 [profile.release]
 strip = true
