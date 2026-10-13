@@ -3,11 +3,11 @@
 use alucard::{
     build_image, compose_role_prompt, database_path, find_run, finish_run, github_queue,
     github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue_with_open_issues,
-    migrate, open, parse_tasks, prepare_run, recent_runs, record_task_pr, release, run_claims,
-    run_command as execute_command, run_pull_requests, start_retry_run, start_task_run, status,
-    task_id, task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image,
-    AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider, RunOptions,
-    TaskStatus,
+    migrate, open, parse_tasks, prepare_run, recent_runs, record_task_pr,
+    record_task_pr_gate_state, release, run_claims, run_command as execute_command,
+    run_pull_requests, start_retry_run, start_task_run, status, task_id, task_is_pending,
+    toolchain_preflight, transition_task, warn_if_stale_image, AgentInvocation, AgentRole,
+    AgentSettings, GithubPullRequest, GithubTask, Provider, RunOptions, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -768,7 +768,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         let _ = finish_run(&database, &attempt_run.id, "failed");
                         return fail(&format!("alucard: {error}"));
                     }
-                    if let Err(error) = (CiGate {
+                    match (CiGate {
                         tools: &tools,
                         settings: &settings,
                         options: &options,
@@ -782,7 +782,19 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         iteration,
                         &mut checks_available,
                     ) {
-                        eprintln!("alucard: CI gate for PR #{number}: {error}");
+                        Ok(result) => {
+                            if let Err(error) = record_task_pr_gate_state(
+                                &database,
+                                &selected.ledger_id,
+                                number,
+                                result.gate_state(),
+                            ) {
+                                eprintln!(
+                                    "alucard: could not record CI gate for PR #{number}: {error}"
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!("alucard: CI gate for PR #{number}: {error}"),
                     }
                     let _ = release(&database, &claim.id, &owner_run_id);
                     let _ = finish_run(&database, &attempt_run.id, "completed");
@@ -905,6 +917,16 @@ enum CiResult {
     Missing,
 }
 
+impl CiResult {
+    fn gate_state(self) -> &'static str {
+        match self {
+            Self::Green => "ci_green",
+            Self::Failed => "ci_failed",
+            Self::Missing => "ci_missing",
+        }
+    }
+}
+
 struct CiGate<'a> {
     tools: &'a Path,
     settings: &'a AgentSettings,
@@ -921,7 +943,7 @@ impl CiGate<'_> {
         pr_number: i64,
         iteration: usize,
         checks_available: &mut bool,
-    ) -> Result<(), String> {
+    ) -> Result<CiResult, String> {
         let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
         let remote = remote.trim();
         for attempt in 1..=3 {
@@ -946,15 +968,27 @@ impl CiGate<'_> {
             )? {
                 CiResult::Green => {
                     println!("CI gate: PR #{pr_number} green — ready for review.");
-                    return Ok(());
+                    return Ok(CiResult::Green);
                 }
                 CiResult::Missing => {
                     eprintln!("CI gate: no CI ran for PR #{pr_number} — not green; review must not treat this PR as ready to merge.");
-                    return Ok(());
+                    let _ = execute_command(
+                        "gh",
+                        &[
+                            "pr",
+                            "comment",
+                            &pr_number.to_string(),
+                            "--body",
+                            no_ci_comment(),
+                        ],
+                        &prepared.clone,
+                        Some(Duration::from_secs(2700)),
+                    );
+                    return Ok(CiResult::Missing);
                 }
                 CiResult::Failed if attempt == 3 => {
                     eprintln!("CI gate: PR #{pr_number} still failing after 3 check attempts.");
-                    return Ok(());
+                    return Ok(CiResult::Failed);
                 }
                 CiResult::Failed => {}
             }
@@ -985,6 +1019,7 @@ impl CiGate<'_> {
                 .directory
                 .join(format!("iter-{iteration}-fix-{attempt}.jsonl"));
             let name = format!("alucard-fix-{}-{attempt}", prepared.run.id);
+            let fix_iteration = format!("{iteration}-fix-{attempt}");
             let _ = AgentInvocation {
                 role: AgentRole::CiFix,
                 name: &name,
@@ -999,11 +1034,11 @@ impl CiGate<'_> {
                 github_repo: self.github_repo,
                 worktree_read_only: false,
                 output_dir: None,
-                extra_env: &[],
+                extra_env: &[("ALUCARD_ITER", &fix_iteration)],
             }
             .invoke(self.settings, &log);
         }
-        Ok(())
+        Ok(CiResult::Failed)
     }
 }
 
@@ -1220,11 +1255,17 @@ fn ci_fix_prompt(
     branch: &str,
     failure_log: &str,
 ) -> Result<String, String> {
+    let instructions = fs::read_to_string(tools.join("alucard-ci-fix-prompt.md"))
+        .map_err(|error| error.to_string())?;
     Ok(format!(
-        "<instructions>{}</instructions>\n<pr_num>{pr_number}</pr_num>\n<branch>{branch}</branch>\n<failure_log>{}</failure_log>",
-        fs::read_to_string(tools.join("alucard-ci-fix-prompt.md")).map_err(|error| error.to_string())?,
+        "<instructions>\n{}\n</instructions>\n<pr_num>{pr_number}</pr_num>\n<branch>{branch}</branch>\n<failure_log>\n{}\n</failure_log>",
+        instructions.trim_end_matches('\n'),
         xml_escape(failure_log),
     ))
+}
+
+fn no_ci_comment() -> &'static str {
+    "**🤖 Alucard CI gate: no CI ran — not green**\n\nNo CI checks reported for this PR's head commit. Workflows may be missing or disabled, or the token cannot see their runs. The agents ran only the checks the container can run, so nothing has run this repository's full suite.\n\nReview continues, but an approval will not mark this PR ready to merge. Run the full checks before merging."
 }
 
 fn gh_text(repository: &Path, args: &[&str]) -> Result<String, String> {
@@ -2378,7 +2419,43 @@ printf '%s' "$FULL_PROMPT""#,
         let prompt =
             ci_fix_prompt(Path::new(env!("CARGO_MANIFEST_DIR")), 1, "branch", &log).unwrap();
 
-        assert!(prompt.contains("<failure_log>selected &lt;failure&gt; log</failure_log>"));
+        assert!(prompt.contains("<failure_log>\nselected &lt;failure&gt; log\n</failure_log>"));
+    }
+
+    #[test]
+    fn ci_fix_prompt_matches_bash() {
+        let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let failure_log = "selected <failure> & log";
+        let bash = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1/alucard"
+_fix_prompt="<instructions>
+$(<"$1/alucard-ci-fix-prompt.md")
+</instructions>
+<pr_num>${2}</pr_num>
+<branch>${3}</branch>
+<failure_log>
+$(printf '%s' "$4" | xml_escape)
+</failure_log>"
+printf '%s' "$_fix_prompt""#,
+                "bash",
+                tools.to_str().unwrap(),
+                "17",
+                "agent/test",
+                failure_log,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            bash.status.success(),
+            "{}",
+            String::from_utf8_lossy(&bash.stderr)
+        );
+        assert_eq!(
+            ci_fix_prompt(tools, 17, "agent/test", failure_log).unwrap(),
+            String::from_utf8(bash.stdout).unwrap()
+        );
     }
 
     #[test]
