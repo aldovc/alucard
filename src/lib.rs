@@ -911,6 +911,52 @@ mod agent_tests {
             .any(|pair| pair == ["-m", "inherited-codex"]));
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn wrapup_uses_worker_model_with_its_own_budget() {
+        let dir = env::temp_dir().join(format!("alucard-wrapup-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let env_file = dir.join("alucard.env");
+        fs::write(&env_file, "").unwrap();
+        let values = [
+            ("ALUCARD_WORKER_PROVIDER", "claude"),
+            ("ALUCARD_WORKER_CLAUDE_MODEL", "worker-model"),
+            ("ALUCARD_WORKER_MAX_TURNS", "180"),
+            ("ALUCARD_WORKER_MAX_BUDGET", "10"),
+            ("ALUCARD_WRAPUP_MAX_TURNS", "12"),
+            ("ALUCARD_WRAPUP_MAX_BUDGET", "1"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<BTreeMap<_, _>>();
+        let settings = AgentSettings::from_values(values, None).unwrap();
+        let invocation = AgentInvocation {
+            role: AgentRole::Wrapup,
+            name: "alucard-wrapup-test",
+            image: "alucard:test",
+            env_file: &env_file,
+            worktree: Path::new(&dir),
+            prompt: "prompt",
+            timeout_minutes: 1,
+            network: None,
+            playwright_cache: None,
+            database_url: None,
+            github_repo: None,
+            worktree_read_only: false,
+            output_dir: None,
+            extra_env: &[],
+        };
+
+        let args = invocation.docker_args(&settings).unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["--max-turns", "12"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--max-budget-usd", "1"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "worker-model"]));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 pub struct AgentInvocation<'a> {
