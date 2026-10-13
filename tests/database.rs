@@ -74,10 +74,20 @@ fn migration_is_idempotent_and_enforces_the_ledger_constraints() {
         .unwrap();
 
     #[cfg(unix)]
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    {
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     drop(connection);
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
