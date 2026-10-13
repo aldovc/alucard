@@ -11,7 +11,7 @@ use alucard::{
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
 
 fn main() -> ExitCode {
@@ -593,6 +593,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         .ok()
         .map(|()| cache.join("playwright-browsers"));
     let github_repo = github_repo_slug(&options.queue.repository);
+    let mut checks_available = true;
     if !options.no_build {
         if let Err(error) = build_image(&tools, &options.image) {
             return fail(&format!("alucard: {error}"));
@@ -762,7 +763,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     playwright_cache: playwright_cache.as_deref(),
                     github_repo: github_repo.as_deref(),
                 })
-                .run(&prepared, &branch, number, iteration)
+                .run(&prepared, &branch, number, iteration, &mut checks_available)
                 {
                     eprintln!("alucard: CI gate for PR #{number}: {error}");
                 }
@@ -840,10 +841,10 @@ impl CiGate<'_> {
         branch: &str,
         pr_number: i64,
         iteration: usize,
+        checks_available: &mut bool,
     ) -> Result<(), String> {
         let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
         let remote = remote.trim();
-        let mut checks_available = true;
         for attempt in 1..=3 {
             let head = gh_text(
                 &prepared.clone,
@@ -862,7 +863,7 @@ impl CiGate<'_> {
                 pr_number,
                 branch,
                 head.trim(),
-                &mut checks_available,
+                checks_available,
             )? {
                 CiResult::Green => {
                     println!("CI gate: PR #{pr_number} green — ready for review.");
@@ -900,11 +901,7 @@ impl CiGate<'_> {
             if !clone.status.success() {
                 return Err(String::from_utf8_lossy(&clone.stderr).trim().to_string());
             }
-            let prompt = format!(
-            "<instructions>{}</instructions>\n<pr_num>{pr_number}</pr_num>\n<branch>{branch}</branch>\n<failure_log>{}</failure_log>",
-            fs::read_to_string(self.tools.join("alucard-ci-fix-prompt.md")).map_err(|error| error.to_string())?,
-            xml_escape(&failure_log),
-        );
+            let prompt = ci_fix_prompt(self.tools, pr_number, branch, &failure_log)?;
             let log = prepared
                 .directory
                 .join(format!("iter-{iteration}-fix-{attempt}.jsonl"));
@@ -938,11 +935,42 @@ fn probe_ci(
     head: &str,
     checks_available: &mut bool,
 ) -> Result<CiResult, String> {
+    probe_ci_with(
+        repository,
+        pr_number,
+        branch,
+        head,
+        checks_available,
+        &mut |args, timeout| {
+            execute_command("gh", args, repository, Some(timeout))
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn probe_ci_with<F>(
+    repository: &Path,
+    pr_number: i64,
+    branch: &str,
+    head: &str,
+    checks_available: &mut bool,
+    command: &mut F,
+) -> Result<CiResult, String>
+where
+    F: FnMut(&[&str], Duration) -> Result<std::process::Output, String>,
+{
     if !*checks_available {
-        return poll_ci_run_list(repository, pr_number, branch, head);
+        return poll_ci_run_list_with(
+            repository,
+            pr_number,
+            branch,
+            head,
+            command,
+            &mut Instant::now,
+            &mut std::thread::sleep,
+        );
     }
-    let checks = execute_command(
-        "gh",
+    let checks = command(
         &[
             "pr",
             "checks",
@@ -951,10 +979,8 @@ fn probe_ci(
             "--interval",
             "30",
         ],
-        repository,
-        Some(Duration::from_secs(2700)),
-    )
-    .map_err(|error| error.to_string())?;
+        Duration::from_secs(2700),
+    )?;
     if checks.status.success() {
         return Ok(CiResult::Green);
     }
@@ -966,18 +992,35 @@ fn probe_ci(
         return Ok(CiResult::Failed);
     }
     *checks_available = false;
-    poll_ci_run_list(repository, pr_number, branch, head)
+    poll_ci_run_list_with(
+        repository,
+        pr_number,
+        branch,
+        head,
+        command,
+        &mut Instant::now,
+        &mut std::thread::sleep,
+    )
 }
 
-fn poll_ci_run_list(
-    repository: &Path,
+fn poll_ci_run_list_with<F, N, S>(
+    _repository: &Path,
     pr_number: i64,
     branch: &str,
     head: &str,
-) -> Result<CiResult, String> {
-    for probe in 0..4 {
-        let output = gh_text(
-            repository,
+    command: &mut F,
+    now: &mut N,
+    sleep: &mut S,
+) -> Result<CiResult, String>
+where
+    F: FnMut(&[&str], Duration) -> Result<std::process::Output, String>,
+    N: FnMut() -> Instant,
+    S: FnMut(Duration),
+{
+    let deadline = now() + Duration::from_secs(2700);
+    let mut absent_probes = 0;
+    loop {
+        let output = command(
             &[
                 "run",
                 "list",
@@ -986,7 +1029,12 @@ fn poll_ci_run_list(
                 "--json",
                 "status,conclusion,databaseId,headSha",
             ],
+            Duration::from_secs(2700),
         )?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
         let runs: Vec<serde_json::Value> = serde_json::from_str(&output)
             .map_err(|error| format!("invalid gh run list response: {error}"))?;
         let branch_has_runs = !runs.is_empty();
@@ -995,7 +1043,8 @@ fn poll_ci_run_list(
         }
         if runs.iter().all(|run| run["headSha"].as_str() != Some(head)) {
             let limit = if branch_has_runs { 2 } else { 4 };
-            if probe + 1 >= limit {
+            absent_probes += 1;
+            if absent_probes >= limit {
                 if branch_has_runs {
                     eprintln!("CI gate: no run for current HEAD {head}; older SHAs on this branch did run.");
                 } else {
@@ -1004,9 +1053,11 @@ fn poll_ci_run_list(
                 return Ok(CiResult::Missing);
             }
         }
-        std::thread::sleep(Duration::from_secs(30));
+        if now() >= deadline {
+            return Ok(CiResult::Missing);
+        }
+        sleep(Duration::from_secs(30));
     }
-    Ok(CiResult::Missing)
 }
 
 fn current_head_ci_result(runs: &[serde_json::Value], head: &str) -> Option<CiResult> {
@@ -1032,8 +1083,21 @@ fn current_head_ci_result(runs: &[serde_json::Value], head: &str) -> Option<CiRe
 }
 
 fn failed_run_log(repository: &Path, branch: &str, head: &str) -> Result<String, String> {
-    let output = gh_text(
-        repository,
+    failed_run_log_with(repository, branch, head, &mut |args, timeout| {
+        execute_command("gh", args, repository, Some(timeout)).map_err(|error| error.to_string())
+    })
+}
+
+fn failed_run_log_with<F>(
+    _repository: &Path,
+    branch: &str,
+    head: &str,
+    command: &mut F,
+) -> Result<String, String>
+where
+    F: FnMut(&[&str], Duration) -> Result<std::process::Output, String>,
+{
+    let output = command(
         &[
             "run",
             "list",
@@ -1042,7 +1106,12 @@ fn failed_run_log(repository: &Path, branch: &str, head: &str) -> Result<String,
             "--json",
             "databaseId,conclusion,headSha",
         ],
+        Duration::from_secs(2700),
     )?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let output = String::from_utf8_lossy(&output.stdout).to_string();
     let runs: Vec<serde_json::Value> = serde_json::from_str(&output)
         .map_err(|error| format!("invalid gh run list response: {error}"))?;
     let Some(id) = runs.iter().find_map(|run| {
@@ -1052,10 +1121,30 @@ fn failed_run_log(repository: &Path, branch: &str, head: &str) -> Result<String,
     }) else {
         return Ok(String::new());
     };
-    gh_text(
-        repository,
+    command(
         &["run", "view", &id.to_string(), "--log-failed"],
+        Duration::from_secs(2700),
     )
+    .and_then(|output| {
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    })
+}
+
+fn ci_fix_prompt(
+    tools: &Path,
+    pr_number: i64,
+    branch: &str,
+    failure_log: &str,
+) -> Result<String, String> {
+    Ok(format!(
+        "<instructions>{}</instructions>\n<pr_num>{pr_number}</pr_num>\n<branch>{branch}</branch>\n<failure_log>{}</failure_log>",
+        fs::read_to_string(tools.join("alucard-ci-fix-prompt.md")).map_err(|error| error.to_string())?,
+        xml_escape(failure_log),
+    ))
 }
 
 fn gh_text(repository: &Path, args: &[&str]) -> Result<String, String> {
@@ -1907,6 +1996,18 @@ fn version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Output;
+
+    fn command_output(stdout: &str, stderr: &str, status: i32) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
 
     #[test]
     fn worker_prompt_matches_bash_for_pinned_issues_and_local_tasks() {
@@ -2041,5 +2142,115 @@ printf '%s' "$FULL_PROMPT""#,
             current_head_ci_result(runs.as_array().unwrap(), "other"),
             None
         );
+    }
+
+    #[test]
+    fn ci_checks_denial_uses_run_list_for_later_gates() {
+        let repository = Path::new(".");
+        let mut available = true;
+        let checks_calls = Cell::new(0);
+        let mut outputs = VecDeque::from([
+            command_output("", "Resource not accessible by integration", 1),
+            command_output(
+                r#"[{"headSha":"head","status":"completed","conclusion":"success"}]"#,
+                "",
+                0,
+            ),
+            command_output(
+                r#"[{"headSha":"head","status":"completed","conclusion":"success"}]"#,
+                "",
+                0,
+            ),
+        ]);
+        let mut command = |args: &[&str], _timeout| {
+            if args.starts_with(&["pr", "checks"]) {
+                checks_calls.set(checks_calls.get() + 1);
+            }
+            Ok(outputs.pop_front().unwrap())
+        };
+
+        assert_eq!(
+            probe_ci_with(
+                repository,
+                1,
+                "branch",
+                "head",
+                &mut available,
+                &mut command,
+            )
+            .unwrap(),
+            CiResult::Green
+        );
+        assert_eq!(
+            probe_ci_with(
+                repository,
+                2,
+                "branch",
+                "head",
+                &mut available,
+                &mut command,
+            )
+            .unwrap(),
+            CiResult::Green
+        );
+
+        assert!(!available);
+        assert_eq!(checks_calls.get(), 1);
+    }
+
+    #[test]
+    fn ci_fix_prompt_uses_the_current_head_failed_run_log() {
+        let mut outputs = VecDeque::from([
+            command_output(
+                r#"[{"databaseId":11,"headSha":"old","conclusion":"failure"},{"databaseId":22,"headSha":"head","conclusion":"failure"}]"#,
+                "",
+                0,
+            ),
+            command_output("selected <failure> log", "", 0),
+        ]);
+        let mut command = |args: &[&str], _timeout| {
+            if args[1] == "view" {
+                assert_eq!(args[2], "22");
+            }
+            Ok(outputs.pop_front().unwrap())
+        };
+
+        let log = failed_run_log_with(Path::new("."), "branch", "head", &mut command).unwrap();
+        let prompt =
+            ci_fix_prompt(Path::new(env!("CARGO_MANIFEST_DIR")), 1, "branch", &log).unwrap();
+
+        assert!(prompt.contains("<failure_log>selected &lt;failure&gt; log</failure_log>"));
+    }
+
+    #[test]
+    fn ci_run_list_waits_for_a_pending_current_head_past_four_probes() {
+        let pending = r#"[{"headSha":"old","status":"completed","conclusion":"failure"},{"headSha":"head","status":"in_progress","conclusion":null}]"#;
+        let completed = r#"[{"headSha":"old","status":"completed","conclusion":"failure"},{"headSha":"head","status":"completed","conclusion":"success"}]"#;
+        let mut outputs = VecDeque::from([
+            command_output(pending, "", 0),
+            command_output(pending, "", 0),
+            command_output(pending, "", 0),
+            command_output(pending, "", 0),
+            command_output(completed, "", 0),
+        ]);
+        let clock = Cell::new(Instant::now());
+        let mut command = |_args: &[&str], _timeout| Ok(outputs.pop_front().unwrap());
+        let mut now = || clock.get();
+        let mut sleep = |duration| clock.set(clock.get() + duration);
+
+        assert_eq!(
+            poll_ci_run_list_with(
+                Path::new("."),
+                1,
+                "branch",
+                "head",
+                &mut command,
+                &mut now,
+                &mut sleep,
+            )
+            .unwrap(),
+            CiResult::Green
+        );
+        assert!(outputs.is_empty());
     }
 }
