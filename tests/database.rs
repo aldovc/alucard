@@ -1,7 +1,8 @@
 use alucard::{
     abandoned_task_claims, acquire_pr, acquire_task, begin_operation, finish_operation, heartbeat,
     migrate, open, prepare_run, record_task_pr, release, release_abandoned_task_claim, run_command,
-    start_retry_run, status, transition_task, ClaimError, RunOptions, TaskStatus,
+    start_retry_run, start_task_retry_run, status, task_claim_attempts, transition_task,
+    AbandonedTaskClaim, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -124,7 +125,8 @@ fn retry_attempts_have_distinct_run_records_and_workspaces() {
     migrate(&path).unwrap();
 
     let first = start_retry_run(&path, &repository, &logs, &cache, None).unwrap();
-    let second = start_retry_run(&path, &repository, &logs, &cache, None).unwrap();
+    let second =
+        start_task_retry_run(&path, &repository, &logs, &cache, None, Some(&first.id)).unwrap();
 
     assert_ne!(first.id, second.id);
     assert_ne!(first.logs_path, second.logs_path);
@@ -134,6 +136,24 @@ fn retry_attempts_have_distinct_run_records_and_workspaces() {
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         2
+    );
+    let attempts = task_claim_attempts(
+        &path,
+        &AbandonedTaskClaim {
+            lease_id: "claim".to_string(),
+            run_id: first.id.clone(),
+            task_id: "task".to_string(),
+            repository_id: first.repository_id.clone(),
+            branch: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| &attempt.run_id)
+            .collect::<Vec<_>>(),
+        vec![&first.id, &second.id]
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -890,7 +910,7 @@ fn remote_operations_are_durable_and_idempotent() {
 #[test]
 fn migration_is_idempotent_and_enforces_the_ledger_constraints() {
     let path = database_path();
-    assert_eq!(status(&path).unwrap().pending_migrations, 5);
+    assert_eq!(status(&path).unwrap().pending_migrations, 6);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
 
@@ -974,7 +994,7 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     assert!(!status.status.success());
     assert!(String::from_utf8(status.stdout)
         .unwrap()
-        .contains("pending migrations: 5"));
+        .contains("pending migrations: 6"));
 
     let migrate = Command::new(binary)
         .args(["--db-path", path.to_str().unwrap(), "db", "migrate"])
@@ -1108,7 +1128,7 @@ fn status_preserves_existing_database_parent_permissions() {
     fs::create_dir(parent).unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(status(&path).unwrap().pending_migrations, 5);
+    assert_eq!(status(&path).unwrap().pending_migrations, 6);
     assert_eq!(
         fs::metadata(parent).unwrap().permissions().mode() & 0o777,
         0o755

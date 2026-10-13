@@ -7,10 +7,10 @@ use alucard::{
     mark_claim_needs_reconciliation, migrate, open, parse_tasks, prepare_run, recent_runs,
     record_recovery_failure, record_recovery_pr, record_task_pr, release,
     release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
-    run_reconciliation_reason, run_recovery, start_retry_run, start_task_run, status, task_id,
-    task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image, AgentInvocation,
-    AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider, RecoveryPullRequest,
-    RunOptions, TaskStatus,
+    run_reconciliation_reason, run_recovery, start_task_retry_run, start_task_run, status,
+    task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
+    warn_if_stale_image, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask,
+    Provider, RecoveryPullRequest, RunOptions, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -797,12 +797,13 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     {
                         let _ = finish_run(&database, &attempt_run.id, "failed");
                         attempt += 1;
-                        attempt_run = match start_retry_run(
+                        attempt_run = match start_task_retry_run(
                             &database,
                             &options.queue.repository,
                             &options.logs_root,
                             &cache,
                             Some(&options.image),
+                            Some(&owner_run_id),
                         ) {
                             Ok(run) => run,
                             Err(error) => {
@@ -910,6 +911,20 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+enum ReconciliationAction {
+    Record {
+        claim: alucard::AbandonedTaskClaim,
+        number: i64,
+        branch: String,
+        sha: String,
+    },
+    Human {
+        claim: alucard::AbandonedTaskClaim,
+        reason: String,
+    },
+    Release(alucard::AbandonedTaskClaim),
+}
+
 fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
     migrate(database).map_err(|error| error.to_string())?;
     let repository_id = repository
@@ -917,22 +932,69 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .to_string_lossy()
         .to_string();
+    let mut actions = Vec::new();
     for claim in
         abandoned_task_claims(database, &repository_id).map_err(|error| error.to_string())?
     {
-        if docker_run_is_active(&claim.run_id)? {
+        let attempts = task_claim_attempts(database, &claim).map_err(|error| error.to_string())?;
+        if attempts
+            .iter()
+            .map(|attempt| docker_run_is_active(&attempt.run_id))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|active| active)
+        {
             continue;
         }
-        let branch = claim
-            .branch
-            .clone()
-            .or_else(|| abandoned_branch(database, &claim.run_id));
-        let remote = match branch.as_deref() {
-            Some(branch) => reconcile_remote_pr(repository, branch)?,
-            None => None,
-        };
-        match (branch, remote) {
-            (_, Some((number, branch, sha))) => {
+        let mut branches = claim.branch.clone().into_iter().collect::<Vec<_>>();
+        for attempt in &attempts {
+            if let Some(branch) = attempt.branch.clone().or_else(|| abandoned_branch(attempt)) {
+                if !branches.contains(&branch) {
+                    branches.push(branch);
+                }
+            }
+        }
+        let remotes = branches
+            .iter()
+            .map(|branch| reconcile_remote_pr(repository, branch).map(|remote| (branch, remote)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some((_, Some((number, branch, sha)))) =
+            remotes.iter().find(|(_, remote)| remote.is_some())
+        {
+            actions.push(ReconciliationAction::Record {
+                claim,
+                number: *number,
+                branch: branch.clone(),
+                sha: sha.clone(),
+            });
+        } else if let Some(branch) = branches
+            .iter()
+            .map(|branch| remote_branch_exists(repository, branch).map(|exists| (branch, exists)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|(branch, exists)| exists.then_some(branch))
+        {
+            actions.push(ReconciliationAction::Human {
+                claim,
+                reason: format!("branch {branch} exists without an open pull request"),
+            });
+        } else if branches.is_empty() {
+            actions.push(ReconciliationAction::Human {
+                claim,
+                reason: "branch identity is unavailable".to_string(),
+            });
+        } else {
+            actions.push(ReconciliationAction::Release(claim));
+        }
+    }
+    for action in actions {
+        match action {
+            ReconciliationAction::Record {
+                claim,
+                number,
+                branch,
+                sha,
+            } => {
                 record_task_pr(
                     database,
                     &claim.task_id,
@@ -948,31 +1010,21 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
                 finish_run(database, &claim.run_id, "interrupted")
                     .map_err(|error| error.to_string())?;
             }
-            (Some(branch), None) => {
-                if remote_branch_exists(repository, &branch)? {
-                    mark_claim_needs_reconciliation(
-                        database,
-                        &claim,
-                        &format!("branch {branch} exists without an open pull request"),
-                    )
+            ReconciliationAction::Human { claim, reason } => {
+                mark_claim_needs_reconciliation(database, &claim, &reason)
                     .map_err(|error| error.to_string())?;
-                } else {
-                    release_abandoned_task_claim(database, &claim)
-                        .map_err(|error| error.to_string())?;
-                }
             }
-            (None, None) => {
-                mark_claim_needs_reconciliation(database, &claim, "branch identity is unavailable")
-                    .map_err(|error| error.to_string())?
+            ReconciliationAction::Release(claim) => {
+                release_abandoned_task_claim(database, &claim)
+                    .map_err(|error| error.to_string())?;
             }
         }
     }
     Ok(())
 }
 
-fn abandoned_branch(database: &Path, run_id: &str) -> Option<String> {
-    let run = find_run(database, run_id).ok().flatten()?;
-    let clone = PathBuf::from(run.logs_path?).join("repository");
+fn abandoned_branch(attempt: &alucard::TaskClaimAttempt) -> Option<String> {
+    let clone = PathBuf::from(attempt.logs_path.as_ref()?).join("repository");
     execute_command("git", &["branch", "--show-current"], &clone, None)
         .ok()
         .filter(|output| output.status.success())

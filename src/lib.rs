@@ -1738,6 +1738,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("../migrations/0003_recovery_checkout.sql")),
     (4, include_str!("../migrations/0004_reconciliation.sql")),
     (5, include_str!("../migrations/0005_run_branch.sql")),
+    (6, include_str!("../migrations/0006_retry_owner.sql")),
 ];
 
 pub struct DatabaseStatus {
@@ -1807,6 +1808,14 @@ pub struct AbandonedTaskClaim {
     pub task_id: String,
     pub repository_id: String,
     pub branch: Option<String>,
+}
+
+/// A run that may still be working on a task claimed by an earlier run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TaskClaimAttempt {
+    pub run_id: String,
+    pub branch: Option<String>,
+    pub logs_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2004,6 +2013,18 @@ pub fn start_retry_run(
     cache_root: &Path,
     image: Option<&str>,
 ) -> Result<Run, DatabaseError> {
+    start_task_retry_run(path, repository, logs_root, cache_root, image, None)
+}
+
+/// Creates a retry attempt associated with the task claim that owns it.
+pub fn start_task_retry_run(
+    path: &Path,
+    repository: &Path,
+    logs_root: &Path,
+    cache_root: &Path,
+    image: Option<&str>,
+    owner_run_id: Option<&str>,
+) -> Result<Run, DatabaseError> {
     let repository = repository.canonicalize()?;
     let repository_name = repository
         .file_name()
@@ -2020,8 +2041,8 @@ pub fn start_retry_run(
         params![repository_id, repository_name, cache.to_string_lossy()],
     )?;
     connection.execute(
-        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, pid, hostname)
-         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6)",
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, pid, hostname, retry_owner_run_id)
+         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
         params![
             run_id,
             repository_id,
@@ -2029,6 +2050,7 @@ pub fn start_retry_run(
             logs_path,
             std::process::id(),
             hostname()?,
+            owner_run_id,
         ],
     )?;
     Ok(Run {
@@ -2326,6 +2348,30 @@ pub fn abandoned_task_claims(
         })
         .collect();
     Ok(claims)
+}
+
+/// Lists the claim owner and every retry run that can still be working on its task.
+pub fn task_claim_attempts(
+    path: &Path,
+    claim: &AbandonedTaskClaim,
+) -> Result<Vec<TaskClaimAttempt>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, branch, logs_path FROM runs
+         WHERE id = ?1 OR retry_owner_run_id = ?1
+         ORDER BY started_at, id",
+    )?;
+    let attempts = statement
+        .query_map([&claim.run_id], |row| {
+            Ok(TaskClaimAttempt {
+                run_id: row.get(0)?,
+                branch: row.get(1)?,
+                logs_path: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)?;
+    Ok(attempts)
 }
 
 /// Returns a safely abandoned task to the queue and releases its claim.
