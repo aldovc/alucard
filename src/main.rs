@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::{collections::BTreeMap, fs};
 
+const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's.";
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (db_path, commands) = match parse_db_path(&args) {
@@ -1189,10 +1191,15 @@ fn record_recovery(
         "recovery_marker",
     )
     .map_err(|error| error.to_string())?;
-    let marker_body = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness.";
     let comment = gh_output(
         &prepared.clone,
-        &["pr", "comment", &number.to_string(), "--body", marker_body],
+        &[
+            "pr",
+            "comment",
+            &number.to_string(),
+            "--body",
+            RECOVERY_MARKER_BODY,
+        ],
         "could not post recovery marker",
     );
     let marker_error = comment.err();

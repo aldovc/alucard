@@ -263,7 +263,11 @@ case "$1 $2" in
     done
     : > "$ALUCARD_RECOVERY_CREATED" ;;
   'pr comment')
-    if [ "$ALUCARD_RECOVERY_SCENARIO" = marker ]; then echo 'marker denied' >&2; exit 1; fi ;;
+    if [ "$ALUCARD_RECOVERY_SCENARIO" = marker ]; then echo 'marker denied' >&2; exit 1; fi
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --body ]; then printf '%s' "$2" > "$ALUCARD_RECOVERY_MARKER"; break; fi
+      shift
+    done ;;
   'pr edit')
     for argument in "$@"; do
       if [ "$ALUCARD_RECOVERY_SCENARIO" = label ] && [ "$argument" = needs-human ]; then echo 'label denied' >&2; exit 1; fi
@@ -292,6 +296,7 @@ esac
             .env("ALUCARD_RECOVERY_SCENARIO", scenario)
             .env("ALUCARD_RECOVERY_CREATED", root.join("recovery-created"))
             .env("ALUCARD_RECOVERY_BODY", root.join("recovery-body"))
+            .env("ALUCARD_RECOVERY_MARKER", root.join("recovery-marker"))
             .env("ALUCARD_RECOVERY_TRACE", root.join("recovery-trace"))
             .env("ALUCARD_CACHE_DIR", root.join("cache"))
             .args([
@@ -355,6 +360,10 @@ esac
             assert!(
                 body.contains("It does not resume implementation."),
                 "{body}"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("recovery-marker")).unwrap(),
+                "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."
             );
         }
         let run_id: String = connection
