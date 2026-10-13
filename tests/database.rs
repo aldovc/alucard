@@ -1,7 +1,8 @@
 use alucard::{
-    acquire_pr, acquire_task, begin_operation, finish_operation, heartbeat, migrate, open,
-    prepare_run, record_task_pr, release, run_command, start_retry_run, status, transition_task,
-    ClaimError, RunOptions, TaskStatus,
+    abandoned_task_claims, acquire_pr, acquire_task, begin_operation, finish_operation, heartbeat,
+    migrate, open, prepare_run, record_task_pr, record_task_pr_gate_state, release,
+    release_abandoned_task_claim, run_command, start_retry_run, start_task_retry_run, status,
+    task_claim_attempts, transition_task, AbandonedTaskClaim, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -124,7 +125,8 @@ fn retry_attempts_have_distinct_run_records_and_workspaces() {
     migrate(&path).unwrap();
 
     let first = start_retry_run(&path, &repository, &logs, &cache, None).unwrap();
-    let second = start_retry_run(&path, &repository, &logs, &cache, None).unwrap();
+    let second =
+        start_task_retry_run(&path, &repository, &logs, &cache, None, Some(&first.id)).unwrap();
 
     assert_ne!(first.id, second.id);
     assert_ne!(first.logs_path, second.logs_path);
@@ -134,6 +136,24 @@ fn retry_attempts_have_distinct_run_records_and_workspaces() {
             .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         2
+    );
+    let attempts = task_claim_attempts(
+        &path,
+        &AbandonedTaskClaim {
+            lease_id: "claim".to_string(),
+            run_id: first.id.clone(),
+            task_id: "task".to_string(),
+            repository_id: first.repository_id.clone(),
+            branch: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| &attempt.run_id)
+            .collect::<Vec<_>>(),
+        vec![&first.id, &second.id]
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -332,6 +352,17 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
             )
             .unwrap(),
         "running"
+    );
+    assert_eq!(
+        open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT branch FROM runs WHERE id = ?1",
+                [&first.run.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        first.branch
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -785,6 +816,69 @@ fn opened_pr_moves_the_claimed_task_to_in_flight() {
             .unwrap(),
         42
     );
+    record_task_pr_gate_state(&path, "task", 42, "ci_missing").unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT gate_state FROM pull_requests WHERE task_id = 'task'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "ci_missing"
+    );
+}
+
+#[test]
+fn abandoned_claims_only_include_dead_local_owners_and_can_be_released() {
+    let path = database_path();
+    prepare_claims(&path, &["dead", "live"]);
+    let hostname = fs::read_to_string("/etc/hostname")
+        .unwrap()
+        .trim()
+        .to_string();
+    let connection = open(&path).unwrap();
+    for (run, pid) in [
+        ("dead-run", i64::MAX),
+        ("live-run", i64::from(std::process::id())),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, pid, hostname)
+                 VALUES (?1, 'repo', 'run', 'running', 'now', 'now', ?2, ?3)",
+                (run, pid, &hostname),
+            )
+            .unwrap();
+    }
+    drop(connection);
+    let dead = acquire_task(&path, "dead", "dead-run").unwrap();
+    acquire_task(&path, "live", "live-run").unwrap();
+
+    let abandoned = abandoned_task_claims(&path, "repo").unwrap();
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0].lease_id, dead.id);
+    release_abandoned_task_claim(&path, &abandoned[0]).unwrap();
+
+    let connection = open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT status FROM tasks WHERE id = 'dead'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&dead.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "released"
+    );
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
 #[test]
@@ -827,7 +921,7 @@ fn remote_operations_are_durable_and_idempotent() {
 #[test]
 fn migration_is_idempotent_and_enforces_the_ledger_constraints() {
     let path = database_path();
-    assert_eq!(status(&path).unwrap().pending_migrations, 4);
+    assert_eq!(status(&path).unwrap().pending_migrations, 7);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
 
@@ -911,7 +1005,7 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     assert!(!status.status.success());
     assert!(String::from_utf8(status.stdout)
         .unwrap()
-        .contains("pending migrations: 4"));
+        .contains("pending migrations: 7"));
 
     let migrate = Command::new(binary)
         .args(["--db-path", path.to_str().unwrap(), "db", "migrate"])
@@ -1045,7 +1139,7 @@ fn status_preserves_existing_database_parent_permissions() {
     fs::create_dir(parent).unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(status(&path).unwrap().pending_migrations, 4);
+    assert_eq!(status(&path).unwrap().pending_migrations, 7);
     assert_eq!(
         fs::metadata(parent).unwrap().permissions().mode() & 0o777,
         0o755
