@@ -208,6 +208,12 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
     let repository = root.join("source");
     seed_repository(&repository);
     assert!(Command::new("git")
+        .args(["branch", "release"])
+        .current_dir(&repository)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
         .args([
             "-C",
             repository.to_str().unwrap(),
@@ -228,7 +234,7 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
             repository: &repository,
             logs_root: &logs,
             cache_root: &cache,
-            base: "HEAD",
+            base: "release",
             image: None,
             task: Some("alpha"),
             issue: None,
@@ -241,7 +247,7 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
             repository: &repository,
             logs_root: &logs,
             cache_root: &cache,
-            base: "HEAD",
+            base: "release",
             image: None,
             task: None,
             issue: Some(42),
@@ -255,6 +261,23 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
     assert!(second.clone.join(".git").is_dir());
     assert!(first.branch.ends_with("-task-alpha"));
     assert!(second.branch.ends_with("-issue-42"));
+    assert_eq!(
+        String::from_utf8(
+            Command::new("git")
+                .args([
+                    "config",
+                    "--get",
+                    &format!("branch.{}.gh-merge-base", first.branch),
+                ])
+                .current_dir(&first.clone)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim(),
+        "release"
+    );
     assert_eq!(
         String::from_utf8(
             Command::new("git")

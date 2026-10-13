@@ -2257,6 +2257,15 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         &["switch", "--quiet", "-c", &branch, &base_sha],
         &clone,
     )?;
+    run_checked(
+        "git",
+        &[
+            "config",
+            &format!("branch.{branch}.gh-merge-base"),
+            options.base,
+        ],
+        &clone,
+    )?;
 
     let mut connection = open(path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
