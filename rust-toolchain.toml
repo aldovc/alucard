@@ -1,0 +1,5 @@
+# Keep in step with the toolchain the Dockerfile installs: the agent image's
+# rustup home is read-only, so a mismatch cannot be downloaded at run time.
+[toolchain]
+channel = "1.85.0"
+components = ["clippy", "rustfmt"]
