@@ -456,6 +456,9 @@ case "$1 $2" in
   'run '*)
     for argument in "$@"; do case "$argument" in alucard-*) printf '%s\n' "$argument" >> "$ALUCARD_GITHUB_RECOVERY_DOCKER_TRACE" ;; *:/work:rw) worktree=${argument%:/work:rw} ;; *:/work-output:rw) output=${argument%:/work-output:rw} ;; esac; done
     if [ -n "$output" ]; then
+      if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = wrapup_timeout ]; then
+        exit 124
+      fi
       printf '%s\n' '## Done' > "$output/.alucard-handoff"
       printf '%s\n' 'Recovery handoff.' >> "$output/.alucard-handoff"
       if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = wrapup_dirty ]; then
@@ -467,6 +470,10 @@ case "$1 $2" in
       timeout)
         printf 'unfinished\n' > "$worktree/recovery.txt"
         exit 124 ;;
+      wrapup_timeout)
+        printf 'unfinished\n' > "$worktree/recovery.txt"
+        printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"failed"}'
+        exit 1 ;;
       *)
         printf 'unfinished\n' > "$worktree/recovery.txt"
         git -C "$worktree" add recovery.txt
@@ -678,6 +685,29 @@ fn test_timeout_recovery() {
     assert!(String::from_utf8(commits.stdout)
         .unwrap()
         .contains("wip: alucard recovery — uncommitted worker state"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn wrapup_timeout_still_creates_a_recovery_pr() {
+    let root = temporary_path("github-wrapup-timeout-recovery");
+    fs::create_dir(&root).unwrap();
+    run_github_recovery_case(&root, "wrapup_timeout");
+    let commits = Command::new("git")
+        .args([
+            "--git-dir",
+            root.join("remote.git").to_str().unwrap(),
+            "log",
+            "--all",
+            "--format=%s",
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8(commits.stdout)
+        .unwrap()
+        .contains("wip: alucard recovery — uncommitted worker state"));
+    let trace = fs::read_to_string(root.join("gh-trace")).unwrap();
+    assert!(trace.contains("pr create ") && trace.contains(" --draft "));
     fs::remove_dir_all(root).unwrap();
 }
 
