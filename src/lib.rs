@@ -2437,6 +2437,17 @@ pub fn record_recovery_pr(
          ON CONFLICT(original_run_id) DO UPDATE SET pull_request_number = excluded.pull_request_number, branch = excluded.branch, reason = excluded.reason, checkout_path = excluded.checkout_path",
         (Uuid::new_v4().to_string(), task_id, run_id, recovery.branch, recovery.number, recovery.reason, recovery.checkout_path.to_string_lossy()),
     )?;
+    let target = format!("recovery-pr:{}", recovery.number);
+    for operation_type in ["alucard-label", "needs-human-label", "recovery_marker"] {
+        transaction.execute(
+            "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 0, datetime('now'), datetime('now'))
+             ON CONFLICT(repository_id, target, operation_type) DO UPDATE SET
+               phase = CASE WHEN operations.phase = 'failed' THEN 'pending' ELSE operations.phase END,
+               updated_at = datetime('now')",
+            (Uuid::new_v4().to_string(), &repository_id, &target, operation_type),
+        )?;
+    }
     transaction.execute("UPDATE tasks SET status = 'in_flight', pr_number = ?1, updated_at = datetime('now') WHERE id = ?2", (recovery.number, task_id))?;
     transaction.commit()?;
     Ok(())
@@ -3433,6 +3444,85 @@ mod tests {
         assert!(abandoned_task_claims(&path, "repository")
             .unwrap()
             .is_empty());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_pr_link_journals_all_annotation_intents() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repository', '', 'repository', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+                 VALUES ('run', 'repository', 'run', 'running', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+                 VALUES ('task', 'repository', 'local', 'task', '', 'claimed', '[]', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                 VALUES ('claim', 'repository', 'task', 'task', 'run', 'active', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+
+        record_recovery_pr(
+            &path,
+            "task",
+            "claim",
+            "run",
+            RecoveryPullRequest {
+                number: 91,
+                branch: "alucard/recovery",
+                head_sha: "sha",
+                reason: "Exhausted",
+                checkout_path: &directory,
+            },
+        )
+        .unwrap();
+
+        let operations = pending_operations(&path, "repository").unwrap();
+        assert_eq!(operations.len(), 3);
+        assert!(operations
+            .iter()
+            .all(|operation| operation.target == "recovery-pr:91"));
+        let mut operation_types = operations
+            .iter()
+            .map(|operation| operation.operation_type.as_str())
+            .collect::<Vec<_>>();
+        operation_types.sort_unstable();
+        assert_eq!(
+            operation_types,
+            ["alucard-label", "needs-human-label", "recovery_marker"]
+        );
+        assert_eq!(
+            open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT pull_request_number FROM recovery WHERE original_run_id = 'run'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            91
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

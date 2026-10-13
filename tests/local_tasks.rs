@@ -901,6 +901,16 @@ esac
         1,
         "{trace}"
     );
+    for label in ["alucard", "needs-human"] {
+        assert_eq!(
+            trace
+                .lines()
+                .filter(|line| line.starts_with("pr edit") && line.contains(label))
+                .count(),
+            1,
+            "{trace}"
+        );
+    }
     assert!(root.join("alucard").exists());
     assert!(root.join("needs-human").exists());
 

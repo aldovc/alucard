@@ -2095,13 +2095,20 @@ fn record_recovery(
     )
     .map_err(|error| error.to_string())?;
     let target = format!("recovery-pr:{number}");
-    let alucard_label = begin_operation(
-        database,
-        &prepared.run.repository_id,
-        &target,
-        "alucard-label",
-    )
-    .map_err(|error| error.to_string())?;
+    let annotations =
+        ["alucard-label", "needs-human-label", "recovery_marker"].map(|operation_type| {
+            begin_operation(
+                database,
+                &prepared.run.repository_id,
+                &target,
+                operation_type,
+            )
+            .map_err(|error| error.to_string())
+        });
+    let [alucard_label, label, marker] = annotations;
+    let alucard_label = alucard_label?;
+    let label = label?;
+    let marker = marker?;
     let alucard_labelled = gh_output(
         &prepared.clone,
         &["pr", "edit", &number.to_string(), "--add-label", "alucard"],
@@ -2111,15 +2118,10 @@ fn record_recovery(
     finish_operation(database, &alucard_label, alucard_label_error.as_deref())
         .map_err(|error| error.to_string())?;
     if let Some(error) = alucard_label_error {
+        finish_operation(database, &label, Some(&error)).map_err(|error| error.to_string())?;
+        finish_operation(database, &marker, Some(&error)).map_err(|error| error.to_string())?;
         return Err(error);
     }
-    let label = begin_operation(
-        database,
-        &prepared.run.repository_id,
-        &target,
-        "needs-human-label",
-    )
-    .map_err(|error| error.to_string())?;
     let labelled = gh_output(
         &prepared.clone,
         &[
@@ -2135,15 +2137,9 @@ fn record_recovery(
     finish_operation(database, &label, label_error.as_deref())
         .map_err(|error| error.to_string())?;
     if let Some(error) = label_error {
+        finish_operation(database, &marker, Some(&error)).map_err(|error| error.to_string())?;
         return Err(error);
     }
-    let marker = begin_operation(
-        database,
-        &prepared.run.repository_id,
-        &target,
-        "recovery_marker",
-    )
-    .map_err(|error| error.to_string())?;
     let comment = gh_output(
         &prepared.clone,
         &[
