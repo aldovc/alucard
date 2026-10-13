@@ -978,6 +978,9 @@ fn recover_worker_changes(
     } else {
         None
     };
+    let dirty = execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
+        .map_err(|error| error.to_string())?;
+    let dirty = !dirty.stdout.is_empty();
     if dirty {
         let add = execute_command("git", &["add", "-A"], &prepared.clone, None)
             .map_err(|error| error.to_string())?;

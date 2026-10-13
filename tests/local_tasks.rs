@@ -459,6 +459,9 @@ case "$1 $2" in
     if [ -n "$output" ]; then
       printf '%s\n' '## Done' > "$output/.alucard-handoff"
       printf '%s\n' 'Recovery handoff.' >> "$output/.alucard-handoff"
+      if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = wrapup_dirty ]; then
+        printf 'wrap-up fix\n' > "$worktree/wrapup.txt"
+      fi
       exit 1
     fi
     case "$ALUCARD_GITHUB_RECOVERY_SCENARIO" in
@@ -612,6 +615,38 @@ fn test_worker_recovery() {
         trace.contains("issue edit 134 --remove-label in-progress"),
         "{trace}"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn wrapup_changes_are_committed_to_the_recovery_branch() {
+    let root = temporary_path("github-wrapup-recovery");
+    fs::create_dir(&root).unwrap();
+    run_github_recovery_case(&root, "wrapup_dirty");
+    let branch = Command::new("git")
+        .args([
+            "--git-dir",
+            root.join("remote.git").to_str().unwrap(),
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/alucard/",
+        ])
+        .output()
+        .unwrap();
+    let branch = String::from_utf8(branch.stdout).unwrap();
+    let branch = branch.trim();
+    assert!(!branch.is_empty());
+    let file = Command::new("git")
+        .args([
+            "--git-dir",
+            root.join("remote.git").to_str().unwrap(),
+            "show",
+            &format!("{branch}:wrapup.txt"),
+        ])
+        .output()
+        .unwrap();
+    assert!(file.status.success(), "{file:?}");
+    assert_eq!(String::from_utf8(file.stdout).unwrap(), "wrap-up fix\n");
     fs::remove_dir_all(root).unwrap();
 }
 
