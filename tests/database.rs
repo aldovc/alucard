@@ -54,6 +54,10 @@ fn insert_run(path: &Path, run_id: &str) {
 }
 
 fn seed_repository(path: &Path) {
+    seed_repository_with_readme(path, "seed\n");
+}
+
+fn seed_repository_with_readme(path: &Path, readme: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::create_dir(path).unwrap();
     Command::new("git")
@@ -71,7 +75,7 @@ fn seed_repository(path: &Path) {
         .current_dir(path)
         .status()
         .unwrap();
-    fs::write(path.join("README.md"), "seed\n").unwrap();
+    fs::write(path.join("README.md"), readme).unwrap();
     Command::new("git")
         .args(["add", "."])
         .current_dir(path)
@@ -82,6 +86,65 @@ fn seed_repository(path: &Path) {
         .current_dir(path)
         .status()
         .unwrap();
+}
+
+#[test]
+fn prepared_runs_with_matching_repository_names_use_separate_caches() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let first_repository = root.join("team-a/api");
+    let second_repository = root.join("team-b/api");
+    seed_repository_with_readme(&first_repository, "team a\n");
+    seed_repository_with_readme(&second_repository, "team b\n");
+    let logs = root.join("logs");
+    let cache = root.join("cache");
+
+    let first = prepare_run(
+        &path,
+        RunOptions {
+            repository: &first_repository,
+            logs_root: &logs,
+            cache_root: &cache,
+            base: "HEAD",
+            image: None,
+            task: None,
+            issue: None,
+        },
+    )
+    .unwrap();
+    let second = prepare_run(
+        &path,
+        RunOptions {
+            repository: &second_repository,
+            logs_root: &logs,
+            cache_root: &cache,
+            base: "HEAD",
+            image: None,
+            task: None,
+            issue: None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(first.clone.join("README.md")).unwrap(),
+        "team a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(second.clone.join("README.md")).unwrap(),
+        "team b\n"
+    );
+    let cache_paths = open(&path)
+        .unwrap()
+        .prepare("SELECT cache_path FROM repositories ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(cache_paths.len(), 2);
+    assert_ne!(cache_paths[0], cache_paths[1]);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -137,6 +200,59 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
             .unwrap(),
         "running"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn concurrent_preparation_keeps_working_clones_usable() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let repository = root.join("source");
+    seed_repository(&repository);
+    migrate(&path).unwrap();
+    let logs = root.join("logs");
+    let cache = root.join("cache");
+    let barrier = Arc::new(Barrier::new(2));
+    let preparations = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let repository = repository.clone();
+            let logs = logs.clone();
+            let cache = cache.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                prepare_run(
+                    &path,
+                    RunOptions {
+                        repository: &repository,
+                        logs_root: &logs,
+                        cache_root: &cache,
+                        base: "HEAD",
+                        image: None,
+                        task: None,
+                        issue: None,
+                    },
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let runs = preparations
+        .into_iter()
+        .map(|preparation| preparation.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_ne!(runs[0].clone, runs[1].clone);
+    assert_ne!(runs[0].branch, runs[1].branch);
+    for run in runs {
+        assert!(run.clone.join(".git").is_dir());
+        assert!(Command::new("git")
+            .args(["rev-parse", "--verify", &run.branch])
+            .current_dir(run.clone)
+            .status()
+            .unwrap()
+            .success());
+    }
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -485,6 +601,78 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     assert!(String::from_utf8(status.stdout)
         .unwrap()
         .contains("pending migrations: 0"));
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn runs_commands_list_recent_runs_and_show_claims_and_pull_requests() {
+    let path = database_path();
+    migrate(&path).unwrap();
+    let connection = open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repo', 'owner', 'name', 'now')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path)
+             VALUES ('older', 'repo', 'run', 'completed', '2026-01-01', '2026-01-01', 'old', NULL, '/tmp/old'),
+                    ('current', 'repo', 'continue', 'running', '2026-01-02', '2026-01-02', 'abc123', 'image:test', '/tmp/current')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+             VALUES ('task-1', 'repo', 'github', '1', 'Task', 'claimed', '[]', 'now')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+             VALUES ('claim-1', 'repo', 'task', 'task-1', 'current', 'active', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO pull_requests (id, task_id, repository_id, number, branch, head_sha, kind, remote_state, gate_state)
+             VALUES ('pr-1', 'task-1', 'repo', 42, 'alucard/task-1', 'abc123', 'normal', 'open', 'pending')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let binary = env!("CARGO_BIN_EXE_alucard");
+    let list = Command::new(binary)
+        .args(["--db-path", path.to_str().unwrap(), "runs"])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    assert_eq!(
+        String::from_utf8(list.stdout).unwrap(),
+        "current\trunning\tcontinue\t/tmp/current\nolder\tcompleted\trun\t/tmp/old\n"
+    );
+
+    let show = Command::new(binary)
+        .args([
+            "--db-path",
+            path.to_str().unwrap(),
+            "runs",
+            "show",
+            "current",
+        ])
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    let stdout = String::from_utf8(show.stdout).unwrap();
+    assert!(stdout.contains("id: current\nrepository: repo\ncommand: continue\nstatus: running"));
+    assert!(stdout.contains("base sha: abc123\nimage: image:test\nlogs: /tmp/current"));
+    assert!(stdout.contains("claim: task task-1 active"));
+    assert!(stdout.contains("pr: #42 alucard/task-1"));
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 

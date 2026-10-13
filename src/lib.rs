@@ -352,10 +352,10 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
     let repository_id = repository.to_string_lossy().to_string();
-    let cache = options.cache_root.join(repository_name);
+    let cache_key = repository_cache_key(&repository);
+    let cache = options.cache_root.join(&cache_key);
     fs::create_dir_all(options.cache_root)?;
-    let lock_path = options.cache_root.join(format!("{repository_name}.lock"));
-    let lock = File::create(lock_path)?;
+    let lock = File::create(options.cache_root.join(format!("{cache_key}.lock")))?;
     lock.lock_exclusive()?;
     if cache.exists() {
         run_checked("git", &["fetch", "--quiet", "origin"], &cache)?;
@@ -371,7 +371,6 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
             options.cache_root,
         )?;
     }
-    FileExt::unlock(&lock)?;
 
     let run_id = Uuid::new_v4().to_string();
     let directory = options.logs_root.join(&run_id);
@@ -387,6 +386,7 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         ],
         &directory,
     )?;
+    FileExt::unlock(&lock)?;
     if !clone.join(".git").is_dir() {
         return Err(RunError::InvalidClone);
     }
@@ -435,6 +435,17 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         clone,
         branch,
     })
+}
+
+fn repository_cache_key(repository: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = repository.as_os_str().as_encoded_bytes();
+    let mut key = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        key.push(HEX[(byte >> 4) as usize] as char);
+        key.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    key
 }
 
 pub fn interrupt_running_runs(path: &Path) -> Result<usize, DatabaseError> {
