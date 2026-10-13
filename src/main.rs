@@ -141,7 +141,13 @@ fn tool_dir() -> Option<PathBuf> {
 fn version() -> String {
     tool_dir()
         .and_then(|dir| {
-            execute_command("git", &["describe", "--tags", "--always", "--dirty"], &dir).ok()
+            execute_command(
+                "git",
+                &["describe", "--tags", "--always", "--dirty"],
+                &dir,
+                None,
+            )
+            .ok()
         })
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
