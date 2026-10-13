@@ -1,24 +1,26 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    abandoned_task_claims, archive_prompt, begin_operation, begin_operation_with_payload,
-    build_image, compose_role_prompt, database_path, defer_operation, find_run, finish_operation,
-    finish_run, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
-    iteration_usage_comment_for_dirs, local_queue_with_open_issues, local_queue_with_open_prs,
-    log_event, mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
+    abandoned_pull_request_claims, abandoned_task_claims, acquire_pr, archive_prompt,
+    begin_operation, begin_operation_with_payload, build_image, compose_role_prompt, database_path,
+    defer_operation, find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
+    import_github_tasks, import_local_tasks, iteration_usage_comment_for_dirs,
+    local_queue_with_open_issues, local_queue_with_open_prs, log_event,
+    mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
     pending_operations, prepare_run, recent_runs, record_recovery_failure, record_recovery_pr,
     record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
-    release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
-    run_reconciliation_reason, run_recovery, start_task_retry_run, start_task_run, status,
-    task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
-    usage_report_for_dirs, warn_if_stale_image, write_iteration_measurement, write_run_measurement,
+    release_abandoned_pull_request_claim, release_abandoned_task_claim, run_claims,
+    run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
+    start_merge_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
+    task_is_pending, toolchain_preflight, transition_task, usage_report_for_dirs,
+    warn_if_stale_image, write_iteration_measurement, write_run_measurement,
     write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentRole,
     AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
     RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
 
@@ -46,6 +48,7 @@ fn main() -> ExitCode {
         Some("doctor") => doctor_command(&commands[1..], db_path),
         Some("queue") => queue_command(&commands[1..], db_path),
         Some("run") => run_command(&commands[1..], db_path),
+        Some("merge") => merge_command(&commands[1..], db_path),
         Some("build") => build_command(&commands[1..]),
         Some("runs") => match database_path(db_path) {
             Ok(path) => runs_command(&commands[1..], &path),
@@ -55,6 +58,512 @@ fn main() -> ExitCode {
         None => {
             fail("usage: alucard [--db-path PATH] {version|build|queue|runs|doctor|db migrate|db status}")
         }
+    }
+}
+
+struct MergeOptions {
+    pr_number: i64,
+    repository: PathBuf,
+    env_file: PathBuf,
+    logs_root: PathBuf,
+    check_command: Option<String>,
+    timeout_minutes: u64,
+    dry_run: bool,
+}
+
+impl MergeOptions {
+    fn parse(args: &[String], tools: &Path) -> Result<Self, String> {
+        let pr_number = args
+            .first()
+            .and_then(|value| value.parse().ok())
+            .filter(|n: &i64| *n > 0)
+            .ok_or(
+                "usage: alucard merge <PR_NUM> [TARGET_REPO] — PR_NUM must be a positive integer",
+            )?;
+        let mut options = Self {
+            pr_number,
+            repository: nonempty_environment("ALUCARD_TARGET_REPO")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().expect("current directory")),
+            env_file: nonempty_environment("ALUCARD_ENV_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| tools.join("alucard.env")),
+            logs_root: nonempty_environment("ALUCARD_LOGS_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(".alucard-logs")),
+            check_command: None,
+            timeout_minutes: 60,
+            dry_run: false,
+        };
+        let mut repository_set = false;
+        let mut values = args[1..].iter();
+        while let Some(value) = values.next() {
+            match value.as_str() {
+                "-C" | "--repo" => {
+                    options.repository =
+                        PathBuf::from(values.next().ok_or("--repo requires a path")?)
+                }
+                "--env-file" => {
+                    options.env_file =
+                        PathBuf::from(values.next().ok_or("--env-file requires a path")?)
+                }
+                "--logs-root" => {
+                    options.logs_root =
+                        PathBuf::from(values.next().ok_or("--logs-root requires a path")?)
+                }
+                "--check-command" => {
+                    options.check_command = Some(
+                        values
+                            .next()
+                            .ok_or("--check-command requires a command")?
+                            .clone(),
+                    )
+                }
+                "-t" | "--timeout-minutes" => {
+                    options.timeout_minutes = values
+                        .next()
+                        .ok_or("--timeout-minutes requires a number")?
+                        .parse()
+                        .ok()
+                        .filter(|n: &u64| *n > 0)
+                        .ok_or("timeout must be greater than zero")?
+                }
+                "--dry-run" => options.dry_run = true,
+                "-h" | "--help" => return Err(
+                    "usage: alucard merge <PR_NUM> [TARGET_REPO] [--check-command CMD] [--dry-run]"
+                        .to_string(),
+                ),
+                option if option.starts_with('-') => {
+                    return Err(format!("unknown merge option: {option}"))
+                }
+                repository if !repository_set => {
+                    options.repository = PathBuf::from(repository);
+                    repository_set = true;
+                }
+                value => return Err(format!("unexpected argument: {value}")),
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
+    let Some(tools) = tool_dir() else {
+        return fail("alucard: could not locate tool files");
+    };
+    let options = match MergeOptions::parse(args, &tools) {
+        Ok(options) => options,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let database = match database_path(db_path) {
+        Ok(path) => path,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let repository = match options.repository.canonicalize() {
+        Ok(path) if git_repository_root(&path).is_some() => path,
+        _ => return fail("alucard: target repository is not a git repository"),
+    };
+    if let Err(error) = reconcile_startup(&database, &repository) {
+        return fail(&format!("alucard: reconciliation failed: {error}"));
+    }
+    let settings = match AgentSettings::from_environment(Some(&options.env_file)) {
+        Ok(settings) => settings,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let Some(check_command) = options
+        .check_command
+        .as_deref()
+        .or_else(|| settings.value("ALUCARD_CHECK_COMMAND"))
+    else {
+        return fail(
+            "alucard: no check command: pass --check-command CMD or set ALUCARD_CHECK_COMMAND",
+        );
+    };
+    let run = match start_merge_run(&database, &repository, &options.logs_root) {
+        Ok(run) => run,
+        Err(error) => return fail(&format!("alucard: could not start merge run: {error}")),
+    };
+    if options.logs_root.starts_with("/tmp") {
+        eprintln!("warning: logs under /tmp will not survive a reboot");
+    }
+    let claim = match acquire_pr(&database, &run.repository_id, options.pr_number, &run.id) {
+        Ok(claim) => claim,
+        Err(error) => {
+            let _ = finish_run(&database, &run.id, "failed");
+            return fail(&format!(
+                "alucard: could not lease PR #{}: {error}",
+                options.pr_number
+            ));
+        }
+    };
+    let result = merge_pr(
+        &repository,
+        &options,
+        check_command,
+        run.logs_path.as_deref().unwrap_or_default(),
+    );
+    let _ = release(&database, &claim.id, &run.id);
+    let _ = finish_run(
+        &database,
+        &run.id,
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(&format!("alucard: {error}")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MergePullRequest {
+    state: String,
+    #[serde(rename = "headRefName")]
+    branch: String,
+    #[serde(rename = "baseRefName")]
+    base: String,
+    #[serde(rename = "isCrossRepository")]
+    cross_repository: bool,
+    comments: Vec<MergeComment>,
+}
+#[derive(serde::Deserialize)]
+struct MergeComment {
+    author: MergeAuthor,
+    body: String,
+}
+#[derive(serde::Deserialize)]
+struct MergeAuthor {
+    login: String,
+}
+
+fn merge_pr(
+    repository: &Path,
+    options: &MergeOptions,
+    check_command: &str,
+    logs_path: &str,
+) -> Result<(), String> {
+    let number = options.pr_number.to_string();
+    let metadata: MergePullRequest = serde_json::from_slice(&gh_output(
+        repository,
+        &[
+            "pr",
+            "view",
+            &number,
+            "--json",
+            "state,headRefName,baseRefName,isCrossRepository,comments",
+        ],
+        "could not read pull request",
+    )?)
+    .map_err(|error| format!("could not parse pull request: {error}"))?;
+    if metadata.state != "OPEN" {
+        return Err(format!(
+            "PR #{} is not open (state: {})",
+            options.pr_number, metadata.state
+        ));
+    }
+    if metadata.cross_repository {
+        return Err(format!(
+            "PR #{} comes from a fork; merge only rebases branches on origin",
+            options.pr_number
+        ));
+    }
+    let login = gh_text(repository, &["api", "user", "--jq", ".login"])
+        .map_err(|_| "could not read the GitHub login the harness posts as".to_string())?;
+    let approved = harness_approved_sha(&metadata.comments, login.trim()).ok_or_else(|| {
+        format!(
+            "PR #{} has no harness approval to merge: run: alucard continue {}",
+            options.pr_number, options.pr_number
+        )
+    })?;
+    fs::create_dir_all(logs_path).map_err(|error| error.to_string())?;
+    let checkout = PathBuf::from(logs_path).join("repository");
+    let origin = git_output(repository, &["remote", "get-url", "origin"])?;
+    let clone = execute_command(
+        "git",
+        &[
+            "clone",
+            "--quiet",
+            "--branch",
+            &metadata.branch,
+            origin.trim(),
+            checkout.to_str().ok_or("invalid checkout path")?,
+        ],
+        repository,
+        Some(Duration::from_secs(120)),
+    )
+    .map_err(|error| error.to_string())?;
+    if !clone.status.success() {
+        return Err("could not fetch PR branch".to_string());
+    }
+    let result = merge_checkout(&checkout, &metadata, &approved, options, check_command);
+    let _ = fs::remove_dir_all(&checkout);
+    result
+}
+
+fn harness_approved_sha(comments: &[MergeComment], login: &str) -> Option<String> {
+    let comment = comments.iter().rev().find(|comment| {
+        comment.author.login == login && comment.body.starts_with("**🤖 Alucard review cycle ")
+    })?;
+    if !comment.body.lines().next()?.contains(": APPROVED") {
+        return None;
+    }
+    let sha = comment
+        .body
+        .split("Reviewed head: `")
+        .nth(1)?
+        .split('`')
+        .next()?;
+    (sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
+fn merge_checkout(
+    checkout: &Path,
+    metadata: &MergePullRequest,
+    approved: &str,
+    options: &MergeOptions,
+    check_command: &str,
+) -> Result<(), String> {
+    let head = git_output(checkout, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    if head != approved {
+        return Err(format!(
+            "PR #{} head {} is not the commit the harness approved ({}). Run: alucard continue {}",
+            options.pr_number,
+            &head[..12],
+            &approved[..12],
+            options.pr_number
+        ));
+    }
+    let fetch = execute_command(
+        "git",
+        &[
+            "fetch",
+            "--quiet",
+            "origin",
+            &format!(
+                "+refs/heads/{}:refs/remotes/origin/{}",
+                metadata.base, metadata.base
+            ),
+        ],
+        checkout,
+        Some(Duration::from_secs(120)),
+    )
+    .map_err(|error| error.to_string())?;
+    if !fetch.status.success() {
+        return Err(format!("could not fetch {}", metadata.base));
+    }
+    let base = git_output(
+        checkout,
+        &["rev-parse", &format!("origin/{}", metadata.base)],
+    )?
+    .trim()
+    .to_string();
+    let ancestor = execute_command(
+        "git",
+        &["merge-base", "--is-ancestor", &base, "HEAD"],
+        checkout,
+        None,
+    )
+    .map_err(|error| error.to_string())?
+    .status
+    .success();
+    let (new_head, rebased) = if ancestor {
+        (head.clone(), false)
+    } else {
+        let rebase = execute_command(
+            "git",
+            &["rebase", &base],
+            checkout,
+            Some(Duration::from_secs(120)),
+        )
+        .map_err(|error| error.to_string())?;
+        if !rebase.status.success() {
+            let conflicts = git_output(checkout, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default();
+            let _ = execute_command("git", &["rebase", "--abort"], checkout, None);
+            if conflicts.trim().is_empty() {
+                return Err(format!(
+                    "rebase of PR #{} failed without a conflict; nothing pushed or merged",
+                    options.pr_number
+                ));
+            }
+            let body = format!(
+                "**🤖 Alucard merge: rebase conflict — needs human**\n\nRebasing `{head}` onto {} (`{base}`) conflicts in:\n\n{}\nNothing was pushed or merged.",
+                metadata.base,
+                conflicts.lines().map(|path| format!("- `{path}`")).collect::<Vec<_>>().join("\n")
+            );
+            merge_post(checkout, options.pr_number, &body, options.dry_run);
+            if !options.dry_run {
+                let _ = execute_command(
+                    "gh",
+                    &[
+                        "api",
+                        "-X",
+                        "POST",
+                        &format!(
+                            "repos/{{owner}}/{{repo}}/issues/{}/labels",
+                            options.pr_number
+                        ),
+                        "-f",
+                        "labels[]=needs-human",
+                    ],
+                    checkout,
+                    None,
+                );
+            }
+            return Err(format!(
+                "rebase of PR #{} failed; nothing pushed or merged",
+                options.pr_number
+            ));
+        }
+        (
+            git_output(checkout, &["rev-parse", "HEAD"])?
+                .trim()
+                .to_string(),
+            true,
+        )
+    };
+    let check_log_path = checkout.parent().unwrap().join("check.log");
+    let check = run_merge_check(
+        checkout,
+        check_command,
+        options.timeout_minutes,
+        &check_log_path,
+    )?;
+    let check_log = fs::read_to_string(&check_log_path).unwrap_or_default();
+    let evidence = format!("**🤖 Alucard merge: checks {}**\n\nRan `{}` on `{}`: exit {}.\n\n<details><summary>Last lines of output</summary>\n\n```\n{}\n```\n\n</details>", if check.success() { "passed" } else { "failed — not merged" }, check_command, new_head, check.code().unwrap_or(1), check_log.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+    if !check.success() {
+        merge_post(checkout, options.pr_number, &evidence, options.dry_run);
+        return Err(format!(
+            "checks failed; see {}/check.log",
+            checkout.parent().unwrap().display()
+        ));
+    }
+    if options.dry_run {
+        merge_post(checkout, options.pr_number, &evidence, true);
+        println!(
+            "Dry run: checks passed on {}; not pushing or merging.",
+            &new_head[..12]
+        );
+        return Ok(());
+    }
+    if rebased {
+        let lease = format!("--force-with-lease=refs/heads/{}:{}", metadata.branch, head);
+        let push = execute_command(
+            "git",
+            &[
+                "push",
+                "--quiet",
+                &lease,
+                "origin",
+                &format!("HEAD:refs/heads/{}", metadata.branch),
+            ],
+            checkout,
+            Some(Duration::from_secs(120)),
+        )
+        .map_err(|error| error.to_string())?;
+        if !push.status.success() {
+            return Err("push of rebased PR was rejected: the branch moved since it was checked. Nothing merged.".to_string());
+        }
+        for _ in 0..30 {
+            let pr_head = gh_text(
+                checkout,
+                &[
+                    "pr",
+                    "view",
+                    &options.pr_number.to_string(),
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+            )
+            .unwrap_or_default();
+            if pr_head.trim() == new_head {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    merge_post(checkout, options.pr_number, &evidence, false);
+    let merged = execute_command(
+        "gh",
+        &[
+            "pr",
+            "merge",
+            &options.pr_number.to_string(),
+            "--squash",
+            "--match-head-commit",
+            &new_head,
+        ],
+        checkout,
+        Some(Duration::from_secs(120)),
+    )
+    .map_err(|error| error.to_string())?;
+    if !merged.status.success() {
+        return Err(format!(
+            "merging PR #{} failed after checks passed",
+            options.pr_number
+        ));
+    }
+    let _ = execute_command(
+        "gh",
+        &[
+            "api",
+            "--silent",
+            "-X",
+            "DELETE",
+            &format!(
+                "repos/{{owner}}/{{repo}}/git/refs/heads/{}",
+                metadata.branch
+            ),
+        ],
+        checkout,
+        None,
+    );
+    println!("PR #{} merged.", options.pr_number);
+    Ok(())
+}
+
+fn run_merge_check(
+    checkout: &Path,
+    check_command: &str,
+    timeout_minutes: u64,
+    log_path: &Path,
+) -> Result<ExitStatus, String> {
+    let log = fs::File::create(log_path).map_err(|error| error.to_string())?;
+    Command::new("timeout")
+        .args([
+            "--kill-after",
+            "30s",
+            &format!("{timeout_minutes}m"),
+            "bash",
+            "-c",
+            check_command,
+        ])
+        .current_dir(checkout)
+        .stdout(Stdio::from(
+            log.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(log))
+        .status()
+        .map_err(|error| error.to_string())
+}
+
+fn merge_post(repository: &Path, number: i64, body: &str, dry_run: bool) {
+    if dry_run {
+        println!("\n--- dry run: would comment on PR #{number} ---\n{body}\n---");
+    } else {
+        let _ = execute_command(
+            "gh",
+            &["pr", "comment", &number.to_string(), "--body", body],
+            repository,
+            None,
+        );
     }
 }
 
@@ -1109,6 +1618,12 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         .to_string_lossy()
         .to_string();
     replay_recovery_operations(database, repository, &repository_id)?;
+    for claim in abandoned_pull_request_claims(database, &repository_id)
+        .map_err(|error| error.to_string())?
+    {
+        release_abandoned_pull_request_claim(database, &claim)
+            .map_err(|error| error.to_string())?;
+    }
     let mut actions = Vec::new();
     for claim in
         abandoned_task_claims(database, &repository_id).map_err(|error| error.to_string())?
