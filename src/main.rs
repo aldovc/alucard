@@ -379,6 +379,12 @@ fn merge_checkout(
             let conflicts = git_output(checkout, &["diff", "--name-only", "--diff-filter=U"])
                 .unwrap_or_default();
             let _ = execute_command("git", &["rebase", "--abort"], checkout, None);
+            if conflicts.trim().is_empty() {
+                return Err(format!(
+                    "rebase of PR #{} failed without a conflict; nothing pushed or merged",
+                    options.pr_number
+                ));
+            }
             let body = format!(
                 "**🤖 Alucard merge: rebase conflict — needs human**\n\nRebasing `{head}` onto {} (`{base}`) conflicts in:\n\n{}\nNothing was pushed or merged.",
                 metadata.base,

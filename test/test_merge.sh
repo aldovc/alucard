@@ -169,6 +169,23 @@ assert_not_contains "nothing is merged" "pr merge" "$TRACE"
 assert_merge_lifecycle failed
 
 echo ""
+echo "── rebase fails without a conflict ──"
+setup_repos stale
+mkdir -p "$STATE/hooks"
+printf '#!/bin/sh\nexit 1\n' > "$STATE/hooks/pre-rebase"
+chmod +x "$STATE/hooks/pre-rebase"
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$STATE/hooks"
+run_merge --check-command 'true'
+unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+assert_eq "merge fails" "1" "$RC"
+assert_contains "the non-conflict failure is reported" "failed without a conflict" "$OUT"
+assert_eq "nothing is pushed" "$PR_SHA" "$REMOTE_HEAD"
+assert_eq "no conflict handoff is posted" "" "$POSTED"
+assert_not_contains "the PR is not labelled needs-human" "needs-human" "$TRACE"
+assert_not_contains "nothing is merged" "pr merge" "$TRACE"
+assert_merge_lifecycle failed
+
+echo ""
 echo "── checks fail after the rebase ──"
 setup_repos stale
 run_merge --check-command 'echo "FAILED tests/db/test_x.py"; exit 3'
