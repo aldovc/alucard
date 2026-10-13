@@ -2664,6 +2664,13 @@ pub struct AbandonedTaskClaim {
     pub branch: Option<String>,
 }
 
+/// An active pull request claim whose owning process is no longer alive on this host.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AbandonedPullRequestClaim {
+    pub lease_id: String,
+    pub run_id: String,
+}
+
 /// A run that may still be working on a task claimed by an earlier run.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TaskClaimAttempt {
@@ -3360,6 +3367,43 @@ pub fn abandoned_task_claims(
     Ok(claims)
 }
 
+/// Lists pull request claims whose local owner process has exited.
+pub fn abandoned_pull_request_claims(
+    path: &Path,
+    repository_id: &str,
+) -> Result<Vec<AbandonedPullRequestClaim>, DatabaseError> {
+    let connection = open(path)?;
+    let hostname = hostname()?;
+    let mut statement = connection.prepare(
+        "SELECT claims.id, claims.run_id
+         FROM claims
+         JOIN runs ON runs.id = claims.run_id
+         WHERE claims.state = 'active' AND claims.resource_kind = 'pr'
+             AND claims.repository_id = ?2
+             AND runs.hostname = ?1 AND runs.pid IS NOT NULL",
+    )?;
+    let claims = statement
+        .query_map((hostname, repository_id), |row| {
+            Ok(AbandonedPullRequestClaim {
+                lease_id: row.get(0)?,
+                run_id: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|claim| {
+            connection
+                .query_row(
+                    "SELECT pid FROM runs WHERE id = ?1",
+                    [&claim.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok_and(|pid| !process_is_alive(pid))
+        })
+        .collect();
+    Ok(claims)
+}
+
 /// Lists the claim owner and every retry run that can still be working on its task.
 pub fn task_claim_attempts(
     path: &Path,
@@ -3398,6 +3442,30 @@ pub fn release_abandoned_task_claim(
     )?;
     release(path, &claim.lease_id, &claim.run_id)?;
     finish_run(path, &claim.run_id, "interrupted")?;
+    Ok(())
+}
+
+/// Releases a pull request claim left by an interrupted merge run.
+pub fn release_abandoned_pull_request_claim(
+    path: &Path,
+    claim: &AbandonedPullRequestClaim,
+) -> Result<(), ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE claims SET state = 'released', heartbeat_at = datetime('now')
+         WHERE id = ?1 AND run_id = ?2 AND state = 'active'",
+        (&claim.lease_id, &claim.run_id),
+    )?;
+    if changed != 1 {
+        return Err(ClaimError::LeaseNotActive);
+    }
+    transaction.execute(
+        "UPDATE runs SET status = 'interrupted', heartbeat_at = datetime('now'), ended_at = datetime('now')
+         WHERE id = ?1",
+        [&claim.run_id],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -4113,6 +4181,67 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].task_id, "task-b");
         assert_eq!(claims[0].branch.as_deref(), Some("alucard/run-b"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn abandoned_pull_request_claims_release_only_dead_merge_owners() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        let hostname = hostname().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repository', '', 'repository', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        for (run_id, pid) in [
+            ("dead-merge", i64::MAX),
+            ("live-merge", i64::from(std::process::id())),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, pid, hostname)
+                     VALUES (?1, 'repository', 'merge', 'running', datetime('now'), datetime('now'), ?2, ?3)",
+                    params![run_id, pid, hostname],
+                )
+                .unwrap();
+        }
+        for (claim_id, resource_key, run_id) in [
+            ("dead-claim", "9", "dead-merge"),
+            ("live-claim", "10", "live-merge"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                     VALUES (?1, 'repository', 'pr', ?2, ?3, 'active', datetime('now'), datetime('now'))",
+                    params![claim_id, resource_key, run_id],
+                )
+                .unwrap();
+        }
+
+        let claims = abandoned_pull_request_claims(&path, "repository").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].run_id, "dead-merge");
+        release_abandoned_pull_request_claim(&path, &claims[0]).unwrap();
+        assert_eq!(
+            find_run(&path, "dead-merge").unwrap().unwrap().status,
+            "interrupted"
+        );
+        let live_claim: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE id = 'live-claim' AND state = 'active')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(live_claim);
+        acquire_pr(&path, "repository", 9, "live-merge").unwrap();
 
         fs::remove_dir_all(directory).unwrap();
     }

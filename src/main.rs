@@ -1,21 +1,21 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    abandoned_task_claims, acquire_pr, archive_prompt, begin_operation,
-    begin_operation_with_payload, build_image, compose_role_prompt, database_path, defer_operation,
-    find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
+    abandoned_pull_request_claims, abandoned_task_claims, acquire_pr, archive_prompt,
+    begin_operation, begin_operation_with_payload, build_image, compose_role_prompt, database_path,
+    defer_operation, find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
     import_github_tasks, import_local_tasks, local_queue_with_open_issues,
     local_queue_with_open_prs, log_event, mark_claim_needs_reconciliation, migrate, open,
     operation_exists, parse_tasks, pending_operations, prepare_run, recent_runs,
     record_recovery_failure, record_recovery_pr, record_task_pr, record_task_pr_gate_state,
-    record_task_pr_review, release, release_abandoned_task_claim, run_claims,
-    run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
-    start_merge_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
-    task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image,
-    write_iteration_measurement, write_run_measurement, write_stage_measurement,
-    write_task_headings, AgentExit, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest,
-    GithubTask, IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate,
-    TaskState, TaskStatus,
+    record_task_pr_review, release, release_abandoned_pull_request_claim,
+    release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
+    run_reconciliation_reason, run_recovery, start_merge_run, start_task_retry_run, start_task_run,
+    status, task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
+    warn_if_stale_image, write_iteration_measurement, write_run_measurement,
+    write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentRole,
+    AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
+    RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -1588,6 +1588,12 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         .to_string_lossy()
         .to_string();
     replay_recovery_operations(database, repository, &repository_id)?;
+    for claim in abandoned_pull_request_claims(database, &repository_id)
+        .map_err(|error| error.to_string())?
+    {
+        release_abandoned_pull_request_claim(database, &claim)
+            .map_err(|error| error.to_string())?;
+    }
     let mut actions = Vec::new();
     for claim in
         abandoned_task_claims(database, &repository_id).map_err(|error| error.to_string())?
