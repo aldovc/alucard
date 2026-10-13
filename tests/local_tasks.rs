@@ -607,6 +607,26 @@ esac
                     < trace.find("pr comment 91 --body"),
                 "{trace}"
             );
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let records = fs::read_to_string(log_dir.join("measurements.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let iteration = records
+                .iter()
+                .find(|record| record["record"] == "iteration")
+                .unwrap();
+            assert_eq!(iteration["pr"], "91");
+            assert_eq!(iteration["ci_result"], "");
+            assert_eq!(iteration["review_verdict"], "");
+            assert_eq!(iteration["review_cycles"], 0);
+            assert_eq!(iteration["roles"]["worker"]["invocations"], 2);
         }
         let run_id: String = connection
             .query_row("SELECT id FROM runs", [], |row| row.get(0))

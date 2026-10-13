@@ -1547,7 +1547,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         usage_log_dirs.push(prepared.directory.clone());
                         continue;
                     }
-                    match recover_worker_changes(
+                    let recovery_pr = match recover_worker_changes(
                         &database,
                         &tools,
                         &options,
@@ -1561,14 +1561,17 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         result.as_ref().ok().and_then(|value| value.status),
                         &log,
                     ) {
-                        Ok(Some(number)) => post_iteration_usage(
-                            &options.queue.repository,
-                            &usage_log_dirs,
-                            iteration,
-                            number,
-                            iteration_started.elapsed().as_secs(),
-                        ),
-                        Ok(None) => {}
+                        Ok(Some(number)) => {
+                            post_iteration_usage(
+                                &options.queue.repository,
+                                &usage_log_dirs,
+                                iteration,
+                                number,
+                                iteration_started.elapsed().as_secs(),
+                            );
+                            Some(number)
+                        }
+                        Ok(None) => None,
                         Err(error) => {
                             eprintln!("alucard: recovery requires human attention: {error}");
                             let _ = transition_task(
@@ -1578,8 +1581,26 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                 &owner_run_id,
                                 TaskStatus::Human,
                             );
+                            None
                         }
-                    }
+                    };
+                    write_iteration_measurement(IterationMeasurement {
+                        database: &database,
+                        run_id: &attempt_run.id,
+                        log_dir: &prepared.directory,
+                        log_dirs: &usage_log_dirs
+                            .iter()
+                            .map(PathBuf::as_path)
+                            .collect::<Vec<_>>(),
+                        iteration,
+                        pr: recovery_pr,
+                        base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        status: result.as_ref().ok().and_then(|value| value.status),
+                        duration: iteration_started.elapsed().as_secs(),
+                        ci_result: "",
+                        review_verdict: "",
+                        review_cycles: 0,
+                    });
                     print!("{}", usage_report_for_dirs(&usage_log_dirs));
                     let _ = release(&database, &claim.id, &owner_run_id);
                     if let Some(issue) = selected.issue.as_ref() {
