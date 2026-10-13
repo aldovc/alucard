@@ -1,12 +1,13 @@
 use alucard::{
     github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue,
     local_queue_with_open_issues, migrate, open, parse_tasks, resolve_pinned_issue,
-    GithubPullRequest, GithubTask, TaskState,
+    write_task_headings, GithubPullRequest, GithubTask, TaskHeadingUpdate, TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temporary_path(name: &str) -> PathBuf {
@@ -15,6 +16,129 @@ fn temporary_path(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("alucard-{name}-{}-{unique}", std::process::id()))
+}
+
+#[test]
+fn task_heading_write_preserves_non_heading_bytes() {
+    let path = temporary_path("task-heading-write");
+    let original =
+        "# Plan\r\n\r\n## [>] one: First (PR #12)\r\n\r\nBody  \r\n\r\n## [ ] two: Second\r\n";
+    fs::write(&path, original).unwrap();
+    write_task_headings(
+        &path,
+        original,
+        &[TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::Pending,
+            pr_number: None,
+            previous_pr_number: Some(12),
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "# Plan\r\n\r\n## [ ] one: First (previous attempt: PR #12)\r\n\r\nBody  \r\n\r\n## [ ] two: Second\r\n"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn task_heading_write_preserves_previous_attempt_when_opening_pr() {
+    let path = temporary_path("task-heading-previous-attempt");
+    let original = "## [ ] one: First (previous attempt: PR #3)\n";
+    fs::write(&path, original).unwrap();
+    write_task_headings(
+        &path,
+        original,
+        &[TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::InFlight,
+            pr_number: Some(5),
+            previous_pr_number: None,
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "## [>] one: First (previous attempt: PR #3) (PR #5)\n"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn task_heading_write_rejects_changed_file() {
+    let path = temporary_path("task-heading-conflict");
+    let original = "## [>] one: First (PR #12)\n";
+    fs::write(&path, "## [h] one: Human edit\n").unwrap();
+    let error = write_task_headings(
+        &path,
+        original,
+        &[TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::Done,
+            pr_number: Some(12),
+            previous_pr_number: None,
+        }],
+    )
+    .unwrap_err();
+    assert!(error.contains("changed during reconciliation"));
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "## [h] one: Human edit\n"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn concurrent_task_heading_writes_report_a_conflict() {
+    let root = temporary_path("task-heading-concurrent-write");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("tasks.md");
+    let original = "## [>] one: First (PR #12)\n";
+    fs::write(&path, original).unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+    let writers = [
+        TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::Done,
+            pr_number: Some(12),
+            previous_pr_number: None,
+        },
+        TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::Pending,
+            pr_number: None,
+            previous_pr_number: Some(12),
+        },
+    ]
+    .into_iter()
+    .map(|update| {
+        let path = path.clone();
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            write_task_headings(&path, original, &[update])
+        })
+    })
+    .collect::<Vec<_>>();
+    barrier.wait();
+
+    let results = writers
+        .into_iter()
+        .map(|writer| writer.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert!(results.iter().any(|result| {
+        result
+            .as_ref()
+            .is_err_and(|error| error.contains("changed during reconciliation"))
+    }));
+    assert!([
+        "## [x] one: First (PR #12)\n",
+        "## [ ] one: First (previous attempt: PR #12)\n",
+    ]
+    .contains(&fs::read_to_string(&path).unwrap().as_str()));
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn run(command: &mut Command) {
@@ -861,6 +985,15 @@ fn parser_normalizes_crlf_task_content() {
 #[test]
 fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     let database = temporary_path("queue").join("ledger.db");
+    let gh_root = temporary_path("queue-gh");
+    fs::create_dir_all(&gh_root).unwrap();
+    let gh = gh_root.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') printf '%s\\n' '[[]]' ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     let binary = env!("CARGO_BIN_EXE_alucard");
     let contract = PathBuf::from("test/fixtures/contracts/local-tasks.md")
         .canonicalize()
@@ -868,6 +1001,7 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     let expected = fs::read_to_string("test/fixtures/contracts/local-queue.json").unwrap();
 
     let output = Command::new(binary)
+        .env("PATH", &gh_root)
         .args([
             "--db-path",
             database.to_str().unwrap(),
@@ -893,6 +1027,7 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     assert_eq!(connection.total_changes(), changed_before);
     drop(connection);
     fs::remove_dir_all(database.parent().unwrap()).unwrap();
+    fs::remove_dir_all(gh_root).unwrap();
 }
 
 #[test]
@@ -935,9 +1070,13 @@ fn queue_resolves_explicit_environment_and_detected_task_sources() {
     fs::create_dir_all(&task_directory).unwrap();
     let detected = task_directory.join("tasks.md");
     fs::copy("test/fixtures/contracts/local-tasks.md", &detected).unwrap();
+    let gh = root.join("gh");
+    fs::write(&gh, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     let binary = env!("CARGO_BIN_EXE_alucard");
 
     let detected_run = Command::new(binary)
+        .env("PATH", &root)
         .args([
             "--db-path",
             root.join("detected.db").to_str().unwrap(),
@@ -950,6 +1089,7 @@ fn queue_resolves_explicit_environment_and_detected_task_sources() {
 
     let environment_run = Command::new(binary)
         .env("ALUCARD_TASKS_FILE", &detected)
+        .env("PATH", &root)
         .args([
             "--db-path",
             root.join("environment.db").to_str().unwrap(),
@@ -1021,6 +1161,41 @@ fn queue_does_not_fetch_issues_for_locally_blocked_tasks() {
         serde_json::from_str::<serde_json::Value>("[]").unwrap()
     );
     assert!(!invoked.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn queue_excludes_reset_task_with_matching_open_pr_on_later_page() {
+    let root = temporary_path("reset-task-open-pr");
+    fs::create_dir_all(&root).unwrap();
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "## [ ] task: Reset task\n").unwrap();
+    let gh = root.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') printf '%s\\n' '[[],[{\"number\":12,\"title\":\"Open work\",\"body\":\"Task: task\"}]]' ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = env!("CARGO_BIN_EXE_alucard");
+
+    let output = Command::new(binary)
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "queue",
+            "--tasks",
+            tasks.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!([])
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1148,6 +1323,60 @@ fn pinned_issue_resolution_rejects_ineligible_issues() {
 }
 
 #[test]
+fn run_leaves_in_flight_task_unchanged_when_pr_lookup_fails() {
+    let root = temporary_path("run-local-pr-lookup-failure");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&repository).unwrap();
+    git_repository(&repository);
+    let tasks = root.join("tasks.md");
+    let original = "## [>] task: In flight (PR #12)\n";
+    fs::write(&tasks, original).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr view') echo 'lookup failed' >&2; exit 1 ;;\n  'api --paginate') echo '[[]]' ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let docker = bin.join("docker");
+    fs::write(&docker, "#!/bin/sh\necho stamp\n").unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "run",
+            "--tasks",
+            tasks.to_str().unwrap(),
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            repository.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(&tasks).unwrap(), original);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     let root = temporary_path("run-local");
     let repository = root.join("repository");
@@ -1185,7 +1414,7 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list')\n    if mkdir \"$ALUCARD_SELECTION/lock\" 2>/dev/null; then : > \"$ALUCARD_SELECTION/first\"; fi\n    : > \"$ALUCARD_SELECTION/$$\"\n    while [ \"$(find \"$ALUCARD_SELECTION\" -maxdepth 1 -type f ! -name first | wc -l)\" -lt 2 ]; do sleep 0.01; done\n    echo '[]' ;;\n  'pr list') echo '[]' ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list')\n    if mkdir \"$ALUCARD_SELECTION/lock\" 2>/dev/null; then : > \"$ALUCARD_SELECTION/first\"; fi\n    : > \"$ALUCARD_SELECTION/$$\"\n    while [ \"$(find \"$ALUCARD_SELECTION\" -maxdepth 1 -type f ! -name first | wc -l)\" -lt 2 ]; do sleep 0.01; done\n    echo '[]' ;;\n  'api --paginate') echo '[[]]' ;;\n  'pr list') echo '[]' ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();

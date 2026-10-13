@@ -1543,6 +1543,14 @@ impl TaskState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskHeadingUpdate {
+    pub id: String,
+    pub state: TaskState,
+    pub pr_number: Option<i64>,
+    pub previous_pr_number: Option<i64>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedTasks {
     pub parent_context: String,
@@ -1715,6 +1723,127 @@ pub fn local_queue_with_open_issues(
         })
         .cloned()
         .collect()
+}
+
+pub fn local_queue_with_open_prs(
+    tasks: &[LocalTask],
+    open_issues: Option<&[i64]>,
+    open_prs: &[GithubPullRequest],
+) -> Vec<LocalTask> {
+    local_queue_with_open_issues(tasks, open_issues)
+        .into_iter()
+        .filter(|task| {
+            !open_prs.iter().any(|pr| {
+                [pr.title.as_str(), pr.body.as_str()].iter().any(|text| {
+                    text.lines()
+                        .any(|line| line.trim() == format!("Task: {}", task.id))
+                })
+            })
+        })
+        .collect()
+}
+
+pub fn write_task_headings(
+    path: &Path,
+    expected_contents: &str,
+    updates: &[TaskHeadingUpdate],
+) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let lock_path = path.with_file_name(
+        path.file_name()
+            .map(|name| {
+                let mut name = name.to_os_string();
+                name.push(".lock");
+                name
+            })
+            .unwrap_or_else(|| "tasks.lock".into()),
+    );
+    let lock = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open {}: {error}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("cannot lock {}: {error}", lock_path.display()))?;
+    let result = (|| {
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if contents != expected_contents {
+            return Err(format!(
+                "tasks file changed during reconciliation: {}",
+                path.display()
+            ));
+        }
+        let parsed = parse_tasks(&contents).map_err(|errors| errors.join("\n"))?;
+        let mut lines: Vec<String> = contents.split_inclusive('\n').map(str::to_owned).collect();
+        for update in updates {
+            let task = parsed
+                .tasks
+                .iter()
+                .find(|task| task.id == update.id)
+                .ok_or_else(|| format!("task {} no longer exists", update.id))?;
+            let line = lines
+                .get_mut(task.line - 1)
+                .ok_or_else(|| format!("task {} heading is missing", update.id))?;
+            let ending = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            match (update.state, update.pr_number, update.previous_pr_number) {
+                (TaskState::InFlight, Some(number), _) => {
+                    let heading = line.trim_end_matches(['\r', '\n']);
+                    *line = format!(
+                        "{} (PR #{number}){ending}",
+                        heading.replacen("## [ ]", "## [>]", 1)
+                    );
+                }
+                (TaskState::Done, _, _) => {
+                    *line = line.replacen("## [>]", "## [x]", 1);
+                }
+                (TaskState::Pending, _, Some(number)) => {
+                    let heading = line.trim_end_matches(['\r', '\n']);
+                    let suffix = format!("(PR #{number})");
+                    let heading = heading.strip_suffix(&suffix).ok_or_else(|| {
+                        format!("task {} heading is missing PR #{number}", task.id)
+                    })?;
+                    *line = format!(
+                        "{}(previous attempt: PR #{number}){ending}",
+                        heading.replacen("## [>]", "## [ ]", 1)
+                    );
+                }
+                _ => return Err(format!("unsupported heading update for task {}", task.id)),
+            }
+        }
+        let rewritten = lines.concat();
+        let temporary = path.with_extension(format!("tasks-{}.tmp", Uuid::new_v4()));
+        fs::write(&temporary, rewritten)
+            .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+        fs::set_permissions(
+            &temporary,
+            file.metadata()
+                .map_err(|error| error.to_string())?
+                .permissions(),
+        )
+        .map_err(|error| format!("cannot set permissions on {}: {error}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .map_err(|error| format!("cannot replace {}: {error}", path.display()))?;
+        Ok(())
+    })();
+    let _ = FileExt::unlock(&lock);
+    result
 }
 
 pub fn import_local_tasks(

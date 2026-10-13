@@ -3,12 +3,13 @@
 use alucard::{
     begin_operation, build_image, compose_role_prompt, database_path, find_run, finish_operation,
     finish_run, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
-    local_queue_with_open_issues, migrate, open, parse_tasks, prepare_run, recent_runs,
-    record_recovery_failure, record_recovery_pr, record_task_pr, release, run_claims,
-    run_command as execute_command, run_pull_requests, run_recovery, start_retry_run,
+    local_queue_with_open_issues, local_queue_with_open_prs, migrate, open, parse_tasks,
+    prepare_run, recent_runs, record_recovery_failure, record_recovery_pr, record_task_pr, release,
+    run_claims, run_command as execute_command, run_pull_requests, run_recovery, start_retry_run,
     start_task_run, status, task_id, task_is_pending, toolchain_preflight, transition_task,
-    warn_if_stale_image, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask,
-    Provider, RecoveryPullRequest, RunOptions, TaskStatus,
+    warn_if_stale_image, write_task_headings, AgentInvocation, AgentRole, AgentSettings,
+    GithubPullRequest, GithubTask, Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate,
+    TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -768,6 +769,27 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         let _ = release(&database, &claim.id, &owner_run_id);
                         let _ = finish_run(&database, &attempt_run.id, "failed");
                         return fail(&format!("alucard: {error}"));
+                    }
+                    if let Some(local_id) = selected.local_id.as_ref() {
+                        let Some(file) = task_file.as_deref() else {
+                            unreachable!("local task has a task file");
+                        };
+                        let contents = fs::read_to_string(file).map_err(|error| error.to_string());
+                        match contents.and_then(|contents| {
+                            write_task_headings(
+                                file,
+                                &contents,
+                                &[TaskHeadingUpdate {
+                                    id: local_id.clone(),
+                                    state: TaskState::InFlight,
+                                    pr_number: Some(number),
+                                    previous_pr_number: None,
+                                }],
+                            )
+                        }) {
+                            Ok(()) => {}
+                            Err(error) => eprintln!("alucard: {error}"),
+                        }
                     }
                     let _ = release(&database, &claim.id, &owner_run_id);
                     let _ = finish_run(&database, &attempt_run.id, "completed");
@@ -1634,11 +1656,22 @@ fn select_run_task(
     database: &Path,
 ) -> Result<Option<SelectedRunTask>, String> {
     if let Some(file) = task_file {
-        let parsed = parse_tasks(&fs::read_to_string(file).map_err(|error| error.to_string())?)
-            .map_err(|errors| errors.join("\n"))?;
-        let tasks = local_queue_with_open_issues(
+        let contents = fs::read_to_string(file).map_err(|error| error.to_string())?;
+        let mut parsed = parse_tasks(&contents).map_err(|errors| errors.join("\n"))?;
+        reconcile_local_tasks(file, &contents, &parsed, &options.repository)?;
+        if parsed
+            .tasks
+            .iter()
+            .any(|task| task.state == TaskState::InFlight && task.pr_number.is_some())
+        {
+            parsed = parse_tasks(&fs::read_to_string(file).map_err(|error| error.to_string())?)
+                .map_err(|errors| errors.join("\n"))?;
+        }
+        let open_prs = fetch_open_local_prs(&options.repository)?;
+        let tasks = local_queue_with_open_prs(
             &parsed.tasks,
             fetch_open_issue_numbers(&options.repository).as_deref(),
+            &open_prs,
         );
         migrate(database).map_err(|error| error.to_string())?;
         let mut connection = open(database).map_err(|error| error.to_string())?;
@@ -1742,6 +1775,54 @@ fn select_run_task(
         local_body: String::new(),
         parent_context: String::new(),
     }))
+}
+
+fn reconcile_local_tasks(
+    file: &Path,
+    contents: &str,
+    parsed: &alucard::ParsedTasks,
+    repository: &Path,
+) -> Result<(), String> {
+    let mut updates = Vec::new();
+    for task in parsed
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::InFlight && task.pr_number.is_some())
+    {
+        let number = task.pr_number.expect("filtered above");
+        let output = match gh_output(
+            repository,
+            &[
+                "pr",
+                "view",
+                &number.to_string(),
+                "--json",
+                "state",
+                "--jq",
+                ".state",
+            ],
+            "could not inspect pull request",
+        ) {
+            Ok(output) => output,
+            Err(_) => return Ok(()),
+        };
+        match String::from_utf8_lossy(&output).trim() {
+            "MERGED" => updates.push(TaskHeadingUpdate {
+                id: task.id.clone(),
+                state: TaskState::Done,
+                pr_number: Some(number),
+                previous_pr_number: None,
+            }),
+            "CLOSED" => updates.push(TaskHeadingUpdate {
+                id: task.id.clone(),
+                state: TaskState::Pending,
+                pr_number: None,
+                previous_pr_number: Some(number),
+            }),
+            _ => {}
+        }
+    }
+    write_task_headings(file, contents, &updates)
 }
 
 fn worker_prompt(
@@ -2068,7 +2149,7 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             ))
         }
     };
-    let parsed = match parse_tasks(&contents) {
+    let mut parsed = match parse_tasks(&contents) {
         Ok(parsed) => parsed,
         Err(errors) => {
             return fail(&format!(
@@ -2078,6 +2159,34 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             ))
         }
     };
+    if let Err(error) = reconcile_local_tasks(&task_file, &contents, &parsed, &options.repository) {
+        return fail(&format!("alucard: {error}"));
+    }
+    if parsed
+        .tasks
+        .iter()
+        .any(|task| task.state == TaskState::InFlight && task.pr_number.is_some())
+    {
+        let current = match fs::read_to_string(&task_file) {
+            Ok(contents) => contents,
+            Err(error) => {
+                return fail(&format!(
+                    "alucard: cannot read {}: {error}",
+                    task_file.display()
+                ))
+            }
+        };
+        parsed = match parse_tasks(&current) {
+            Ok(parsed) => parsed,
+            Err(errors) => {
+                return fail(&format!(
+                    "alucard: invalid tasks file {}:\n{}",
+                    task_file.display(),
+                    errors.join("\n")
+                ))
+            }
+        };
+    }
     let path = match database_path(db_path) {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
@@ -2099,9 +2208,18 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         .any(|task| !task.issue_blockers.is_empty())
         .then(|| fetch_open_issue_numbers(&options.repository))
         .flatten();
-    match serde_json::to_string_pretty(&local_queue_with_open_issues(
+    let open_prs = if locally_eligible.is_empty() {
+        Vec::new()
+    } else {
+        match fetch_open_local_prs(&options.repository) {
+            Ok(pull_requests) => pull_requests,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        }
+    };
+    match serde_json::to_string_pretty(&local_queue_with_open_prs(
         &parsed.tasks,
         open_issues.as_deref(),
+        &open_prs,
     )) {
         Ok(queue) => {
             println!("{queue}");
@@ -2169,6 +2287,25 @@ fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>,
             format!("{context}: {error}")
         })
     }
+}
+
+fn fetch_open_local_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
+    let output = gh_output(
+        repository,
+        &[
+            "api",
+            "--paginate",
+            "--slurp",
+            "repos/{owner}/{repo}/pulls?state=open&per_page=100",
+        ],
+        "could not list open pull requests",
+    )?;
+    if output.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice::<Vec<Vec<GithubPullRequest>>>(&output)
+        .map(|pages| pages.into_iter().flatten().collect())
+        .map_err(|error| format!("could not parse open pull requests: {error}"))
 }
 
 fn fetch_github_issues(repository: &Path) -> Result<Vec<GithubTask>, String> {
