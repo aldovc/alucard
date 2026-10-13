@@ -222,8 +222,132 @@ pub fn build_inputs_hash(tool_dir: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyInstall {
+    pub command: &'static str,
+    pub directory: PathBuf,
+}
+
+/// Finds dependency installs at the repository root and one directory below it.
+pub fn detect_dependency_installs(repository: &Path) -> io::Result<Vec<DependencyInstall>> {
+    let root_has_python = repository.join("pyproject.toml").is_file();
+    let root_has_node = repository.join("package-lock.json").is_file();
+    let mut directories = vec![PathBuf::new()];
+    for entry in fs::read_dir(repository)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.file_name() != ".git" {
+            directories.push(PathBuf::from(entry.file_name()));
+        }
+    }
+    directories.sort();
+    let mut installs = Vec::new();
+    for directory in directories {
+        let path = repository.join(&directory);
+        if path.join("pyproject.toml").is_file()
+            && (directory.as_os_str().is_empty() || !root_has_python)
+        {
+            installs.push(DependencyInstall {
+                command: "uv sync",
+                directory: directory.clone(),
+            });
+        }
+        if path.join("package-lock.json").is_file()
+            && (directory.as_os_str().is_empty() || !root_has_node)
+        {
+            installs.push(DependencyInstall {
+                command: "npm ci",
+                directory,
+            });
+        }
+    }
+    Ok(installs)
+}
+
+/// Builds the status text injected into worker, reviewer, and feedback prompts.
+pub fn toolchain_status(results: &[(DependencyInstall, i32)]) -> String {
+    if results.is_empty() {
+        return "No Python or Node manifest found — dependency preflight skipped.".into();
+    }
+    let describe = |install: &DependencyInstall| {
+        if install.directory.as_os_str().is_empty() {
+            format!("`{}` at the repo root", install.command)
+        } else {
+            format!("`{}` in {}/", install.command, install.directory.display())
+        }
+    };
+    let good: Vec<_> = results.iter().filter(|(_, rc)| *rc == 0).collect();
+    let bad: Vec<_> = results.iter().filter(|(_, rc)| *rc != 0).collect();
+    let completed = good
+        .iter()
+        .map(|(install, _)| format!("{} completes", describe(install)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if bad.is_empty() {
+        let where_to_run = if good.len() > 1 {
+            "; run each in its own directory"
+        } else {
+            ""
+        };
+        return format!("OK — {completed} in the container{where_to_run}. This verifies dependency installation only, not test execution or availability of services and credentials. Follow the project's documented local and CI verification workflow.");
+    }
+    let failed = bad
+        .iter()
+        .map(|(install, rc)| format!("{} fails inside the container (rc={rc})", describe(install)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if good.is_empty() {
+        return format!("BROKEN — {failed}. Agents CANNOT install dependencies, so local checks requiring those dependencies are blocked until the install failure is resolved. Do not demand local execution evidence for those checks; report them as unrun and follow the project's documented CI verification workflow.");
+    }
+    let directories = bad
+        .iter()
+        .map(|(install, _)| format!("{}/", install.directory.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("BROKEN — {failed}; {completed}. Agents CANNOT install dependencies for {directories}; local checks requiring those dependencies are blocked until the install failure is resolved. Do not demand local execution evidence for those checks. For the rest of the repo, run the documented local checks. Successful installs do not verify test execution or availability of services and credentials. Follow the project's documented local and CI verification workflow and report unrun checks.")
+}
+
 pub fn build_image(tool_dir: &Path, image: &str) -> Result<(), String> {
     build_image_with_docker(tool_dir, image, Path::new("docker"))
+}
+
+/// Warns when an existing image was built from different image inputs.
+pub fn warn_if_stale_image(tool_dir: &Path, image: &str) -> Result<(), String> {
+    warn_if_stale_image_with_docker(tool_dir, image, Path::new("docker"))
+}
+
+fn warn_if_stale_image_with_docker(
+    tool_dir: &Path,
+    image: &str,
+    docker: &Path,
+) -> Result<(), String> {
+    let wanted = build_inputs_hash(tool_dir).map_err(|error| error.to_string())?;
+    let output = Command::new(docker)
+        .args([
+            "image",
+            "inspect",
+            "-f",
+            "{{index .Config.Labels \"alucard.build-inputs\"}}",
+            image,
+        ])
+        .output()
+        .map_err(|error| format!("cannot inspect Docker image {image}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("Docker image not found: {image}"));
+    }
+    let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if found == wanted {
+        return Ok(());
+    }
+    if found.is_empty() || found == "<no value>" {
+        eprintln!("Warning: {image} carries no build-input stamp — it predates this check and may be stale.");
+    } else {
+        eprintln!("Warning: {image} was built from different Dockerfile/entrypoint.sh content than {} holds now.", tool_dir.display());
+    }
+    eprintln!(
+        "         Rebuild with 'docker build -t {image} {}', or drop --no-build.",
+        tool_dir.display()
+    );
+    Ok(())
 }
 
 fn build_image_with_docker(tool_dir: &Path, image: &str, docker: &Path) -> Result<(), String> {
@@ -293,7 +417,10 @@ fn docker_image_tag_count(docker: &Path, image: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod agent_tests {
-    use super::{build_image_with_docker, AgentInvocation, AgentRole, AgentSettings};
+    use super::{
+        build_image_with_docker, warn_if_stale_image_with_docker, AgentInvocation, AgentRole,
+        AgentSettings,
+    };
     use std::collections::BTreeMap;
     use std::env;
     use std::fs;
@@ -355,6 +482,30 @@ mod agent_tests {
     }
 
     #[test]
+    fn no_build_freshness_accepts_current_stamps_and_warns_for_stale_ones() {
+        let dir =
+            std::env::temp_dir().join(format!("alucard-image-stamp-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(dir.join("entrypoint.sh"), "#!/bin/sh\n").unwrap();
+        let docker = dir.join("docker");
+        fs::write(
+            &docker,
+            "#!/bin/sh\nprintf '%s\\n' \"$ALUCARD_TEST_STAMP\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let stamp = super::build_inputs_hash(&dir).unwrap();
+        env::set_var("ALUCARD_TEST_STAMP", &stamp);
+        assert!(warn_if_stale_image_with_docker(&dir, "alucard:test", &docker).is_ok());
+        env::set_var("ALUCARD_TEST_STAMP", "stale");
+        assert!(warn_if_stale_image_with_docker(&dir, "alucard:test", &docker).is_ok());
+        env::remove_var("ALUCARD_TEST_STAMP");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn invoke_cleans_up_when_codex_stdin_closes_early() {
         let dir = env::temp_dir().join(format!("alucard-invoke-cleanup-{}", uuid::Uuid::new_v4()));
         let bin = dir.join("bin");
@@ -393,6 +544,9 @@ mod agent_tests {
             playwright_cache: None,
             database_url: None,
             github_repo: None,
+            worktree_read_only: false,
+            output_dir: None,
+            extra_env: &[],
         };
         let result = invocation.invoke(&settings, &dir.join("agent.log"));
 
@@ -441,6 +595,9 @@ mod agent_tests {
             playwright_cache: None,
             database_url: None,
             github_repo: None,
+            worktree_read_only: false,
+            output_dir: None,
+            extra_env: &[],
         };
         let worker_args = invocation.docker_args(&settings).unwrap();
         assert!(worker_args
@@ -481,6 +638,9 @@ pub struct AgentInvocation<'a> {
     pub playwright_cache: Option<&'a Path>,
     pub database_url: Option<&'a str>,
     pub github_repo: Option<&'a str>,
+    pub worktree_read_only: bool,
+    pub output_dir: Option<&'a Path>,
+    pub extra_env: &'a [(&'a str, &'a str)],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -676,7 +836,11 @@ impl AgentInvocation<'_> {
             "-e".into(),
             "GH_CONFIG_DIR=/tmp/gh".into(),
             "-v".into(),
-            format!("{}:/work:rw", self.worktree.display()),
+            format!(
+                "{}:/work:{}",
+                self.worktree.display(),
+                if self.worktree_read_only { "ro" } else { "rw" }
+            ),
         ];
         if provider == Provider::Codex {
             args.insert(2, "-i".into());
@@ -696,6 +860,15 @@ impl AgentInvocation<'_> {
         }
         if let Some(repo) = self.github_repo {
             args.extend(["-e".into(), format!("GH_REPO={repo}")]);
+        }
+        if let Some(output_dir) = self.output_dir {
+            args.extend([
+                "-v".into(),
+                format!("{}:/work-output:rw", output_dir.display()),
+            ]);
+        }
+        for (key, value) in self.extra_env {
+            args.extend(["-e".into(), format!("{key}={value}")]);
         }
         args.push(self.image.into());
         match provider {

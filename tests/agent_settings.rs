@@ -1,6 +1,7 @@
 use alucard::{
-    build_inputs_hash, classify_agent_output, compose_role_prompt, AgentExit, AgentInvocation,
-    AgentRole, AgentSettings, Provider,
+    build_inputs_hash, classify_agent_output, compose_role_prompt, detect_dependency_installs,
+    toolchain_status, AgentExit, AgentInvocation, AgentRole, AgentSettings, DependencyInstall,
+    Provider,
 };
 use std::fs;
 use std::path::Path;
@@ -27,6 +28,9 @@ fn invocation(role: AgentRole) -> AgentInvocation<'static> {
         playwright_cache: None,
         database_url: None,
         github_repo: None,
+        worktree_read_only: false,
+        output_dir: None,
+        extra_env: &[],
     }
 }
 
@@ -64,6 +68,9 @@ fn role_settings_and_docker_arguments_match_bash_contract() {
         playwright_cache: Some(Path::new("/tmp/browsers")),
         database_url: Some("postgresql://postgres:postgres@postgres:5432/postgres"),
         github_repo: Some("example/repo"),
+        worktree_read_only: false,
+        output_dir: None,
+        extra_env: &[],
     };
     let args = invocation.docker_args(&agent_settings).unwrap();
     assert!(args
@@ -79,6 +86,50 @@ fn role_settings_and_docker_arguments_match_bash_contract() {
             .any(|value| value
                 == "DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres")
     );
+}
+
+#[test]
+fn role_mounts_and_extra_environment_match_bash_contract() {
+    let agent_settings = settings("ALUCARD_PROVIDER=claude\n");
+    let output = Path::new("/tmp/output");
+    let invocation = AgentInvocation {
+        worktree_read_only: true,
+        output_dir: Some(output),
+        extra_env: &[("ALUCARD_ITER", "7-review-2")],
+        ..invocation(AgentRole::Reviewer)
+    };
+    let args = invocation.docker_args(&agent_settings).unwrap();
+    assert!(args.iter().any(|arg| arg == "/tmp/worktree:/work:ro"));
+    assert!(args.iter().any(|arg| arg == "/tmp/output:/work-output:rw"));
+    assert!(args.iter().any(|arg| arg == "ALUCARD_ITER=7-review-2"));
+}
+
+#[test]
+fn toolchain_manifests_and_status_match_bash_contract() {
+    let repository = std::env::temp_dir().join(format!("alucard-preflight-{}", Uuid::new_v4()));
+    fs::create_dir_all(repository.join("backend")).unwrap();
+    fs::create_dir_all(repository.join("frontend")).unwrap();
+    fs::write(repository.join("backend/pyproject.toml"), "").unwrap();
+    fs::write(repository.join("frontend/package-lock.json"), "").unwrap();
+    let installs = detect_dependency_installs(&repository).unwrap();
+    assert_eq!(
+        installs,
+        vec![
+            DependencyInstall {
+                command: "uv sync",
+                directory: "backend".into()
+            },
+            DependencyInstall {
+                command: "npm ci",
+                directory: "frontend".into()
+            },
+        ]
+    );
+    let status = toolchain_status(&[(installs[0].clone(), 0), (installs[1].clone(), 3)]);
+    assert!(status.starts_with("BROKEN — `npm ci` in frontend/ fails inside the container (rc=3)"));
+    assert!(status.contains("`uv sync` in backend/ completes"));
+    assert!(status.contains("For the rest of the repo, run the documented local checks"));
+    fs::remove_dir_all(repository).unwrap();
 }
 
 #[test]
