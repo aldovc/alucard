@@ -88,6 +88,24 @@ fn events_prompts_and_usage_summary_are_local_artifacts() {
     let measurements = fs::read_to_string(root.join("measurements.jsonl")).unwrap();
     assert!(measurements.contains("\"usage_missing\":0"));
     assert!(measurements.contains("\"cost_complete\":false"));
+    let measurement: serde_json::Value = serde_json::from_str(&measurements).unwrap();
+    let timestamp = measurement["ts"].as_str().unwrap();
+    assert_eq!(timestamp.len(), 20);
+    assert!(timestamp
+        .bytes()
+        .enumerate()
+        .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()));
+    assert_eq!(
+        [
+            timestamp.as_bytes()[4],
+            timestamp.as_bytes()[7],
+            timestamp.as_bytes()[10],
+            timestamp.as_bytes()[13],
+            timestamp.as_bytes()[16],
+            timestamp.as_bytes()[19],
+        ],
+        [b'-', b'-', b'T', b':', b':', b'Z']
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

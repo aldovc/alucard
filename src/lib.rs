@@ -1226,11 +1226,7 @@ fn write_measurement(log_dir: &Path, value: Value) {
 }
 
 fn timestamp() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
+    event_timestamp()
 }
 fn repository_id(repository: &Path) -> String {
     repository.to_string_lossy().to_string()
