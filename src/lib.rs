@@ -1224,10 +1224,14 @@ fn role_settings(settings: &AgentSettings) -> Map<String, Value> {
 
 #[cfg(test)]
 mod measurement_tests {
-    use super::{role_settings, run_measurement_record, AgentSettings, RunMeasurementMetadata};
+    use super::{
+        repository_id, role_settings, run_measurement_record, AgentSettings, RunMeasurementMetadata,
+    };
     use serde_json::Value;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::path::Path;
+    use std::process::Command;
 
     #[test]
     fn run_measurement_has_the_complete_bash_compatible_schema() {
@@ -1311,6 +1315,45 @@ mod measurement_tests {
             object["roles"]["WORKER"]["provider"],
             Value::String("codex".to_string())
         );
+    }
+
+    #[test]
+    fn repository_id_uses_the_origin_across_checkout_paths() {
+        let directory =
+            std::env::temp_dir().join(format!("alucard-repository-id-{}", uuid::Uuid::new_v4()));
+        let https_checkout = directory.join("checkout");
+        let cached_checkout = directory.join("cache/example/web");
+        let ssh_checkout = directory.join("ssh-checkout");
+        let no_remote = directory.join("no-remote");
+        for (checkout, origin) in [
+            (&https_checkout, "https://github.com/example/web.git"),
+            (&cached_checkout, "https://github.com/example/web.git"),
+            (&ssh_checkout, "git@github.com:example/web.git"),
+            (&no_remote, ""),
+        ] {
+            fs::create_dir_all(checkout).unwrap();
+            assert!(Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(checkout)
+                .status()
+                .unwrap()
+                .success());
+            if !origin.is_empty() {
+                assert!(Command::new("git")
+                    .args(["remote", "add", "origin", origin])
+                    .current_dir(checkout)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+        }
+
+        assert_eq!(repository_id(&https_checkout), "example/web");
+        assert_eq!(repository_id(&cached_checkout), "example/web");
+        assert_eq!(repository_id(&ssh_checkout), "example/web");
+        assert_eq!(repository_id(&no_remote), "no-remote");
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -1444,7 +1487,35 @@ fn timestamp() -> String {
     event_timestamp()
 }
 fn repository_id(repository: &Path) -> String {
-    repository.to_string_lossy().to_string()
+    let fallback = || {
+        repository
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    let Ok(output) = run_command("git", &["remote", "get-url", "origin"], repository, None) else {
+        return fallback();
+    };
+    if !output.status.success() {
+        return fallback();
+    }
+    let url = String::from_utf8_lossy(&output.stdout);
+    let url = url
+        .trim()
+        .strip_suffix(".git")
+        .unwrap_or(url.trim())
+        .trim_end_matches('/');
+    let url = url.split_once("://").map_or(url, |(_, url)| url);
+    let url = url.split_once('@').map_or(url, |(_, url)| url);
+    let url = url.split_once(':').map_or(url, |(_, url)| url);
+    let mut segments = url.rsplit('/');
+    let Some(name) = segments.next().filter(|name| !name.is_empty()) else {
+        return fallback();
+    };
+    let Some(owner) = segments.next().filter(|owner| !owner.is_empty()) else {
+        return fallback();
+    };
+    format!("{owner}/{name}")
 }
 
 fn diff_measurement(repository: &Path, base: &str, head: &str) -> Value {
