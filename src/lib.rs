@@ -333,6 +333,7 @@ fn run_checked(program: &str, arguments: &[&str], cwd: &Path) -> Result<Output, 
 
 pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, RunError> {
     migrate(path)?;
+    interrupt_running_runs(path)?;
 
     let repository = options.repository.canonicalize()?;
     let repository_name = repository

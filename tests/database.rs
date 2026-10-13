@@ -1,6 +1,6 @@
 use alucard::{
-    acquire_pr, acquire_task, heartbeat, interrupt_running_runs, migrate, open, prepare_run,
-    release, status, transition_task, ClaimError, RunOptions, TaskStatus,
+    acquire_pr, acquire_task, heartbeat, migrate, open, prepare_run, release, status,
+    transition_task, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -322,22 +322,59 @@ fn concurrent_preparation_keeps_working_clones_usable() {
 }
 
 #[test]
-fn startup_interrupts_unfinished_runs() {
+fn preparing_a_run_reconciles_abandoned_owners() {
     let path = database_path();
-    prepare_claims(&path, &[]);
-    insert_run(&path, "stopped");
-    open(&path)
-        .unwrap()
+    let root = path.parent().unwrap();
+    let repository = root.join("source");
+    seed_repository(&repository);
+    let logs = root.join("logs");
+    let cache = root.join("cache");
+    let first = prepare_run(
+        &path,
+        RunOptions {
+            repository: &repository,
+            logs_root: &logs,
+            cache_root: &cache,
+            base: "HEAD",
+            image: None,
+            task: None,
+            issue: None,
+        },
+    )
+    .unwrap();
+    let connection = open(&path).unwrap();
+    for (run_id, pid) in [
+        ("stopped", i64::MAX),
+        ("live", i64::from(std::process::id())),
+    ] {
+        connection
         .execute(
-            "UPDATE runs SET pid = ?1, hostname = ?2 WHERE id = 'stopped'",
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, pid, hostname)
+             VALUES (?1, ?2, 'run', 'running', 'now', 'now', ?3, ?4)",
             (
-                i64::MAX,
+                run_id,
+                &first.run.repository_id,
+                pid,
                 std::fs::read_to_string("/etc/hostname").unwrap().trim(),
             ),
         )
         .unwrap();
+    }
 
-    assert_eq!(interrupt_running_runs(&path).unwrap(), 1);
+    prepare_run(
+        &path,
+        RunOptions {
+            repository: &repository,
+            logs_root: &logs,
+            cache_root: &cache,
+            base: "HEAD",
+            image: None,
+            task: None,
+            issue: None,
+        },
+    )
+    .unwrap();
+
     assert_eq!(
         open(&path)
             .unwrap()
@@ -347,26 +384,6 @@ fn startup_interrupts_unfinished_runs() {
             .unwrap(),
         "interrupted"
     );
-    fs::remove_dir_all(path.parent().unwrap()).unwrap();
-}
-
-#[test]
-fn startup_keeps_runs_owned_by_live_processes() {
-    let path = database_path();
-    prepare_claims(&path, &[]);
-    insert_run(&path, "live");
-    open(&path)
-        .unwrap()
-        .execute(
-            "UPDATE runs SET pid = ?1, hostname = ?2 WHERE id = 'live'",
-            (
-                i64::from(std::process::id()),
-                std::fs::read_to_string("/etc/hostname").unwrap().trim(),
-            ),
-        )
-        .unwrap();
-
-    assert_eq!(interrupt_running_runs(&path).unwrap(), 0);
     assert_eq!(
         open(&path)
             .unwrap()
@@ -376,7 +393,7 @@ fn startup_keeps_runs_owned_by_live_processes() {
             .unwrap(),
         "running"
     );
-    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
