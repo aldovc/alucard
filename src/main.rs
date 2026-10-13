@@ -5,11 +5,12 @@ use alucard::{
     finish_run, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
     local_queue_with_open_issues, local_queue_with_open_prs, migrate, open, parse_tasks,
     prepare_run, recent_runs, record_recovery_failure, record_recovery_pr, record_task_pr,
-    record_task_pr_gate_state, release, run_claims, run_command as execute_command,
-    run_pull_requests, run_recovery, start_retry_run, start_task_run, status, task_id,
-    task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image,
-    write_task_headings, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask,
-    Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
+    record_task_pr_gate_state, record_task_pr_review, release, run_claims,
+    run_command as execute_command, run_pull_requests, run_recovery, start_retry_run,
+    start_task_run, status, task_id, task_is_pending, toolchain_preflight, transition_task,
+    warn_if_stale_image, write_task_headings, AgentInvocation, AgentRole, AgentSettings,
+    GithubPullRequest, GithubTask, Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate,
+    TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -484,6 +485,7 @@ struct RunCommandOptions {
     logs_root: PathBuf,
     env_file: PathBuf,
     transport_attempts: usize,
+    max_review_cycles: usize,
 }
 
 impl RunCommandOptions {
@@ -513,6 +515,7 @@ impl RunCommandOptions {
         let mut env_file = nonempty_environment("ALUCARD_ENV_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| tools.join("alucard.env"));
+        let mut max_review_cycles = 10;
         let mut values = args.iter();
         while let Some(value) = values.next() {
             match value.as_str() {
@@ -549,6 +552,15 @@ impl RunCommandOptions {
                 "--env-file" => {
                     env_file = PathBuf::from(values.next().ok_or("--env-file requires a path")?)
                 }
+                "--max-review-cycles" => {
+                    max_review_cycles = values
+                        .next()
+                        .ok_or("--max-review-cycles requires a number")?
+                        .parse()
+                        .ok()
+                        .filter(|value: &usize| *value > 0)
+                        .ok_or("max review cycles must be greater than zero")?
+                }
                 _ => queue_args.push(value.clone()),
             }
         }
@@ -579,6 +591,7 @@ impl RunCommandOptions {
             logs_root,
             env_file,
             transport_attempts,
+            max_review_cycles,
         })
     }
 }
@@ -697,19 +710,20 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 return fail(&format!("alucard: {error}"));
             }
         };
+        let toolchain_status = toolchain_preflight(
+            &options.queue.repository,
+            &options.base,
+            &options.image,
+            &options.env_file,
+            options.timeout_minutes,
+        )
+        .unwrap_or_else(|error| format!("Preflight unavailable: {error}"));
         let prompt = match worker_prompt(
             &tools,
             &selected,
             &options.base,
             &commits,
-            &toolchain_preflight(
-                &options.queue.repository,
-                &options.base,
-                &options.image,
-                &options.env_file,
-                options.timeout_minutes,
-            )
-            .unwrap_or_else(|error| format!("Preflight unavailable: {error}")),
+            &toolchain_status,
         ) {
             Ok(prompt) => prompt,
             Err(error) => {
@@ -793,7 +807,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             Err(error) => eprintln!("alucard: {error}"),
                         }
                     }
-                    match (CiGate {
+                    let ci_result = match (CiGate {
                         tools: &tools,
                         settings: &settings,
                         options: &options,
@@ -818,8 +832,27 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                     "alucard: could not record CI gate for PR #{number}: {error}"
                                 );
                             }
+                            Some(result)
                         }
-                        Err(error) => eprintln!("alucard: CI gate for PR #{number}: {error}"),
+                        Err(error) => {
+                            eprintln!("alucard: CI gate for PR #{number}: {error}");
+                            None
+                        }
+                    };
+                    if let Err(error) = review_gate(
+                        &database,
+                        &tools,
+                        &options,
+                        &settings,
+                        &prepared,
+                        &selected.ledger_id,
+                        number,
+                        &branch,
+                        ci_result,
+                        iteration,
+                        &toolchain_status,
+                    ) {
+                        eprintln!("alucard: review gate for PR #{number}: {error}");
                     }
                     let _ = release(&database, &claim.id, &owner_run_id);
                     let _ = finish_run(&database, &attempt_run.id, "completed");
@@ -1101,6 +1134,298 @@ impl CiGate<'_> {
         }
         Ok(CiResult::Failed)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewVerdict {
+    Approved,
+    ChangesRequested,
+    Blocked,
+}
+
+impl ReviewVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "APPROVED",
+            Self::ChangesRequested => "CHANGES_REQUESTED",
+            Self::Blocked => "BLOCKED",
+        }
+    }
+
+    fn gate_state(self) -> &'static str {
+        match self {
+            Self::Approved => "review_approved",
+            Self::ChangesRequested => "review_changes_requested",
+            Self::Blocked => "review_blocked",
+        }
+    }
+}
+
+fn review_verdict(formal: &str, decision_file: &str) -> Option<ReviewVerdict> {
+    if decision_file == "BLOCKED" {
+        return Some(ReviewVerdict::Blocked);
+    }
+    match formal {
+        "APPROVED" => Some(ReviewVerdict::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewVerdict::ChangesRequested),
+        _ => match decision_file {
+            "APPROVED" => Some(ReviewVerdict::Approved),
+            "CHANGES_REQUESTED" => Some(ReviewVerdict::ChangesRequested),
+            _ => None,
+        },
+    }
+}
+
+fn reviewer_prompt(
+    tools: &Path,
+    pr_number: i64,
+    cycle: usize,
+    max_cycles: usize,
+    toolchain_status: &str,
+) -> Result<String, String> {
+    let instructions = compose_role_prompt(tools, "alucard-reviewer-prompt.md", None)
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "<instructions>\n{instructions}\n</instructions>\n<pr_num>{pr_number}</pr_num>\n<review_cycle>{cycle} of {max_cycles}</review_cycle>\n<toolchain_status>\n{}\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blockers>",
+        xml_escape(toolchain_status),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn review_gate(
+    database: &Path,
+    tools: &Path,
+    options: &RunCommandOptions,
+    settings: &AgentSettings,
+    prepared: &alucard::PreparedRun,
+    task_id: &str,
+    pr_number: i64,
+    branch: &str,
+    ci_result: Option<CiResult>,
+    iteration: usize,
+    toolchain_status: &str,
+) -> Result<(), String> {
+    println!("Review gate: PR #{pr_number} on {branch}.");
+    let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
+    let root = std::env::temp_dir().join(format!("alucard-review-{}", uuid::Uuid::new_v4()));
+    let checkout = root.join("checkout");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+    let result = (|| {
+        let cloned = execute_command(
+            "git",
+            &[
+                "clone",
+                "--quiet",
+                "--branch",
+                branch,
+                remote.trim(),
+                &checkout.display().to_string(),
+            ],
+            &prepared.clone,
+            Some(Duration::from_secs(120)),
+        )
+        .map_err(|error| error.to_string())?;
+        if !cloned.status.success() {
+            return Err(String::from_utf8_lossy(&cloned.stderr).trim().to_string());
+        }
+        let reviewed_sha = git_output(&checkout, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
+        let prompt = reviewer_prompt(
+            tools,
+            pr_number,
+            1,
+            options.max_review_cycles,
+            toolchain_status,
+        )?;
+        let log = prepared
+            .directory
+            .join(format!("iter-{iteration}-review-1.jsonl"));
+        let name = format!("alucard-review-{}-1", prepared.run.id);
+        let _agent = AgentInvocation {
+            role: AgentRole::Reviewer,
+            name: &name,
+            image: &options.image,
+            env_file: &options.env_file,
+            worktree: &checkout,
+            prompt: &prompt,
+            timeout_minutes: options.timeout_minutes,
+            network: None,
+            playwright_cache: None,
+            database_url: None,
+            github_repo: github_repo_slug(&options.queue.repository).as_deref(),
+            worktree_read_only: true,
+            output_dir: Some(&output_dir),
+            extra_env: &[],
+        }
+        .invoke(settings, &log);
+        let current_head = gh_text(
+            &prepared.clone,
+            &[
+                "pr",
+                "view",
+                &pr_number.to_string(),
+                "--json",
+                "headRefOid",
+                "--jq",
+                ".headRefOid",
+            ],
+        )?
+        .trim()
+        .to_string();
+        let file_verdict = fs::read_to_string(output_dir.join(".alucard-review"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let file_body =
+            fs::read_to_string(output_dir.join(".alucard-review-body")).unwrap_or_default();
+        let formal = gh_text(
+            &prepared.clone,
+            &["pr", "view", &pr_number.to_string(), "--json", "reviews", "--jq", "[.reviews[] | select(.state == \"APPROVED\" or .state == \"CHANGES_REQUESTED\")] | last | .state // empty"],
+        )?;
+        let formal = formal.trim();
+        let verdict = review_verdict(formal, &file_verdict);
+        let body = if verdict.is_some() && !file_verdict.is_empty() && formal != file_verdict {
+            file_body
+        } else if !formal.is_empty() {
+            gh_text(
+                &prepared.clone,
+                &["pr", "view", &pr_number.to_string(), "--json", "reviews", "--jq", "[.reviews[] | select(.state == \"APPROVED\" or .state == \"CHANGES_REQUESTED\")] | last | .body // \"\""],
+            )?
+        } else {
+            String::new()
+        };
+        match verdict {
+            Some(ReviewVerdict::Approved) => {
+                let no_ci = ci_result == Some(CiResult::Missing);
+                let status = if no_ci {
+                    "APPROVED — no CI ran, needs human"
+                } else {
+                    "APPROVED"
+                };
+                let marker = if file_verdict == "APPROVED" {
+                    format!("**🤖 Alucard reviewed head** `{reviewed_sha}`\n\n")
+                } else {
+                    String::new()
+                };
+                let comment = format!(
+                    "**🤖 Alucard review cycle 1/{}: {status}**\n\n{marker}{body}",
+                    options.max_review_cycles
+                );
+                let _ = execute_command(
+                    "gh",
+                    &["pr", "comment", &pr_number.to_string(), "--body", &comment],
+                    &prepared.clone,
+                    None,
+                );
+                if no_ci {
+                    let _ = execute_command(
+                        "gh",
+                        &[
+                            "pr",
+                            "edit",
+                            &pr_number.to_string(),
+                            "--add-label",
+                            "needs-human",
+                        ],
+                        &prepared.clone,
+                        None,
+                    );
+                }
+                record_task_pr_review(
+                    database,
+                    task_id,
+                    pr_number,
+                    ReviewVerdict::Approved.as_str(),
+                    if no_ci {
+                        "review_needs_human"
+                    } else {
+                        ReviewVerdict::Approved.gate_state()
+                    },
+                    Some(&reviewed_sha),
+                    &current_head,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Some(verdict) => {
+                let suffix = if verdict == ReviewVerdict::Blocked {
+                    " — needs human"
+                } else {
+                    ""
+                };
+                let comment = format!(
+                    "**🤖 Alucard review cycle 1/{}: {}{suffix}**\n\n{body}",
+                    options.max_review_cycles,
+                    verdict.as_str()
+                );
+                let _ = execute_command(
+                    "gh",
+                    &["pr", "comment", &pr_number.to_string(), "--body", &comment],
+                    &prepared.clone,
+                    None,
+                );
+                if verdict == ReviewVerdict::Blocked {
+                    let _ = execute_command(
+                        "gh",
+                        &[
+                            "pr",
+                            "edit",
+                            &pr_number.to_string(),
+                            "--add-label",
+                            "needs-human",
+                        ],
+                        &prepared.clone,
+                        None,
+                    );
+                }
+                record_task_pr_review(
+                    database,
+                    task_id,
+                    pr_number,
+                    verdict.as_str(),
+                    verdict.gate_state(),
+                    None,
+                    &current_head,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            None => {
+                let comment = format!("**🤖 Alucard review cycle 1/{}: no review posted — needs human**\n\nThe reviewer did not record a valid verdict. **This PR has not been reviewed.**", options.max_review_cycles);
+                let _ = execute_command(
+                    "gh",
+                    &["pr", "comment", &pr_number.to_string(), "--body", &comment],
+                    &prepared.clone,
+                    None,
+                );
+                let _ = execute_command(
+                    "gh",
+                    &[
+                        "pr",
+                        "edit",
+                        &pr_number.to_string(),
+                        "--add-label",
+                        "needs-human",
+                    ],
+                    &prepared.clone,
+                    None,
+                );
+                record_task_pr_review(
+                    database,
+                    task_id,
+                    pr_number,
+                    "",
+                    "review_missing",
+                    None,
+                    &current_head,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(root);
+    result
 }
 
 fn probe_ci(
@@ -3097,6 +3422,56 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn reviewer_decision_file_falls_back_and_blocked_overrides_formal_review() {
+        assert_eq!(
+            review_verdict("", "APPROVED"),
+            Some(ReviewVerdict::Approved)
+        );
+        assert_eq!(
+            review_verdict("CHANGES_REQUESTED", "APPROVED"),
+            Some(ReviewVerdict::ChangesRequested)
+        );
+        assert_eq!(
+            review_verdict("APPROVED", "BLOCKED"),
+            Some(ReviewVerdict::Blocked)
+        );
+        assert_eq!(review_verdict("", "invalid"), None);
+    }
+
+    #[test]
+    fn reviewer_prompt_matches_bash() {
+        let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let status = "No Python or Node manifest found — dependency preflight skipped.";
+        let instructions = compose_role_prompt(tools, "alucard-reviewer-prompt.md", None).unwrap();
+        let bash = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1/alucard"
+printf '<instructions>\n%s\n</instructions>\n<pr_num>%s</pr_num>\n<review_cycle>%s of %s</review_cycle>\n<toolchain_status>\n' "$2" "$3" "$4" "$5"
+printf '%s' "$6" | xml_escape
+printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blockers>'"#,
+                "bash",
+                tools.to_str().unwrap(),
+                &instructions,
+                "17",
+                "1",
+                "10",
+                status,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            bash.status.success(),
+            "{}",
+            String::from_utf8_lossy(&bash.stderr)
+        );
+        assert_eq!(
+            reviewer_prompt(tools, 17, 1, 10, status).unwrap(),
+            String::from_utf8(bash.stdout).unwrap()
+        );
     }
 
     #[test]
