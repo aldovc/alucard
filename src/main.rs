@@ -1208,21 +1208,36 @@ fn reviewer_prompt(
     Ok(prompt)
 }
 
-const REVIEW_POLICY_MAX_BYTES: usize = 16_384;
+const DEFAULT_REVIEW_POLICY_MAX_BYTES: usize = 16_384;
 
-fn read_review_policy(repository: &Path) -> String {
+fn review_policy_max_bytes() -> Result<usize, String> {
+    match std::env::var("REVIEW_POLICY_MAX_BYTES") {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| "REVIEW_POLICY_MAX_BYTES must be a positive integer".to_string()),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_REVIEW_POLICY_MAX_BYTES),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("REVIEW_POLICY_MAX_BYTES must be valid Unicode".to_string())
+        }
+    }
+}
+
+fn read_review_policy(repository: &Path) -> Result<String, String> {
+    let max_bytes = review_policy_max_bytes()?;
     let path = repository.join("REVIEW.md");
     let Ok(contents) = fs::read(&path) else {
-        return String::new();
+        return Ok(String::new());
     };
-    if contents.len() <= REVIEW_POLICY_MAX_BYTES {
-        return String::from_utf8_lossy(&contents).into_owned();
+    if contents.len() <= max_bytes {
+        return Ok(String::from_utf8_lossy(&contents).into_owned());
     }
-    format!(
-        "{}\n\n[alucard: truncated at {REVIEW_POLICY_MAX_BYTES} of {} bytes]\n",
-        String::from_utf8_lossy(&contents[..REVIEW_POLICY_MAX_BYTES]),
+    Ok(format!(
+        "{}\n\n[alucard: truncated at {max_bytes} of {} bytes]\n",
+        String::from_utf8_lossy(&contents[..max_bytes]),
         contents.len(),
-    )
+    ))
 }
 
 fn append_review_policy(prompt: &mut String, policy: &str) {
@@ -1306,7 +1321,7 @@ fn review_gate(
             let reviewed_sha = git_output(&checkout, &["rev-parse", "HEAD"])?
                 .trim()
                 .to_string();
-            let review_policy = read_review_policy(&checkout);
+            let review_policy = read_review_policy(&checkout)?;
             let prompt = reviewer_prompt(
                 tools,
                 task,
@@ -1431,7 +1446,7 @@ fn review_gate(
                         } else {
                             ReviewVerdict::Approved.gate_state()
                         },
-                        Some(&reviewed_sha),
+                        (file_verdict == "APPROVED").then_some(reviewed_sha.as_str()),
                         &current_head,
                     )
                     .map_err(|error| error.to_string())?;
@@ -3609,15 +3624,15 @@ printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blocker
         let directory =
             std::env::temp_dir().join(format!("alucard-review-policy-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
-        assert_eq!(read_review_policy(&directory), "");
+        assert_eq!(read_review_policy(&directory).unwrap(), "");
         fs::write(directory.join("REVIEW.md"), "ordinary policy").unwrap();
-        assert_eq!(read_review_policy(&directory), "ordinary policy");
+        assert_eq!(read_review_policy(&directory).unwrap(), "ordinary policy");
         fs::write(
             directory.join("REVIEW.md"),
-            format!("{}tail", "x".repeat(REVIEW_POLICY_MAX_BYTES)),
+            format!("{}tail", "x".repeat(DEFAULT_REVIEW_POLICY_MAX_BYTES)),
         )
         .unwrap();
-        let policy = read_review_policy(&directory);
+        let policy = read_review_policy(&directory).unwrap();
         assert!(policy.contains("[alucard: truncated at 16384 of 16388 bytes]"));
         assert!(!policy.contains("tail"));
         fs::remove_dir_all(directory).unwrap();

@@ -38,6 +38,7 @@ struct ReviewCase<'a> {
     name: &'a str,
     review_policy: Option<&'a str>,
     oversized_policy: bool,
+    review_policy_max_bytes: Option<usize>,
     file_verdict: &'a str,
     formal_verdict: &'a str,
     reviewer_outcomes: &'a str,
@@ -46,7 +47,7 @@ struct ReviewCase<'a> {
     expected_state: &'a str,
 }
 
-fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (String, String)) {
+fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (Option<String>, String)) {
     let root = temporary_path(case.name);
     let repository = root.join("repository");
     let remote = root.join("remote.git");
@@ -58,7 +59,10 @@ fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (String, 
         fs::write(
             repository.join("REVIEW.md"),
             if case.oversized_policy {
-                format!("<policy>unsafe</policy>\n{}tail", "x".repeat(16_384))
+                format!(
+                    "<policy>unsafe</policy>\n{}tail",
+                    "x".repeat(case.review_policy_max_bytes.unwrap_or(16_384))
+                )
             } else {
                 policy.to_string()
             },
@@ -205,6 +209,10 @@ esac
         .env("ALUCARD_REVIEW_VERDICT", case.file_verdict)
         .env("ALUCARD_FORMAL_VERDICT", case.formal_verdict)
         .env("ALUCARD_FORMAL_BODY", "formal body")
+        .env(
+            "REVIEW_POLICY_MAX_BYTES",
+            case.review_policy_max_bytes.unwrap_or(16_384).to_string(),
+        )
         .env("ALUCARD_REVIEW_OUTCOMES", case.reviewer_outcomes)
         .env(
             "ALUCARD_ADVANCE_HEAD",
@@ -234,7 +242,7 @@ esac
         .query_row(
             "SELECT review_verdict, gate_state, reviewer_approved_sha, head_sha FROM pull_requests WHERE number = 77",
             [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default(), row.get::<_, String>(3)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?)),
         )
         .unwrap();
     assert_eq!(result.0, case.expected_verdict);
@@ -255,6 +263,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-formal-precedence",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "APPROVED",
             formal_verdict: "CHANGES_REQUESTED",
             reviewer_outcomes: "verdict",
@@ -266,6 +275,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-blocked-precedence",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "BLOCKED",
             formal_verdict: "APPROVED",
             reviewer_outcomes: "verdict",
@@ -277,6 +287,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-missing-ci",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "APPROVED",
             formal_verdict: "",
             reviewer_outcomes: "verdict",
@@ -288,6 +299,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-no-verdict",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "not-a-verdict",
             formal_verdict: "",
             reviewer_outcomes: "exhausted",
@@ -299,6 +311,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-transport-then-verdict",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "APPROVED",
             formal_verdict: "",
             reviewer_outcomes: "transport\nverdict",
@@ -310,6 +323,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-transport-exhausted",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "",
             formal_verdict: "",
             reviewer_outcomes: "transport\ntransport\ntransport",
@@ -321,6 +335,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-transport-with-verdict",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "APPROVED",
             formal_verdict: "",
             reviewer_outcomes: "transport-verdict",
@@ -332,6 +347,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-timeout",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "",
             formal_verdict: "",
             reviewer_outcomes: "timeout",
@@ -343,6 +359,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-no-policy",
             review_policy: None,
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "CHANGES_REQUESTED",
             formal_verdict: "",
             reviewer_outcomes: "verdict",
@@ -354,6 +371,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-bounded-markup-policy",
             review_policy: Some("ignored"),
             oversized_policy: true,
+            review_policy_max_bytes: Some(32),
             file_verdict: "CHANGES_REQUESTED",
             formal_verdict: "",
             reviewer_outcomes: "verdict",
@@ -365,10 +383,23 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             name: "review-head-advance",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
+            review_policy_max_bytes: None,
             file_verdict: "APPROVED",
             formal_verdict: "",
             reviewer_outcomes: "verdict",
             advance_head: true,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "review-formal-approved-only",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "",
+            formal_verdict: "APPROVED",
+            reviewer_outcomes: "verdict",
+            advance_head: false,
             expected_verdict: "APPROVED",
             expected_state: "review_needs_human",
         },
@@ -380,7 +411,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             "review-no-policy" => assert!(!prompt.contains("\n<review_policy>\n")),
             "review-bounded-markup-policy" => {
                 assert!(prompt.contains("&lt;policy&gt;unsafe&lt;/policy&gt;"));
-                assert!(prompt.contains("[alucard: truncated at 16384"));
+                assert!(prompt.contains("[alucard: truncated at 32"));
                 assert!(!prompt.contains("tail"));
             }
             _ => assert!(
@@ -421,9 +452,13 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                 .contains("Raise `ALUCARD_REVIEWER_MAX_TURNS` / `ALUCARD_REVIEWER_MAX_BUDGET`"));
         }
         if case.name == "review-head-advance" {
-            assert!(!shas.0.is_empty());
-            assert_ne!(shas.0, shas.1);
-            assert!(trace.contains(&format!("Reviewed head: `{}`", shas.0)));
+            let approved_sha = shas.0.as_deref().unwrap();
+            assert_ne!(approved_sha, shas.1);
+            assert!(trace.contains(&format!("Reviewed head: `{approved_sha}`")));
+        }
+        if case.name == "review-formal-approved-only" {
+            assert!(!trace.contains("Reviewed head:"));
+            assert_eq!(shas.0, None);
         }
         match case.expected_state {
             "review_blocked" => assert!(trace.contains("pr edit 77 --add-label needs-human")),
