@@ -106,8 +106,28 @@ fn prepare_directory(path: &Path) -> io::Result<()> {
     else {
         return Ok(());
     };
-    fs::create_dir_all(parent)?;
-    restrict_directory_permissions(parent)
+    if create_directory(parent)? {
+        restrict_directory_permissions(parent)?;
+    }
+    Ok(())
+}
+
+fn create_directory(path: &Path) -> io::Result<bool> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            else {
+                return Err(error);
+            };
+            create_directory(parent)?;
+            create_directory(path)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]

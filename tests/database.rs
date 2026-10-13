@@ -112,3 +112,19 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
         .contains("pending migrations: 0"));
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn status_preserves_existing_database_parent_permissions() {
+    let path = database_path();
+    let parent = path.parent().unwrap();
+    fs::create_dir(parent).unwrap();
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(status(&path).unwrap().pending_migrations, 1);
+    assert_eq!(
+        fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    fs::remove_dir_all(parent).unwrap();
+}
