@@ -306,6 +306,77 @@ pub fn toolchain_status(results: &[(DependencyInstall, i32)]) -> String {
     format!("BROKEN — {failed}; {completed}. Agents CANNOT install dependencies for {directories}; local checks requiring those dependencies are blocked until the install failure is resolved. Do not demand local execution evidence for those checks. For the rest of the repo, run the documented local checks. Successful installs do not verify test execution or availability of services and credentials. Follow the project's documented local and CI verification workflow and report unrun checks.")
 }
 
+/// Runs dependency installs in a fresh clone of the base branch.
+pub fn toolchain_preflight(
+    repository: &Path,
+    base_branch: &str,
+    image: &str,
+    env_file: &Path,
+    timeout_minutes: u64,
+) -> Result<String, String> {
+    let installs = detect_dependency_installs(repository).map_err(|error| error.to_string())?;
+    if installs.is_empty() {
+        return Ok(toolchain_status(&[]));
+    }
+
+    let clone = env::temp_dir().join(format!("alucard-preflight-{}", Uuid::new_v4()));
+    let cloned = Command::new("git")
+        .args([
+            "clone",
+            "--local",
+            "--no-tags",
+            "--single-branch",
+            "--branch",
+            base_branch,
+        ])
+        .arg(repository)
+        .arg(&clone)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !cloned {
+        let _ = fs::remove_dir_all(clone);
+        return Ok(format!(
+            "Preflight clone of {base_branch} failed — dependency build unverified."
+        ));
+    }
+
+    let result = (|| {
+        let name = format!("alucard-preflight-{}", std::process::id());
+        let mut results = Vec::new();
+        for install in installs {
+            let working_directory = format!("/work/{}", install.directory.display());
+            let docker_args = vec![
+                "run".into(),
+                "--rm".into(),
+                "--name".into(),
+                name.clone(),
+                "--env-file".into(),
+                env_file.display().to_string(),
+                "-e".into(),
+                "HOME=/home/alucard".into(),
+                "-v".into(),
+                format!("{}:/work:rw", clone.display()),
+                "-w".into(),
+                working_directory,
+                image.into(),
+                "bash".into(),
+                "-lc".into(),
+                install.command.into(),
+            ];
+            let status = timeout_docker_command(timeout_minutes, &docker_args).status();
+            cleanup_docker_container(&name);
+            let rc = status
+                .map_err(|error| format!("cannot start docker: {error}"))?
+                .code()
+                .unwrap_or(1);
+            results.push((install, rc));
+        }
+        Ok(toolchain_status(&results))
+    })();
+    let _ = fs::remove_dir_all(clone);
+    result
+}
+
 pub fn build_image(tool_dir: &Path, image: &str) -> Result<(), String> {
     build_image_with_docker(tool_dir, image, Path::new("docker"))
 }
@@ -436,6 +507,10 @@ mod agent_tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
 
     fn run_build(
         previous: &str,
@@ -522,7 +597,86 @@ mod agent_tests {
     }
 
     #[test]
+    fn preflight_reaps_failed_containers_and_reports_their_status() {
+        let _path_lock = PATH_LOCK.lock().unwrap();
+        let dir = env::temp_dir().join(format!("alucard-preflight-{}", uuid::Uuid::new_v4()));
+        let repository = dir.join("repository");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("package-lock.json"), "{}").unwrap();
+        Command::new("git")
+            .args(["init", "--initial-branch", "main"])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Alucard Test",
+                "-c",
+                "user.email=alucard@example.test",
+                "commit",
+                "-m",
+                "test",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap();
+
+        let trace = dir.join("trace");
+        fs::write(
+            bin.join("timeout"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"timeout $*\" >> {}\nwhile [ \"$1\" != docker ]; do shift; done\nshift\nexec docker \"$@\"\n",
+                trace.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            bin.join("docker"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\n[ \"$1\" = run ] && exit 23\n",
+                trace.display()
+            ),
+        )
+        .unwrap();
+        for command in [bin.join("timeout"), bin.join("docker")] {
+            fs::set_permissions(command, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env_file = dir.join("alucard.env");
+        fs::write(&env_file, "").unwrap();
+        let path = env::var_os("PATH").unwrap_or_default();
+        env::set_var(
+            "PATH",
+            format!("{}:{}", bin.display(), path.to_string_lossy()),
+        );
+
+        let status =
+            super::toolchain_preflight(&repository, "main", "alucard:test", &env_file, 7).unwrap();
+
+        env::set_var("PATH", path);
+        let trace = fs::read_to_string(trace).unwrap();
+        assert!(
+            trace.contains("timeout --kill-after 30s 7m docker run --rm --name alucard-preflight-")
+        );
+        assert!(trace.contains(&format!(
+            "docker rm -f alucard-preflight-{}",
+            std::process::id()
+        )));
+        assert!(trace.find("docker run").unwrap() < trace.find("docker rm -f").unwrap());
+        assert!(status.contains("`npm ci` at the repo root fails inside the container (rc=23)"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn invoke_cleans_up_when_codex_stdin_closes_early() {
+        let _path_lock = PATH_LOCK.lock().unwrap();
         let dir = env::temp_dir().join(format!("alucard-invoke-cleanup-{}", uuid::Uuid::new_v4()));
         let bin = dir.join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -814,6 +968,23 @@ fn has_rate_limit_error(message: &str, anchored: bool) -> bool {
     }
 }
 
+fn timeout_docker_command(timeout_minutes: u64, docker_args: &[String]) -> Command {
+    let mut command = Command::new("timeout");
+    command
+        .args([
+            "--kill-after",
+            "30s",
+            &format!("{timeout_minutes}m"),
+            "docker",
+        ])
+        .args(docker_args);
+    command
+}
+
+fn cleanup_docker_container(name: &str) {
+    let _ = Command::new("docker").args(["rm", "-f", name]).status();
+}
+
 impl AgentInvocation<'_> {
     pub fn docker_args(&self, settings: &AgentSettings) -> Result<Vec<String>, String> {
         let provider = settings.provider(self.role)?;
@@ -938,15 +1109,8 @@ impl AgentInvocation<'_> {
         let docker_args = self.docker_args(settings)?;
         let log = File::create(log_file)
             .map_err(|error| format!("cannot create {}: {error}", log_file.display()))?;
-        let mut command = Command::new("timeout");
+        let mut command = timeout_docker_command(self.timeout_minutes, &docker_args);
         command
-            .args([
-                "--kill-after",
-                "30s",
-                &format!("{}m", self.timeout_minutes),
-                "docker",
-            ])
-            .args(&docker_args)
             .current_dir(self.worktree)
             .stdout(Stdio::from(
                 log.try_clone().map_err(|error| error.to_string())?,
@@ -971,9 +1135,7 @@ impl AgentInvocation<'_> {
                 .wait()
                 .map_err(|error| format!("cannot wait for docker: {error}"))
         })();
-        let _ = Command::new("docker")
-            .args(["rm", "-f", self.name])
-            .status();
+        cleanup_docker_container(self.name);
         let status = status?;
         let log = fs::read_to_string(log_file).unwrap_or_default();
         let classification = classify_agent_output(provider, status.code(), &log);
