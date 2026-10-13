@@ -1,10 +1,10 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    database_path, find_run, github_queue, github_ticket_blockers, import_github_tasks,
-    import_local_tasks, local_queue_with_open_issues, migrate, open, parse_tasks, recent_runs,
-    run_claims, run_command as execute_command, run_pull_requests, status, GithubPullRequest,
-    GithubTask,
+    build_image, database_path, find_run, github_queue, github_ticket_blockers,
+    import_github_tasks, import_local_tasks, local_queue_with_open_issues, migrate, open,
+    parse_tasks, recent_runs, run_claims, run_command as execute_command, run_pull_requests,
+    status, AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -28,14 +28,43 @@ fn main() -> ExitCode {
         },
         Some("doctor") => doctor_command(&commands[1..], db_path),
         Some("queue") => queue_command(&commands[1..], db_path),
+        Some("build") => build_command(&commands[1..]),
         Some("runs") => match database_path(db_path) {
             Ok(path) => runs_command(&commands[1..], &path),
             Err(error) => fail(&format!("alucard: {error}")),
         },
         Some(cmd) => fail(&format!("alucard: unknown command: {cmd}")),
         None => {
-            fail("usage: alucard [--db-path PATH] {version|queue|runs|doctor|db migrate|db status}")
+            fail("usage: alucard [--db-path PATH] {version|build|queue|runs|doctor|db migrate|db status}")
         }
+    }
+}
+
+fn build_command(args: &[String]) -> ExitCode {
+    let mut image = nonempty_environment("ALUCARD_IMAGE")
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| "ghcr.io/aldovc/alucard:latest".to_string());
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--image" => match args.next() {
+                Some(value) if !value.is_empty() => image = value.clone(),
+                None => return fail("alucard: --image requires an image name"),
+                Some(_) => return fail("alucard: --image requires an image name"),
+            },
+            "-h" | "--help" => {
+                println!("usage: alucard build [--image IMAGE]");
+                return ExitCode::SUCCESS;
+            }
+            _ => return fail(&format!("alucard: unknown build option: {arg}")),
+        }
+    }
+    let Some(dir) = tool_dir().or_else(|| std::env::current_dir().ok()) else {
+        return fail("alucard: cannot find tool directory");
+    };
+    match build_image(&dir, &image) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(&format!("alucard: {error}")),
     }
 }
 
@@ -174,36 +203,44 @@ fn doctor_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     } else {
         println!("ok: tool files in {}", tools.display());
     }
-    let environment = match read_environment(&options.env_file) {
-        Ok(environment) => {
+    let settings = match AgentSettings::from_environment(Some(&options.env_file)) {
+        Ok(settings) => {
             println!("ok: env file {}", options.env_file.display());
-            environment
+            Some(settings)
         }
         Err(_) => {
             println!("missing: env file {}", options.env_file.display());
             ok = false;
-            BTreeMap::new()
+            None
         }
     };
-    if options.env_file.is_file() {
-        if environment.get("GITHUB_TOKEN").is_none_or(String::is_empty) {
+    if let Some(settings) = settings {
+        if !settings.has_value("GITHUB_TOKEN") {
             println!("missing: GITHUB_TOKEN value");
             ok = false;
         }
-        let providers = ["WORKER", "CI_FIX", "REVIEWER", "FEEDBACK"]
-            .iter()
-            .filter_map(|role| match resolve_provider(&environment, role) {
+        let providers = [
+            ("WORKER", AgentRole::Worker),
+            ("CI_FIX", AgentRole::CiFix),
+            ("REVIEWER", AgentRole::Reviewer),
+            ("FEEDBACK", AgentRole::Feedback),
+        ]
+        .into_iter()
+            .filter_map(|(role_name, role)| match settings.provider(role) {
                 Ok(provider) => Some(provider),
-                Err(provider) => {
-                    println!("missing: unrecognized provider '{provider}' for role {role}: must be 'claude' or 'codex'");
+                Err(_) => {
+                    println!("missing: unrecognized provider '{}' for role {role_name}: must be 'claude' or 'codex'", settings.provider_name(role));
                     ok = false;
                     None
                 }
             })
             .collect::<Vec<_>>();
-        for (provider, key) in [("claude", "ANTHROPIC_API_KEY"), ("codex", "OPENAI_API_KEY")] {
+        for (provider, key) in [
+            (Provider::Claude, "ANTHROPIC_API_KEY"),
+            (Provider::Codex, "OPENAI_API_KEY"),
+        ] {
             if providers.contains(&provider) {
-                if environment.get(key).is_some_and(|value| !value.is_empty()) {
+                if settings.has_value(key) {
                     println!("ok: {key}");
                 } else {
                     println!("missing: {key} value");
@@ -328,58 +365,6 @@ fn git_repository_root(directory: &std::path::Path) -> Option<PathBuf> {
         let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
         (!root.is_empty()).then(|| PathBuf::from(root))
     })?
-}
-
-fn read_environment(path: &std::path::Path) -> Result<BTreeMap<String, String>, std::io::Error> {
-    let mut environment: BTreeMap<String, String> = [
-        "GITHUB_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "ALUCARD_PROVIDER",
-        "ALUCARD_WORKER_PROVIDER",
-        "ALUCARD_CI_FIX_PROVIDER",
-        "ALUCARD_REVIEWER_PROVIDER",
-        "ALUCARD_FEEDBACK_PROVIDER",
-    ]
-    .into_iter()
-    .filter_map(|name| {
-        std::env::var(name)
-            .ok()
-            .map(|value| (name.to_string(), value))
-    })
-    .collect();
-    for line in fs::read_to_string(path)?.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((name, value)) = line.strip_prefix("export ").unwrap_or(line).split_once('=') {
-            environment.insert(
-                name.trim().to_string(),
-                value.trim_matches('"').trim_matches('\'').to_string(),
-            );
-        }
-    }
-    Ok(environment)
-}
-
-fn resolve_provider<'a>(
-    environment: &'a BTreeMap<String, String>,
-    role: &str,
-) -> Result<&'a str, &'a str> {
-    let provider = environment
-        .get(&format!("ALUCARD_{role}_PROVIDER"))
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            environment
-                .get("ALUCARD_PROVIDER")
-                .filter(|value| !value.is_empty())
-        })
-        .map_or("claude", String::as_str);
-    match provider {
-        "claude" | "codex" => Ok(provider),
-        _ => Err(provider),
-    }
 }
 
 fn github_ref(path: &std::path::Path) -> Option<String> {

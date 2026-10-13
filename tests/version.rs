@@ -13,6 +13,55 @@ fn empty_environment_defaults(command: &mut Command) -> &mut Command {
         .env("ALUCARD_CACHE_DIR", "")
 }
 
+#[cfg(unix)]
+#[test]
+fn build_uses_default_image_for_a_blank_environment_and_rejects_a_blank_flag() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let directory = std::env::temp_dir().join(format!(
+        "alucard-build-command-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let bin = directory.join("bin");
+    let trace = directory.join("docker.trace");
+    fs::create_dir_all(&bin).unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in\n  'image inspect') exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .arg("build")
+        .current_dir(root)
+        .env("ALUCARD_IMAGE", "")
+        .env("ALUCARD_DOCKER_TRACE", &trace)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(fs::read_to_string(&trace)
+        .unwrap()
+        .contains("-t ghcr.io/aldovc/alucard:latest"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .args(["build", "--image", ""])
+        .current_dir(root)
+        .env("ALUCARD_DOCKER_TRACE", &trace)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--image requires an image name"));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn without_ledger_check(output: std::process::Output) -> String {
     String::from_utf8(output.stdout)
         .unwrap()

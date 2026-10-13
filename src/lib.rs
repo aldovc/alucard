@@ -3,16 +3,797 @@
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// The provider selected for an agent role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Claude,
+    Codex,
+}
+
+impl Provider {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            _ => Err(format!(
+                "unrecognized provider '{value}': must be 'claude' or 'codex'"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    Worker,
+    CiFix,
+    Reviewer,
+    Feedback,
+    Wrapup,
+}
+
+impl AgentRole {
+    pub fn setting_name(self) -> &'static str {
+        match self {
+            Self::Worker | Self::Wrapup => "WORKER",
+            Self::CiFix => "CI_FIX",
+            Self::Reviewer => "REVIEWER",
+            Self::Feedback => "FEEDBACK",
+        }
+    }
+
+    fn turn_budget_setting_name(self) -> &'static str {
+        match self {
+            Self::Wrapup => "WRAPUP",
+            _ => self.setting_name(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSettings {
+    values: std::collections::BTreeMap<String, String>,
+}
+
+impl AgentSettings {
+    pub fn from_environment(env_file: Option<&Path>) -> Result<Self, String> {
+        Self::from_values(env::vars().collect(), env_file)
+    }
+
+    fn from_values(
+        mut values: std::collections::BTreeMap<String, String>,
+        env_file: Option<&Path>,
+    ) -> Result<Self, String> {
+        let startup_defaults = [
+            ("ALUCARD_WORKER_MAX_TURNS", "180"),
+            ("ALUCARD_WORKER_MAX_BUDGET", "10"),
+            ("ALUCARD_CI_FIX_MAX_TURNS", "30"),
+            ("ALUCARD_CI_FIX_MAX_BUDGET", "2"),
+            ("ALUCARD_REVIEWER_MAX_TURNS", "45"),
+            ("ALUCARD_REVIEWER_MAX_BUDGET", "2"),
+            ("ALUCARD_FEEDBACK_MAX_TURNS", "50"),
+            ("ALUCARD_FEEDBACK_MAX_BUDGET", "2"),
+            ("ALUCARD_WRAPUP_MAX_TURNS", "12"),
+            ("ALUCARD_WRAPUP_MAX_BUDGET", "1"),
+            ("ALUCARD_CLAUDE_MODEL", "sonnet"),
+            ("ALUCARD_CLAUDE_FALLBACK_MODEL", "haiku"),
+            ("ALUCARD_CODEX_MODEL", "gpt-5.6-terra"),
+        ]
+        .into_iter()
+        .map(|(key, default)| {
+            (
+                key,
+                values
+                    .get(key)
+                    .filter(|value| !value.is_empty())
+                    .map(String::as_str)
+                    .unwrap_or(default)
+                    .to_string(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+        if let Some(path) = env_file {
+            let contents = fs::read_to_string(path)
+                .map_err(|error| format!("cannot read env file {}: {error}", path.display()))?;
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let line = line.strip_prefix("export ").unwrap_or(line);
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                let key = key.trim();
+                let value = value.trim().trim_matches(['\'', '"']);
+                values.insert(
+                    key.to_string(),
+                    if value.is_empty() {
+                        startup_defaults.get(key).cloned().unwrap_or_default()
+                    } else {
+                        value.to_string()
+                    },
+                );
+            }
+        }
+        Ok(Self { values })
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.values
+            .get(key)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn provider(&self, role: AgentRole) -> Result<Provider, String> {
+        Provider::parse(self.provider_name(role))
+    }
+
+    pub fn provider_name(&self, role: AgentRole) -> &str {
+        let key = format!("ALUCARD_{}_PROVIDER", role.setting_name());
+        self.get(&key)
+            .or_else(|| self.get("ALUCARD_PROVIDER"))
+            .unwrap_or("claude")
+    }
+
+    pub fn has_value(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn setting(&self, role: AgentRole, suffix: &str, default: &str) -> String {
+        let role_key = format!("ALUCARD_{}_{}", role.setting_name(), suffix);
+        self.get(&role_key)
+            .or_else(|| self.get(&format!("ALUCARD_{suffix}")))
+            .unwrap_or(default)
+            .to_string()
+    }
+
+    pub fn turns(&self, role: AgentRole) -> String {
+        let default = match role {
+            AgentRole::Worker => "180",
+            AgentRole::CiFix => "30",
+            AgentRole::Reviewer => "45",
+            AgentRole::Feedback => "50",
+            AgentRole::Wrapup => "12",
+        };
+        self.get(&format!(
+            "ALUCARD_{}_MAX_TURNS",
+            role.turn_budget_setting_name()
+        ))
+        .unwrap_or(default)
+        .to_string()
+    }
+
+    pub fn budget(&self, role: AgentRole) -> String {
+        let default = match role {
+            AgentRole::Worker => "10",
+            AgentRole::CiFix => "2",
+            AgentRole::Reviewer => "2",
+            AgentRole::Feedback => "2",
+            AgentRole::Wrapup => "1",
+        };
+        self.get(&format!(
+            "ALUCARD_{}_MAX_BUDGET",
+            role.turn_budget_setting_name()
+        ))
+        .unwrap_or(default)
+        .to_string()
+    }
+}
+
+pub fn compose_role_prompt(
+    tool_dir: &Path,
+    role_file: &str,
+    trailer_file: Option<&str>,
+) -> io::Result<String> {
+    let mut prompt = fs::read_to_string(tool_dir.join(role_file))?;
+    prompt.push_str("\n\n");
+    prompt.push_str(&fs::read_to_string(
+        tool_dir.join("alucard-engineering-policy.md"),
+    )?);
+    if let Some(trailer) = trailer_file {
+        prompt.push_str("\n\n");
+        prompt.push_str(&fs::read_to_string(tool_dir.join(trailer))?);
+    }
+    Ok(prompt)
+}
+
+pub fn build_inputs_hash(tool_dir: &Path) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    for name in ["Dockerfile", "entrypoint.sh"] {
+        let path = tool_dir.join(name);
+        if path.is_file() {
+            hasher.update(format!("=== {name}\n").as_bytes());
+            hasher.update(fs::read(path)?);
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn build_image(tool_dir: &Path, image: &str) -> Result<(), String> {
+    build_image_with_docker(tool_dir, image, Path::new("docker"))
+}
+
+fn build_image_with_docker(tool_dir: &Path, image: &str, docker: &Path) -> Result<(), String> {
+    let hash = build_inputs_hash(tool_dir).map_err(|error| error.to_string())?;
+    let previous_id = docker_image_id(docker, image);
+    let status = Command::new(docker)
+        .args([
+            "build",
+            "--label",
+            &format!("alucard.build-inputs={hash}"),
+            "-t",
+            image,
+        ])
+        .arg(tool_dir)
+        .status()
+        .map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Err(format!("docker build failed with {status}"));
+    }
+    let Some(previous_id) = previous_id else {
+        return Ok(());
+    };
+    let Some(new_id) = docker_image_id(docker, image) else {
+        return Ok(());
+    };
+    if new_id == previous_id || docker_image_tag_count(docker, &previous_id) != Some(0) {
+        return Ok(());
+    }
+
+    let display_id = previous_id.get(7..19).unwrap_or(&previous_id);
+    eprintln!("Removing superseded image {display_id}...");
+    let removed = Command::new(docker)
+        .args(["rmi", &previous_id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !removed {
+        eprintln!("Warning: could not remove superseded image {display_id} (a container may still hold it).");
+    }
+    Ok(())
+}
+
+fn docker_image_id(docker: &Path, image: &str) -> Option<String> {
+    let output = Command::new(docker)
+        .args(["image", "inspect", "-f", "{{.Id}}", image])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn docker_image_tag_count(docker: &Path, image: &str) -> Option<usize> {
+    let output = Command::new(docker)
+        .args(["image", "inspect", "-f", "{{len .RepoTags}}", image])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+        .flatten()
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::{build_image_with_docker, AgentInvocation, AgentRole, AgentSettings};
+    use std::collections::BTreeMap;
+    use std::env;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn run_build(
+        previous: &str,
+        next: &str,
+        tags: usize,
+        build_rc: i32,
+        rmi_rc: i32,
+    ) -> (Result<(), String>, String) {
+        let dir =
+            std::env::temp_dir().join(format!("alucard-build-image-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(dir.join("entrypoint.sh"), "#!/bin/sh\n").unwrap();
+        let trace = dir.join("trace");
+        let built = dir.join("built");
+        let docker = dir.join("docker");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {trace}\ncase \"$1 $2\" in\n  'image inspect')\n    case \"$*\" in\n      *'{{{{.Id}}}}'*)\n        if [ -f {built} ]; then id='{next}'; else id='{previous}'; fi\n        [ -n \"$id\" ] || exit 1\n        printf '%s\\n' \"$id\" ;;\n      *'{{{{len .RepoTags}}}}'*) printf '%s\\n' '{tags}' ;;\n    esac ;;\n  'build '*) touch {built}; exit {build_rc} ;;\n  'rmi '*) exit {rmi_rc} ;;\nesac\n",
+            trace = trace.display(),
+            built = built.display(),
+        );
+        fs::write(&docker, script).unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        let result = build_image_with_docker(&dir, "alucard:test", &docker);
+        let trace = fs::read_to_string(trace).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        (result, trace)
+    }
+
+    #[test]
+    fn build_cleanup_matches_bash_contract() {
+        let old = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let new = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let (result, trace) = run_build(old, new, 0, 0, 0);
+        assert!(result.is_ok());
+        assert!(trace.contains(&format!("rmi {old}")));
+
+        let (result, trace) = run_build(old, old, 0, 0, 0);
+        assert!(result.is_ok());
+        assert!(!trace.contains("rmi"));
+
+        let (result, trace) = run_build(old, new, 2, 0, 0);
+        assert!(result.is_ok());
+        assert!(!trace.contains("rmi"));
+
+        let (result, trace) = run_build(old, new, 0, 1, 0);
+        assert!(result.is_err());
+        assert!(!trace.contains("rmi"));
+
+        let (result, trace) = run_build(old, new, 0, 0, 1);
+        assert!(result.is_ok());
+        assert!(trace.contains(&format!("rmi {old}")));
+    }
+
+    #[test]
+    fn invoke_cleans_up_when_codex_stdin_closes_early() {
+        let dir = env::temp_dir().join(format!("alucard-invoke-cleanup-{}", uuid::Uuid::new_v4()));
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let trace = dir.join("trace");
+        let timeout = bin.join("timeout");
+        let docker = bin.join("docker");
+        fs::write(&timeout, "#!/bin/sh\nexec 0<&-\nsleep 1\n").unwrap();
+        fs::write(
+            &docker,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n", trace.display()),
+        )
+        .unwrap();
+        for command in [&timeout, &docker] {
+            fs::set_permissions(command, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env_file = dir.join("alucard.env");
+        fs::write(&env_file, "ALUCARD_PROVIDER=codex\n").unwrap();
+        let settings = AgentSettings::from_environment(Some(&env_file)).unwrap();
+        let path = env::var_os("PATH").unwrap_or_default();
+        env::set_var(
+            "PATH",
+            format!("{}:{}", bin.display(), path.to_string_lossy()),
+        );
+
+        let prompt = "x".repeat(8 * 1024 * 1024);
+        let invocation = AgentInvocation {
+            role: AgentRole::Worker,
+            name: "alucard-test-cleanup",
+            image: "alucard:test",
+            env_file: &env_file,
+            worktree: Path::new(&dir),
+            prompt: &prompt,
+            timeout_minutes: 1,
+            network: None,
+            playwright_cache: None,
+            database_url: None,
+            github_repo: None,
+        };
+        let result = invocation.invoke(&settings, &dir.join("agent.log"));
+
+        env::set_var("PATH", path);
+        assert!(matches!(result, Err(error) if error.contains("cannot send prompt to codex")));
+        assert_eq!(
+            fs::read_to_string(&trace).unwrap(),
+            "rm -f alucard-test-cleanup\n"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn blank_env_settings_keep_inherited_startup_defaults() {
+        let dir = env::temp_dir().join(format!("alucard-agent-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let env_file = dir.join("alucard.env");
+        fs::write(
+            &env_file,
+            "ALUCARD_CLAUDE_MODEL=\nALUCARD_CLAUDE_FALLBACK_MODEL=\nALUCARD_CODEX_MODEL=\nALUCARD_WORKER_MAX_TURNS=\nALUCARD_WORKER_MAX_BUDGET=\n",
+        )
+        .unwrap();
+        let values = [
+            ("ALUCARD_PROVIDER", "claude"),
+            ("ALUCARD_CI_FIX_PROVIDER", "codex"),
+            ("ALUCARD_CLAUDE_MODEL", "inherited-claude"),
+            ("ALUCARD_CLAUDE_FALLBACK_MODEL", "inherited-fallback"),
+            ("ALUCARD_CODEX_MODEL", "inherited-codex"),
+            ("ALUCARD_WORKER_MAX_TURNS", "181"),
+            ("ALUCARD_WORKER_MAX_BUDGET", "11"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<BTreeMap<_, _>>();
+        let settings = AgentSettings::from_values(values, Some(&env_file)).unwrap();
+
+        let invocation = AgentInvocation {
+            role: AgentRole::Worker,
+            name: "alucard-test",
+            image: "alucard:test",
+            env_file: &env_file,
+            worktree: Path::new(&dir),
+            prompt: "prompt",
+            timeout_minutes: 1,
+            network: None,
+            playwright_cache: None,
+            database_url: None,
+            github_repo: None,
+        };
+        let worker_args = invocation.docker_args(&settings).unwrap();
+        assert!(worker_args
+            .windows(2)
+            .any(|pair| pair == ["--max-turns", "181"]));
+        assert!(worker_args
+            .windows(2)
+            .any(|pair| pair == ["--max-budget-usd", "11"]));
+        assert!(worker_args
+            .windows(2)
+            .any(|pair| pair == ["--model", "inherited-claude"]));
+        assert!(worker_args
+            .windows(2)
+            .any(|pair| pair == ["--fallback-model", "inherited-fallback"]));
+
+        let codex_args = AgentInvocation {
+            role: AgentRole::CiFix,
+            ..invocation
+        }
+        .docker_args(&settings)
+        .unwrap();
+        assert!(codex_args
+            .windows(2)
+            .any(|pair| pair == ["-m", "inherited-codex"]));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+pub struct AgentInvocation<'a> {
+    pub role: AgentRole,
+    pub name: &'a str,
+    pub image: &'a str,
+    pub env_file: &'a Path,
+    pub worktree: &'a Path,
+    pub prompt: &'a str,
+    pub timeout_minutes: u64,
+    pub network: Option<&'a str>,
+    pub playwright_cache: Option<&'a Path>,
+    pub database_url: Option<&'a str>,
+    pub github_repo: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentExit {
+    Clean,
+    Wedged,
+    NoWorktree,
+    Timeout,
+    Exhausted,
+    Transport,
+    Billing,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentResult {
+    pub status: Option<i32>,
+    pub classification: AgentExit,
+}
+
+/// Classifies an agent process exit from its final provider result record.
+pub fn classify_agent_output(provider: Provider, status: Option<i32>, log: &str) -> AgentExit {
+    if log.contains("Shell cwd was reset to /work (deleted)") {
+        return AgentExit::Wedged;
+    }
+
+    if status == Some(78) {
+        return AgentExit::NoWorktree;
+    }
+
+    if matches!(status, Some(124 | 137)) {
+        return AgentExit::Timeout;
+    }
+
+    let record = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| match provider {
+            Provider::Claude => record.get("type").and_then(Value::as_str) == Some("result"),
+            Provider::Codex => {
+                record.get("type").and_then(Value::as_str) == Some("item.completed")
+                    && record
+                        .get("item")
+                        .and_then(|item| item.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("error")
+            }
+        })
+        .last();
+
+    let Some(record) = record else {
+        return if status == Some(0) {
+            AgentExit::Clean
+        } else {
+            AgentExit::Failed
+        };
+    };
+
+    if record.get("error").and_then(Value::as_str) == Some("billing_error") {
+        return AgentExit::Billing;
+    }
+
+    match provider {
+        Provider::Codex => {
+            let message = record
+                .get("item")
+                .and_then(|item| item.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if has_transport_error(message, false) {
+                AgentExit::Transport
+            } else {
+                AgentExit::Failed
+            }
+        }
+        Provider::Claude => {
+            let subtype = record
+                .get("subtype")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if subtype == "error_max_turns" {
+                return AgentExit::Exhausted;
+            }
+            let api_status = record.get("api_error_status").and_then(Value::as_i64);
+            if api_status == Some(429) || matches!(api_status, Some(500..=599)) {
+                return AgentExit::Transport;
+            }
+            let is_error = record
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if subtype == "success" && !is_error && status == Some(0) {
+                return AgentExit::Clean;
+            }
+            if subtype == "success" && is_error {
+                return AgentExit::Transport;
+            }
+            let result = record
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if is_error && has_transport_error(result, true) {
+                AgentExit::Transport
+            } else {
+                AgentExit::Failed
+            }
+        }
+    }
+}
+
+fn has_transport_error(message: &str, anchored: bool) -> bool {
+    let message = message.to_ascii_lowercase();
+    if has_rate_limit_error(&message, anchored) {
+        return true;
+    }
+
+    [
+        "connection closed",
+        "network error",
+        "overloaded",
+        "gateway",
+        "reset by peer",
+        "econnreset",
+        "timed out waiting",
+        "api error",
+    ]
+    .iter()
+    .any(|marker| {
+        if anchored {
+            message.starts_with(marker)
+        } else {
+            message.contains(marker)
+        }
+    })
+}
+
+fn has_rate_limit_error(message: &str, anchored: bool) -> bool {
+    let matches_rate_limit = |suffix: &str| {
+        let Some(after_rate) = suffix.strip_prefix("rate") else {
+            return false;
+        };
+        after_rate.starts_with("limit")
+            || after_rate
+                .chars()
+                .next()
+                .is_some_and(|separator| after_rate[separator.len_utf8()..].starts_with("limit"))
+    };
+
+    if anchored {
+        matches_rate_limit(message)
+    } else {
+        message
+            .match_indices("rate")
+            .any(|(index, _)| matches_rate_limit(&message[index..]))
+    }
+}
+
+impl AgentInvocation<'_> {
+    pub fn docker_args(&self, settings: &AgentSettings) -> Result<Vec<String>, String> {
+        let provider = settings.provider(self.role)?;
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let mut args = vec![
+            "run".into(),
+            "--rm".into(),
+            "--name".into(),
+            self.name.into(),
+            "--network".into(),
+            self.network.unwrap_or("bridge").into(),
+            "--memory".into(),
+            "4g".into(),
+            "--cpus".into(),
+            "2".into(),
+            "--read-only".into(),
+            "--tmpfs".into(),
+            "/tmp:exec,size=2g".into(),
+            "--tmpfs".into(),
+            format!("/home/alucard:size=2g,uid={uid},gid={gid}"),
+            "--ulimit".into(),
+            "nofile=8192:8192".into(),
+            "--user".into(),
+            format!("{uid}:{gid}"),
+            "--security-opt".into(),
+            "no-new-privileges".into(),
+            "--cap-drop".into(),
+            "ALL".into(),
+            "--env-file".into(),
+            self.env_file.display().to_string(),
+            "-e".into(),
+            "HOME=/home/alucard".into(),
+            "-e".into(),
+            "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig".into(),
+            "-e".into(),
+            "GH_CONFIG_DIR=/tmp/gh".into(),
+            "-v".into(),
+            format!("{}:/work:rw", self.worktree.display()),
+        ];
+        if provider == Provider::Codex {
+            args.insert(2, "-i".into());
+        }
+        if let Some(cache) = self.playwright_cache {
+            args.extend([
+                "-v".into(),
+                format!("{}:/opt/alucard-browsers:rw", cache.display()),
+                "-e".into(),
+                "PLAYWRIGHT_BROWSERS_PATH=/opt/alucard-browsers".into(),
+                "-e".into(),
+                "PLAYWRIGHT_SKIP_BROWSER_GC=1".into(),
+            ]);
+        }
+        if let Some(url) = self.database_url {
+            args.extend(["-e".into(), format!("DATABASE_URL={url}")]);
+        }
+        if let Some(repo) = self.github_repo {
+            args.extend(["-e".into(), format!("GH_REPO={repo}")]);
+        }
+        args.push(self.image.into());
+        match provider {
+            Provider::Codex => args.extend([
+                "codex".into(),
+                "exec".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--json".into(),
+                "--ephemeral".into(),
+                "-m".into(),
+                settings.setting(self.role, "CODEX_MODEL", "gpt-5.6-terra"),
+                "-".into(),
+            ]),
+            Provider::Claude => {
+                args.extend([
+                    "claude".into(),
+                    "-p".into(),
+                    "--verbose".into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--include-partial-messages".into(),
+                    "--permission-mode".into(),
+                    "bypassPermissions".into(),
+                    "--max-turns".into(),
+                    settings.turns(self.role),
+                    "--max-budget-usd".into(),
+                    settings.budget(self.role),
+                    "--model".into(),
+                    settings.setting(self.role, "CLAUDE_MODEL", "sonnet"),
+                    "--fallback-model".into(),
+                    settings.setting(self.role, "CLAUDE_FALLBACK_MODEL", "haiku"),
+                ]);
+                let effort = settings.setting(self.role, "EFFORT", "");
+                if !effort.is_empty() {
+                    args.extend(["--effort".into(), effort]);
+                }
+                let prompt = format!(
+                    "{}\n<turn_budget>\nThis run gets {} turns. The harness stops you the moment the cap is reached, wherever you are.\n</turn_budget>",
+                    self.prompt,
+                    settings.turns(self.role),
+                );
+                args.extend(["--disallowedTools".into(), "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)".into(), "--".into(), prompt]);
+            }
+        }
+        Ok(args)
+    }
+
+    /// Runs Docker with direct file output so a descendant cannot block pipe draining after timeout.
+    pub fn invoke(&self, settings: &AgentSettings, log_file: &Path) -> Result<AgentResult, String> {
+        let provider = settings.provider(self.role)?;
+        let docker_args = self.docker_args(settings)?;
+        let log = File::create(log_file)
+            .map_err(|error| format!("cannot create {}: {error}", log_file.display()))?;
+        let mut command = Command::new("timeout");
+        command
+            .args([
+                "--kill-after",
+                "30s",
+                &format!("{}m", self.timeout_minutes),
+                "docker",
+            ])
+            .args(&docker_args)
+            .current_dir(self.worktree)
+            .stdout(Stdio::from(
+                log.try_clone().map_err(|error| error.to_string())?,
+            ))
+            .stderr(Stdio::from(log));
+        if provider == Provider::Codex {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot start docker: {error}"))?;
+        let status = (|| {
+            if provider == Provider::Codex {
+                child
+                    .stdin
+                    .take()
+                    .expect("codex stdin is piped")
+                    .write_all(self.prompt.as_bytes())
+                    .map_err(|error| format!("cannot send prompt to codex: {error}"))?;
+            }
+            child
+                .wait()
+                .map_err(|error| format!("cannot wait for docker: {error}"))
+        })();
+        let _ = Command::new("docker")
+            .args(["rm", "-f", self.name])
+            .status();
+        let status = status?;
+        let log = fs::read_to_string(log_file).unwrap_or_default();
+        let classification = classify_agent_output(provider, status.code(), &log);
+        Ok(AgentResult {
+            status: status.code(),
+            classification,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalTask {
