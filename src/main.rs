@@ -4,11 +4,11 @@ use alucard::{
     begin_operation, build_image, compose_role_prompt, database_path, find_run, finish_operation,
     finish_run, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
     local_queue_with_open_issues, migrate, open, parse_tasks, prepare_run, recent_runs,
-    record_recovery_pr, record_task_pr, release, run_claims, run_command as execute_command,
-    run_pull_requests, start_retry_run, start_task_run, status, task_id, task_is_pending,
-    toolchain_preflight, transition_task, warn_if_stale_image, AgentInvocation, AgentRole,
-    AgentSettings, GithubPullRequest, GithubTask, Provider, RecoveryPullRequest, RunOptions,
-    TaskStatus,
+    record_recovery_failure, record_recovery_pr, record_task_pr, release, run_claims,
+    run_command as execute_command, run_pull_requests, run_recovery, start_retry_run,
+    start_task_run, status, task_id, task_is_pending, toolchain_preflight, transition_task,
+    warn_if_stale_image, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask,
+    Provider, RecoveryPullRequest, RunOptions, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -964,6 +964,15 @@ fn recover_worker_changes(
     if !pushed.status.success() {
         let error = String::from_utf8_lossy(&pushed.stderr).trim().to_string();
         let _ = finish_operation(database, &push, Some(&error));
+        record_recovery_failure(
+            database,
+            &task.ledger_id,
+            run_id,
+            &prepared.branch,
+            &prepared.clone,
+            &error,
+        )
+        .map_err(|error| error.to_string())?;
         return Err(format!(
             "push failed; checkout retained at {}: {error}",
             prepared.clone.display()
@@ -1025,6 +1034,15 @@ fn recover_worker_changes(
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let _ = finish_operation(database, &pr, Some(&error));
+        record_recovery_failure(
+            database,
+            &task.ledger_id,
+            run_id,
+            &prepared.branch,
+            &prepared.clone,
+            &error,
+        )
+        .map_err(|error| error.to_string())?;
         return Err(format!(
             "recovery PR creation failed; checkout retained at {}: {error}",
             prepared.clone.display()
@@ -1119,12 +1137,9 @@ fn record_recovery(
         &["pr", "comment", &number.to_string(), "--body", marker_body],
         "could not post recovery marker",
     );
-    finish_operation(
-        database,
-        &marker,
-        comment.as_ref().err().map(String::as_str),
-    )
-    .map_err(|error| error.to_string())?;
+    let marker_error = comment.err();
+    finish_operation(database, &marker, marker_error.as_deref())
+        .map_err(|error| error.to_string())?;
     let label = begin_operation(
         database,
         &prepared.run.repository_id,
@@ -1143,12 +1158,16 @@ fn record_recovery(
         ],
         "could not label recovery PR",
     );
-    finish_operation(
-        database,
-        &label,
-        labelled.as_ref().err().map(String::as_str),
-    )
-    .map_err(|error| error.to_string())?;
+    let label_error = labelled.err();
+    finish_operation(database, &label, label_error.as_deref())
+        .map_err(|error| error.to_string())?;
+    if marker_error.is_some() || label_error.is_some() {
+        return Err([marker_error, label_error]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
     if let Some(issue) = &task.issue {
         let comment = format!("**🤖 Alucard recovery** — the worker on this ticket stopped ({classification:?}, rc={}). Its unfinished work is on draft PR #{number}.", status.unwrap_or(1));
         let _ = gh_output(
@@ -2015,6 +2034,22 @@ fn runs_command(args: &[String], path: &std::path::Path) -> ExitCode {
                 };
                 for (number, branch) in pull_requests {
                     println!("pr: #{number} {branch}");
+                }
+                let recovery = match run_recovery(path, &run.id) {
+                    Ok(recovery) => recovery,
+                    Err(error) => return fail(&format!("alucard: database error: {error}")),
+                };
+                if let Some(recovery) = recovery {
+                    println!("recovery branch: {}", recovery.branch);
+                    if let Some(number) = recovery.pull_request_number {
+                        println!("recovery pr: #{number}");
+                    }
+                    if let Some(checkout_path) = recovery.checkout_path {
+                        println!("recovery checkout: {checkout_path}");
+                    }
+                    if let Some(failure_reason) = recovery.failure_reason {
+                        println!("recovery failure: {failure_reason}");
+                    }
                 }
                 ExitCode::SUCCESS
             }

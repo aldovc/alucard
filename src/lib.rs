@@ -1790,6 +1790,13 @@ pub struct RecoveryPullRequest<'a> {
     pub checkout_path: &'a Path,
 }
 
+pub struct Recovery {
+    pub branch: String,
+    pub pull_request_number: Option<i64>,
+    pub checkout_path: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClaimResource {
     Task,
@@ -2198,6 +2205,25 @@ pub fn record_recovery_pr(
     )?;
     transaction.execute("UPDATE tasks SET status = 'in_flight', pr_number = ?1, updated_at = datetime('now') WHERE id = ?2", (recovery.number, task_id))?;
     transaction.commit()?;
+    Ok(())
+}
+
+/// Records a checkout retained after recovery publication fails.
+pub fn record_recovery_failure(
+    path: &Path,
+    task_id: &str,
+    run_id: &str,
+    branch: &str,
+    checkout_path: &Path,
+    failure_reason: &str,
+) -> Result<(), DatabaseError> {
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT INTO recovery (id, task_id, original_run_id, branch, reason, checkout_path, failure_reason, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'publication_failed', ?5, ?6, datetime('now'))
+         ON CONFLICT(original_run_id) DO UPDATE SET branch = excluded.branch, checkout_path = excluded.checkout_path, failure_reason = excluded.failure_reason",
+        (Uuid::new_v4().to_string(), task_id, run_id, branch, checkout_path.to_string_lossy(), failure_reason),
+    )?;
     Ok(())
 }
 
@@ -2630,6 +2656,23 @@ pub fn run_pull_requests(path: &Path, run_id: &str) -> Result<Vec<(i64, String)>
         .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(pull_requests)
+}
+
+pub fn run_recovery(path: &Path, run_id: &str) -> Result<Option<Recovery>, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT branch, pull_request_number, checkout_path, failure_reason FROM recovery WHERE original_run_id = ?1",
+            [run_id],
+            |row| Ok(Recovery {
+                branch: row.get(0)?,
+                pull_request_number: row.get(1)?,
+                checkout_path: row.get(2)?,
+                failure_reason: row.get(3)?,
+            }),
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {

@@ -196,6 +196,163 @@ esac
 }
 
 #[test]
+fn recovery_publication_failures_are_retained_and_parked_for_humans() {
+    for scenario in ["push", "pr", "marker", "label"] {
+        let root = temporary_path(&format!("recovery-{scenario}"));
+        let repository = root.join("repository");
+        let remote = root.join("remote.git");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir(&repository).unwrap();
+        git_repository(&repository);
+        run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().unwrap(),
+        ]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ]));
+        let git = bin.join("git");
+        fs::write(
+            &git,
+            "#!/bin/sh\nif [ \"$1\" = push ] && [ \"$ALUCARD_RECOVERY_SCENARIO\" = push ]; then echo 'push denied' >&2; exit 1; fi\nexec \"$ALUCARD_REAL_GIT\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+        let docker = bin.join("docker");
+        fs::write(
+            &docker,
+            r#"#!/bin/sh
+case "$1 $2" in
+  'image inspect') echo stamp ;;
+  'run '*)
+    for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; esac; done
+    printf 'unfinished\n' > "$worktree/recovery.txt"
+    git -C "$worktree" add recovery.txt
+    git -C "$worktree" -c user.email=test@example.com -c user.name=Test commit -qm recovery
+    printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"failed"}'
+    exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        let gh = bin.join("gh");
+        fs::write(
+            &gh,
+            r#"#!/bin/sh
+printf '%s\n' "$1 $2" >> "$ALUCARD_RECOVERY_TRACE"
+case "$1 $2" in
+  'pr list')
+    if [ -f "$ALUCARD_RECOVERY_CREATED" ]; then echo '[{"number":91,"headRefName":"recovery","headRefOid":"abc"}]'; else echo '[]'; fi ;;
+  'pr create')
+    if [ "$ALUCARD_RECOVERY_SCENARIO" = pr ]; then echo 'create denied' >&2; exit 1; fi
+    : > "$ALUCARD_RECOVERY_CREATED" ;;
+  'pr comment')
+    if [ "$ALUCARD_RECOVERY_SCENARIO" = marker ]; then echo 'marker denied' >&2; exit 1; fi ;;
+  'pr edit')
+    if [ "$ALUCARD_RECOVERY_SCENARIO" = label ]; then echo 'label denied' >&2; exit 1; fi ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        let tasks = root.join("tasks.md");
+        fs::write(&tasks, "## [ ] 1: Recovery task\n\nBody\n").unwrap();
+        let environment = root.join("agent.env");
+        fs::write(
+            &environment,
+            "ALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+        )
+        .unwrap();
+        let database = root.join("ledger.db");
+        let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("ALUCARD_REAL_GIT", "/usr/bin/git")
+            .env("ALUCARD_RECOVERY_SCENARIO", scenario)
+            .env("ALUCARD_RECOVERY_CREATED", root.join("recovery-created"))
+            .env("ALUCARD_RECOVERY_TRACE", root.join("recovery-trace"))
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .args([
+                "--db-path",
+                database.to_str().unwrap(),
+                "run",
+                "--iterations",
+                "1",
+                "--tasks",
+                tasks.to_str().unwrap(),
+                "--env-file",
+                environment.to_str().unwrap(),
+                "--logs-root",
+                root.join("logs").to_str().unwrap(),
+                "--no-build",
+                repository.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{scenario}: {output:?}");
+        let connection = open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT status FROM tasks", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "human",
+            "{scenario}"
+        );
+        if matches!(scenario, "marker" | "label") {
+            let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
+            assert!(trace.contains("pr comment"), "{scenario}: {trace}");
+            assert!(trace.contains("pr edit"), "{scenario}: {trace}");
+        }
+        let run_id: String = connection
+            .query_row("SELECT id FROM runs", [], |row| row.get(0))
+            .unwrap();
+        let recovery: (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT checkout_path, failure_reason FROM recovery WHERE original_run_id = ?1",
+                [&run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        if matches!(scenario, "push" | "pr") {
+            assert!(recovery.0.is_some(), "{scenario}");
+            assert!(recovery.1.is_some(), "{scenario}");
+            let shown = Command::new(env!("CARGO_BIN_EXE_alucard"))
+                .args([
+                    "--db-path",
+                    database.to_str().unwrap(),
+                    "runs",
+                    "show",
+                    &run_id,
+                ])
+                .output()
+                .unwrap();
+            let shown = String::from_utf8(shown.stdout).unwrap();
+            assert!(shown.contains("recovery checkout:"), "{shown}");
+            assert!(shown.contains("recovery failure:"), "{shown}");
+            assert!(shown.contains(recovery.0.as_deref().unwrap()), "{shown}");
+            assert!(shown.contains(recovery.1.as_deref().unwrap()), "{shown}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn parser_preserves_task_structure_and_queue_eligibility() {
     let contents = fs::read_to_string("test/fixtures/tasks-basic.md").unwrap();
     let parsed = parse_tasks(&contents).unwrap();
