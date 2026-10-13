@@ -504,35 +504,38 @@ esac
         )
         .unwrap();
         let database = root.join("ledger.db");
-        let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
-            .env(
-                "PATH",
-                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-            )
-            .env("ALUCARD_REAL_GIT", "/usr/bin/git")
-            .env("ALUCARD_RECOVERY_SCENARIO", scenario)
-            .env("ALUCARD_RECOVERY_CREATED", root.join("recovery-created"))
-            .env("ALUCARD_RECOVERY_BODY", root.join("recovery-body"))
-            .env("ALUCARD_RECOVERY_MARKER", root.join("recovery-marker"))
-            .env("ALUCARD_RECOVERY_TRACE", root.join("recovery-trace"))
-            .env("ALUCARD_CACHE_DIR", root.join("cache"))
-            .args([
-                "--db-path",
-                database.to_str().unwrap(),
-                "run",
-                "--iterations",
-                "1",
-                "--tasks",
-                tasks.to_str().unwrap(),
-                "--env-file",
-                environment.to_str().unwrap(),
-                "--logs-root",
-                root.join("logs").to_str().unwrap(),
-                "--no-build",
-                repository.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
+        let invoke = || {
+            Command::new(env!("CARGO_BIN_EXE_alucard"))
+                .env(
+                    "PATH",
+                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("ALUCARD_REAL_GIT", "/usr/bin/git")
+                .env("ALUCARD_RECOVERY_SCENARIO", scenario)
+                .env("ALUCARD_RECOVERY_CREATED", root.join("recovery-created"))
+                .env("ALUCARD_RECOVERY_BODY", root.join("recovery-body"))
+                .env("ALUCARD_RECOVERY_MARKER", root.join("recovery-marker"))
+                .env("ALUCARD_RECOVERY_TRACE", root.join("recovery-trace"))
+                .env("ALUCARD_CACHE_DIR", root.join("cache"))
+                .args([
+                    "--db-path",
+                    database.to_str().unwrap(),
+                    "run",
+                    "--iterations",
+                    "1",
+                    "--tasks",
+                    tasks.to_str().unwrap(),
+                    "--env-file",
+                    environment.to_str().unwrap(),
+                    "--logs-root",
+                    root.join("logs").to_str().unwrap(),
+                    "--no-build",
+                    repository.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+        };
+        let output = invoke();
         assert!(output.status.success(), "{scenario}: {output:?}");
         let connection = open(&database).unwrap();
         assert_eq!(
@@ -616,6 +619,15 @@ esac
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
+        let failed_target = (scenario == "pr").then(|| {
+            connection
+                .query_row(
+                    "SELECT target FROM operations WHERE operation_type = 'create_recovery_pr'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        });
         drop(connection);
         if matches!(scenario, "push" | "pr") {
             assert!(recovery.0.is_some(), "{scenario}");
@@ -635,6 +647,26 @@ esac
             assert!(shown.contains("recovery failure:"), "{shown}");
             assert!(shown.contains(recovery.0.as_deref().unwrap()), "{shown}");
             assert!(shown.contains(recovery.1.as_deref().unwrap()), "{shown}");
+        }
+        if scenario == "pr" {
+            assert!(invoke().status.success());
+            let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
+            assert_eq!(
+                trace
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with("pr create")
+                            && line.contains(
+                                failed_target
+                                    .as_deref()
+                                    .unwrap()
+                                    .trim_start_matches("recovery:"),
+                            )
+                    })
+                    .count(),
+                1,
+                "{trace}"
+            );
         }
         fs::remove_dir_all(root).unwrap();
     }

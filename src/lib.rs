@@ -2496,7 +2496,7 @@ pub fn begin_operation_with_payload(
     )?)
 }
 
-/// Lists unfinished operations for one repository.
+/// Lists recovery operations eligible for replay for one repository.
 pub fn pending_operations(
     path: &Path,
     repository_id: &str,
@@ -2504,7 +2504,7 @@ pub fn pending_operations(
     let connection = open(path)?;
     let mut statement = connection.prepare(
         "SELECT id, target, operation_type, payload FROM operations
-         WHERE repository_id = ?1 AND phase != 'done' ORDER BY created_at, id",
+         WHERE repository_id = ?1 AND phase = 'pending' ORDER BY created_at, id",
     )?;
     let operations = statement
         .query_map([repository_id], |row| {

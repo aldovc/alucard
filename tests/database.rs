@@ -920,7 +920,7 @@ fn remote_operations_are_durable_and_idempotent() {
 }
 
 #[test]
-fn recovery_operations_keep_replay_payload_and_failures_pending() {
+fn recovery_operations_replay_only_deferred_failures() {
     let path = database_path();
     migrate(&path).unwrap();
     let connection = open(&path).unwrap();
@@ -940,6 +940,10 @@ fn recovery_operations_keep_replay_payload_and_failures_pending() {
         Some(r#"{"base":"main"}"#),
     )
     .unwrap();
+
+    finish_operation(&path, &operation, Some("GitHub unavailable")).unwrap();
+    assert!(pending_operations(&path, "repo").unwrap().is_empty());
+
     defer_operation(&path, &operation, "GitHub unavailable").unwrap();
 
     assert_eq!(
