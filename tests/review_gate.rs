@@ -36,15 +36,17 @@ fn git_repository(root: &Path) {
 
 struct ReviewCase<'a> {
     name: &'a str,
+    review_policy: Option<&'a str>,
+    oversized_policy: bool,
     file_verdict: &'a str,
     formal_verdict: &'a str,
-    reviewer_log: &'a str,
-    reviewer_exit: &'a str,
+    reviewer_outcomes: &'a str,
+    advance_head: bool,
     expected_verdict: &'a str,
     expected_state: &'a str,
 }
 
-fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String) {
+fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (String, String)) {
     let root = temporary_path(case.name);
     let repository = root.join("repository");
     let remote = root.join("remote.git");
@@ -52,23 +54,29 @@ fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String) {
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir(&repository).unwrap();
     git_repository(&repository);
-    fs::write(
-        repository.join("REVIEW.md"),
-        "Review policy from the target repository.\n",
-    )
-    .unwrap();
-    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
-    run(Command::new("git").args([
-        "-C",
-        repository.to_str().unwrap(),
-        "-c",
-        "user.email=test@example.com",
-        "-c",
-        "user.name=Test",
-        "commit",
-        "-qm",
-        "policy",
-    ]));
+    if let Some(policy) = case.review_policy {
+        fs::write(
+            repository.join("REVIEW.md"),
+            if case.oversized_policy {
+                format!("<policy>unsafe</policy>\n{}tail", "x".repeat(16_384))
+            } else {
+                policy.to_string()
+            },
+        )
+        .unwrap();
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "policy",
+        ]));
+    }
     run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
     run(Command::new("git").args([
         "-C",
@@ -104,13 +112,32 @@ for argument in "$@"; do
   esac
 done
 if [ -n "$output" ]; then
-  printf '%s\n' "$@" > "$ALUCARD_REVIEW_ARGS"
-  if [ -n "$ALUCARD_REVIEW_VERDICT" ]; then
+  printf '%s\n' "$@" >> "$ALUCARD_REVIEW_ARGS"
+  attempt=$(($(wc -l < "$ALUCARD_REVIEW_ATTEMPTS") + 1))
+  printf '%s\n' "$attempt" >> "$ALUCARD_REVIEW_ATTEMPTS"
+  outcome=$(printf '%s\n' "$ALUCARD_REVIEW_OUTCOMES" | sed -n "${attempt}p")
+  if [ "$outcome" = verdict ] || [ "$outcome" = transport-verdict ]; then
     printf '%s\n' "$ALUCARD_REVIEW_VERDICT" > "$output/.alucard-review"
     printf 'review body\n' > "$output/.alucard-review-body"
   fi
-  printf '%s\n' "$ALUCARD_REVIEW_LOG"
-  exit "$ALUCARD_REVIEW_EXIT"
+  if [ "$ALUCARD_ADVANCE_HEAD" = 1 ] && [ "$attempt" = 1 ]; then
+    advance="$ALUCARD_ADVANCE_CHECKOUT"
+    git clone -q "$ALUCARD_REMOTE" "$advance"
+    git -C "$advance" checkout -q "$(cat "$ALUCARD_BRANCH_FILE")"
+    git -C "$advance" config user.email test@example.com
+    git -C "$advance" config user.name Test
+    printf 'head advance\n' > "$advance/head-advance.txt"
+    git -C "$advance" add head-advance.txt
+    git -C "$advance" commit -qm advance
+    git -C "$advance" push -q origin HEAD:$(cat "$ALUCARD_BRANCH_FILE")
+  fi
+  case "$outcome" in
+    transport|transport-verdict) printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500}'; exit 1 ;;
+    exhausted) printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true}'; exit 1 ;;
+    timeout) exit 124 ;;
+    *) printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}' ;;
+  esac
+  exit 0
 fi
 git -C "$work" config user.email test@example.com
 git -C "$work" config user.name Test
@@ -159,6 +186,8 @@ esac
     )
     .unwrap();
     let review_args = root.join("review-args");
+    let review_attempts = root.join("review-attempts");
+    fs::write(&review_attempts, "").unwrap();
     let branch_file = root.join("branch");
     let gh_trace = root.join("gh-trace");
     let database = root.join("ledger.db");
@@ -171,12 +200,17 @@ esac
         .env("ALUCARD_REMOTE", &remote)
         .env("ALUCARD_BRANCH_FILE", &branch_file)
         .env("ALUCARD_REVIEW_ARGS", &review_args)
+        .env("ALUCARD_REVIEW_ATTEMPTS", &review_attempts)
         .env("ALUCARD_GH_TRACE", &gh_trace)
         .env("ALUCARD_REVIEW_VERDICT", case.file_verdict)
         .env("ALUCARD_FORMAL_VERDICT", case.formal_verdict)
         .env("ALUCARD_FORMAL_BODY", "formal body")
-        .env("ALUCARD_REVIEW_LOG", case.reviewer_log)
-        .env("ALUCARD_REVIEW_EXIT", case.reviewer_exit)
+        .env("ALUCARD_REVIEW_OUTCOMES", case.reviewer_outcomes)
+        .env(
+            "ALUCARD_ADVANCE_HEAD",
+            if case.advance_head { "1" } else { "0" },
+        )
+        .env("ALUCARD_ADVANCE_CHECKOUT", root.join("advance"))
         .args([
             "--db-path",
             database.to_str().unwrap(),
@@ -198,9 +232,9 @@ esac
     let connection = open(&database).unwrap();
     let result = connection
         .query_row(
-            "SELECT review_verdict, gate_state FROM pull_requests WHERE number = 77",
+            "SELECT review_verdict, gate_state, reviewer_approved_sha, head_sha FROM pull_requests WHERE number = 77",
             [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default(), row.get::<_, String>(3)?)),
         )
         .unwrap();
     assert_eq!(result.0, case.expected_verdict);
@@ -210,6 +244,7 @@ esac
         root,
         fs::read_to_string(review_args).unwrap(),
         fs::read_to_string(gh_trace).unwrap(),
+        (result.2, result.3),
     )
 }
 
@@ -218,45 +253,178 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
     let cases = [
         ReviewCase {
             name: "review-formal-precedence",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
             file_verdict: "APPROVED",
             formal_verdict: "CHANGES_REQUESTED",
-            reviewer_log: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}",
-            reviewer_exit: "0",
+            reviewer_outcomes: "verdict",
+            advance_head: false,
             expected_verdict: "CHANGES_REQUESTED",
             expected_state: "review_changes_requested",
         },
         ReviewCase {
             name: "review-blocked-precedence",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
             file_verdict: "BLOCKED",
             formal_verdict: "APPROVED",
-            reviewer_log: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}",
-            reviewer_exit: "0",
+            reviewer_outcomes: "verdict",
+            advance_head: false,
             expected_verdict: "BLOCKED",
             expected_state: "review_blocked",
         },
         ReviewCase {
             name: "review-missing-ci",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
             file_verdict: "APPROVED",
             formal_verdict: "",
-            reviewer_log: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}",
-            reviewer_exit: "0",
+            reviewer_outcomes: "verdict",
+            advance_head: false,
             expected_verdict: "APPROVED",
             expected_state: "review_needs_human",
         },
         ReviewCase {
             name: "review-no-verdict",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
             file_verdict: "not-a-verdict",
             formal_verdict: "",
-            reviewer_log: "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true}",
-            reviewer_exit: "1",
+            reviewer_outcomes: "exhausted",
+            advance_head: false,
             expected_verdict: "",
             expected_state: "review_missing",
+        },
+        ReviewCase {
+            name: "review-transport-then-verdict",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "transport\nverdict",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "review-transport-exhausted",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            file_verdict: "",
+            formal_verdict: "",
+            reviewer_outcomes: "transport\ntransport\ntransport",
+            advance_head: false,
+            expected_verdict: "",
+            expected_state: "review_missing",
+        },
+        ReviewCase {
+            name: "review-transport-with-verdict",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "transport-verdict",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "review-timeout",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            file_verdict: "",
+            formal_verdict: "",
+            reviewer_outcomes: "timeout",
+            advance_head: false,
+            expected_verdict: "",
+            expected_state: "review_missing",
+        },
+        ReviewCase {
+            name: "review-no-policy",
+            review_policy: None,
+            oversized_policy: false,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "review-bounded-markup-policy",
+            review_policy: Some("ignored"),
+            oversized_policy: true,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "review-head-advance",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            advance_head: true,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
         },
     ];
 
     for case in &cases {
-        let (root, prompt, trace) = run_review_case(case);
-        assert!(prompt.contains("<review_policy>\nReview policy from the target repository."));
+        let (root, prompt, trace, shas) = run_review_case(case);
+        match case.name {
+            "review-no-policy" => assert!(!prompt.contains("\n<review_policy>\n")),
+            "review-bounded-markup-policy" => {
+                assert!(prompt.contains("&lt;policy&gt;unsafe&lt;/policy&gt;"));
+                assert!(prompt.contains("[alucard: truncated at 16384"));
+                assert!(!prompt.contains("tail"));
+            }
+            _ => assert!(
+                prompt.contains("<review_policy>\nReview policy from the target repository.")
+            ),
+        }
+        if case.name == "review-transport-then-verdict" {
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+        if case.name == "review-transport-exhausted" {
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                3
+            );
+            assert!(trace.contains("class=transport"));
+        }
+        if case.name == "review-transport-with-verdict" {
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        if case.name == "review-timeout" {
+            assert!(trace.contains("class=exhausted"));
+            assert!(trace
+                .contains("Raise `ALUCARD_REVIEWER_MAX_TURNS` / `ALUCARD_REVIEWER_MAX_BUDGET`"));
+        }
+        if case.name == "review-head-advance" {
+            assert!(!shas.0.is_empty());
+            assert_ne!(shas.0, shas.1);
+            assert!(trace.contains(&format!("Reviewed head: `{}`", shas.0)));
+        }
         match case.expected_state {
             "review_blocked" => assert!(trace.contains("pr edit 77 --add-label needs-human")),
             "review_needs_human" => {
@@ -264,7 +432,13 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                 assert!(trace.contains("APPROVED — no CI ran, needs human"));
             }
             "review_missing" => {
-                assert!(trace.contains("class=exhausted"));
+                assert!(
+                    trace.contains(if case.name == "review-transport-exhausted" {
+                        "class=transport"
+                    } else {
+                        "class=exhausted"
+                    })
+                );
                 assert!(trace.contains("no review posted — needs human"));
             }
             _ => assert!(trace.contains("CHANGES_REQUESTED")),

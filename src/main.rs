@@ -1239,7 +1239,7 @@ fn no_verdict_reason(
     timeout_minutes: u64,
 ) -> String {
     match classification {
-        AgentExit::Exhausted => format!(
+        AgentExit::Exhausted | AgentExit::Timeout => format!(
             "The reviewer hit a harness cap (max turns, budget, or the {timeout_minutes}m timeout) before recording a verdict. Raise `ALUCARD_REVIEWER_MAX_TURNS` / `ALUCARD_REVIEWER_MAX_BUDGET` if this repeats."
         ),
         AgentExit::Transport => "The reviewer lost its provider connection on every attempt. Nothing was reviewed; re-run `alucard continue` for this PR.".to_string(),
@@ -1254,7 +1254,7 @@ fn no_verdict_reason(
 
 fn review_failure_class(classification: AgentExit) -> &'static str {
     match classification {
-        AgentExit::Exhausted => "exhausted",
+        AgentExit::Exhausted | AgentExit::Timeout => "exhausted",
         AgentExit::Transport => "transport",
         AgentExit::Wedged => "wedged",
         AgentExit::NoWorktree => "no_worktree",
@@ -1280,240 +1280,250 @@ fn review_gate(
     println!("Review gate: PR #{pr_number} on {branch}.");
     let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
     let root = std::env::temp_dir().join(format!("alucard-review-{}", uuid::Uuid::new_v4()));
-    let checkout = root.join("checkout");
-    let output_dir = root.join("output");
-    fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
     let result = (|| {
-        let cloned = execute_command(
-            "git",
-            &[
-                "clone",
-                "--quiet",
-                "--branch",
-                branch,
-                remote.trim(),
-                &checkout.display().to_string(),
-            ],
-            &prepared.clone,
-            Some(Duration::from_secs(120)),
-        )
-        .map_err(|error| error.to_string())?;
-        if !cloned.status.success() {
-            return Err(String::from_utf8_lossy(&cloned.stderr).trim().to_string());
-        }
-        let reviewed_sha = git_output(&checkout, &["rev-parse", "HEAD"])?
+        for attempt in 1..=options.transport_attempts {
+            let attempt_root = root.join(format!("attempt-{attempt}"));
+            let checkout = attempt_root.join("checkout");
+            let output_dir = attempt_root.join("output");
+            fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+            let cloned = execute_command(
+                "git",
+                &[
+                    "clone",
+                    "--quiet",
+                    "--branch",
+                    branch,
+                    remote.trim(),
+                    &checkout.display().to_string(),
+                ],
+                &prepared.clone,
+                Some(Duration::from_secs(120)),
+            )
+            .map_err(|error| error.to_string())?;
+            if !cloned.status.success() {
+                return Err(String::from_utf8_lossy(&cloned.stderr).trim().to_string());
+            }
+            let reviewed_sha = git_output(&checkout, &["rev-parse", "HEAD"])?
+                .trim()
+                .to_string();
+            let review_policy = read_review_policy(&checkout);
+            let prompt = reviewer_prompt(
+                tools,
+                task,
+                pr_number,
+                1,
+                options.max_review_cycles,
+                toolchain_status,
+                &review_policy,
+            )?;
+            let log = prepared
+                .directory
+                .join(format!("iter-{iteration}-review-1-attempt-{attempt}.jsonl"));
+            let name = format!("alucard-review-{}-1-{attempt}", prepared.run.id);
+            let agent = AgentInvocation {
+                role: AgentRole::Reviewer,
+                name: &name,
+                image: &options.image,
+                env_file: &options.env_file,
+                worktree: &checkout,
+                prompt: &prompt,
+                timeout_minutes: options.timeout_minutes,
+                network: None,
+                playwright_cache: None,
+                database_url: None,
+                github_repo: github_repo_slug(&options.queue.repository).as_deref(),
+                worktree_read_only: true,
+                output_dir: Some(&output_dir),
+                extra_env: &[],
+            }
+            .invoke(settings, &log)?;
+            let current_head = gh_text(
+                &prepared.clone,
+                &[
+                    "pr",
+                    "view",
+                    &pr_number.to_string(),
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+            )?
             .trim()
             .to_string();
-        let review_policy = read_review_policy(&checkout);
-        let prompt = reviewer_prompt(
-            tools,
-            task,
-            pr_number,
-            1,
-            options.max_review_cycles,
-            toolchain_status,
-            &review_policy,
-        )?;
-        let log = prepared
-            .directory
-            .join(format!("iter-{iteration}-review-1.jsonl"));
-        let name = format!("alucard-review-{}-1", prepared.run.id);
-        let agent = AgentInvocation {
-            role: AgentRole::Reviewer,
-            name: &name,
-            image: &options.image,
-            env_file: &options.env_file,
-            worktree: &checkout,
-            prompt: &prompt,
-            timeout_minutes: options.timeout_minutes,
-            network: None,
-            playwright_cache: None,
-            database_url: None,
-            github_repo: github_repo_slug(&options.queue.repository).as_deref(),
-            worktree_read_only: true,
-            output_dir: Some(&output_dir),
-            extra_env: &[],
-        }
-        .invoke(settings, &log)?;
-        let current_head = gh_text(
-            &prepared.clone,
-            &[
-                "pr",
-                "view",
-                &pr_number.to_string(),
-                "--json",
-                "headRefOid",
-                "--jq",
-                ".headRefOid",
-            ],
-        )?
-        .trim()
-        .to_string();
-        let file_verdict = fs::read_to_string(output_dir.join(".alucard-review"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let file_body =
-            fs::read_to_string(output_dir.join(".alucard-review-body")).unwrap_or_default();
-        let formal = gh_text(
+            let file_verdict = fs::read_to_string(output_dir.join(".alucard-review"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let file_body =
+                fs::read_to_string(output_dir.join(".alucard-review-body")).unwrap_or_default();
+            let formal = gh_text(
             &prepared.clone,
             &["pr", "view", &pr_number.to_string(), "--json", "reviews", "--jq", "[.reviews[] | select(.state == \"APPROVED\" or .state == \"CHANGES_REQUESTED\")] | last | .state // empty"],
         )?;
-        let formal = formal.trim();
-        let verdict = review_verdict(formal, &file_verdict);
-        let body = if verdict.is_some() && !file_verdict.is_empty() && formal != file_verdict {
-            file_body
-        } else if !formal.is_empty() {
-            gh_text(
+            let formal = formal.trim();
+            let verdict = review_verdict(formal, &file_verdict);
+            if verdict.is_none()
+                && agent.classification == AgentExit::Transport
+                && attempt < options.transport_attempts
+            {
+                continue;
+            }
+            let body = if verdict.is_some() && !file_verdict.is_empty() && formal != file_verdict {
+                file_body
+            } else if !formal.is_empty() {
+                gh_text(
                 &prepared.clone,
                 &["pr", "view", &pr_number.to_string(), "--json", "reviews", "--jq", "[.reviews[] | select(.state == \"APPROVED\" or .state == \"CHANGES_REQUESTED\")] | last | .body // \"\""],
             )?
-        } else {
-            String::new()
-        };
-        match verdict {
-            Some(ReviewVerdict::Approved) => {
-                let no_ci = ci_result == Some(CiResult::Missing);
-                let status = if no_ci {
-                    "APPROVED — no CI ran, needs human"
-                } else {
-                    "APPROVED"
-                };
-                let marker = if file_verdict == "APPROVED" {
-                    format!("Reviewed head: `{reviewed_sha}`\n\n")
-                } else {
-                    String::new()
-                };
-                let no_ci_body = if no_ci {
-                    "The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.\n\n"
-                } else {
-                    ""
-                };
-                let comment = format!(
-                    "**🤖 Alucard review cycle 1/{}: {status}**\n\n{marker}{no_ci_body}{body}",
-                    options.max_review_cycles
-                );
-                let _ = execute_command(
-                    "gh",
-                    &["pr", "comment", &pr_number.to_string(), "--body", &comment],
-                    &prepared.clone,
-                    None,
-                );
-                if no_ci {
-                    let _ = execute_command(
-                        "gh",
-                        &[
-                            "pr",
-                            "edit",
-                            &pr_number.to_string(),
-                            "--add-label",
-                            "needs-human",
-                        ],
-                        &prepared.clone,
-                        None,
-                    );
-                }
-                record_task_pr_review(
-                    database,
-                    task_id,
-                    pr_number,
-                    ReviewVerdict::Approved.as_str(),
-                    if no_ci {
-                        "review_needs_human"
+            } else {
+                String::new()
+            };
+            match verdict {
+                Some(ReviewVerdict::Approved) => {
+                    let no_ci = ci_result == Some(CiResult::Missing);
+                    let status = if no_ci {
+                        "APPROVED — no CI ran, needs human"
                     } else {
-                        ReviewVerdict::Approved.gate_state()
-                    },
-                    Some(&reviewed_sha),
-                    &current_head,
-                )
-                .map_err(|error| error.to_string())?;
-            }
-            Some(verdict) => {
-                let suffix = if verdict == ReviewVerdict::Blocked {
-                    " — needs human"
-                } else {
-                    ""
-                };
-                let handoff = if verdict == ReviewVerdict::Blocked {
-                    format!("The remaining merge-blocking work cannot be done inside the harness container. Alucard stopped the review loop here rather than spend the remaining {} cycle(s) re-reporting it.\n\n", options.max_review_cycles.saturating_sub(1))
-                } else {
-                    String::new()
-                };
-                let comment = format!(
-                    "**🤖 Alucard review cycle 1/{}: {}{suffix}**\n\n{handoff}{body}",
-                    options.max_review_cycles,
-                    verdict.as_str()
-                );
-                let _ = execute_command(
-                    "gh",
-                    &["pr", "comment", &pr_number.to_string(), "--body", &comment],
-                    &prepared.clone,
-                    None,
-                );
-                if verdict == ReviewVerdict::Blocked {
+                        "APPROVED"
+                    };
+                    let marker = if file_verdict == "APPROVED" {
+                        format!("Reviewed head: `{reviewed_sha}`\n\n")
+                    } else {
+                        String::new()
+                    };
+                    let no_ci_body = if no_ci {
+                        "The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.\n\n"
+                    } else {
+                        ""
+                    };
+                    let comment = format!(
+                        "**🤖 Alucard review cycle 1/{}: {status}**\n\n{marker}{no_ci_body}{body}",
+                        options.max_review_cycles
+                    );
                     let _ = execute_command(
                         "gh",
-                        &[
-                            "pr",
-                            "edit",
-                            &pr_number.to_string(),
-                            "--add-label",
-                            "needs-human",
-                        ],
+                        &["pr", "comment", &pr_number.to_string(), "--body", &comment],
                         &prepared.clone,
                         None,
                     );
+                    if no_ci {
+                        let _ = execute_command(
+                            "gh",
+                            &[
+                                "pr",
+                                "edit",
+                                &pr_number.to_string(),
+                                "--add-label",
+                                "needs-human",
+                            ],
+                            &prepared.clone,
+                            None,
+                        );
+                    }
+                    record_task_pr_review(
+                        database,
+                        task_id,
+                        pr_number,
+                        ReviewVerdict::Approved.as_str(),
+                        if no_ci {
+                            "review_needs_human"
+                        } else {
+                            ReviewVerdict::Approved.gate_state()
+                        },
+                        Some(&reviewed_sha),
+                        &current_head,
+                    )
+                    .map_err(|error| error.to_string())?;
                 }
-                record_task_pr_review(
-                    database,
-                    task_id,
-                    pr_number,
-                    verdict.as_str(),
-                    verdict.gate_state(),
-                    None,
-                    &current_head,
-                )
-                .map_err(|error| error.to_string())?;
-            }
-            None => {
-                let comment = format!(
+                Some(verdict) => {
+                    let suffix = if verdict == ReviewVerdict::Blocked {
+                        " — needs human"
+                    } else {
+                        ""
+                    };
+                    let handoff = if verdict == ReviewVerdict::Blocked {
+                        format!("The remaining merge-blocking work cannot be done inside the harness container. Alucard stopped the review loop here rather than spend the remaining {} cycle(s) re-reporting it.\n\n", options.max_review_cycles.saturating_sub(1))
+                    } else {
+                        String::new()
+                    };
+                    let comment = format!(
+                        "**🤖 Alucard review cycle 1/{}: {}{suffix}**\n\n{handoff}{body}",
+                        options.max_review_cycles,
+                        verdict.as_str()
+                    );
+                    let _ = execute_command(
+                        "gh",
+                        &["pr", "comment", &pr_number.to_string(), "--body", &comment],
+                        &prepared.clone,
+                        None,
+                    );
+                    if verdict == ReviewVerdict::Blocked {
+                        let _ = execute_command(
+                            "gh",
+                            &[
+                                "pr",
+                                "edit",
+                                &pr_number.to_string(),
+                                "--add-label",
+                                "needs-human",
+                            ],
+                            &prepared.clone,
+                            None,
+                        );
+                    }
+                    record_task_pr_review(
+                        database,
+                        task_id,
+                        pr_number,
+                        verdict.as_str(),
+                        verdict.gate_state(),
+                        None,
+                        &current_head,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                None => {
+                    let comment = format!(
                     "**🤖 Alucard review cycle 1/{}: no review posted — needs human** (rc={}, class={})\n\n{}\n\n**This PR has not been reviewed.** Nothing below this gate ran for it.",
                     options.max_review_cycles,
                     agent.status.unwrap_or(1),
                     review_failure_class(agent.classification),
                     no_verdict_reason(agent.classification, agent.status, options.timeout_minutes),
                 );
-                let _ = execute_command(
-                    "gh",
-                    &["pr", "comment", &pr_number.to_string(), "--body", &comment],
-                    &prepared.clone,
-                    None,
-                );
-                let _ = execute_command(
-                    "gh",
-                    &[
-                        "pr",
-                        "edit",
-                        &pr_number.to_string(),
-                        "--add-label",
-                        "needs-human",
-                    ],
-                    &prepared.clone,
-                    None,
-                );
-                record_task_pr_review(
-                    database,
-                    task_id,
-                    pr_number,
-                    "",
-                    "review_missing",
-                    None,
-                    &current_head,
-                )
-                .map_err(|error| error.to_string())?;
+                    let _ = execute_command(
+                        "gh",
+                        &["pr", "comment", &pr_number.to_string(), "--body", &comment],
+                        &prepared.clone,
+                        None,
+                    );
+                    let _ = execute_command(
+                        "gh",
+                        &[
+                            "pr",
+                            "edit",
+                            &pr_number.to_string(),
+                            "--add-label",
+                            "needs-human",
+                        ],
+                        &prepared.clone,
+                        None,
+                    );
+                    record_task_pr_review(
+                        database,
+                        task_id,
+                        pr_number,
+                        "",
+                        "review_missing",
+                        None,
+                        &current_head,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
             }
+            return Ok(());
         }
-        Ok(())
+        unreachable!("reviewer attempt budget is non-zero")
     })();
     let _ = fs::remove_dir_all(root);
     result
