@@ -174,6 +174,11 @@ fn stage_measurement_buckets_test_paths_and_renames() {
     assert_eq!(diff["unavailable"], true);
     assert_eq!(diff["from"], "missing-base");
     assert_eq!(diff["to"], merge_head);
+    let fields = diff.as_object().unwrap();
+    assert_eq!(fields.len(), 4);
+    assert!(fields["reason"].is_string());
+    assert!(fields["from"].is_string());
+    assert!(fields["to"].is_string());
     assert_eq!(record["from_prev"], record["from_base"]);
     fs::remove_dir_all(root).unwrap();
 }
