@@ -835,7 +835,9 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     }
                     if let Err(error) = recover_worker_changes(
                         &database,
+                        &tools,
                         &options,
+                        &settings,
                         &selected,
                         &claim.id,
                         &owner_run_id,
@@ -843,6 +845,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         iteration,
                         classification,
                         result.as_ref().ok().and_then(|value| value.status),
+                        &log,
                     ) {
                         eprintln!("alucard: recovery requires human attention: {error}");
                         let _ = transition_task(
@@ -908,7 +911,9 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
 #[allow(clippy::too_many_arguments)]
 fn recover_worker_changes(
     database: &Path,
+    tools: &Path,
     options: &RunCommandOptions,
+    settings: &AgentSettings,
     task: &SelectedRunTask,
     lease_id: &str,
     run_id: &str,
@@ -916,6 +921,7 @@ fn recover_worker_changes(
     iteration: usize,
     classification: alucard::AgentExit,
     status: Option<i32>,
+    worker_log: &Path,
 ) -> Result<(), String> {
     if classification == alucard::AgentExit::Clean
         || (classification == alucard::AgentExit::Transport && status == Some(0))
@@ -957,6 +963,21 @@ fn recover_worker_changes(
             &options.queue.repository,
         );
     }
+    let handoff = if wrapup_applies(classification) && wrapup_enabled(settings) {
+        run_wrapup_agent(
+            tools,
+            options,
+            settings,
+            task,
+            prepared,
+            iteration,
+            classification,
+            status,
+            worker_log,
+        )
+    } else {
+        None
+    };
     if dirty {
         let add = execute_command("git", &["add", "-A"], &prepared.clone, None)
             .map_err(|error| error.to_string())?;
@@ -1037,7 +1058,13 @@ fn recover_worker_changes(
         );
     }
     let title = recovery_title(iteration, classification, status);
-    let body = recovery_body(task, classification, status, commit_count);
+    let body = recovery_body(
+        task,
+        classification,
+        status,
+        commit_count,
+        handoff.as_deref(),
+    );
     let pr = begin_operation(
         database,
         &prepared.run.repository_id,
@@ -1338,11 +1365,177 @@ fn recovery_class(classification: alucard::AgentExit) -> &'static str {
     }
 }
 
+fn wrapup_applies(classification: alucard::AgentExit) -> bool {
+    matches!(
+        classification,
+        alucard::AgentExit::Exhausted | alucard::AgentExit::Failed
+    )
+}
+
+fn wrapup_enabled(settings: &AgentSettings) -> bool {
+    let turns = settings.turns(AgentRole::Wrapup);
+    !turns.is_empty()
+        && turns.bytes().all(|byte| byte.is_ascii_digit())
+        && turns.parse::<u64>().is_ok_and(|turns| turns > 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_wrapup_agent(
+    tools: &Path,
+    options: &RunCommandOptions,
+    settings: &AgentSettings,
+    task: &SelectedRunTask,
+    prepared: &alucard::PreparedRun,
+    iteration: usize,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+    worker_log: &Path,
+) -> Option<String> {
+    let output_dir = prepared.directory.parent()?.join("wrapup-output");
+    if fs::create_dir(&output_dir).is_err() {
+        return None;
+    }
+    let log = prepared
+        .directory
+        .join(format!("iter-{iteration}-wrapup.jsonl"));
+    let name = format!("alucard-wrapup-{iteration}-{}", prepared.run.id);
+    let agent_iteration = format!("{iteration}-wrapup");
+    let base = prepared.run.base_sha.as_deref().unwrap_or("HEAD");
+    let prompt = wrapup_prompt(
+        tools,
+        task,
+        &options.base,
+        base,
+        classification,
+        status,
+        &worker_last_words(worker_log, settings.provider(AgentRole::Worker).ok()),
+    )
+    .ok();
+    if let Some(prompt) = prompt {
+        let _ = AgentInvocation {
+            role: AgentRole::Wrapup,
+            name: &name,
+            image: &options.image,
+            env_file: &options.env_file,
+            worktree: &prepared.clone,
+            prompt: &prompt,
+            timeout_minutes: options.timeout_minutes,
+            network: None,
+            playwright_cache: None,
+            database_url: None,
+            github_repo: None,
+            worktree_read_only: false,
+            output_dir: Some(&output_dir),
+            extra_env: &[("ALUCARD_ITER", &agent_iteration)],
+        }
+        .invoke(settings, &log);
+    }
+    let handoff = fs::read_to_string(output_dir.join(".alucard-handoff"))
+        .ok()
+        .filter(|handoff| !handoff.is_empty());
+    let _ = fs::remove_dir_all(output_dir);
+    handoff
+}
+
+fn worker_last_words(log: &Path, provider: Option<Provider>) -> String {
+    let Ok(log) = fs::read_to_string(log) else {
+        return "No narration was captured from the worker.".to_string();
+    };
+    let mut words = Vec::new();
+    for line in log.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match provider {
+            Some(Provider::Codex)
+                if record["type"] == "item.completed"
+                    && record["item"]["type"] == "agent_message" =>
+            {
+                if let Some(text) = record["item"]["text"].as_str() {
+                    words.push(text.to_string());
+                }
+            }
+            Some(Provider::Claude) if record["type"] == "assistant" => {
+                if let Some(content) = record["message"]["content"].as_array() {
+                    words.extend(content.iter().filter_map(|item| {
+                        (item["type"] == "text")
+                            .then(|| item["text"].as_str())
+                            .flatten()
+                            .map(str::to_string)
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    let words = words.join("\n");
+    if words.is_empty() {
+        return "No narration was captured from the worker.".to_string();
+    }
+    if words.chars().count() > 4000 {
+        return format!(
+            "…{}",
+            words
+                .chars()
+                .rev()
+                .take(4000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
+    }
+    words
+}
+
+fn wrapup_prompt(
+    tools: &Path,
+    task: &SelectedRunTask,
+    base_branch: &str,
+    base_sha: &str,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+    last_words: &str,
+) -> Result<String, String> {
+    let instructions = fs::read_to_string(tools.join("alucard-wrapup-prompt.md"))
+        .map_err(|error| error.to_string())?
+        .trim_end_matches('\n')
+        .to_string();
+    let ticket = match (&task.issue, &task.local_id) {
+        (Some(issue), _) => format!("issue #{}", issue.number),
+        (None, Some(id)) => format!("task {id}"),
+        (None, None) => "unknown — the worker did not claim a ticket".to_string(),
+    };
+    let mut prompt = format!(
+        "<instructions>\n{instructions}\n</instructions>\n<ticket>{}</ticket>\n<stop_reason>The worker {} (rc={}) before opening a PR.</stop_reason>\n<base_branch>{}</base_branch>\n<base_sha>{}</base_sha>\n<worker_last_words>\n{}\n</worker_last_words>",
+        xml_escape(&ticket),
+        recovery_stop_description(classification),
+        status.unwrap_or(1),
+        xml_escape(base_branch),
+        xml_escape(base_sha),
+        xml_escape(last_words),
+    );
+    if task.issue.is_none() {
+        let local = WorkerLocalTaskPrompt {
+            id: task.local_id.as_deref(),
+            title: &task.local_title,
+            body: &task.local_body,
+        };
+        prompt.push_str(&format!(
+            "\n<task>{}</task>\n<parent_context>{}</parent_context>",
+            xml_escape(&serde_json::to_string(&local).expect("local task is serializable")),
+            xml_escape(&task.parent_context),
+        ));
+    }
+    Ok(prompt)
+}
+
 fn recovery_body(
     task: &SelectedRunTask,
     classification: alucard::AgentExit,
     status: Option<i32>,
     commits: usize,
+    handoff: Option<&str>,
 ) -> String {
     let (reference, finish, handback) = match (&task.issue, &task.local_id) {
         (Some(issue), _) => (
@@ -1363,8 +1556,12 @@ fn recovery_body(
     } else {
         format!("{reference}\n\n")
     };
+    let handoff = handoff
+        .filter(|handoff| !handoff.is_empty())
+        .map(|handoff| format!("\n\n## Handoff from the wrap-up agent\n\n{handoff}"))
+        .unwrap_or_default();
     format!(
-        "{reference}**🤖 Alucard recovery PR** — the worker {stop} (rc={}) before opening a PR. Its {commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.\n\nThis is not a finished change. What each next step does:\n\n- **Finish it here** — {finish}\n- **Hand it back** — {handback}\n- **`alucard continue <PR_NUM>`** runs the CI and review gates on what is here. It does not resume implementation.",
+        "{reference}**🤖 Alucard recovery PR** — the worker {stop} (rc={}) before opening a PR. Its {commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.{handoff}\n\nThis is not a finished change. What each next step does:\n\n- **Finish it here** — {finish}\n- **Hand it back** — {handback}\n- **`alucard continue <PR_NUM>`** runs the CI and review gates on what is here. It does not resume implementation.",
         status.unwrap_or(1)
     )
 }
@@ -2438,15 +2635,76 @@ printf '%s' "$FULL_PROMPT""#,
             parent_context: String::new(),
         };
 
-        let github = recovery_body(&github_task, alucard::AgentExit::Exhausted, Some(1), 2);
+        let github = recovery_body(
+            &github_task,
+            alucard::AgentExit::Exhausted,
+            Some(1),
+            2,
+            None,
+        );
         assert!(github.starts_with("Refs #42\n\n"));
         assert!(github.contains("change the `Refs` line above to `Closes`"));
         assert!(github.contains("`alucard run --issue <N>`"));
 
-        let local = recovery_body(&local_task, alucard::AgentExit::Exhausted, Some(1), 2);
+        let local = recovery_body(&local_task, alucard::AgentExit::Exhausted, Some(1), 2, None);
         assert!(local.starts_with("Task: 7\n\n"));
         assert!(local.contains("the harness flips the task to `[x]` when this PR merges."));
         assert!(local.contains("task flips back to `[ ]` at the next queue build"));
+    }
+
+    #[test]
+    fn wrapup_prompt_matches_bash() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let task = SelectedRunTask {
+            ledger_id: String::new(),
+            issue: Some(GithubTask {
+                number: 42,
+                title: String::new(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: None,
+            }),
+            local_id: None,
+            local_title: String::new(),
+            local_body: String::new(),
+            parent_context: String::new(),
+        };
+        let bash = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1/alucard"
+TOOL_DIR="$1"
+BASE_BRANCH=main
+prompt="<instructions>
+$(<"$TOOL_DIR/alucard-wrapup-prompt.md")
+</instructions>
+<ticket>$(printf '%s' 'issue #42' | xml_escape)</ticket>
+<stop_reason>The worker ran out of turns or hit its time limit (rc=1) before opening a PR.</stop_reason>
+<base_branch>${BASE_BRANCH}</base_branch>
+<base_sha>abc</base_sha>
+<worker_last_words>
+$(printf '%s' 'last & <words>' | xml_escape)
+</worker_last_words>"
+printf '%s' "$prompt""#,
+                "bash",
+                root.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(bash.status.success());
+        assert_eq!(
+            wrapup_prompt(
+                root,
+                &task,
+                "main",
+                "abc",
+                alucard::AgentExit::Exhausted,
+                Some(1),
+                "last & <words>",
+            )
+            .unwrap(),
+            String::from_utf8(bash.stdout).unwrap()
+        );
     }
 
     #[test]

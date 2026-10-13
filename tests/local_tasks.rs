@@ -455,7 +455,12 @@ case "$1 $2" in
   'image inspect') echo stamp ;;
   'run '*)
     printf x >> "$ALUCARD_GITHUB_RECOVERY_DOCKER_TRACE"
-    for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; esac; done
+    for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; *:/work-output:rw) output=${argument%:/work-output:rw} ;; esac; done
+    if [ -n "$output" ]; then
+      printf '%s\n' '## Done' > "$output/.alucard-handoff"
+      printf '%s\n' 'Recovery handoff.' >> "$output/.alucard-handoff"
+      exit 1
+    fi
     case "$ALUCARD_GITHUB_RECOVERY_SCENARIO" in
       timeout)
         printf 'unfinished\n' > "$worktree/recovery.txt"
@@ -578,7 +583,7 @@ esac
     assert!(output.status.success(), "{scenario}: {output:?}");
     assert_eq!(
         fs::read_to_string(root.join("docker-trace")).unwrap().len(),
-        1,
+        if scenario == "timeout" { 1 } else { 2 },
         "{scenario}"
     );
 }
@@ -591,6 +596,9 @@ fn test_worker_recovery() {
     assert!(fs::read_to_string(root.join("body"))
         .unwrap()
         .starts_with("Refs #134\n\n"));
+    assert!(fs::read_to_string(root.join("body"))
+        .unwrap()
+        .contains("## Handoff from the wrap-up agent\n\n## Done\nRecovery handoff."));
     assert_eq!(
         fs::read_to_string(root.join("marker")).unwrap(),
         "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."
