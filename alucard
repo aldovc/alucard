@@ -2434,17 +2434,22 @@ command_doctor() {
     fi
   done
 
-  local _missing_files=false
-  while IFS= read -r _f; do
-    if [ ! -f "$TOOL_DIR/$_f" ]; then
-      echo "missing: $TOOL_DIR/$_f"
-      _missing_files=true
-    fi
-  done < <(required_tool_files)
-  if [ "$_missing_files" = "false" ]; then
-    echo "ok: tool files in $TOOL_DIR"
-  else
+  if [ ! -f "$REQUIRED_TOOL_FILES_FILE" ]; then
+    echo "missing: $REQUIRED_TOOL_FILES_FILE"
     ok=false
+  else
+    local _missing_files=false
+    while IFS= read -r _f; do
+      if [ ! -f "$TOOL_DIR/$_f" ]; then
+        echo "missing: $TOOL_DIR/$_f"
+        _missing_files=true
+      fi
+    done < <(required_tool_files)
+    if [ "$_missing_files" = "false" ]; then
+      echo "ok: tool files in $TOOL_DIR"
+    else
+      ok=false
+    fi
   fi
 
   if [ -f "$ENV_FILE" ]; then

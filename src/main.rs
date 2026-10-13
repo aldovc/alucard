@@ -162,8 +162,19 @@ fn doctor_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             println!("missing: GITHUB_TOKEN value");
             ok = false;
         }
+        let providers = ["WORKER", "CI_FIX", "REVIEWER", "FEEDBACK"]
+            .iter()
+            .filter_map(|role| match resolve_provider(&environment, role) {
+                Ok(provider) => Some(provider),
+                Err(provider) => {
+                    println!("missing: unrecognized provider '{provider}' for role {role}: must be 'claude' or 'codex'");
+                    ok = false;
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         for (provider, key) in [("claude", "ANTHROPIC_API_KEY"), ("codex", "OPENAI_API_KEY")] {
-            if uses_provider(&environment, provider) {
+            if providers.contains(&provider) {
                 if environment.get(key).is_some_and(|value| !value.is_empty()) {
                     println!("ok: {key}");
                 } else {
@@ -190,24 +201,23 @@ fn doctor_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             );
             ok = false;
         }
-    } else if is_github_ref(&options.repository)
-        && command_success(
+    } else if let Some(github_ref) = github_ref(&options.repository) {
+        if command_success(
             "gh",
             &tools,
-            &[
-                "repo",
-                "view",
-                options.repository.to_str().unwrap_or_default(),
-                "--json",
-                "name",
-            ],
-        )
-    {
-        println!(
-            "ok: target repo is GitHub ref {} (cache: {})",
-            options.repository.display(),
-            cache_path(&options.repository).display()
-        );
+            &["repo", "view", &github_ref, "--json", "name"],
+        ) {
+            println!(
+                "ok: target repo is GitHub ref {} (cache: {})",
+                github_ref,
+                cache_path(&github_ref).display()
+            );
+        } else {
+            println!(
+                "missing: cannot reach GitHub repo {github_ref} (check GITHUB_TOKEN and network)"
+            );
+            ok = false;
+        }
     } else {
         println!(
             "missing: valid target git repo at {} (or a GitHub ref like owner/repo)",
@@ -245,12 +255,18 @@ fn doctor_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         }
     };
     match status(&path) {
-        Ok(database) if database.pending_migrations == 0 => println!(
-            "ok: ledger {} (WAL enabled, migrations current)",
-            path.display()
-        ),
-        Ok(_) => {
+        Ok(database) if database.pending_migrations == 0 && database.journal_mode == "wal" => {
+            println!(
+                "ok: ledger {} (WAL enabled, migrations current)",
+                path.display()
+            )
+        }
+        Ok(database) if database.pending_migrations != 0 => {
             println!("missing: ledger migrations (run: alucard db migrate)");
+            ok = false;
+        }
+        Ok(database) => {
+            println!("missing: ledger WAL mode is {}", database.journal_mode);
             ok = false;
         }
         Err(error) => {
@@ -310,32 +326,48 @@ fn read_environment(path: &std::path::Path) -> Result<BTreeMap<String, String>, 
     Ok(environment)
 }
 
-fn uses_provider(environment: &BTreeMap<String, String>, provider: &str) -> bool {
-    ["WORKER", "CI_FIX", "REVIEWER", "FEEDBACK"]
-        .iter()
-        .any(|role| {
+fn resolve_provider<'a>(
+    environment: &'a BTreeMap<String, String>,
+    role: &str,
+) -> Result<&'a str, &'a str> {
+    let provider = environment
+        .get(&format!("ALUCARD_{role}_PROVIDER"))
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
             environment
-                .get(&format!("ALUCARD_{role}_PROVIDER"))
+                .get("ALUCARD_PROVIDER")
                 .filter(|value| !value.is_empty())
-                .or_else(|| {
-                    environment
-                        .get("ALUCARD_PROVIDER")
-                        .filter(|value| !value.is_empty())
-                })
-                .map_or("claude", String::as_str)
-                == provider
         })
+        .map_or("claude", String::as_str);
+    match provider {
+        "claude" | "codex" => Ok(provider),
+        _ => Err(provider),
+    }
 }
 
-fn is_github_ref(path: &std::path::Path) -> bool {
-    let Some(value) = path.to_str() else {
-        return false;
-    };
-    let mut parts = value.split('/');
-    matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty())
+fn github_ref(path: &std::path::Path) -> Option<String> {
+    let value = path
+        .to_str()?
+        .strip_suffix(".git")
+        .unwrap_or(path.to_str()?);
+    let value = value
+        .strip_prefix("git@github.com:")
+        .or_else(|| value.strip_prefix("https://github.com/"))
+        .unwrap_or(value);
+    let (owner, name) = value.split_once('/')?;
+    if name.contains('/') || owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    [owner, name]
+        .iter()
+        .all(|part| {
+            part.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        })
+        .then(|| format!("{owner}/{name}"))
 }
 
-fn cache_path(repository: &std::path::Path) -> PathBuf {
+fn cache_path(repository: &str) -> PathBuf {
     std::env::var_os("ALUCARD_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(|| {
