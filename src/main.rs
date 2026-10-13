@@ -2263,7 +2263,8 @@ fn feedback_prompt(
     let instructions = compose_role_prompt(tools, "alucard-feedback-prompt.md", None)
         .map_err(|error| error.to_string())?;
     let mut prompt = format!(
-        "<instructions>\n{instructions}\n</instructions>\n<pr_num>{pr_number}</pr_num>\n<branch>{branch}</branch>\n<toolchain_status>\n{}\n</toolchain_status>\n<review_findings>\n{}\n</review_findings>",
+        "<instructions>\n{instructions}\n</instructions>\n<pr_num>{pr_number}</pr_num>\n<branch>{}</branch>\n<toolchain_status>\n{}\n</toolchain_status>\n<review_findings>\n{}\n</review_findings>",
+        xml_escape(branch),
         xml_escape(toolchain_status),
         xml_escape(findings),
     );
@@ -5124,18 +5125,19 @@ printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blocker
     fn feedback_prompt_matches_bash() {
         let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
         let instructions = compose_role_prompt(tools, "alucard-feedback-prompt.md", None).unwrap();
+        let branch = "feature/<unsafe>&branch";
         let status = "status <safe>";
         let findings = "Finding <one> & two";
         let policy = "Policy <rule>";
         let bash = Command::new("bash")
             .args([
                 "-c",
-                r#"source "$1/alucard"; prompt=$(printf '<instructions>\n%s\n</instructions>\n<pr_num>%s</pr_num>\n<branch>%s</branch>\n<toolchain_status>\n' "$2" "$3" "$4"; printf '%s' "$5" | xml_escape; printf '\n</toolchain_status>\n<review_findings>\n'; printf '%s' "$6" | xml_escape; printf '\n</review_findings>'); append_review_policy "$prompt" "$7""#,
+                r#"source "$1/alucard"; prompt=$(printf '<instructions>\n%s\n</instructions>\n<pr_num>%s</pr_num>\n<branch>' "$2" "$3"; printf '%s' "$4" | xml_escape; printf '</branch>\n<toolchain_status>\n'; printf '%s' "$5" | xml_escape; printf '\n</toolchain_status>\n<review_findings>\n'; printf '%s' "$6" | xml_escape; printf '\n</review_findings>'); append_review_policy "$prompt" "$7""#,
                 "bash",
                 tools.to_str().unwrap(),
                 &instructions,
                 "17",
-                "feature/test",
+                branch,
                 status,
                 findings,
                 policy,
@@ -5148,7 +5150,7 @@ printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blocker
             String::from_utf8_lossy(&bash.stderr)
         );
         assert_eq!(
-            feedback_prompt(tools, 17, "feature/test", status, findings, policy).unwrap(),
+            feedback_prompt(tools, 17, branch, status, findings, policy).unwrap(),
             String::from_utf8(bash.stdout).unwrap()
         );
     }
