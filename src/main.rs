@@ -2407,6 +2407,7 @@ fn run_feedback_once(
     toolchain_status: &str,
 ) -> Result<(AgentResult, Option<String>, Option<bool>, bool), String> {
     let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
+    let before = remote_branch_sha(&prepared.clone, branch);
     let root = std::env::temp_dir().join(format!("alucard-feedback-{}", uuid::Uuid::new_v4()));
     let checkout = root.join("checkout");
     let output = root.join("output");
@@ -2428,7 +2429,6 @@ fn run_feedback_once(
     if !cloned.status.success() {
         return Err(String::from_utf8_lossy(&cloned.stderr).trim().to_string());
     }
-    let before = remote_branch_sha(&prepared.clone, branch);
     let policy = read_review_policy(&checkout)?;
     let prompt = feedback_prompt(
         tools,

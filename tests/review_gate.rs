@@ -256,6 +256,33 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
 
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        r#"#!/bin/sh
+set -eu
+if [ "${ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP:-0}" = 1 ] && [ "${1:-}" = clone ] && [ "${2:-}" = --quiet ] && [ "${3:-}" = --branch ]; then
+  case "${6:-}" in
+    *alucard-feedback-*/checkout)
+      advance="$ALUCARD_ADVANCE_CHECKOUT"
+      /usr/bin/git clone -q "$ALUCARD_REMOTE" "$advance"
+      /usr/bin/git -C "$advance" checkout -q "$(cat "$ALUCARD_BRANCH_FILE")"
+      /usr/bin/git -C "$advance" config user.email test@example.com
+      /usr/bin/git -C "$advance" config user.name Test
+      printf 'feedback setup advance\n' > "$advance/feedback-setup-advance.txt"
+      /usr/bin/git -C "$advance" add feedback-setup-advance.txt
+      /usr/bin/git -C "$advance" commit -qm advance
+      /usr/bin/git -C "$advance" push -q origin "HEAD:$(cat "$ALUCARD_BRANCH_FILE")"
+      export ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP=0
+      ;;
+  esac
+fi
+exec /usr/bin/git "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+
     let gh = bin.join("gh");
     fs::write(
         &gh,
@@ -360,6 +387,7 @@ esac
             match case.name {
                 "feedback-blocked" => "push-blocked",
                 "feedback-fails-after-push" => "push-fail",
+                "feedback-setup-advance" => "stall",
                 _ => "push",
             },
         )
@@ -374,6 +402,14 @@ esac
         .env(
             "ALUCARD_ADVANCE_HEAD",
             if case.advance_head { "1" } else { "0" },
+        )
+        .env(
+            "ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP",
+            if case.name == "feedback-setup-advance" {
+                "1"
+            } else {
+                "0"
+            },
         )
         .env("ALUCARD_ADVANCE_CHECKOUT", root.join("advance"))
         .args([
@@ -718,6 +754,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             expected_state: "review_changes_requested",
         },
         ReviewCase {
+            name: "feedback-setup-advance",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
             name: "feedback-ci-missing-after-push",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
@@ -857,6 +906,17 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             assert!(repairs.contains("-0-2"), "{repairs}");
             assert!(repairs.contains("-1-1"), "{repairs}");
             assert!(repairs.contains("-1-2"), "{repairs}");
+        }
+        if case.name == "feedback-setup-advance" {
+            assert!(!trace.contains("feedback agent stopped without publishing"));
+            assert_eq!(trace.matches("pr checks").count(), 2);
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
         }
         if case.name == "feedback-cycle-exhaustion" {
             assert!(trace.contains("gave up after 2/2 review cycles — needs human"));
