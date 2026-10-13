@@ -371,6 +371,11 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
             options.cache_root,
         )?;
     }
+    let remote_base = format!("origin/{}", options.base);
+    let base_sha =
+        String::from_utf8_lossy(&run_checked("git", &["rev-parse", &remote_base], &cache)?.stdout)
+            .trim()
+            .to_string();
 
     let run_id = Uuid::new_v4().to_string();
     let directory = options.logs_root.join(&run_id);
@@ -390,10 +395,6 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
     if !clone.join(".git").is_dir() {
         return Err(RunError::InvalidClone);
     }
-    let base_sha =
-        String::from_utf8_lossy(&run_checked("git", &["rev-parse", options.base], &clone)?.stdout)
-            .trim()
-            .to_string();
     let suffix = options
         .issue
         .map(|issue| format!("issue-{issue}"))

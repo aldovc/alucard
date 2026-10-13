@@ -204,6 +204,71 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
 }
 
 #[test]
+fn prepared_run_uses_the_refreshed_remote_head() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let repository = root.join("source");
+    seed_repository(&repository);
+    let logs = root.join("logs");
+    let cache = root.join("cache");
+
+    prepare_run(
+        &path,
+        RunOptions {
+            repository: &repository,
+            logs_root: &logs,
+            cache_root: &cache,
+            base: "HEAD",
+            image: None,
+            task: None,
+            issue: None,
+        },
+    )
+    .unwrap();
+    fs::write(repository.join("README.md"), "updated\n").unwrap();
+    Command::new("git")
+        .args(["commit", "-am", "update"])
+        .current_dir(&repository)
+        .status()
+        .unwrap();
+    let updated_sha = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repository)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let refreshed = prepare_run(
+        &path,
+        RunOptions {
+            repository: &repository,
+            logs_root: &logs,
+            cache_root: &cache,
+            base: "HEAD",
+            image: None,
+            task: None,
+            issue: None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        refreshed.run.base_sha.as_deref(),
+        Some(updated_sha.as_str())
+    );
+    assert_eq!(
+        fs::read_to_string(refreshed.clone.join("README.md")).unwrap(),
+        "updated\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn concurrent_preparation_keeps_working_clones_usable() {
     let path = database_path();
     let root = path.parent().unwrap();
