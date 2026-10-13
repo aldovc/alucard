@@ -81,7 +81,10 @@ impl AgentSettings {
     }
 
     fn get(&self, key: &str) -> Option<&str> {
-        self.values.get(key).map(String::as_str)
+        self.values
+            .get(key)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
     }
 
     pub fn provider(&self, role: AgentRole) -> Result<Provider, String> {

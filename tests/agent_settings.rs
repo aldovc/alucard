@@ -59,6 +59,36 @@ fn role_settings_and_docker_arguments_match_bash_contract() {
 }
 
 #[test]
+fn blank_settings_fall_back_like_bash_parameter_expansion() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let example = AgentSettings::from_environment(Some(&root.join("alucard.env.example"))).unwrap();
+    assert_eq!(example.provider(AgentRole::Worker), Ok(Provider::Claude));
+
+    let configured = settings(
+        "ALUCARD_PROVIDER=codex\nALUCARD_WORKER_PROVIDER=\nALUCARD_CODEX_MODEL=global\nALUCARD_WORKER_CODEX_MODEL=\nALUCARD_MAX_TURNS=190\nALUCARD_WORKER_MAX_TURNS=\nALUCARD_MAX_BUDGET=11\nALUCARD_WORKER_MAX_BUDGET=\nALUCARD_EFFORT=high\nALUCARD_WORKER_EFFORT=\n",
+    );
+    assert_eq!(configured.provider(AgentRole::Worker), Ok(Provider::Codex));
+    assert_eq!(
+        configured.setting(AgentRole::Worker, "CODEX_MODEL", "default"),
+        "global"
+    );
+    assert_eq!(configured.turns(AgentRole::Worker), "190");
+    assert_eq!(configured.budget(AgentRole::Worker), "11");
+    assert_eq!(configured.setting(AgentRole::Worker, "EFFORT", ""), "high");
+
+    let defaults = settings(
+        "ALUCARD_PROVIDER=\nALUCARD_WORKER_PROVIDER=\nALUCARD_CODEX_MODEL=\nALUCARD_WORKER_CODEX_MODEL=\nALUCARD_MAX_TURNS=\nALUCARD_WORKER_MAX_TURNS=\nALUCARD_MAX_BUDGET=\nALUCARD_WORKER_MAX_BUDGET=\n",
+    );
+    assert_eq!(defaults.provider(AgentRole::Worker), Ok(Provider::Claude));
+    assert_eq!(
+        defaults.setting(AgentRole::Worker, "CODEX_MODEL", "default"),
+        "default"
+    );
+    assert_eq!(defaults.turns(AgentRole::Worker), "180");
+    assert_eq!(defaults.budget(AgentRole::Worker), "10");
+}
+
+#[test]
 fn prompt_and_image_stamp_match_bash_inputs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let prompt = compose_role_prompt(
