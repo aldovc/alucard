@@ -130,7 +130,7 @@ fn stage_measurement_buckets_test_paths_and_renames() {
     git(&root, &["commit", "-qm", "changes"]);
     let head = git(&root, &["rev-parse", "HEAD"]);
 
-    write_stage_measurement(&root, &root, 1, None, &base, &head);
+    write_stage_measurement(&root, &root, "main", 1, None, &base, &head);
 
     let record: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())
@@ -143,5 +143,41 @@ fn stage_measurement_buckets_test_paths_and_renames() {
         .unwrap()
         .iter()
         .any(|path| path == "tests/renamed.rs"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stage_measurement_reports_when_the_tracked_base_advances() {
+    let root = temporary_path("base-drift");
+    fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "test@example.com"]);
+    git(&root, &["config", "user.name", "Test User"]);
+    fs::write(root.join("base.txt"), "base\n").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "base"]);
+    let base = git(&root, &["rev-parse", "HEAD"]);
+    git(&root, &["update-ref", "refs/remotes/origin/main", &base]);
+    git(&root, &["switch", "-qc", "worker"]);
+    fs::write(root.join("worker.txt"), "worker\n").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "worker"]);
+    let head = git(&root, &["rev-parse", "HEAD"]);
+    git(&root, &["switch", "-q", "main"]);
+    fs::write(root.join("base.txt"), "advanced\n").unwrap();
+    git(&root, &["commit", "-am", "advance base", "-q"]);
+    let advanced_base = git(&root, &["rev-parse", "HEAD"]);
+    git(
+        &root,
+        &["update-ref", "refs/remotes/origin/main", &advanced_base],
+    );
+    git(&root, &["switch", "-q", "worker"]);
+
+    write_stage_measurement(&root, &root, "main", 1, None, &base, &head);
+
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())
+            .unwrap();
+    assert_eq!(record["base_drifted"], true);
     fs::remove_dir_all(root).unwrap();
 }

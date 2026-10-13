@@ -778,6 +778,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     write_stage_measurement(
                         &prepared.directory,
                         &prepared.clone,
+                        &options.base,
                         iteration,
                         Some(number),
                         prepared.run.base_sha.as_deref().unwrap_or_default(),

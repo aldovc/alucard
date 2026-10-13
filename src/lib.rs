@@ -1361,6 +1361,7 @@ mod measurement_tests {
 pub fn write_stage_measurement(
     log_dir: &Path,
     repository: &Path,
+    base_branch: &str,
     iteration: usize,
     pr: Option<i64>,
     base_sha: &str,
@@ -1372,10 +1373,21 @@ pub fn write_stage_measurement(
             "format": 1, "record": "stage", "ts": timestamp(), "repo_id": repository_id(repository),
             "iter": iteration.to_string(), "pr": pr.map(|number| number.to_string()).unwrap_or_default(),
             "stage": "worker", "cycle": 0, "base_sha": base_sha, "prev_sha": "", "head_sha": head_sha,
-            "is_merge": false, "base_drifted": false, "baseline_source": "pinned",
+            "is_merge": false, "base_drifted": base_drifted(repository, base_branch, base_sha), "baseline_source": "pinned",
             "from_base": diff_measurement(repository, base_sha, head_sha), "from_prev": {}
         }),
     );
+}
+
+fn base_drifted(repository: &Path, base_branch: &str, base_sha: &str) -> bool {
+    if base_sha.is_empty() {
+        return false;
+    }
+    let remote_base = format!("origin/{base_branch}");
+    run_command("git", &["rev-parse", &remote_base], repository, None)
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() != base_sha)
 }
 
 pub struct IterationMeasurement<'a> {
