@@ -2549,6 +2549,14 @@ make_agent_clone_locked() {
   local branch="$1" dest="$2" mode="$3"
   if [ "$mode" = "base" ]; then
     git -C "$REPO_ABS" fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+    # clone --branch sees only REPO_ABS's local branches, and a --base other
+    # than the checked-out one exists here only as that remote-tracking ref.
+    # A --local clone shares every object, so clone HEAD and track $branch;
+    # the caller resets to it.
+    git clone --local --no-tags --single-branch "$REPO_ABS" "$dest"
+    git -C "$dest" config remote.origin.fetch "+refs/heads/$branch:refs/remotes/origin/$branch"
+    git -C "$dest" update-ref "refs/remotes/origin/$branch" "$(git -C "$REPO_ABS" rev-parse "origin/$branch")"
+    return
   else
     git -C "$REPO_ABS" fetch origin "$branch"
     git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
