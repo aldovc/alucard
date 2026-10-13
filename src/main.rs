@@ -463,6 +463,25 @@ fn merge_checkout(
         if !push.status.success() {
             return Err("push of rebased PR was rejected: the branch moved since it was checked. Nothing merged.".to_string());
         }
+        for _ in 0..30 {
+            let pr_head = gh_text(
+                checkout,
+                &[
+                    "pr",
+                    "view",
+                    &options.pr_number.to_string(),
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+            )
+            .unwrap_or_default();
+            if pr_head.trim() == new_head {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
     }
     merge_post(checkout, options.pr_number, &evidence, false);
     let merged = execute_command(

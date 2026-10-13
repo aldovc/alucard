@@ -42,7 +42,17 @@ case "$1 $2" in
   "api user") printf '%s\n' alucard-bot ;;
   "pr view")
     case "$*" in
-      *headRefOid*) git --git-dir="$ALUCARD_TEST_REMOTE" rev-parse "refs/heads/$ALUCARD_TEST_BRANCH" ;;
+      *headRefOid*)
+        calls=$(cat "$ALUCARD_TEST_STATE/pr-head-calls" 2>/dev/null || echo 0)
+        calls=$((calls + 1))
+        printf '%s\n' "$calls" > "$ALUCARD_TEST_STATE/pr-head-calls"
+        if [ -n "${ALUCARD_TEST_STALE_PR_HEAD:-}" ] \
+          && [ "$calls" -le "${ALUCARD_TEST_STALE_PR_HEAD_CALLS:-0}" ]; then
+          printf '%s\n' "$ALUCARD_TEST_STALE_PR_HEAD"
+        else
+          : > "$ALUCARD_TEST_STATE/pr-head-advanced"
+          git --git-dir="$ALUCARD_TEST_REMOTE" rev-parse "refs/heads/$ALUCARD_TEST_BRANCH"
+        fi ;;
       *) jq -n --arg b "$ALUCARD_TEST_BRANCH" --argjson c "$ALUCARD_TEST_COMMENTS" \
            '{state: "OPEN", headRefName: $b, baseRefName: "main",
              isCrossRepository: false, comments: $c}' ;;
@@ -52,6 +62,12 @@ case "$1 $2" in
       [ "$1" = "--body" ] && { printf '%s\n' "$2" >> "$ALUCARD_TEST_STATE/comments"; break; }
       shift
     done ;;
+  "pr merge")
+    if [ -n "${ALUCARD_TEST_STALE_PR_HEAD:-}" ] \
+      && [ ! -f "$ALUCARD_TEST_STATE/pr-head-advanced" ]; then
+      echo 'merge attempted before PR head advanced' >&2
+      exit 1
+    fi ;;
   *) : ;;
 esac
 MOCK
@@ -132,7 +148,9 @@ PASSING_CHECK='cat a.txt > "$ALUCARD_TEST_STATE/checked"; echo "== 12 passed =="
 
 echo "── stale but clean approved PR ──"
 setup_repos stale
+export ALUCARD_TEST_STALE_PR_HEAD="$PR_SHA" ALUCARD_TEST_STALE_PR_HEAD_CALLS=1
 ALUCARD_TEST_STATE="$STATE" run_merge --check-command "$PASSING_CHECK"
+unset ALUCARD_TEST_STALE_PR_HEAD ALUCARD_TEST_STALE_PR_HEAD_CALLS
 assert_eq "merge succeeds" "0" "$RC"
 assert_contains "a logs root under /tmp warns, as for run" "will not survive a reboot" "$OUT"
 assert_eq "the checks ran on the rebased tree" "base moved" "$(cat "$STATE/checked" 2>/dev/null)"
@@ -146,6 +164,8 @@ assert_contains "the evidence comment says the checks passed" "Alucard merge: ch
 assert_contains "and carries the check's summary" "== 12 passed ==" "$POSTED"
 assert_contains "squash-merges exactly the commit it checked" \
   "gh pr merge 9 --squash --match-head-commit $REMOTE_HEAD" "$TRACE"
+assert_eq "the stale PR head is polled until it advances" "2" \
+  "$(cat "$STATE/pr-head-calls")"
 assert_contains "and deletes the branch" "git/refs/heads/$BRANCH" "$TRACE"
 assert_merge_lifecycle completed
 
