@@ -2577,6 +2577,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("../migrations/0005_run_branch.sql")),
     (6, include_str!("../migrations/0006_retry_owner.sql")),
     (7, include_str!("../migrations/0007_measurements.sql")),
+    (8, include_str!("../migrations/0008_review_verdict.sql")),
 ];
 
 pub struct DatabaseStatus {
@@ -3047,6 +3048,26 @@ pub fn record_task_pr_gate_state(
     connection.execute(
         "UPDATE pull_requests SET gate_state = ?1 WHERE task_id = ?2 AND number = ?3",
         (gate_state, task_id, number),
+    )?;
+    Ok(())
+}
+
+/// Records the outcome of a reviewer pass for a pull request.
+pub fn record_task_pr_review(
+    path: &Path,
+    task_id: &str,
+    number: i64,
+    verdict: &str,
+    gate_state: &str,
+    approved_sha: Option<&str>,
+    head_sha: &str,
+) -> Result<(), DatabaseError> {
+    let connection = open(path)?;
+    connection.execute(
+        "UPDATE pull_requests
+         SET review_verdict = ?1, gate_state = ?2, reviewer_approved_sha = ?3, head_sha = ?4
+         WHERE task_id = ?5 AND number = ?6",
+        (verdict, gate_state, approved_sha, head_sha, task_id, number),
     )?;
     Ok(())
 }
