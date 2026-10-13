@@ -1911,6 +1911,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_run_owners.sql")),
     (3, include_str!("../migrations/0003_recovery_checkout.sql")),
+    (4, include_str!("../migrations/0004_reconciliation.sql")),
+    (5, include_str!("../migrations/0005_run_branch.sql")),
+    (6, include_str!("../migrations/0006_retry_owner.sql")),
 ];
 
 pub struct DatabaseStatus {
@@ -1970,6 +1973,24 @@ pub struct Recovery {
     pub pull_request_number: Option<i64>,
     pub checkout_path: Option<String>,
     pub failure_reason: Option<String>,
+}
+
+/// An active task claim whose owning process is no longer alive on this host.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AbandonedTaskClaim {
+    pub lease_id: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub repository_id: String,
+    pub branch: Option<String>,
+}
+
+/// A run that may still be working on a task claimed by an earlier run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TaskClaimAttempt {
+    pub run_id: String,
+    pub branch: Option<String>,
+    pub logs_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2167,6 +2188,18 @@ pub fn start_retry_run(
     cache_root: &Path,
     image: Option<&str>,
 ) -> Result<Run, DatabaseError> {
+    start_task_retry_run(path, repository, logs_root, cache_root, image, None)
+}
+
+/// Creates a retry attempt associated with the task claim that owns it.
+pub fn start_task_retry_run(
+    path: &Path,
+    repository: &Path,
+    logs_root: &Path,
+    cache_root: &Path,
+    image: Option<&str>,
+    owner_run_id: Option<&str>,
+) -> Result<Run, DatabaseError> {
     let repository = repository.canonicalize()?;
     let repository_name = repository
         .file_name()
@@ -2183,8 +2216,8 @@ pub fn start_retry_run(
         params![repository_id, repository_name, cache.to_string_lossy()],
     )?;
     connection.execute(
-        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, pid, hostname)
-         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6)",
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, pid, hostname, retry_owner_run_id)
+         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
         params![
             run_id,
             repository_id,
@@ -2192,6 +2225,7 @@ pub fn start_retry_run(
             logs_path,
             std::process::id(),
             hostname()?,
+            owner_run_id,
         ],
     )?;
     Ok(Run {
@@ -2462,6 +2496,125 @@ pub fn finish_run(path: &Path, run_id: &str, status: &str) -> Result<(), Databas
     Ok(())
 }
 
+/// Lists task claims whose local owner process has exited.
+pub fn abandoned_task_claims(
+    path: &Path,
+    repository_id: &str,
+) -> Result<Vec<AbandonedTaskClaim>, DatabaseError> {
+    let connection = open(path)?;
+    let hostname = hostname()?;
+    let mut statement = connection.prepare(
+        "SELECT claims.id, claims.run_id, claims.resource_key, claims.repository_id,
+                COALESCE(runs.branch, recovery.branch, (
+                    SELECT branch FROM pull_requests
+                    WHERE pull_requests.task_id = claims.resource_key
+                      AND pull_requests.repository_id = claims.repository_id
+                      AND pull_requests.number = (
+                          SELECT pr_number FROM tasks
+                          WHERE tasks.id = claims.resource_key
+                            AND tasks.repository_id = claims.repository_id
+                      )
+                ))
+         FROM claims
+         JOIN runs ON runs.id = claims.run_id
+         LEFT JOIN recovery ON recovery.original_run_id = runs.id
+         WHERE claims.state = 'active' AND claims.resource_kind = 'task'
+             AND claims.repository_id = ?2
+             AND runs.hostname = ?1 AND runs.pid IS NOT NULL",
+    )?;
+    let claims = statement
+        .query_map((hostname, repository_id), |row| {
+            Ok(AbandonedTaskClaim {
+                lease_id: row.get(0)?,
+                run_id: row.get(1)?,
+                task_id: row.get(2)?,
+                repository_id: row.get(3)?,
+                branch: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|claim| {
+            connection
+                .query_row(
+                    "SELECT pid FROM runs WHERE id = ?1",
+                    [&claim.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok_and(|pid| !process_is_alive(pid))
+        })
+        .collect();
+    Ok(claims)
+}
+
+/// Lists the claim owner and every retry run that can still be working on its task.
+pub fn task_claim_attempts(
+    path: &Path,
+    claim: &AbandonedTaskClaim,
+) -> Result<Vec<TaskClaimAttempt>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, branch, logs_path FROM runs
+         WHERE id = ?1 OR retry_owner_run_id = ?1
+         ORDER BY id != ?1, started_at, rowid",
+    )?;
+    let attempts = statement
+        .query_map([&claim.run_id], |row| {
+            Ok(TaskClaimAttempt {
+                run_id: row.get(0)?,
+                branch: row.get(1)?,
+                logs_path: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)?;
+    Ok(attempts)
+}
+
+/// Returns a safely abandoned task to the queue and releases its claim.
+pub fn release_abandoned_task_claim(
+    path: &Path,
+    claim: &AbandonedTaskClaim,
+) -> Result<(), ClaimError> {
+    transition_task(
+        path,
+        &claim.task_id,
+        &claim.lease_id,
+        &claim.run_id,
+        TaskStatus::Pending,
+    )?;
+    release(path, &claim.lease_id, &claim.run_id)?;
+    finish_run(path, &claim.run_id, "interrupted")?;
+    Ok(())
+}
+
+/// Keeps an ambiguous claim out of dispatch and makes its reason visible in runs output.
+pub fn mark_claim_needs_reconciliation(
+    path: &Path,
+    claim: &AbandonedTaskClaim,
+    reason: &str,
+) -> Result<(), ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE tasks SET status = 'human', updated_at = datetime('now')
+         WHERE id = ?1 AND EXISTS (
+             SELECT 1 FROM claims WHERE id = ?2 AND run_id = ?3 AND state = 'active'
+         )",
+        (&claim.task_id, &claim.lease_id, &claim.run_id),
+    )?;
+    if changed != 1 {
+        return Err(ClaimError::LeaseNotActive);
+    }
+    transaction.execute(
+        "UPDATE runs SET status = 'interrupted', ended_at = datetime('now'), reconciliation_reason = ?1
+         WHERE id = ?2",
+        (reason, &claim.run_id),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn acquire(
     transaction: &rusqlite::Transaction<'_>,
     repository_id: &str,
@@ -2698,19 +2851,20 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
     )?;
     if options.run_id.is_some() {
         transaction.execute(
-            "UPDATE runs SET base_sha = ?1, image = ?2, logs_path = ?3, heartbeat_at = datetime('now') WHERE id = ?4",
-            params![base_sha, options.image, directory.to_string_lossy(), run_id],
+            "UPDATE runs SET base_sha = ?1, image = ?2, logs_path = ?3, branch = ?4, heartbeat_at = datetime('now') WHERE id = ?5",
+            params![base_sha, options.image, directory.to_string_lossy(), branch, run_id],
         )?;
     } else {
         transaction.execute(
-            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, pid, hostname)
-             VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, branch, pid, hostname)
+             VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 run_id,
                 repository_id,
                 base_sha,
                 options.image,
                 directory.to_string_lossy(),
+                branch,
                 std::process::id(),
                 hostname()?,
             ],
@@ -2816,6 +2970,23 @@ pub fn find_run(path: &Path, run_id: &str) -> Result<Option<Run>, DatabaseError>
             run_from_row,
         )
         .optional()
+        .map_err(Into::into)
+}
+
+/// Returns the recorded reason a crashed run still needs human reconciliation.
+pub fn run_reconciliation_reason(
+    path: &Path,
+    run_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT reconciliation_reason FROM runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|reason| reason.flatten())
         .map_err(Into::into)
 }
 
@@ -3073,8 +3244,8 @@ impl std::error::Error for DatabaseError {}
 
 #[cfg(test)]
 mod tests {
-    use super::journal_mode;
-    use rusqlite::Connection;
+    use super::*;
+    use rusqlite::{params, Connection};
 
     #[test]
     fn journal_mode_reports_non_wal_for_in_memory_databases() {
@@ -3082,5 +3253,111 @@ mod tests {
             journal_mode(&Connection::open_in_memory().unwrap()).unwrap(),
             "wal"
         );
+    }
+
+    #[test]
+    fn abandoned_claims_are_limited_to_the_requested_repository() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        let hostname = hostname().unwrap();
+        for (repository_id, run_id, task_id, branch) in [
+            ("repository-a", "run-a", "task-a", "alucard/run-a"),
+            ("repository-b", "run-b", "task-b", "alucard/run-b"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', ?1, datetime('now'))",
+                    [repository_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, branch, pid, hostname)
+                     VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5)",
+                    params![run_id, repository_id, branch, i64::MAX, hostname],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+                     VALUES (?1, ?2, 'local', ?1, '', 'claimed', '[]', datetime('now'))",
+                    params![task_id, repository_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                     VALUES (?1, ?2, 'task', ?3, ?4, 'active', datetime('now'), datetime('now'))",
+                    params![format!("claim-{task_id}"), repository_id, task_id, run_id],
+                )
+                .unwrap();
+        }
+
+        let claims = abandoned_task_claims(&path, "repository-b").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].task_id, "task-b");
+        assert_eq!(claims[0].branch.as_deref(), Some("alucard/run-b"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn abandoned_claim_reconciliation_releases_once_with_pr_history() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        let hostname = hostname().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repository', '', 'repository', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, pid, hostname)
+                 VALUES ('run', 'repository', 'run', 'running', datetime('now'), datetime('now'), ?1, ?2)",
+                params![i64::MAX, hostname],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, pr_number, updated_at)
+                 VALUES ('task', 'repository', 'local', 'task', '', 'claimed', '[]', 2, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                 VALUES ('claim', 'repository', 'task', 'task', 'run', 'active', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        for (number, branch) in [(1, "alucard/old"), (2, "alucard/current")] {
+            connection
+                .execute(
+                    "INSERT INTO pull_requests (id, task_id, repository_id, number, branch, head_sha, kind, remote_state, gate_state)
+                     VALUES (?1, 'task', 'repository', ?2, ?3, 'sha', 'normal', 'open', 'pending')",
+                    params![format!("pr-{number}"), number, branch],
+                )
+                .unwrap();
+        }
+
+        let claims = abandoned_task_claims(&path, "repository").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].branch.as_deref(), Some("alucard/current"));
+        release_abandoned_task_claim(&path, &claims[0]).unwrap();
+        assert!(abandoned_task_claims(&path, "repository")
+            .unwrap()
+            .is_empty());
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }
