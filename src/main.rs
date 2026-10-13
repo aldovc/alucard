@@ -7,6 +7,7 @@ use alucard::{
 };
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
+use std::{collections::BTreeMap, fs};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -23,9 +24,390 @@ fn main() -> ExitCode {
             Ok(path) => database_command(&commands[1..], path),
             Err(error) => fail(&format!("alucard: {error}")),
         },
+        Some("doctor") => doctor_command(&commands[1..], db_path),
         Some("queue") => queue_command(&commands[1..], db_path),
         Some(cmd) => fail(&format!("alucard: unknown command: {cmd}")),
-        None => fail("usage: alucard [--db-path PATH] {version|queue|db migrate|db status}"),
+        None => fail("usage: alucard [--db-path PATH] {version|queue|doctor|db migrate|db status}"),
+    }
+}
+
+const REQUIRED_TOOL_FILES: &str = include_str!("../required-tool-files.txt");
+
+struct DoctorOptions {
+    repository: PathBuf,
+    env_file: PathBuf,
+    image: String,
+    tasks: Option<PathBuf>,
+    github: bool,
+    issue: bool,
+}
+
+impl DoctorOptions {
+    fn parse(args: &[String], tools: &std::path::Path) -> Result<Self, String> {
+        let mut options = Self {
+            repository: std::env::var_os("ALUCARD_TARGET_REPO")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().expect("current directory")),
+            env_file: std::env::var_os("ALUCARD_ENV_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| tools.join("alucard.env")),
+            image: std::env::var("ALUCARD_IMAGE")
+                .unwrap_or_else(|_| "ghcr.io/aldovc/alucard:latest".to_string()),
+            tasks: std::env::var_os("ALUCARD_TASKS_FILE").map(PathBuf::from),
+            github: false,
+            issue: false,
+        };
+        let mut repository_set = false;
+        let mut tasks_from_flag = false;
+        let mut values = args.iter();
+        while let Some(value) = values.next() {
+            match value.as_str() {
+                "-C" | "--repo" => {
+                    options.repository =
+                        PathBuf::from(values.next().ok_or("--repo requires a path")?);
+                    repository_set = true;
+                }
+                "--env-file" => {
+                    options.env_file =
+                        PathBuf::from(values.next().ok_or("--env-file requires a path")?)
+                }
+                "--image" => {
+                    options.image = values.next().ok_or("--image requires a name")?.clone()
+                }
+                "--tasks" => {
+                    options.tasks = Some(PathBuf::from(
+                        values.next().ok_or("--tasks requires a path")?,
+                    ));
+                    tasks_from_flag = true;
+                }
+                "--github" => options.github = true,
+                "--issue" => {
+                    let issue = values.next().ok_or("--issue requires a number")?;
+                    if issue
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|number| *number > 0)
+                        .is_none()
+                    {
+                        return Err("--issue requires a positive integer".to_string());
+                    }
+                    options.issue = true;
+                }
+                value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+                value if !repository_set => {
+                    options.repository = PathBuf::from(value);
+                    repository_set = true;
+                }
+                value => return Err(format!("unexpected argument: {value}")),
+            }
+        }
+        if options.issue {
+            return Err("--issue is only valid with alucard run".to_string());
+        }
+        if tasks_from_flag && options.github {
+            return Err("--tasks and --github are mutually exclusive".to_string());
+        }
+        if let Some(tasks) = &options.tasks {
+            if !tasks.is_file() {
+                return Err(format!("tasks file not found: {}", tasks.display()));
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn doctor_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
+    let Some(tools) = tool_dir() else {
+        return fail("alucard: could not locate tool files");
+    };
+    let options = match DoctorOptions::parse(args, &tools) {
+        Ok(options) => options,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let mut ok = true;
+    for command in ["git", "gh", "jq", "docker", "timeout"] {
+        if command_exists(command) {
+            println!("ok: {command}");
+        } else {
+            println!("missing: {command}");
+            ok = false;
+        }
+    }
+    let missing_files = REQUIRED_TOOL_FILES.lines().any(|file| {
+        if tools.join(file).is_file() {
+            false
+        } else {
+            println!("missing: {}", tools.join(file).display());
+            true
+        }
+    });
+    if missing_files {
+        ok = false;
+    } else {
+        println!("ok: tool files in {}", tools.display());
+    }
+    let environment = match read_environment(&options.env_file) {
+        Ok(environment) => {
+            println!("ok: env file {}", options.env_file.display());
+            environment
+        }
+        Err(_) => {
+            println!("missing: env file {}", options.env_file.display());
+            ok = false;
+            BTreeMap::new()
+        }
+    };
+    if options.env_file.is_file() {
+        if environment.get("GITHUB_TOKEN").is_none_or(String::is_empty) {
+            println!("missing: GITHUB_TOKEN value");
+            ok = false;
+        }
+        for (provider, key) in [("claude", "ANTHROPIC_API_KEY"), ("codex", "OPENAI_API_KEY")] {
+            if uses_provider(&environment, provider) {
+                if environment.get(key).is_some_and(|value| !value.is_empty()) {
+                    println!("ok: {key}");
+                } else {
+                    println!("missing: {key} value");
+                    ok = false;
+                }
+            }
+        }
+    }
+    let repository = options.repository.canonicalize().ok();
+    if let Some(repository) = repository.as_ref().filter(|path| path.is_dir()) {
+        if command_success("git", repository, &["rev-parse", "--show-toplevel"]) {
+            println!("ok: target repo {}", repository.display());
+            if command_success("git", repository, &["config", "--get", "remote.origin.url"]) {
+                println!("ok: target repo has origin remote");
+            } else {
+                println!("missing: target repo origin remote");
+                ok = false;
+            }
+        } else {
+            println!(
+                "missing: valid target git repo at {} (or a GitHub ref like owner/repo)",
+                options.repository.display()
+            );
+            ok = false;
+        }
+    } else if is_github_ref(&options.repository)
+        && command_success(
+            "gh",
+            &tools,
+            &[
+                "repo",
+                "view",
+                options.repository.to_str().unwrap_or_default(),
+                "--json",
+                "name",
+            ],
+        )
+    {
+        println!(
+            "ok: target repo is GitHub ref {} (cache: {})",
+            options.repository.display(),
+            cache_path(&options.repository).display()
+        );
+    } else {
+        println!(
+            "missing: valid target git repo at {} (or a GitHub ref like owner/repo)",
+            options.repository.display()
+        );
+        ok = false;
+    }
+    if command_success("docker", &tools, &["image", "inspect", &options.image]) {
+        println!("ok: Docker image {}", options.image);
+    } else {
+        println!("missing: Docker image {} (run: docker pull ghcr.io/aldovc/alucard:latest, or alucard build for a local image)", options.image);
+    }
+    if !options.github {
+        let task_file = options.tasks.or_else(|| {
+            repository
+                .map(|path| path.join(".alucard/tasks.md"))
+                .filter(|path| path.is_file())
+        });
+        if let Some(task_file) = task_file {
+            if command_exists("jq") {
+                doctor_tasks(&task_file, &mut ok);
+            } else {
+                println!(
+                    "skipped: tasks file validation ({}) — jq missing",
+                    task_file.display()
+                );
+            }
+        }
+    }
+    let path = match database_path(db_path) {
+        Ok(path) => path,
+        Err(error) => {
+            println!("missing: ledger database ({error})");
+            return ExitCode::FAILURE;
+        }
+    };
+    match status(&path) {
+        Ok(database) if database.pending_migrations == 0 => println!(
+            "ok: ledger {} (WAL enabled, migrations current)",
+            path.display()
+        ),
+        Ok(_) => {
+            println!("missing: ledger migrations (run: alucard db migrate)");
+            ok = false;
+        }
+        Err(error) => {
+            println!("missing: ledger database {} ({error})", path.display());
+            ok = false;
+        }
+    }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new(command).arg("--version").output().is_ok()
+}
+
+fn command_success(command: &str, directory: &std::path::Path, args: &[&str]) -> bool {
+    Command::new(command)
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn read_environment(path: &std::path::Path) -> Result<BTreeMap<String, String>, std::io::Error> {
+    let mut environment: BTreeMap<String, String> = [
+        "GITHUB_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "ALUCARD_PROVIDER",
+        "ALUCARD_WORKER_PROVIDER",
+        "ALUCARD_CI_FIX_PROVIDER",
+        "ALUCARD_REVIEWER_PROVIDER",
+        "ALUCARD_FEEDBACK_PROVIDER",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| (name.to_string(), value))
+    })
+    .collect();
+    for line in fs::read_to_string(path)?.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((name, value)) = line.strip_prefix("export ").unwrap_or(line).split_once('=') {
+            environment.insert(
+                name.trim().to_string(),
+                value.trim_matches('"').trim_matches('\'').to_string(),
+            );
+        }
+    }
+    Ok(environment)
+}
+
+fn uses_provider(environment: &BTreeMap<String, String>, provider: &str) -> bool {
+    ["WORKER", "CI_FIX", "REVIEWER", "FEEDBACK"]
+        .iter()
+        .any(|role| {
+            environment
+                .get(&format!("ALUCARD_{role}_PROVIDER"))
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    environment
+                        .get("ALUCARD_PROVIDER")
+                        .filter(|value| !value.is_empty())
+                })
+                .map_or("claude", String::as_str)
+                == provider
+        })
+}
+
+fn is_github_ref(path: &std::path::Path) -> bool {
+    let Some(value) = path.to_str() else {
+        return false;
+    };
+    let mut parts = value.split('/');
+    matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty())
+}
+
+fn cache_path(repository: &std::path::Path) -> PathBuf {
+    std::env::var_os("ALUCARD_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME").map(|path| PathBuf::from(path).join("alucard"))
+        })
+        .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".cache/alucard")))
+        .unwrap_or_default()
+        .join(repository)
+}
+
+fn doctor_tasks(path: &std::path::Path, ok: &mut bool) {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(_) => return,
+    };
+    let parsed = match parse_tasks(&contents) {
+        Ok(parsed) => parsed,
+        Err(problems) => {
+            println!("invalid: tasks file {}", path.display());
+            for problem in problems {
+                println!("  - {problem}");
+            }
+            *ok = false;
+            return;
+        }
+    };
+    let mut problems = Vec::new();
+    let mut seen = BTreeMap::new();
+    for task in &parsed.tasks {
+        if let Some(first) = seen.insert(&task.id, task.line) {
+            problems.push(format!(
+                "line {}: duplicate task id {} (first used at line {first})",
+                task.line, task.id
+            ));
+        }
+        for blocker in &task.blockers {
+            if !parsed
+                .tasks
+                .iter()
+                .any(|candidate| candidate.id == *blocker)
+            {
+                problems.push(format!(
+                    "line {}: task {} blocked by unknown task id {blocker}",
+                    task.line, task.id
+                ));
+            }
+        }
+    }
+    if parsed.parent_context.split_whitespace().next().is_none() {
+        problems.push(
+            "line 1: empty header — no parent context above the first task heading".to_string(),
+        );
+    }
+    if parsed.tasks.is_empty() {
+        problems.push("line 1: no task headings found".to_string());
+    }
+    if problems.is_empty() {
+        let todo = parsed
+            .tasks
+            .iter()
+            .filter(|task| task.state == alucard::TaskState::Pending)
+            .count();
+        println!(
+            "ok: tasks file {} (local task source, {todo} todo)",
+            path.display()
+        );
+    } else {
+        println!("invalid: tasks file {}", path.display());
+        for problem in problems {
+            println!("  - {problem}");
+        }
+        *ok = false;
     }
 }
 

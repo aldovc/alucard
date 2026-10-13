@@ -2410,22 +2410,15 @@ command_queue() {
   get_task_queue "$REPO_ABS"
 }
 
-# Files that must exist in TOOL_DIR for a run to work. `doctor` reports each
-# missing one; the test suite reads this list to check nothing new is shipped
-# without being checked for.
-REQUIRED_TOOL_FILES=(
-  Dockerfile
-  entrypoint.sh
-  alucard-worker-prompt.md
-  alucard-worker-github-prompt.md
-  alucard-worker-github-issue-prompt.md
-  alucard-worker-local-prompt.md
-  alucard-reviewer-prompt.md
-  alucard-ci-fix-prompt.md
-  alucard-feedback-prompt.md
-  alucard-wrapup-prompt.md
-  alucard-engineering-policy.md
-)
+# Files that must exist in TOOL_DIR for a run to work. The Rust doctor and
+# tests read this manifest too, so the list has one source of truth.
+REQUIRED_TOOL_FILES_FILE="$TOOL_DIR/required-tool-files.txt"
+
+required_tool_files() {
+  while IFS= read -r file || [ -n "$file" ]; do
+    [ -n "$file" ] && printf '%s\n' "$file"
+  done < "$REQUIRED_TOOL_FILES_FILE"
+}
 
 command_doctor() {
   parse_repo_options "$@"
@@ -2442,12 +2435,12 @@ command_doctor() {
   done
 
   local _missing_files=false
-  for _f in "${REQUIRED_TOOL_FILES[@]}"; do
+  while IFS= read -r _f; do
     if [ ! -f "$TOOL_DIR/$_f" ]; then
       echo "missing: $TOOL_DIR/$_f"
       _missing_files=true
     fi
-  done
+  done < <(required_tool_files)
   if [ "$_missing_files" = "false" ]; then
     echo "ok: tool files in $TOOL_DIR"
   else

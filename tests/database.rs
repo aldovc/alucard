@@ -382,6 +382,35 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
+#[test]
+fn doctor_names_migration_command_when_ledger_is_pending() {
+    let path = database_path();
+    let env_file = path.with_file_name("doctor.env");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &env_file,
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .args([
+            "--db-path",
+            path.to_str().unwrap(),
+            "doctor",
+            ".",
+            "--env-file",
+            env_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("alucard db migrate"));
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn status_preserves_existing_database_parent_permissions() {
