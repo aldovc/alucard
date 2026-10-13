@@ -1,15 +1,18 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    abandoned_task_claims, archive_prompt, begin_operation, build_image, compose_role_prompt,
-    database_path, find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
-    import_github_tasks, import_local_tasks, local_queue_with_open_issues,
-    local_queue_with_open_prs, log_event, mark_claim_needs_reconciliation, migrate, open,
-    parse_tasks, prepare_run, recent_runs, record_recovery_failure, record_recovery_pr,
+    abandoned_pull_request_claims, abandoned_task_claims, acquire_pr, archive_prompt,
+    begin_operation, begin_operation_with_payload, build_image, compose_role_prompt, database_path,
+    defer_operation, find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
+    import_github_tasks, import_local_tasks, iteration_usage_comment_for_dirs,
+    local_queue_with_open_issues, local_queue_with_open_prs, log_event,
+    mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
+    pending_operations, prepare_run, recent_runs, record_recovery_failure, record_recovery_pr,
     record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
-    release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
-    run_reconciliation_reason, run_recovery, start_task_retry_run, start_task_run, status,
-    task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
+    release_abandoned_pull_request_claim, release_abandoned_task_claim, run_claims,
+    run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
+    start_merge_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
+    task_is_pending, toolchain_preflight, transition_task, usage_report_for_dirs,
     warn_if_stale_image, write_iteration_measurement, write_run_measurement,
     write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentResult,
     AgentRole, AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
@@ -17,9 +20,12 @@ use alucard::{
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
+
+#[cfg(test)]
+use alucard::usage_report;
 
 const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's.";
 const BLOCKED_FINDINGS_MARKER: &str = "**🤖 Alucard blocked findings**";
@@ -42,6 +48,7 @@ fn main() -> ExitCode {
         Some("doctor") => doctor_command(&commands[1..], db_path),
         Some("queue") => queue_command(&commands[1..], db_path),
         Some("run") => run_command(&commands[1..], db_path),
+        Some("merge") => merge_command(&commands[1..], db_path),
         Some("build") => build_command(&commands[1..]),
         Some("runs") => match database_path(db_path) {
             Ok(path) => runs_command(&commands[1..], &path),
@@ -51,6 +58,512 @@ fn main() -> ExitCode {
         None => {
             fail("usage: alucard [--db-path PATH] {version|build|queue|runs|doctor|db migrate|db status}")
         }
+    }
+}
+
+struct MergeOptions {
+    pr_number: i64,
+    repository: PathBuf,
+    env_file: PathBuf,
+    logs_root: PathBuf,
+    check_command: Option<String>,
+    timeout_minutes: u64,
+    dry_run: bool,
+}
+
+impl MergeOptions {
+    fn parse(args: &[String], tools: &Path) -> Result<Self, String> {
+        let pr_number = args
+            .first()
+            .and_then(|value| value.parse().ok())
+            .filter(|n: &i64| *n > 0)
+            .ok_or(
+                "usage: alucard merge <PR_NUM> [TARGET_REPO] — PR_NUM must be a positive integer",
+            )?;
+        let mut options = Self {
+            pr_number,
+            repository: nonempty_environment("ALUCARD_TARGET_REPO")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().expect("current directory")),
+            env_file: nonempty_environment("ALUCARD_ENV_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| tools.join("alucard.env")),
+            logs_root: nonempty_environment("ALUCARD_LOGS_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(".alucard-logs")),
+            check_command: None,
+            timeout_minutes: 60,
+            dry_run: false,
+        };
+        let mut repository_set = false;
+        let mut values = args[1..].iter();
+        while let Some(value) = values.next() {
+            match value.as_str() {
+                "-C" | "--repo" => {
+                    options.repository =
+                        PathBuf::from(values.next().ok_or("--repo requires a path")?)
+                }
+                "--env-file" => {
+                    options.env_file =
+                        PathBuf::from(values.next().ok_or("--env-file requires a path")?)
+                }
+                "--logs-root" => {
+                    options.logs_root =
+                        PathBuf::from(values.next().ok_or("--logs-root requires a path")?)
+                }
+                "--check-command" => {
+                    options.check_command = Some(
+                        values
+                            .next()
+                            .ok_or("--check-command requires a command")?
+                            .clone(),
+                    )
+                }
+                "-t" | "--timeout-minutes" => {
+                    options.timeout_minutes = values
+                        .next()
+                        .ok_or("--timeout-minutes requires a number")?
+                        .parse()
+                        .ok()
+                        .filter(|n: &u64| *n > 0)
+                        .ok_or("timeout must be greater than zero")?
+                }
+                "--dry-run" => options.dry_run = true,
+                "-h" | "--help" => return Err(
+                    "usage: alucard merge <PR_NUM> [TARGET_REPO] [--check-command CMD] [--dry-run]"
+                        .to_string(),
+                ),
+                option if option.starts_with('-') => {
+                    return Err(format!("unknown merge option: {option}"))
+                }
+                repository if !repository_set => {
+                    options.repository = PathBuf::from(repository);
+                    repository_set = true;
+                }
+                value => return Err(format!("unexpected argument: {value}")),
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
+    let Some(tools) = tool_dir() else {
+        return fail("alucard: could not locate tool files");
+    };
+    let options = match MergeOptions::parse(args, &tools) {
+        Ok(options) => options,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let database = match database_path(db_path) {
+        Ok(path) => path,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let repository = match options.repository.canonicalize() {
+        Ok(path) if git_repository_root(&path).is_some() => path,
+        _ => return fail("alucard: target repository is not a git repository"),
+    };
+    if let Err(error) = reconcile_startup(&database, &repository) {
+        return fail(&format!("alucard: reconciliation failed: {error}"));
+    }
+    let settings = match AgentSettings::from_environment(Some(&options.env_file)) {
+        Ok(settings) => settings,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let Some(check_command) = options
+        .check_command
+        .as_deref()
+        .or_else(|| settings.value("ALUCARD_CHECK_COMMAND"))
+    else {
+        return fail(
+            "alucard: no check command: pass --check-command CMD or set ALUCARD_CHECK_COMMAND",
+        );
+    };
+    let run = match start_merge_run(&database, &repository, &options.logs_root) {
+        Ok(run) => run,
+        Err(error) => return fail(&format!("alucard: could not start merge run: {error}")),
+    };
+    if options.logs_root.starts_with("/tmp") {
+        eprintln!("warning: logs under /tmp will not survive a reboot");
+    }
+    let claim = match acquire_pr(&database, &run.repository_id, options.pr_number, &run.id) {
+        Ok(claim) => claim,
+        Err(error) => {
+            let _ = finish_run(&database, &run.id, "failed");
+            return fail(&format!(
+                "alucard: could not lease PR #{}: {error}",
+                options.pr_number
+            ));
+        }
+    };
+    let result = merge_pr(
+        &repository,
+        &options,
+        check_command,
+        run.logs_path.as_deref().unwrap_or_default(),
+    );
+    let _ = release(&database, &claim.id, &run.id);
+    let _ = finish_run(
+        &database,
+        &run.id,
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(&format!("alucard: {error}")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MergePullRequest {
+    state: String,
+    #[serde(rename = "headRefName")]
+    branch: String,
+    #[serde(rename = "baseRefName")]
+    base: String,
+    #[serde(rename = "isCrossRepository")]
+    cross_repository: bool,
+    comments: Vec<MergeComment>,
+}
+#[derive(serde::Deserialize)]
+struct MergeComment {
+    author: MergeAuthor,
+    body: String,
+}
+#[derive(serde::Deserialize)]
+struct MergeAuthor {
+    login: String,
+}
+
+fn merge_pr(
+    repository: &Path,
+    options: &MergeOptions,
+    check_command: &str,
+    logs_path: &str,
+) -> Result<(), String> {
+    let number = options.pr_number.to_string();
+    let metadata: MergePullRequest = serde_json::from_slice(&gh_output(
+        repository,
+        &[
+            "pr",
+            "view",
+            &number,
+            "--json",
+            "state,headRefName,baseRefName,isCrossRepository,comments",
+        ],
+        "could not read pull request",
+    )?)
+    .map_err(|error| format!("could not parse pull request: {error}"))?;
+    if metadata.state != "OPEN" {
+        return Err(format!(
+            "PR #{} is not open (state: {})",
+            options.pr_number, metadata.state
+        ));
+    }
+    if metadata.cross_repository {
+        return Err(format!(
+            "PR #{} comes from a fork; merge only rebases branches on origin",
+            options.pr_number
+        ));
+    }
+    let login = gh_text(repository, &["api", "user", "--jq", ".login"])
+        .map_err(|_| "could not read the GitHub login the harness posts as".to_string())?;
+    let approved = harness_approved_sha(&metadata.comments, login.trim()).ok_or_else(|| {
+        format!(
+            "PR #{} has no harness approval to merge: run: alucard continue {}",
+            options.pr_number, options.pr_number
+        )
+    })?;
+    fs::create_dir_all(logs_path).map_err(|error| error.to_string())?;
+    let checkout = PathBuf::from(logs_path).join("repository");
+    let origin = git_output(repository, &["remote", "get-url", "origin"])?;
+    let clone = execute_command(
+        "git",
+        &[
+            "clone",
+            "--quiet",
+            "--branch",
+            &metadata.branch,
+            origin.trim(),
+            checkout.to_str().ok_or("invalid checkout path")?,
+        ],
+        repository,
+        Some(Duration::from_secs(120)),
+    )
+    .map_err(|error| error.to_string())?;
+    if !clone.status.success() {
+        return Err("could not fetch PR branch".to_string());
+    }
+    let result = merge_checkout(&checkout, &metadata, &approved, options, check_command);
+    let _ = fs::remove_dir_all(&checkout);
+    result
+}
+
+fn harness_approved_sha(comments: &[MergeComment], login: &str) -> Option<String> {
+    let comment = comments.iter().rev().find(|comment| {
+        comment.author.login == login && comment.body.starts_with("**🤖 Alucard review cycle ")
+    })?;
+    if !comment.body.lines().next()?.contains(": APPROVED") {
+        return None;
+    }
+    let sha = comment
+        .body
+        .split("Reviewed head: `")
+        .nth(1)?
+        .split('`')
+        .next()?;
+    (sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
+fn merge_checkout(
+    checkout: &Path,
+    metadata: &MergePullRequest,
+    approved: &str,
+    options: &MergeOptions,
+    check_command: &str,
+) -> Result<(), String> {
+    let head = git_output(checkout, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    if head != approved {
+        return Err(format!(
+            "PR #{} head {} is not the commit the harness approved ({}). Run: alucard continue {}",
+            options.pr_number,
+            &head[..12],
+            &approved[..12],
+            options.pr_number
+        ));
+    }
+    let fetch = execute_command(
+        "git",
+        &[
+            "fetch",
+            "--quiet",
+            "origin",
+            &format!(
+                "+refs/heads/{}:refs/remotes/origin/{}",
+                metadata.base, metadata.base
+            ),
+        ],
+        checkout,
+        Some(Duration::from_secs(120)),
+    )
+    .map_err(|error| error.to_string())?;
+    if !fetch.status.success() {
+        return Err(format!("could not fetch {}", metadata.base));
+    }
+    let base = git_output(
+        checkout,
+        &["rev-parse", &format!("origin/{}", metadata.base)],
+    )?
+    .trim()
+    .to_string();
+    let ancestor = execute_command(
+        "git",
+        &["merge-base", "--is-ancestor", &base, "HEAD"],
+        checkout,
+        None,
+    )
+    .map_err(|error| error.to_string())?
+    .status
+    .success();
+    let (new_head, rebased) = if ancestor {
+        (head.clone(), false)
+    } else {
+        let rebase = execute_command(
+            "git",
+            &["rebase", &base],
+            checkout,
+            Some(Duration::from_secs(120)),
+        )
+        .map_err(|error| error.to_string())?;
+        if !rebase.status.success() {
+            let conflicts = git_output(checkout, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default();
+            let _ = execute_command("git", &["rebase", "--abort"], checkout, None);
+            if conflicts.trim().is_empty() {
+                return Err(format!(
+                    "rebase of PR #{} failed without a conflict; nothing pushed or merged",
+                    options.pr_number
+                ));
+            }
+            let body = format!(
+                "**🤖 Alucard merge: rebase conflict — needs human**\n\nRebasing `{head}` onto {} (`{base}`) conflicts in:\n\n{}\nNothing was pushed or merged.",
+                metadata.base,
+                conflicts.lines().map(|path| format!("- `{path}`")).collect::<Vec<_>>().join("\n")
+            );
+            merge_post(checkout, options.pr_number, &body, options.dry_run);
+            if !options.dry_run {
+                let _ = execute_command(
+                    "gh",
+                    &[
+                        "api",
+                        "-X",
+                        "POST",
+                        &format!(
+                            "repos/{{owner}}/{{repo}}/issues/{}/labels",
+                            options.pr_number
+                        ),
+                        "-f",
+                        "labels[]=needs-human",
+                    ],
+                    checkout,
+                    None,
+                );
+            }
+            return Err(format!(
+                "rebase of PR #{} failed; nothing pushed or merged",
+                options.pr_number
+            ));
+        }
+        (
+            git_output(checkout, &["rev-parse", "HEAD"])?
+                .trim()
+                .to_string(),
+            true,
+        )
+    };
+    let check_log_path = checkout.parent().unwrap().join("check.log");
+    let check = run_merge_check(
+        checkout,
+        check_command,
+        options.timeout_minutes,
+        &check_log_path,
+    )?;
+    let check_log = fs::read_to_string(&check_log_path).unwrap_or_default();
+    let evidence = format!("**🤖 Alucard merge: checks {}**\n\nRan `{}` on `{}`: exit {}.\n\n<details><summary>Last lines of output</summary>\n\n```\n{}\n```\n\n</details>", if check.success() { "passed" } else { "failed — not merged" }, check_command, new_head, check.code().unwrap_or(1), check_log.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+    if !check.success() {
+        merge_post(checkout, options.pr_number, &evidence, options.dry_run);
+        return Err(format!(
+            "checks failed; see {}/check.log",
+            checkout.parent().unwrap().display()
+        ));
+    }
+    if options.dry_run {
+        merge_post(checkout, options.pr_number, &evidence, true);
+        println!(
+            "Dry run: checks passed on {}; not pushing or merging.",
+            &new_head[..12]
+        );
+        return Ok(());
+    }
+    if rebased {
+        let lease = format!("--force-with-lease=refs/heads/{}:{}", metadata.branch, head);
+        let push = execute_command(
+            "git",
+            &[
+                "push",
+                "--quiet",
+                &lease,
+                "origin",
+                &format!("HEAD:refs/heads/{}", metadata.branch),
+            ],
+            checkout,
+            Some(Duration::from_secs(120)),
+        )
+        .map_err(|error| error.to_string())?;
+        if !push.status.success() {
+            return Err("push of rebased PR was rejected: the branch moved since it was checked. Nothing merged.".to_string());
+        }
+        for _ in 0..30 {
+            let pr_head = gh_text(
+                checkout,
+                &[
+                    "pr",
+                    "view",
+                    &options.pr_number.to_string(),
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+            )
+            .unwrap_or_default();
+            if pr_head.trim() == new_head {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    merge_post(checkout, options.pr_number, &evidence, false);
+    let merged = execute_command(
+        "gh",
+        &[
+            "pr",
+            "merge",
+            &options.pr_number.to_string(),
+            "--squash",
+            "--match-head-commit",
+            &new_head,
+        ],
+        checkout,
+        Some(Duration::from_secs(120)),
+    )
+    .map_err(|error| error.to_string())?;
+    if !merged.status.success() {
+        return Err(format!(
+            "merging PR #{} failed after checks passed",
+            options.pr_number
+        ));
+    }
+    let _ = execute_command(
+        "gh",
+        &[
+            "api",
+            "--silent",
+            "-X",
+            "DELETE",
+            &format!(
+                "repos/{{owner}}/{{repo}}/git/refs/heads/{}",
+                metadata.branch
+            ),
+        ],
+        checkout,
+        None,
+    );
+    println!("PR #{} merged.", options.pr_number);
+    Ok(())
+}
+
+fn run_merge_check(
+    checkout: &Path,
+    check_command: &str,
+    timeout_minutes: u64,
+    log_path: &Path,
+) -> Result<ExitStatus, String> {
+    let log = fs::File::create(log_path).map_err(|error| error.to_string())?;
+    Command::new("timeout")
+        .args([
+            "--kill-after",
+            "30s",
+            &format!("{timeout_minutes}m"),
+            "bash",
+            "-c",
+            check_command,
+        ])
+        .current_dir(checkout)
+        .stdout(Stdio::from(
+            log.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(log))
+        .status()
+        .map_err(|error| error.to_string())
+}
+
+fn merge_post(repository: &Path, number: i64, body: &str, dry_run: bool) {
+    if dry_run {
+        println!("\n--- dry run: would comment on PR #{number} ---\n{body}\n---");
+    } else {
+        let _ = execute_command(
+            "gh",
+            &["pr", "comment", &number.to_string(), "--body", body],
+            repository,
+            None,
+        );
     }
 }
 
@@ -664,6 +1177,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         let owner_run_id = run.id.clone();
         let mut attempt_run = run;
         let mut attempt = 1;
+        let iteration_started = Instant::now();
         let mut prepared =
             match prepare_attempt(&database, &options, &cache, &selected, &attempt_run) {
                 Ok(prepared) => prepared,
@@ -679,6 +1193,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     return fail(&format!("alucard: {error}"));
                 }
             };
+        let mut usage_log_dirs = vec![prepared.directory.clone()];
         if let Some(issue) = selected.issue.as_ref() {
             if let Err(error) = gh_output(
                 &options.queue.repository,
@@ -845,6 +1360,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         );
                         let _ = release(&database, &claim.id, &owner_run_id);
                         let _ = finish_run(&database, &attempt_run.id, "failed");
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
                         return fail(&format!("alucard: {error}"));
                     }
                     if let Some(local_id) = selected.local_id.as_ref() {
@@ -917,12 +1433,20 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     ) {
                         eprintln!("alucard: review gate for PR #{number}: {error}");
                     }
+                    report_iteration_usage(
+                        &options.queue.repository,
+                        &usage_log_dirs,
+                        iteration,
+                        number,
+                        iteration_started.elapsed().as_secs(),
+                    );
                     let _ = release(&database, &claim.id, &owner_run_id);
                     let _ = finish_run(&database, &attempt_run.id, "completed");
                     break;
                 }
                 Ok(None) => {
                     if classification == alucard::AgentExit::Billing {
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
                         release_without_pr(
                             &database,
                             &selected,
@@ -957,6 +1481,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                     &owner_run_id,
                                     &options.queue.repository,
                                 );
+                                print!("{}", usage_report_for_dirs(&usage_log_dirs));
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
@@ -977,12 +1502,14 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                     &options.queue.repository,
                                 );
                                 let _ = finish_run(&database, &attempt_run.id, "failed");
+                                print!("{}", usage_report_for_dirs(&usage_log_dirs));
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
+                        usage_log_dirs.push(prepared.directory.clone());
                         continue;
                     }
-                    if let Err(error) = recover_worker_changes(
+                    match recover_worker_changes(
                         &database,
                         &tools,
                         &options,
@@ -996,15 +1523,26 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         result.as_ref().ok().and_then(|value| value.status),
                         &log,
                     ) {
-                        eprintln!("alucard: recovery requires human attention: {error}");
-                        let _ = transition_task(
-                            &database,
-                            &selected.ledger_id,
-                            &claim.id,
-                            &owner_run_id,
-                            TaskStatus::Human,
-                        );
+                        Ok(Some(number)) => post_iteration_usage(
+                            &options.queue.repository,
+                            &usage_log_dirs,
+                            iteration,
+                            number,
+                            iteration_started.elapsed().as_secs(),
+                        ),
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("alucard: recovery requires human attention: {error}");
+                            let _ = transition_task(
+                                &database,
+                                &selected.ledger_id,
+                                &claim.id,
+                                &owner_run_id,
+                                TaskStatus::Human,
+                            );
+                        }
                     }
+                    print!("{}", usage_report_for_dirs(&usage_log_dirs));
                     let _ = release(&database, &claim.id, &owner_run_id);
                     if let Some(issue) = selected.issue.as_ref() {
                         if let Ok(operation) = begin_operation(
@@ -1048,6 +1586,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &options.queue.repository,
                     );
                     let _ = finish_run(&database, &attempt_run.id, "failed");
+                    print!("{}", usage_report_for_dirs(&usage_log_dirs));
                     return fail(&format!("alucard: {error}"));
                 }
             }
@@ -1060,6 +1599,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
 enum ReconciliationAction {
     Record {
         claim: alucard::AbandonedTaskClaim,
+        attempts: Vec<alucard::TaskClaimAttempt>,
         number: i64,
         branch: String,
         sha: String,
@@ -1078,6 +1618,13 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .to_string_lossy()
         .to_string();
+    replay_recovery_operations(database, repository, &repository_id)?;
+    for claim in abandoned_pull_request_claims(database, &repository_id)
+        .map_err(|error| error.to_string())?
+    {
+        release_abandoned_pull_request_claim(database, &claim)
+            .map_err(|error| error.to_string())?;
+    }
     let mut actions = Vec::new();
     for claim in
         abandoned_task_claims(database, &repository_id).map_err(|error| error.to_string())?
@@ -1109,6 +1656,7 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         {
             actions.push(ReconciliationAction::Record {
                 claim,
+                attempts,
                 number: *number,
                 branch: branch.clone(),
                 sha: sha.clone(),
@@ -1137,24 +1685,66 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         match action {
             ReconciliationAction::Record {
                 claim,
+                attempts,
                 number,
                 branch,
                 sha,
             } => {
-                record_task_pr(
+                let recovery = operation_exists(
                     database,
-                    &claim.task_id,
-                    &claim.lease_id,
-                    &claim.run_id,
-                    number,
-                    &branch,
-                    &sha,
+                    &claim.repository_id,
+                    &format!("recovery:{branch}"),
+                    "create_recovery_pr",
                 )
                 .map_err(|error| error.to_string())?;
+                if recovery {
+                    let checkout_path = attempts
+                        .iter()
+                        .find(|attempt| attempt.branch.as_deref() == Some(&branch))
+                        .and_then(|attempt| attempt.logs_path.as_deref())
+                        .map(PathBuf::from)
+                        .map(|path| path.join("repository"))
+                        .ok_or_else(|| {
+                            format!("recovery branch {branch} has no recorded checkout")
+                        })?;
+                    record_recovery_pr(
+                        database,
+                        &claim.task_id,
+                        &claim.lease_id,
+                        &claim.run_id,
+                        RecoveryPullRequest {
+                            number,
+                            branch: &branch,
+                            head_sha: &sha,
+                            reason: "interrupted",
+                            checkout_path: &checkout_path,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                } else {
+                    record_task_pr(
+                        database,
+                        &claim.task_id,
+                        &claim.lease_id,
+                        &claim.run_id,
+                        number,
+                        &branch,
+                        &sha,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
                 release(database, &claim.lease_id, &claim.run_id)
                     .map_err(|error| error.to_string())?;
                 finish_run(database, &claim.run_id, "interrupted")
                     .map_err(|error| error.to_string())?;
+                if recovery {
+                    ensure_recovery_annotations(
+                        database,
+                        repository,
+                        &claim.repository_id,
+                        number,
+                    )?;
+                }
             }
             ReconciliationAction::Human { claim, reason } => {
                 mark_claim_needs_reconciliation(database, &claim, &reason)
@@ -1167,6 +1757,195 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn ensure_recovery_annotations(
+    database: &Path,
+    repository: &Path,
+    repository_id: &str,
+    number: i64,
+) -> Result<(), String> {
+    let target = format!("recovery-pr:{number}");
+    for operation_type in ["alucard-label", "needs-human-label", "recovery_marker"] {
+        let operation = begin_operation(database, repository_id, &target, operation_type)
+            .map_err(|error| error.to_string())?;
+        match replay_recovery_annotation(repository, &target, operation_type) {
+            Ok(()) => {
+                finish_operation(database, &operation, None).map_err(|error| error.to_string())?
+            }
+            Err(error) => {
+                defer_operation(database, &operation, &error)
+                    .map_err(|database_error| database_error.to_string())?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryPushPayload {
+    checkout: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryPullRequestPayload {
+    base: String,
+    title: String,
+    body: String,
+}
+
+fn replay_recovery_operations(
+    database: &Path,
+    repository: &Path,
+    repository_id: &str,
+) -> Result<(), String> {
+    let mut operations =
+        pending_operations(database, repository_id).map_err(|error| error.to_string())?;
+    operations.sort_by_key(|operation| match operation.operation_type.as_str() {
+        "push" => 0,
+        "create_recovery_pr" => 1,
+        _ => 2,
+    });
+    for operation in operations {
+        let replay = match (
+            operation.target.strip_prefix("recovery:"),
+            operation.operation_type.as_str(),
+        ) {
+            (Some(branch), "push") => {
+                replay_recovery_push(repository, branch, operation.payload.as_deref())
+            }
+            (Some(branch), "create_recovery_pr") => {
+                replay_recovery_pr(repository, branch, operation.payload.as_deref())
+            }
+            (None, "alucard-label" | "needs-human-label" | "recovery_marker") => {
+                replay_recovery_annotation(repository, &operation.target, &operation.operation_type)
+            }
+            _ => continue,
+        };
+        match replay {
+            Ok(()) => finish_operation(database, &operation.id, None)
+                .map_err(|error| error.to_string())?,
+            Err(error) => {
+                defer_operation(database, &operation.id, &error)
+                    .map_err(|database_error| database_error.to_string())?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replay_recovery_push(
+    repository: &Path,
+    branch: &str,
+    payload: Option<&str>,
+) -> Result<(), String> {
+    if remote_branch_exists(repository, branch)? {
+        return Ok(());
+    }
+    let payload: RecoveryPushPayload =
+        serde_json::from_str(payload.ok_or("recovery push has no replay payload")?)
+            .map_err(|error| format!("could not parse recovery push payload: {error}"))?;
+    let output = execute_command(
+        "git",
+        &["push", "-u", "origin", branch],
+        &payload.checkout,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn replay_recovery_pr(
+    repository: &Path,
+    branch: &str,
+    payload: Option<&str>,
+) -> Result<(), String> {
+    if find_open_pr(repository, branch)?.is_some() {
+        return Ok(());
+    }
+    let payload: RecoveryPullRequestPayload =
+        serde_json::from_str(payload.ok_or("recovery PR has no replay payload")?)
+            .map_err(|error| format!("could not parse recovery PR payload: {error}"))?;
+    gh_output(
+        repository,
+        &[
+            "pr",
+            "create",
+            "--head",
+            branch,
+            "--base",
+            &payload.base,
+            "--draft",
+            "--title",
+            &payload.title,
+            "--body",
+            &payload.body,
+        ],
+        "could not create recovery pull request",
+    )?;
+    find_open_pr(repository, branch)?
+        .ok_or_else(|| "recovery PR was created but cannot be discovered".to_string())?;
+    Ok(())
+}
+
+fn replay_recovery_annotation(
+    repository: &Path,
+    target: &str,
+    operation_type: &str,
+) -> Result<(), String> {
+    let number = target
+        .strip_prefix("recovery-pr:")
+        .ok_or_else(|| "recovery annotation has an invalid target".to_string())?;
+    let view = gh_output(
+        repository,
+        &["pr", "view", number, "--json", "labels,comments"],
+        "could not inspect recovery pull request",
+    )?;
+    let view: serde_json::Value = serde_json::from_slice(&view)
+        .map_err(|error| format!("could not parse recovery pull request: {error}"))?;
+    let labels = view["labels"]
+        .as_array()
+        .ok_or("recovery PR labels are missing")?;
+    let labelled = |name| {
+        labels
+            .iter()
+            .any(|label| label["name"].as_str() == Some(name))
+    };
+    let marked = view["comments"]
+        .as_array()
+        .ok_or("recovery PR comments are missing")?
+        .iter()
+        .any(|comment| comment["body"].as_str() == Some(RECOVERY_MARKER_BODY));
+    match operation_type {
+        "alucard-label" if labelled("alucard") => Ok(()),
+        "needs-human-label" if labelled("needs-human") => Ok(()),
+        "recovery_marker" if marked => Ok(()),
+        "alucard-label" => gh_output(
+            repository,
+            &["pr", "edit", number, "--add-label", "alucard"],
+            "could not label recovery PR",
+        )
+        .map(|_| ()),
+        "needs-human-label" => gh_output(
+            repository,
+            &["pr", "edit", number, "--add-label", "needs-human"],
+            "could not label recovery PR",
+        )
+        .map(|_| ()),
+        "recovery_marker" => gh_output(
+            repository,
+            &["pr", "comment", number, "--body", RECOVERY_MARKER_BODY],
+            "could not post recovery marker",
+        )
+        .map(|_| ()),
+        _ => Ok(()),
+    }
 }
 
 fn abandoned_branch(attempt: &alucard::TaskClaimAttempt) -> Option<String> {
@@ -2450,7 +3229,7 @@ fn recover_worker_changes(
     classification: alucard::AgentExit,
     status: Option<i32>,
     worker_log: &Path,
-) -> Result<(), String> {
+) -> Result<Option<i64>, String> {
     if classification == alucard::AgentExit::Clean
         || (classification == alucard::AgentExit::Transport && status == Some(0))
     {
@@ -2461,7 +3240,8 @@ fn recover_worker_changes(
             run_id,
             &prepared.run.repository_id,
             &options.queue.repository,
-        );
+        )
+        .map(|()| None);
     }
     let base = prepared.run.base_sha.as_deref().unwrap_or("HEAD");
     let commits = execute_command(
@@ -2480,7 +3260,7 @@ fn recover_worker_changes(
     let dirty = !dirty.stdout.is_empty();
     if !dirty && commit_count == 0 {
         if classification == alucard::AgentExit::Transport {
-            return Ok(());
+            return Ok(None);
         }
         return release_pending(
             database,
@@ -2489,7 +3269,8 @@ fn recover_worker_changes(
             run_id,
             &prepared.run.repository_id,
             &options.queue.repository,
-        );
+        )
+        .map(|()| None);
     }
     let handoff = if wrapup_applies(classification) && wrapup_enabled(settings) {
         run_wrapup_agent(
@@ -2535,8 +3316,45 @@ fn recover_worker_changes(
         }
     }
     let target = format!("recovery:{}", prepared.branch);
-    let push = begin_operation(database, &prepared.run.repository_id, &target, "push")
-        .map_err(|error| error.to_string())?;
+    let push_payload = serde_json::json!({ "checkout": prepared.clone }).to_string();
+    let push = begin_operation_with_payload(
+        database,
+        &prepared.run.repository_id,
+        &target,
+        "push",
+        Some(&push_payload),
+    )
+    .map_err(|error| error.to_string())?;
+    let pr = if classification == alucard::AgentExit::Transport && commit_count == 0 {
+        None
+    } else {
+        let title = recovery_title(iteration, classification, status);
+        let body = recovery_body(
+            task,
+            classification,
+            status,
+            commit_count,
+            handoff.as_deref(),
+        );
+        let pr_payload = serde_json::json!({
+            "base": options.base,
+            "title": title,
+            "body": body,
+        })
+        .to_string();
+        Some((
+            begin_operation_with_payload(
+                database,
+                &prepared.run.repository_id,
+                &target,
+                "create_recovery_pr",
+                Some(&pr_payload),
+            )
+            .map_err(|error| error.to_string())?,
+            title,
+            body,
+        ))
+    };
     let pushed = execute_command(
         "git",
         &["push", "-u", "origin", &prepared.branch],
@@ -2547,6 +3365,9 @@ fn recover_worker_changes(
     if !pushed.status.success() {
         let error = String::from_utf8_lossy(&pushed.stderr).trim().to_string();
         let _ = finish_operation(database, &push, Some(&error));
+        if let Some((pr, _, _)) = &pr {
+            let _ = finish_operation(database, pr, Some(&error));
+        }
         record_recovery_failure(
             database,
             &task.ledger_id,
@@ -2570,10 +3391,14 @@ fn recover_worker_changes(
             run_id,
             &prepared.run.repository_id,
             &options.queue.repository,
-        );
+        )
+        .map(|()| None);
     }
     if let Some((number, branch, sha)) = find_open_pr(&options.queue.repository, &prepared.branch)?
     {
+        if let Some((pr, _, _)) = &pr {
+            finish_operation(database, pr, None).map_err(|error| error.to_string())?;
+        }
         return record_recovery(
             database,
             task,
@@ -2586,23 +3411,10 @@ fn recover_worker_changes(
             commit_count,
             classification,
             status,
-        );
+        )
+        .map(Some);
     }
-    let title = recovery_title(iteration, classification, status);
-    let body = recovery_body(
-        task,
-        classification,
-        status,
-        commit_count,
-        handoff.as_deref(),
-    );
-    let pr = begin_operation(
-        database,
-        &prepared.run.repository_id,
-        &target,
-        "create_recovery_pr",
-    )
-    .map_err(|error| error.to_string())?;
+    let (pr, title, body) = pr.expect("recovery PR intent is required after a non-clean push");
     let output = execute_command(
         "gh",
         &[
@@ -2655,6 +3467,7 @@ fn recover_worker_changes(
         classification,
         status,
     )
+    .map(Some)
 }
 
 fn release_pending(
@@ -2712,7 +3525,7 @@ fn record_recovery(
     commits: usize,
     classification: alucard::AgentExit,
     status: Option<i32>,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     record_recovery_pr(
         database,
         &task.ledger_id,
@@ -2728,13 +3541,20 @@ fn record_recovery(
     )
     .map_err(|error| error.to_string())?;
     let target = format!("recovery-pr:{number}");
-    let alucard_label = begin_operation(
-        database,
-        &prepared.run.repository_id,
-        &target,
-        "alucard-label",
-    )
-    .map_err(|error| error.to_string())?;
+    let annotations =
+        ["alucard-label", "needs-human-label", "recovery_marker"].map(|operation_type| {
+            begin_operation(
+                database,
+                &prepared.run.repository_id,
+                &target,
+                operation_type,
+            )
+            .map_err(|error| error.to_string())
+        });
+    let [alucard_label, label, marker] = annotations;
+    let alucard_label = alucard_label?;
+    let label = label?;
+    let marker = marker?;
     let alucard_labelled = gh_output(
         &prepared.clone,
         &["pr", "edit", &number.to_string(), "--add-label", "alucard"],
@@ -2744,15 +3564,10 @@ fn record_recovery(
     finish_operation(database, &alucard_label, alucard_label_error.as_deref())
         .map_err(|error| error.to_string())?;
     if let Some(error) = alucard_label_error {
+        finish_operation(database, &label, Some(&error)).map_err(|error| error.to_string())?;
+        finish_operation(database, &marker, Some(&error)).map_err(|error| error.to_string())?;
         return Err(error);
     }
-    let label = begin_operation(
-        database,
-        &prepared.run.repository_id,
-        &target,
-        "needs-human-label",
-    )
-    .map_err(|error| error.to_string())?;
     let labelled = gh_output(
         &prepared.clone,
         &[
@@ -2768,15 +3583,9 @@ fn record_recovery(
     finish_operation(database, &label, label_error.as_deref())
         .map_err(|error| error.to_string())?;
     if let Some(error) = label_error {
+        finish_operation(database, &marker, Some(&error)).map_err(|error| error.to_string())?;
         return Err(error);
     }
-    let marker = begin_operation(
-        database,
-        &prepared.run.repository_id,
-        &target,
-        "recovery_marker",
-    )
-    .map_err(|error| error.to_string())?;
     let comment = gh_output(
         &prepared.clone,
         &[
@@ -2839,7 +3648,7 @@ fn record_recovery(
         finish_operation(database, &label_operation, label_error.as_deref())
             .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    Ok(number)
 }
 
 fn recovery_title(
@@ -3795,6 +4604,69 @@ fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>,
     }
 }
 
+fn post_iteration_usage(
+    repository: &Path,
+    log_dirs: &[PathBuf],
+    iteration: usize,
+    pr: i64,
+    duration: u64,
+) {
+    let Some(body) = iteration_usage_comment_for_dirs(log_dirs, iteration, Some(duration)) else {
+        return;
+    };
+    let pr_number = pr.to_string();
+    let issue = gh_output(
+        repository,
+        &["pr", "view", &pr_number, "--json", "body", "--jq", ".body"],
+        "could not read pull request body for usage comment",
+    )
+    .ok()
+    .and_then(|body| closing_issue_number(&String::from_utf8_lossy(&body)));
+    let (kind, target) = match issue {
+        Some(number) => ("issue", number.to_string()),
+        None => ("PR", pr_number),
+    };
+    println!("Posting token usage to {kind} #{target}...");
+    let command = if kind == "issue" { "issue" } else { "pr" };
+    if let Err(error) = gh_output(
+        repository,
+        &[command, "comment", &target, "--body", &body],
+        "could not post token usage",
+    ) {
+        if let Some(log_dir) = log_dirs.last() {
+            log_event(log_dir, &format!("Measurement: {error} — continuing."));
+        }
+    }
+}
+
+fn report_iteration_usage(
+    repository: &Path,
+    log_dirs: &[PathBuf],
+    iteration: usize,
+    pr: i64,
+    duration: u64,
+) {
+    print!("{}", usage_report_for_dirs(log_dirs));
+    post_iteration_usage(repository, log_dirs, iteration, pr, duration);
+}
+
+fn closing_issue_number(body: &str) -> Option<i64> {
+    let lowercase = body.to_ascii_lowercase();
+    let words = lowercase
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '#'
+            })
+        })
+        .collect::<Vec<_>>();
+    words.windows(2).find_map(|words| {
+        matches!(words[0], "closes" | "fixes" | "resolves")
+            .then(|| words[1].strip_prefix('#')?.parse().ok())
+            .flatten()
+    })
+}
+
 fn fetch_open_local_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
     let output = gh_output(
         repository,
@@ -4160,6 +5032,24 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn no_recovery_pr_still_reports_worker_usage() {
+        let logs =
+            std::env::temp_dir().join(format!("alucard-usage-report-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("iter-1.jsonl"),
+            r#"{"type":"result","modelUsage":{"claude":{"inputTokens":12,"outputTokens":34}},"num_turns":1,"total_cost_usd":0.01}"#,
+        )
+        .unwrap();
+
+        let report = usage_report(&logs);
+
+        assert!(report.contains("=== Alucard Token Usage:"));
+        assert!(report.contains("worker 1"));
+        fs::remove_dir_all(logs).unwrap();
     }
 
     #[test]

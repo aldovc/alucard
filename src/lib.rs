@@ -152,6 +152,11 @@ impl AgentSettings {
         self.get(key).is_some()
     }
 
+    /// Returns an operator-provided setting loaded from the environment or env file.
+    pub fn value(&self, key: &str) -> Option<&str> {
+        self.get(key)
+    }
+
     pub fn setting(&self, role: AgentRole, suffix: &str, default: &str) -> String {
         let role_key = format!("ALUCARD_{}_{}", role.setting_name(), suffix);
         self.get(&role_key)
@@ -1035,23 +1040,25 @@ pub fn extract_agent_usage(log: &Path) -> Option<Usage> {
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect::<Vec<_>>();
-    if let Some(claude) = records
-        .iter()
+    if let Some(claude) = contents
+        .lines()
         .rev()
+        .take(20)
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|record| record["type"] == "result")
     {
+        let mut usage = Usage::default();
         if let Some(models) = claude.get("modelUsage").and_then(Value::as_object) {
-            let mut usage = Usage::default();
             for model in models.values() {
                 usage.input += model["inputTokens"].as_u64().unwrap_or(0);
                 usage.output += model["outputTokens"].as_u64().unwrap_or(0);
                 usage.cache_read += model["cacheReadInputTokens"].as_u64().unwrap_or(0);
                 usage.cache_write += model["cacheCreationInputTokens"].as_u64().unwrap_or(0);
             }
-            usage.turns = claude["num_turns"].as_u64().unwrap_or(0);
-            usage.cost = claude["total_cost_usd"].as_f64();
-            return Some(usage);
         }
+        usage.turns = claude["num_turns"].as_u64().unwrap_or(0);
+        usage.cost = Some(claude["total_cost_usd"].as_f64().unwrap_or(0.0));
+        return Some(usage);
     }
     let mut usage = Usage::default();
     let mut found = false;
@@ -1080,6 +1087,271 @@ pub struct Usage {
     pub cache_write: u64,
     pub turns: u64,
     pub cost: Option<f64>,
+}
+
+/// Formats the end-of-run token table emitted by the Bash orchestrator.
+pub fn usage_report(log_dir: &Path) -> String {
+    usage_report_for_dirs(&[log_dir.to_path_buf()])
+}
+
+/// Formats the end-of-run token table from all logs belonging to one run.
+pub fn usage_report_for_dirs(log_dirs: &[PathBuf]) -> String {
+    let mut rows = usage_rows(log_dirs, None);
+    if rows.is_empty() {
+        return String::new();
+    }
+    rows.sort_by(|left, right| version_cmp(&left.name, &right.name));
+    let totals = usage_totals(&rows);
+    let separator = "-".repeat(86);
+    let mut report = format!(
+        "\n=== Alucard Token Usage: {} ===\n",
+        log_dirs
+            .last()
+            .map(PathBuf::as_path)
+            .unwrap_or_else(|| Path::new(""))
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+    );
+    report.push_str(&usage_header());
+    report.push_str(&format!("{separator}\n"));
+    for row in &rows {
+        report.push_str(&usage_console_row(&row.label, &row.usage));
+    }
+    report.push_str(&format!("{separator}\n"));
+    report.push_str(&usage_console_row("TOTAL", &totals));
+    report.push('\n');
+    report
+}
+
+/// Builds the Bash-compatible token-usage comment for one iteration.
+pub fn iteration_usage_comment(
+    log_dir: &Path,
+    iteration: usize,
+    duration: Option<u64>,
+) -> Option<String> {
+    iteration_usage_comment_for_dirs(&[log_dir.to_path_buf()], iteration, duration)
+}
+
+/// Builds the Bash-compatible token-usage comment from all logs belonging to one iteration.
+pub fn iteration_usage_comment_for_dirs(
+    log_dirs: &[PathBuf],
+    iteration: usize,
+    duration: Option<u64>,
+) -> Option<String> {
+    let rows = usage_rows(log_dirs, Some(iteration));
+    if rows.is_empty() {
+        return None;
+    }
+    let totals = usage_totals(&rows);
+    let mut review_rounds = std::collections::BTreeSet::new();
+    let mut feedback_rounds = std::collections::BTreeSet::new();
+    for name in log_dirs.iter().flat_map(|log_dir| jsonl_names(log_dir)) {
+        let name = name.strip_suffix(".jsonl").unwrap_or(&name);
+        let prefix = format!("iter-{iteration}-");
+        if let Some(rest) = name.strip_prefix(&prefix) {
+            if let Some(round) = rest.strip_prefix("review-") {
+                review_rounds.insert(round.split('-').next().unwrap_or_default().to_string());
+            } else if let Some(round) = rest.strip_prefix("feedback-") {
+                feedback_rounds.insert(round.split('-').next().unwrap_or_default().to_string());
+            }
+        }
+    }
+    let summary = match duration {
+        Some(seconds) if seconds >= 3600 => {
+            format!("Duration: {}h {}m · ", seconds / 3600, seconds % 3600 / 60)
+        }
+        Some(seconds) => format!("Duration: {}m {}s · ", seconds / 60, seconds % 60),
+        None => String::new(),
+    } + &format!(
+        "Review rounds: {} · Feedback rounds: {}",
+        review_rounds.len(),
+        feedback_rounds.len()
+    );
+    let mut body = format!(
+        "**🤖 Alucard token usage (iteration {iteration})**\n\n{summary}\n\n<details><summary>Per-agent breakdown</summary>\n\n| Agent | Input | Output | Cache Read | Cache Write | Turns | Cost |\n|-------|------:|-------:|-----------:|------------:|------:|-----:|\n"
+    );
+    for row in rows {
+        body.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            row.label,
+            row.usage.input,
+            row.usage.output,
+            row.usage.cache_read,
+            row.usage.cache_write,
+            row.usage.turns,
+            display_cost(row.usage.cost)
+        ));
+    }
+    body.push_str(&format!(
+        "| **TOTAL** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** |\n\n</details>",
+        totals.input,
+        totals.output,
+        totals.cache_read,
+        totals.cache_write,
+        totals.turns,
+        display_cost(totals.cost)
+    ));
+    Some(body)
+}
+
+#[derive(Clone)]
+struct UsageRow {
+    name: String,
+    label: String,
+    usage: Usage,
+}
+
+fn usage_rows(log_dirs: &[PathBuf], iteration: Option<usize>) -> Vec<UsageRow> {
+    let mut rows = Vec::new();
+    for log_dir in log_dirs {
+        for name in jsonl_names(log_dir) {
+            let Some(label) = usage_label(&name, iteration) else {
+                continue;
+            };
+            if let Some(usage) = extract_agent_usage(&log_dir.join(&name)) {
+                rows.push(UsageRow { name, label, usage });
+            }
+        }
+    }
+    rows
+}
+
+fn jsonl_names(log_dir: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(log_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".jsonl"))
+        .collect::<Vec<_>>();
+    names.sort_by(|left, right| version_cmp(left, right));
+    names
+}
+
+fn usage_label(name: &str, iteration: Option<usize>) -> Option<String> {
+    let base = name.strip_suffix(".jsonl")?;
+    if let Some(iteration) = iteration {
+        let prefix = format!("iter-{iteration}");
+        if base == prefix {
+            return Some(format!("worker {iteration}"));
+        }
+        let rest = base.strip_prefix(&(prefix + "-"))?;
+        return match rest {
+            value if value.starts_with("fix-") => {
+                Some(format!("ci-fix {iteration}.{}", &value[4..]))
+            }
+            value if value.starts_with("review-") => {
+                Some(format!("review {iteration}.{}", &value[7..]))
+            }
+            value if value.starts_with("feedback-") => {
+                Some(format!("feedback {iteration}.{}", &value[9..]))
+            }
+            value if value.starts_with("attempt-") => {
+                Some(format!("worker attempt {}", &value[8..]))
+            }
+            "wrapup" => Some("wrap-up".to_string()),
+            _ => None,
+        };
+    }
+    let rest = base.strip_prefix("iter-");
+    Some(match rest {
+        Some(value) if value.contains("-fix-") => {
+            format!("ci-fix {}", value.replacen("-fix-", ".", 1))
+        }
+        Some(value) if value.contains("-review-") => {
+            format!("review {}", value.replacen("-review-", ".", 1))
+        }
+        Some(value) if value.contains("-feedback-") => {
+            format!("feedback {}", value.replacen("-feedback-", ".", 1))
+        }
+        Some(value) if value.ends_with("-wrapup") => {
+            format!("wrap-up {}", value.trim_end_matches("-wrapup"))
+        }
+        Some(value) => format!("worker {value}"),
+        None => base.to_string(),
+    })
+}
+
+fn usage_totals(rows: &[UsageRow]) -> Usage {
+    rows.iter().fold(Usage::default(), |mut total, row| {
+        total.input += row.usage.input;
+        total.output += row.usage.output;
+        total.cache_read += row.usage.cache_read;
+        total.cache_write += row.usage.cache_write;
+        total.turns += row.usage.turns;
+        if let Some(cost) = row.usage.cost {
+            total.cost = Some(
+                format!("{:.4}", total.cost.unwrap_or(0.0) + cost)
+                    .parse()
+                    .unwrap_or(0.0),
+            );
+        }
+        total
+    })
+}
+
+fn usage_header() -> String {
+    format!(
+        "{:<22}  {:>10}  {:>8}  {:>12}  {:>12}  {:>5}  {:>8}\n",
+        "Agent", "Input", "Output", "Cache Read", "Cache Write", "Turns", "Cost"
+    )
+}
+
+fn usage_console_row(label: &str, usage: &Usage) -> String {
+    format!(
+        "{label:<22}  {:>10}  {:>8}  {:>12}  {:>12}  {:>5}  {:>8}\n",
+        usage.input,
+        usage.output,
+        usage.cache_read,
+        usage.cache_write,
+        usage.turns,
+        display_cost(usage.cost)
+    )
+}
+
+fn display_cost(cost: Option<f64>) -> String {
+    cost.map(|value| format!("${value:.3}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    fn parts(value: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut digits = value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit());
+        for (index, character) in value.char_indices().skip(1) {
+            if character.is_ascii_digit() != digits {
+                parts.push(&value[start..index]);
+                start = index;
+                digits = !digits;
+            }
+        }
+        parts.push(&value[start..]);
+        parts
+    }
+    let left = left.strip_suffix(".jsonl").unwrap_or(left);
+    let right = right.strip_suffix(".jsonl").unwrap_or(right);
+    let left_parts = parts(left);
+    let right_parts = parts(right);
+    for (left_part, right_part) in left_parts.iter().zip(right_parts.iter()) {
+        let order = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
+            (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
+            _ => left_part.cmp(right_part),
+        };
+        if order != std::cmp::Ordering::Equal {
+            return order;
+        }
+    }
+    match left_parts.len().cmp(&right_parts.len()) {
+        std::cmp::Ordering::Equal => {}
+        order => return order,
+    }
+    left.cmp(right)
 }
 
 /// Writes the stable run summary used by Bash measurement consumers.
@@ -2578,6 +2850,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("../migrations/0006_retry_owner.sql")),
     (7, include_str!("../migrations/0007_measurements.sql")),
     (8, include_str!("../migrations/0008_review_verdict.sql")),
+    (9, include_str!("../migrations/0009_operation_payload.sql")),
 ];
 
 pub struct DatabaseStatus {
@@ -2639,6 +2912,15 @@ pub struct Recovery {
     pub failure_reason: Option<String>,
 }
 
+/// A remote side effect that must be reconciled after an interrupted run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PendingOperation {
+    pub id: String,
+    pub target: String,
+    pub operation_type: String,
+    pub payload: Option<String>,
+}
+
 /// An active task claim whose owning process is no longer alive on this host.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AbandonedTaskClaim {
@@ -2647,6 +2929,13 @@ pub struct AbandonedTaskClaim {
     pub task_id: String,
     pub repository_id: String,
     pub branch: Option<String>,
+}
+
+/// An active pull request claim whose owning process is no longer alive on this host.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AbandonedPullRequestClaim {
+    pub lease_id: String,
+    pub run_id: String,
 }
 
 /// A run that may still be working on a task claimed by an earlier run.
@@ -2922,6 +3211,43 @@ pub fn acquire_pr(
     Ok(claim)
 }
 
+/// Creates a manual merge run before acquiring its pull request lease.
+pub fn start_merge_run(
+    path: &Path,
+    repository: &Path,
+    logs_root: &Path,
+) -> Result<Run, DatabaseError> {
+    migrate(path)?;
+    let repository = repository.canonicalize()?;
+    let repository_name = repository
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
+    let repository_id = repository.to_string_lossy().to_string();
+    let run_id = Uuid::new_v4().to_string();
+    let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
+         VALUES (?1, '', ?2, '', datetime('now'))",
+        params![repository_id, repository_name],
+    )?;
+    connection.execute(
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, logs_path, pid, hostname)
+         VALUES (?1, ?2, 'merge', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5)",
+        params![run_id, repository_id, logs_path, std::process::id(), hostname()?],
+    )?;
+    Ok(Run {
+        id: run_id,
+        repository_id,
+        command: "merge".to_string(),
+        status: "running".to_string(),
+        base_sha: None,
+        image: None,
+        logs_path: Some(logs_path),
+    })
+}
+
 pub fn heartbeat(path: &Path, lease_id: &str, run_id: &str) -> Result<(), ClaimError> {
     update_active_claim(path, lease_id, run_id, "heartbeat_at = datetime('now')")
 }
@@ -3111,6 +3437,17 @@ pub fn record_recovery_pr(
          ON CONFLICT(original_run_id) DO UPDATE SET pull_request_number = excluded.pull_request_number, branch = excluded.branch, reason = excluded.reason, checkout_path = excluded.checkout_path",
         (Uuid::new_v4().to_string(), task_id, run_id, recovery.branch, recovery.number, recovery.reason, recovery.checkout_path.to_string_lossy()),
     )?;
+    let target = format!("recovery-pr:{}", recovery.number);
+    for operation_type in ["alucard-label", "needs-human-label", "recovery_marker"] {
+        transaction.execute(
+            "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 0, datetime('now'), datetime('now'))
+             ON CONFLICT(repository_id, target, operation_type) DO UPDATE SET
+               phase = CASE WHEN operations.phase = 'failed' THEN 'pending' ELSE operations.phase END,
+               updated_at = datetime('now')",
+            (Uuid::new_v4().to_string(), &repository_id, &target, operation_type),
+        )?;
+    }
     transaction.execute("UPDATE tasks SET status = 'in_flight', pr_number = ?1, updated_at = datetime('now') WHERE id = ?2", (recovery.number, task_id))?;
     transaction.commit()?;
     Ok(())
@@ -3142,18 +3479,84 @@ pub fn begin_operation(
     target: &str,
     operation_type: &str,
 ) -> Result<String, DatabaseError> {
+    begin_operation_with_payload(path, repository_id, target, operation_type, None)
+}
+
+/// Creates a durable remote-operation intent, including any data needed to replay it.
+pub fn begin_operation_with_payload(
+    path: &Path,
+    repository_id: &str,
+    target: &str,
+    operation_type: &str,
+    payload: Option<&str>,
+) -> Result<String, DatabaseError> {
     let connection = open(path)?;
     let id = Uuid::new_v4().to_string();
     connection.execute(
-        "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', 0, datetime('now'), datetime('now'))
-         ON CONFLICT(repository_id, target, operation_type) DO NOTHING",
-        (&id, repository_id, target, operation_type),
+        "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, payload, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, datetime('now'), datetime('now'))
+         ON CONFLICT(repository_id, target, operation_type) DO UPDATE SET
+           payload = COALESCE(operations.payload, excluded.payload),
+           phase = CASE WHEN operations.phase = 'failed' THEN 'pending' ELSE operations.phase END,
+           updated_at = datetime('now')",
+        (&id, repository_id, target, operation_type, payload),
     )?;
     Ok(connection.query_row(
         "SELECT id FROM operations WHERE repository_id = ?1 AND target = ?2 AND operation_type = ?3",
         (repository_id, target, operation_type), |row| row.get(0),
     )?)
+}
+
+/// Lists recovery operations eligible for replay for one repository.
+pub fn pending_operations(
+    path: &Path,
+    repository_id: &str,
+) -> Result<Vec<PendingOperation>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, target, operation_type, payload FROM operations
+         WHERE repository_id = ?1 AND phase = 'pending' ORDER BY created_at, id",
+    )?;
+    let operations = statement
+        .query_map([repository_id], |row| {
+            Ok(PendingOperation {
+                id: row.get(0)?,
+                target: row.get(1)?,
+                operation_type: row.get(2)?,
+                payload: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)?;
+    Ok(operations)
+}
+
+/// Reports whether a recovery operation was journaled, including completed intents.
+pub fn operation_exists(
+    path: &Path,
+    repository_id: &str,
+    target: &str,
+    operation_type: &str,
+) -> Result<bool, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE repository_id = ?1 AND target = ?2 AND operation_type = ?3)",
+            (repository_id, target, operation_type),
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+/// Keeps a failed replay eligible for the next startup attempt.
+pub fn defer_operation(path: &Path, operation_id: &str, error: &str) -> Result<(), DatabaseError> {
+    let connection = open(path)?;
+    connection.execute(
+        "UPDATE operations SET phase = 'pending', attempt_count = attempt_count + 1,
+         last_error = ?1, updated_at = datetime('now') WHERE id = ?2",
+        (error, operation_id),
+    )?;
+    Ok(())
 }
 
 /// Completes or records the failure of a journaled remote operation.
@@ -3231,6 +3634,43 @@ pub fn abandoned_task_claims(
     Ok(claims)
 }
 
+/// Lists pull request claims whose local owner process has exited.
+pub fn abandoned_pull_request_claims(
+    path: &Path,
+    repository_id: &str,
+) -> Result<Vec<AbandonedPullRequestClaim>, DatabaseError> {
+    let connection = open(path)?;
+    let hostname = hostname()?;
+    let mut statement = connection.prepare(
+        "SELECT claims.id, claims.run_id
+         FROM claims
+         JOIN runs ON runs.id = claims.run_id
+         WHERE claims.state = 'active' AND claims.resource_kind = 'pr'
+             AND claims.repository_id = ?2
+             AND runs.hostname = ?1 AND runs.pid IS NOT NULL",
+    )?;
+    let claims = statement
+        .query_map((hostname, repository_id), |row| {
+            Ok(AbandonedPullRequestClaim {
+                lease_id: row.get(0)?,
+                run_id: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|claim| {
+            connection
+                .query_row(
+                    "SELECT pid FROM runs WHERE id = ?1",
+                    [&claim.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok_and(|pid| !process_is_alive(pid))
+        })
+        .collect();
+    Ok(claims)
+}
+
 /// Lists the claim owner and every retry run that can still be working on its task.
 pub fn task_claim_attempts(
     path: &Path,
@@ -3269,6 +3709,30 @@ pub fn release_abandoned_task_claim(
     )?;
     release(path, &claim.lease_id, &claim.run_id)?;
     finish_run(path, &claim.run_id, "interrupted")?;
+    Ok(())
+}
+
+/// Releases a pull request claim left by an interrupted merge run.
+pub fn release_abandoned_pull_request_claim(
+    path: &Path,
+    claim: &AbandonedPullRequestClaim,
+) -> Result<(), ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE claims SET state = 'released', heartbeat_at = datetime('now')
+         WHERE id = ?1 AND run_id = ?2 AND state = 'active'",
+        (&claim.lease_id, &claim.run_id),
+    )?;
+    if changed != 1 {
+        return Err(ClaimError::LeaseNotActive);
+    }
+    transaction.execute(
+        "UPDATE runs SET status = 'interrupted', heartbeat_at = datetime('now'), ended_at = datetime('now')
+         WHERE id = ?1",
+        [&claim.run_id],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -3989,6 +4453,67 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_pull_request_claims_release_only_dead_merge_owners() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        let hostname = hostname().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repository', '', 'repository', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        for (run_id, pid) in [
+            ("dead-merge", i64::MAX),
+            ("live-merge", i64::from(std::process::id())),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, pid, hostname)
+                     VALUES (?1, 'repository', 'merge', 'running', datetime('now'), datetime('now'), ?2, ?3)",
+                    params![run_id, pid, hostname],
+                )
+                .unwrap();
+        }
+        for (claim_id, resource_key, run_id) in [
+            ("dead-claim", "9", "dead-merge"),
+            ("live-claim", "10", "live-merge"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                     VALUES (?1, 'repository', 'pr', ?2, ?3, 'active', datetime('now'), datetime('now'))",
+                    params![claim_id, resource_key, run_id],
+                )
+                .unwrap();
+        }
+
+        let claims = abandoned_pull_request_claims(&path, "repository").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].run_id, "dead-merge");
+        release_abandoned_pull_request_claim(&path, &claims[0]).unwrap();
+        assert_eq!(
+            find_run(&path, "dead-merge").unwrap().unwrap().status,
+            "interrupted"
+        );
+        let live_claim: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE id = 'live-claim' AND state = 'active')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(live_claim);
+        acquire_pr(&path, "repository", 9, "live-merge").unwrap();
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn abandoned_claim_reconciliation_releases_once_with_pr_history() {
         let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
@@ -4041,6 +4566,85 @@ mod tests {
         assert!(abandoned_task_claims(&path, "repository")
             .unwrap()
             .is_empty());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_pr_link_journals_all_annotation_intents() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repository', '', 'repository', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+                 VALUES ('run', 'repository', 'run', 'running', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+                 VALUES ('task', 'repository', 'local', 'task', '', 'claimed', '[]', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                 VALUES ('claim', 'repository', 'task', 'task', 'run', 'active', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+
+        record_recovery_pr(
+            &path,
+            "task",
+            "claim",
+            "run",
+            RecoveryPullRequest {
+                number: 91,
+                branch: "alucard/recovery",
+                head_sha: "sha",
+                reason: "Exhausted",
+                checkout_path: &directory,
+            },
+        )
+        .unwrap();
+
+        let operations = pending_operations(&path, "repository").unwrap();
+        assert_eq!(operations.len(), 3);
+        assert!(operations
+            .iter()
+            .all(|operation| operation.target == "recovery-pr:91"));
+        let mut operation_types = operations
+            .iter()
+            .map(|operation| operation.operation_type.as_str())
+            .collect::<Vec<_>>();
+        operation_types.sort_unstable();
+        assert_eq!(
+            operation_types,
+            ["alucard-label", "needs-human-label", "recovery_marker"]
+        );
+        assert_eq!(
+            open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT pull_request_number FROM recovery WHERE original_run_id = 'run'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            91
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
