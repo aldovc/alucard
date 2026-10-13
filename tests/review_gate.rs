@@ -270,7 +270,7 @@ case "$1 $2" in
     if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
       feedback_attempts=$(wc -l < "$ALUCARD_FEEDBACK_ATTEMPTS")
       repair_attempts=$(wc -l < "$ALUCARD_CI_FIX_ATTEMPTS")
-      if [ "$repair_attempts" -ge $(((feedback_attempts + 1) * 2)) ]; then
+      if [ "$repair_attempts" -eq $(((feedback_attempts + 1) * 2)) ]; then
         exit 0
       fi
       echo "checks failed" >&2
