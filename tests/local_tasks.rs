@@ -92,6 +92,30 @@ fn issue_blockers_use_the_open_issue_set() {
 }
 
 #[test]
+fn inline_issue_blockers_use_the_open_issue_set() {
+    let parsed = parse_tasks("## [ ] 1: Blocked\n\nThis task is Blocked by #100.\n").unwrap();
+
+    assert_eq!(parsed.tasks[0].issue_blockers, [100]);
+    assert!(local_queue_with_open_issues(&parsed.tasks, Some(&[100])).is_empty());
+}
+
+#[test]
+fn parser_normalizes_crlf_task_content() {
+    let parsed =
+        parse_tasks("# Context\r\n\r\n## [ ] 1: Ready\r\n\r\nBlocked by: none\r\n").unwrap();
+
+    assert_eq!(parsed.tasks[0].title, "Ready");
+    assert_eq!(parsed.tasks[0].body, "Blocked by: none");
+    assert_eq!(
+        local_queue(&parsed.tasks)
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        ["1"]
+    );
+}
+
+#[test]
 fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     let database = temporary_path("queue").join("ledger.db");
     let binary = env!("CARGO_BIN_EXE_alucard");

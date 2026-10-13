@@ -63,6 +63,7 @@ pub struct ParsedTasks {
 }
 
 pub fn parse_tasks(contents: &str) -> Result<ParsedTasks, Vec<String>> {
+    let contents = contents.replace('\r', "");
     let lines: Vec<_> = contents.lines().collect();
     let mut parent = Vec::new();
     let mut tasks = Vec::new();
@@ -154,6 +155,15 @@ pub fn parse_tasks(contents: &str) -> Result<ParsedTasks, Vec<String>> {
                     task.blockers.push(token.to_string());
                 }
             }
+        }
+        let mut body = task.body.as_str();
+        while let Some(index) = body.find("Blocked by #") {
+            let number = &body[index + "Blocked by #".len()..];
+            let digits = number.bytes().take_while(u8::is_ascii_digit).count();
+            if let Ok(number) = number[..digits].parse() {
+                task.issue_blockers.push(number);
+            }
+            body = &number[digits..];
         }
     }
     if errors.is_empty() {
