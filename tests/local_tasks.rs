@@ -765,6 +765,14 @@ esac
         "recovery-crash",
         None,
     );
+    let original_run_id: String = open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT run_id FROM claims WHERE id = ?1",
+            [&claim_id],
+            |row| row.get(0),
+        )
+        .unwrap();
     let target = "recovery:recovery-crash";
     let push = begin_operation_with_payload(
         &database,
@@ -886,12 +894,29 @@ esac
         open(&database)
             .unwrap()
             .query_row(
-                "SELECT number FROM pull_requests WHERE task_id = ?1",
+                "SELECT number, kind, gate_state FROM pull_requests WHERE task_id = ?1",
                 [&task_id],
-                |row| row.get::<_, i64>(0)
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                }
             )
             .unwrap(),
-        91
+        (91, "recovery".to_string(), "recovery_parked".to_string())
+    );
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT original_run_id FROM recovery WHERE task_id = ?1",
+                [&task_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        original_run_id
     );
     assert_eq!(
         trace

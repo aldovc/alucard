@@ -1052,28 +1052,53 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
                 branch,
                 sha,
             } => {
-                record_task_pr(
-                    database,
-                    &claim.task_id,
-                    &claim.lease_id,
-                    &claim.run_id,
-                    number,
-                    &branch,
-                    &sha,
-                )
-                .map_err(|error| error.to_string())?;
-                release(database, &claim.lease_id, &claim.run_id)
-                    .map_err(|error| error.to_string())?;
-                finish_run(database, &claim.run_id, "interrupted")
-                    .map_err(|error| error.to_string())?;
-                if operation_exists(
+                let recovery = operation_exists(
                     database,
                     &claim.repository_id,
                     &format!("recovery:{branch}"),
                     "create_recovery_pr",
                 )
-                .map_err(|error| error.to_string())?
-                {
+                .map_err(|error| error.to_string())?;
+                if recovery {
+                    let checkout_path = find_run(database, &claim.run_id)
+                        .map_err(|error| error.to_string())?
+                        .and_then(|run| run.logs_path)
+                        .map(PathBuf::from)
+                        .map(|path| path.join("repository"))
+                        .ok_or_else(|| {
+                            format!("recovery run {} has no recorded checkout", claim.run_id)
+                        })?;
+                    record_recovery_pr(
+                        database,
+                        &claim.task_id,
+                        &claim.lease_id,
+                        &claim.run_id,
+                        RecoveryPullRequest {
+                            number,
+                            branch: &branch,
+                            head_sha: &sha,
+                            reason: "interrupted",
+                            checkout_path: &checkout_path,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                } else {
+                    record_task_pr(
+                        database,
+                        &claim.task_id,
+                        &claim.lease_id,
+                        &claim.run_id,
+                        number,
+                        &branch,
+                        &sha,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                release(database, &claim.lease_id, &claim.run_id)
+                    .map_err(|error| error.to_string())?;
+                finish_run(database, &claim.run_id, "interrupted")
+                    .map_err(|error| error.to_string())?;
+                if recovery {
                     ensure_recovery_annotations(
                         database,
                         repository,
