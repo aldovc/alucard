@@ -72,10 +72,10 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     }) {
         return fail(&format!("alucard: database error: {error}"));
     }
-    let open_issues = parsed
-        .tasks
+    let locally_eligible = local_queue_with_open_issues(&parsed.tasks, Some(&[]));
+    let open_issues = locally_eligible
         .iter()
-        .any(|task| task.state == alucard::TaskState::Pending && !task.issue_blockers.is_empty())
+        .any(|task| !task.issue_blockers.is_empty())
         .then(|| fetch_open_issue_numbers(&options.repository))
         .flatten();
     match serde_json::to_string_pretty(&local_queue_with_open_issues(

@@ -163,7 +163,11 @@ pub fn parse_tasks(contents: &str) -> Result<ParsedTasks, Vec<String>> {
             if let Ok(number) = number[..digits].parse() {
                 task.issue_blockers.push(number);
             }
-            body = &number[digits..];
+            body = if digits == 0 {
+                &number[number.chars().next().map_or(0, char::len_utf8)..]
+            } else {
+                &number[digits..]
+            };
         }
     }
     if errors.is_empty() {

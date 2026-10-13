@@ -3,6 +3,7 @@ use alucard::{
     TaskState,
 };
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,6 +101,13 @@ fn inline_issue_blockers_use_the_open_issue_set() {
 }
 
 #[test]
+fn parser_ignores_non_numeric_inline_issue_blockers() {
+    let parsed = parse_tasks("## [ ] 1: Ready\n\nBlocked by #someone and #.\n").unwrap();
+
+    assert!(parsed.tasks[0].issue_blockers.is_empty());
+}
+
+#[test]
 fn parser_normalizes_crlf_task_content() {
     let parsed =
         parse_tasks("# Context\r\n\r\n## [ ] 1: Ready\r\n\r\nBlocked by: none\r\n").unwrap();
@@ -189,4 +197,45 @@ fn queue_resolves_explicit_environment_and_detected_task_sources() {
         .unwrap();
     assert!(!conflict.status.success());
     assert!(String::from_utf8_lossy(&conflict.stderr).contains("--tasks and --github"));
+}
+
+#[test]
+fn queue_does_not_fetch_issues_for_locally_blocked_tasks() {
+    let root = temporary_path("locally-blocked-queue");
+    fs::create_dir_all(&root).unwrap();
+    let tasks = root.join("tasks.md");
+    fs::write(
+        &tasks,
+        "## [>] waiting: Waiting\n\n## [ ] blocked: Blocked\n\nBlocked by: waiting, #100\n",
+    )
+    .unwrap();
+    let gh = root.join("gh");
+    let invoked = root.join("gh-invoked");
+    fs::write(
+        &gh,
+        format!("#!/bin/sh\n: > '{}'\nexit 1\n", invoked.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = env!("CARGO_BIN_EXE_alucard");
+
+    let output = Command::new(binary)
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "queue",
+            "--tasks",
+            tasks.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::from_str::<serde_json::Value>("[]").unwrap()
+    );
+    assert!(!invoked.exists());
+    fs::remove_dir_all(root).unwrap();
 }
