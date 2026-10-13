@@ -34,8 +34,10 @@ fn copy_tool_installation(directory: &Path) -> PathBuf {
         .unwrap();
     }
     let binary = binary_dir.join("alucard");
-    fs::copy(env!("CARGO_BIN_EXE_alucard"), &binary).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    if fs::hard_link(env!("CARGO_BIN_EXE_alucard"), &binary).is_err() {
+        fs::copy(env!("CARGO_BIN_EXE_alucard"), &binary).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     binary
 }
 
