@@ -31,3 +31,35 @@ jobs:
         run: |
           shellcheck --severity=warning --exclude=SC2034 \
             alucard entrypoint.sh install.sh test-*.sh test/*.sh
+
+  rust:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rustup reads the pinned toolchain from rust-toolchain.toml.
+      - name: Lint and test
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      # The release binary must run on hosts with no matching libc, so a
+      # dynamic loader or any shared-library dependency fails the job.
+      - name: Static musl build
+        run: |
+          target="$(uname -m)-unknown-linux-musl"
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add "$target"
+          cargo build --release --target "$target"
+          bin="target/$target/release/alucard"
+          file "$bin"
+          if readelf -lW "$bin" | grep -q INTERP || readelf -dW "$bin" | grep -q NEEDED; then
+            echo "$bin is not statically linked" >&2
+            exit 1
+          fi
+          "$bin" version

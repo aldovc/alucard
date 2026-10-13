@@ -3,3 +3,4 @@ logs/
 .claude/settings.local.json
 .claude/worktrees/
 .alucard/
+/target
