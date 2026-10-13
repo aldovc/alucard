@@ -836,6 +836,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         );
                         let _ = release(&database, &claim.id, &owner_run_id);
                         let _ = finish_run(&database, &attempt_run.id, "failed");
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
                         return fail(&format!("alucard: {error}"));
                     }
                     if let Some(local_id) = selected.local_id.as_ref() {
@@ -935,6 +936,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                     &owner_run_id,
                                     &options.queue.repository,
                                 );
+                                print!("{}", usage_report_for_dirs(&usage_log_dirs));
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
@@ -955,6 +957,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                     &options.queue.repository,
                                 );
                                 let _ = finish_run(&database, &attempt_run.id, "failed");
+                                print!("{}", usage_report_for_dirs(&usage_log_dirs));
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
@@ -1038,6 +1041,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &options.queue.repository,
                     );
                     let _ = finish_run(&database, &attempt_run.id, "failed");
+                    print!("{}", usage_report_for_dirs(&usage_log_dirs));
                     return fail(&format!("alucard: {error}"));
                 }
             }
