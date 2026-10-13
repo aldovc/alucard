@@ -13,19 +13,41 @@ fn settings(contents: &str) -> AgentSettings {
     settings
 }
 
+fn invocation(role: AgentRole) -> AgentInvocation<'static> {
+    AgentInvocation {
+        role,
+        name: "alucard-test",
+        image: "alucard:test",
+        env_file: Path::new("/tmp/alucard.env"),
+        worktree: Path::new("/tmp/worktree"),
+        prompt: "prompt",
+        timeout_minutes: 1,
+        network: None,
+        playwright_cache: None,
+        database_url: None,
+        github_repo: None,
+    }
+}
+
 #[test]
 fn role_settings_and_docker_arguments_match_bash_contract() {
-    let settings = settings(
+    let agent_settings = settings(
         "ALUCARD_PROVIDER=claude\nALUCARD_CI_FIX_PROVIDER=codex\nALUCARD_CLAUDE_MODEL=opus\nALUCARD_WORKER_CLAUDE_MODEL=worker-opus\nALUCARD_CI_FIX_CODEX_MODEL=fix-model\nALUCARD_WORKER_MAX_TURNS=181\n",
     );
-    assert_eq!(settings.provider(AgentRole::Worker), Ok(Provider::Claude));
-    assert_eq!(settings.provider(AgentRole::CiFix), Ok(Provider::Codex));
     assert_eq!(
-        settings.setting(AgentRole::Worker, "CLAUDE_MODEL", "sonnet"),
+        agent_settings.provider(AgentRole::Worker),
+        Ok(Provider::Claude)
+    );
+    assert_eq!(
+        agent_settings.provider(AgentRole::CiFix),
+        Ok(Provider::Codex)
+    );
+    assert_eq!(
+        agent_settings.setting(AgentRole::Worker, "CLAUDE_MODEL", "sonnet"),
         "worker-opus"
     );
     assert_eq!(
-        settings.setting(AgentRole::Reviewer, "CLAUDE_MODEL", "sonnet"),
+        agent_settings.setting(AgentRole::Reviewer, "CLAUDE_MODEL", "sonnet"),
         "opus"
     );
 
@@ -42,7 +64,7 @@ fn role_settings_and_docker_arguments_match_bash_contract() {
         database_url: Some("postgresql://postgres:postgres@postgres:5432/postgres"),
         github_repo: Some("example/repo"),
     };
-    let args = invocation.docker_args(&settings).unwrap();
+    let args = invocation.docker_args(&agent_settings).unwrap();
     assert!(args
         .windows(2)
         .any(|pair| pair == ["--network", "alucard-test"]));
@@ -72,8 +94,8 @@ fn blank_settings_fall_back_like_bash_parameter_expansion() {
         configured.setting(AgentRole::Worker, "CODEX_MODEL", "default"),
         "global"
     );
-    assert_eq!(configured.turns(AgentRole::Worker), "190");
-    assert_eq!(configured.budget(AgentRole::Worker), "11");
+    assert_eq!(configured.turns(AgentRole::Worker), "180");
+    assert_eq!(configured.budget(AgentRole::Worker), "10");
     assert_eq!(configured.setting(AgentRole::Worker, "EFFORT", ""), "high");
 
     let defaults = settings(
@@ -86,6 +108,38 @@ fn blank_settings_fall_back_like_bash_parameter_expansion() {
     );
     assert_eq!(defaults.turns(AgentRole::Worker), "180");
     assert_eq!(defaults.budget(AgentRole::Worker), "10");
+}
+
+#[test]
+fn claude_prompts_include_role_turn_budgets() {
+    let agent_settings = settings(
+        "ALUCARD_PROVIDER=claude\nALUCARD_WORKER_PROVIDER=claude\nALUCARD_CI_FIX_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER=claude\nALUCARD_WORKER_MAX_TURNS=181\nALUCARD_CI_FIX_MAX_TURNS=31\nALUCARD_REVIEWER_MAX_TURNS=46\nALUCARD_FEEDBACK_MAX_TURNS=51\nALUCARD_WRAPUP_MAX_TURNS=13\n",
+    );
+    let cases = [
+        (AgentRole::Worker, "181"),
+        (AgentRole::CiFix, "31"),
+        (AgentRole::Reviewer, "46"),
+        (AgentRole::Feedback, "51"),
+        (AgentRole::Wrapup, "13"),
+    ];
+    for (role, turns) in cases {
+        let args = invocation(role).docker_args(&agent_settings).unwrap();
+        assert_eq!(
+            args.last(),
+            Some(&format!(
+                "prompt\n<turn_budget>\nThis run gets {turns} turns. The harness stops you the moment the cap is reached, wherever you are.\n</turn_budget>"
+            ))
+        );
+    }
+
+    let codex_settings = settings("ALUCARD_CI_FIX_PROVIDER=codex\n");
+    assert_eq!(
+        invocation(AgentRole::CiFix)
+            .docker_args(&codex_settings)
+            .unwrap()
+            .last(),
+        Some(&"-".to_string())
+    );
 }
 
 #[test]

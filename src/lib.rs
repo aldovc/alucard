@@ -51,6 +51,13 @@ impl AgentRole {
             Self::Feedback => "FEEDBACK",
         }
     }
+
+    fn turn_budget_setting_name(self) -> &'static str {
+        match self {
+            Self::Wrapup => "WRAPUP",
+            _ => self.setting_name(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +119,12 @@ impl AgentSettings {
             AgentRole::Feedback => "50",
             AgentRole::Wrapup => "12",
         };
-        self.setting(role, "MAX_TURNS", default)
+        self.get(&format!(
+            "ALUCARD_{}_MAX_TURNS",
+            role.turn_budget_setting_name()
+        ))
+        .unwrap_or(default)
+        .to_string()
     }
 
     pub fn budget(&self, role: AgentRole) -> String {
@@ -123,7 +135,12 @@ impl AgentSettings {
             AgentRole::Feedback => "2",
             AgentRole::Wrapup => "1",
         };
-        self.setting(role, "MAX_BUDGET", default)
+        self.get(&format!(
+            "ALUCARD_{}_MAX_BUDGET",
+            role.turn_budget_setting_name()
+        ))
+        .unwrap_or(default)
+        .to_string()
     }
 }
 
@@ -462,7 +479,12 @@ impl AgentInvocation<'_> {
                 if !effort.is_empty() {
                     args.extend(["--effort".into(), effort]);
                 }
-                args.extend(["--disallowedTools".into(), "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)".into(), "--".into(), self.prompt.into()]);
+                let prompt = format!(
+                    "{}\n<turn_budget>\nThis run gets {} turns. The harness stops you the moment the cap is reached, wherever you are.\n</turn_budget>",
+                    self.prompt,
+                    settings.turns(self.role),
+                );
+                args.extend(["--disallowedTools".into(), "Bash(rm -rf /*),Bash(sudo *),Bash(curl * | sh),Bash(curl * | bash),Bash(wget * | sh),Bash(dd if=*),Bash(mkfs*)".into(), "--".into(), prompt]);
             }
         }
         Ok(args)
