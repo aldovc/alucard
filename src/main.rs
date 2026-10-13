@@ -883,8 +883,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         }
                         Err(error) => eprintln!("alucard: CI gate for PR #{number}: {error}"),
                     }
-                    print!("{}", usage_report(&prepared.directory));
-                    post_iteration_usage(
+                    report_iteration_usage(
                         &options.queue.repository,
                         &prepared.directory,
                         iteration,
@@ -956,7 +955,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         };
                         continue;
                     }
-                    if let Err(error) = recover_worker_changes(
+                    match recover_worker_changes(
                         &database,
                         &tools,
                         &options,
@@ -970,14 +969,24 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         result.as_ref().ok().and_then(|value| value.status),
                         &log,
                     ) {
-                        eprintln!("alucard: recovery requires human attention: {error}");
-                        let _ = transition_task(
-                            &database,
-                            &selected.ledger_id,
-                            &claim.id,
-                            &owner_run_id,
-                            TaskStatus::Human,
-                        );
+                        Ok(Some(number)) => report_iteration_usage(
+                            &options.queue.repository,
+                            &prepared.directory,
+                            iteration,
+                            number,
+                            iteration_started.elapsed().as_secs(),
+                        ),
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("alucard: recovery requires human attention: {error}");
+                            let _ = transition_task(
+                                &database,
+                                &selected.ledger_id,
+                                &claim.id,
+                                &owner_run_id,
+                                TaskStatus::Human,
+                            );
+                        }
                     }
                     let _ = release(&database, &claim.id, &owner_run_id);
                     if let Some(issue) = selected.issue.as_ref() {
@@ -1647,7 +1656,7 @@ fn recover_worker_changes(
     classification: alucard::AgentExit,
     status: Option<i32>,
     worker_log: &Path,
-) -> Result<(), String> {
+) -> Result<Option<i64>, String> {
     if classification == alucard::AgentExit::Clean
         || (classification == alucard::AgentExit::Transport && status == Some(0))
     {
@@ -1658,7 +1667,8 @@ fn recover_worker_changes(
             run_id,
             &prepared.run.repository_id,
             &options.queue.repository,
-        );
+        )
+        .map(|()| None);
     }
     let base = prepared.run.base_sha.as_deref().unwrap_or("HEAD");
     let commits = execute_command(
@@ -1677,7 +1687,7 @@ fn recover_worker_changes(
     let dirty = !dirty.stdout.is_empty();
     if !dirty && commit_count == 0 {
         if classification == alucard::AgentExit::Transport {
-            return Ok(());
+            return Ok(None);
         }
         return release_pending(
             database,
@@ -1686,7 +1696,8 @@ fn recover_worker_changes(
             run_id,
             &prepared.run.repository_id,
             &options.queue.repository,
-        );
+        )
+        .map(|()| None);
     }
     let handoff = if wrapup_applies(classification) && wrapup_enabled(settings) {
         run_wrapup_agent(
@@ -1767,7 +1778,8 @@ fn recover_worker_changes(
             run_id,
             &prepared.run.repository_id,
             &options.queue.repository,
-        );
+        )
+        .map(|()| None);
     }
     if let Some((number, branch, sha)) = find_open_pr(&options.queue.repository, &prepared.branch)?
     {
@@ -1783,7 +1795,8 @@ fn recover_worker_changes(
             commit_count,
             classification,
             status,
-        );
+        )
+        .map(Some);
     }
     let title = recovery_title(iteration, classification, status);
     let body = recovery_body(
@@ -1852,6 +1865,7 @@ fn recover_worker_changes(
         classification,
         status,
     )
+    .map(Some)
 }
 
 fn release_pending(
@@ -1909,7 +1923,7 @@ fn record_recovery(
     commits: usize,
     classification: alucard::AgentExit,
     status: Option<i32>,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     record_recovery_pr(
         database,
         &task.ledger_id,
@@ -2036,7 +2050,7 @@ fn record_recovery(
         finish_operation(database, &label_operation, label_error.as_deref())
             .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    Ok(number)
 }
 
 fn recovery_title(
@@ -3023,6 +3037,17 @@ fn post_iteration_usage(
     ) {
         log_event(log_dir, &format!("Measurement: {error} — continuing."));
     }
+}
+
+fn report_iteration_usage(
+    repository: &Path,
+    log_dir: &Path,
+    iteration: usize,
+    pr: i64,
+    duration: u64,
+) {
+    print!("{}", usage_report(log_dir));
+    post_iteration_usage(repository, log_dir, iteration, pr, duration);
 }
 
 fn closing_issue_number(body: &str) -> Option<i64> {

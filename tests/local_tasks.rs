@@ -482,7 +482,7 @@ case "$1 $2" in
   'pr comment')
     if [ "$ALUCARD_RECOVERY_SCENARIO" = marker ]; then echo 'marker denied' >&2; exit 1; fi
     while [ "$#" -gt 0 ]; do
-      if [ "$1" = --body ]; then printf '%s' "$2" > "$ALUCARD_RECOVERY_MARKER"; break; fi
+      if [ "$1" = --body ]; then printf '%s\n' "$2" >> "$ALUCARD_RECOVERY_MARKER"; break; fi
       shift
     done ;;
   'pr edit')
@@ -595,10 +595,9 @@ esac
                 body.contains("It does not resume implementation."),
                 "{body}"
             );
-            assert_eq!(
-                fs::read_to_string(root.join("recovery-marker")).unwrap(),
-                "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."
-            );
+            let comments = fs::read_to_string(root.join("recovery-marker")).unwrap();
+            assert!(comments.starts_with("**🤖 Alucard recovery PR parked**"));
+            assert!(comments.contains("**🤖 Alucard token usage (iteration 1)**"));
             let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
             assert!(
                 trace.find("pr edit 91 --add-label needs-human")
@@ -734,7 +733,7 @@ case "$1 $2" in
     : > "$ALUCARD_GITHUB_RECOVERY_CREATED" ;;
   'pr comment')
     while [ "$#" -gt 0 ]; do
-      if [ "$1" = --body ]; then printf '%s' "$2" > "$ALUCARD_GITHUB_RECOVERY_MARKER"; break; fi
+      if [ "$1" = --body ]; then printf '%s\n' "$2" >> "$ALUCARD_GITHUB_RECOVERY_MARKER"; break; fi
       shift
     done ;;
 esac
@@ -832,10 +831,9 @@ fn test_worker_recovery() {
     assert!(fs::read_to_string(root.join("docker-trace"))
         .unwrap()
         .contains("alucard-wrapup-1-"));
-    assert_eq!(
-        fs::read_to_string(root.join("marker")).unwrap(),
-        "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."
-    );
+    let comments = fs::read_to_string(root.join("marker")).unwrap();
+    assert!(comments.starts_with("**🤖 Alucard recovery PR parked**"));
+    assert!(comments.contains("**🤖 Alucard token usage (iteration 1)**"));
     let trace = fs::read_to_string(root.join("gh-trace")).unwrap();
     assert!(
         trace.contains("pr edit 91 --add-label needs-human"),
