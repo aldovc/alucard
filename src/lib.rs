@@ -71,7 +71,10 @@ pub fn parse_tasks(contents: &str) -> Result<ParsedTasks, Vec<String>> {
     let mut errors = Vec::new();
 
     for (index, line) in lines.iter().enumerate() {
-        if line.starts_with("##[") || line.starts_with("## [") {
+        if line.strip_prefix("##").is_some_and(|rest| {
+            rest.trim_start_matches(|character: char| character.is_ascii_whitespace())
+                .starts_with('[')
+        }) {
             let heading = line.strip_prefix("## ").unwrap_or("");
             let Some((marker, rest)) = heading
                 .strip_prefix('[')
@@ -188,6 +191,9 @@ fn split_pr_suffix<'a>(title: &'a str, prefix: &str) -> (&'a str, Option<i64>) {
     let Some(number) = number.strip_suffix(')') else {
         return (title, None);
     };
+    if !number.bytes().all(|character| character.is_ascii_digit()) {
+        return (title, None);
+    }
     let Ok(number) = number.parse() else {
         return (title, None);
     };

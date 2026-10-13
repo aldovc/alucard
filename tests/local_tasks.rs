@@ -73,6 +73,31 @@ fn parser_rejects_malformed_headings() {
 }
 
 #[test]
+fn parser_rejects_whitespace_prefixed_malformed_headings() {
+    let errors = parse_tasks("## [ ] ready: Ready\n\n##\t[?] invalid\n\n##  [ ] id: Invalid\n")
+        .unwrap_err()
+        .join("\n");
+
+    assert!(errors.contains("##\t[?] invalid"));
+    assert!(errors.contains("##  [ ] id: Invalid"));
+}
+
+#[test]
+fn parser_only_strips_unsigned_pr_suffixes() {
+    let parsed = parse_tasks(
+        "## [ ] previous: Retried (previous attempt: PR #7)\n\n## [ ] signed: Signed (PR #-7)\n\n## [ ] plus: Plus (previous attempt: PR #+7)\n",
+    )
+    .unwrap();
+
+    assert_eq!(parsed.tasks[0].title, "Retried");
+    assert_eq!(parsed.tasks[0].previous_pr_number, Some(7));
+    assert_eq!(parsed.tasks[1].title, "Signed (PR #-7)");
+    assert_eq!(parsed.tasks[1].pr_number, None);
+    assert_eq!(parsed.tasks[2].title, "Plus (previous attempt: PR #+7)");
+    assert_eq!(parsed.tasks[2].previous_pr_number, None);
+}
+
+#[test]
 fn issue_blockers_use_the_open_issue_set() {
     let parsed =
         parse_tasks(&fs::read_to_string("test/fixtures/tasks-issue-blockers.md").unwrap()).unwrap();
