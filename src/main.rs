@@ -5,7 +5,7 @@ use alucard::{
     compose_role_prompt, database_path, defer_operation, find_run, finish_operation, finish_run,
     github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
     local_queue_with_open_issues, local_queue_with_open_prs, mark_claim_needs_reconciliation,
-    migrate, open, parse_tasks, pending_operations, prepare_run, recent_runs,
+    migrate, open, operation_exists, parse_tasks, pending_operations, prepare_run, recent_runs,
     record_recovery_failure, record_recovery_pr, record_task_pr, record_task_pr_gate_state,
     release, release_abandoned_task_claim, run_claims, run_command as execute_command,
     run_pull_requests, run_reconciliation_reason, run_recovery, start_task_retry_run,
@@ -1066,6 +1066,21 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
                     .map_err(|error| error.to_string())?;
                 finish_run(database, &claim.run_id, "interrupted")
                     .map_err(|error| error.to_string())?;
+                if operation_exists(
+                    database,
+                    &claim.repository_id,
+                    &format!("recovery:{branch}"),
+                    "create_recovery_pr",
+                )
+                .map_err(|error| error.to_string())?
+                {
+                    ensure_recovery_annotations(
+                        database,
+                        repository,
+                        &claim.repository_id,
+                        number,
+                    )?;
+                }
             }
             ReconciliationAction::Human { claim, reason } => {
                 mark_claim_needs_reconciliation(database, &claim, &reason)
@@ -1074,6 +1089,30 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
             ReconciliationAction::Release(claim) => {
                 release_abandoned_task_claim(database, &claim)
                     .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_recovery_annotations(
+    database: &Path,
+    repository: &Path,
+    repository_id: &str,
+    number: i64,
+) -> Result<(), String> {
+    let target = format!("recovery-pr:{number}");
+    for operation_type in ["alucard-label", "needs-human-label", "recovery_marker"] {
+        let operation = begin_operation(database, repository_id, &target, operation_type)
+            .map_err(|error| error.to_string())?;
+        match replay_recovery_annotation(repository, &target, operation_type) {
+            Ok(()) => {
+                finish_operation(database, &operation, None).map_err(|error| error.to_string())?
+            }
+            Err(error) => {
+                defer_operation(database, &operation, &error)
+                    .map_err(|database_error| database_error.to_string())?;
+                return Err(error);
             }
         }
     }

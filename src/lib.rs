@@ -2520,6 +2520,23 @@ pub fn pending_operations(
     Ok(operations)
 }
 
+/// Reports whether a recovery operation was journaled, including completed intents.
+pub fn operation_exists(
+    path: &Path,
+    repository_id: &str,
+    target: &str,
+    operation_type: &str,
+) -> Result<bool, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE repository_id = ?1 AND target = ?2 AND operation_type = ?3)",
+            (repository_id, target, operation_type),
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 /// Keeps a failed replay eligible for the next startup attempt.
 pub fn defer_operation(path: &Path, operation_id: &str, error: &str) -> Result<(), DatabaseError> {
     let connection = open(path)?;
