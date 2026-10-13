@@ -251,7 +251,7 @@ esac
         fs::write(
             &gh,
             r#"#!/bin/sh
-printf '%s\n' "$1 $2" >> "$ALUCARD_RECOVERY_TRACE"
+printf '%s\n' "$*" >> "$ALUCARD_RECOVERY_TRACE"
 case "$1 $2" in
   'pr list')
     if [ -f "$ALUCARD_RECOVERY_CREATED" ]; then echo '[{"number":91,"headRefName":"recovery","headRefOid":"abc"}]'; else echo '[]'; fi ;;
@@ -330,10 +330,27 @@ esac
             },
             "{scenario}"
         );
-        if matches!(scenario, "marker" | "label") {
+        if scenario == "marker" {
             let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
             assert!(trace.contains("pr comment"), "{scenario}: {trace}");
             assert!(trace.contains("pr edit"), "{scenario}: {trace}");
+        }
+        if scenario == "label" {
+            let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
+            assert!(
+                trace.contains("pr edit 91 --add-label needs-human"),
+                "{trace}"
+            );
+            assert!(!trace.contains("pr comment"), "{trace}");
+            assert!(!root.join("recovery-marker").exists(), "{trace}");
+            let phase: String = connection
+                .query_row(
+                    "SELECT phase FROM operations WHERE target = 'recovery-pr:91' AND operation_type = 'needs-human-label'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(phase, "failed");
         }
         if scenario == "alucard_label" {
             let phase: String = connection
@@ -364,6 +381,12 @@ esac
             assert_eq!(
                 fs::read_to_string(root.join("recovery-marker")).unwrap(),
                 "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."
+            );
+            let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
+            assert!(
+                trace.find("pr edit 91 --add-label needs-human")
+                    < trace.find("pr comment 91 --body"),
+                "{trace}"
             );
         }
         let run_id: String = connection

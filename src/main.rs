@@ -1188,27 +1188,6 @@ fn record_recovery(
     if let Some(error) = alucard_label_error {
         return Err(error);
     }
-    let marker = begin_operation(
-        database,
-        &prepared.run.repository_id,
-        &target,
-        "recovery_marker",
-    )
-    .map_err(|error| error.to_string())?;
-    let comment = gh_output(
-        &prepared.clone,
-        &[
-            "pr",
-            "comment",
-            &number.to_string(),
-            "--body",
-            RECOVERY_MARKER_BODY,
-        ],
-        "could not post recovery marker",
-    );
-    let marker_error = comment.err();
-    finish_operation(database, &marker, marker_error.as_deref())
-        .map_err(|error| error.to_string())?;
     let label = begin_operation(
         database,
         &prepared.run.repository_id,
@@ -1230,12 +1209,32 @@ fn record_recovery(
     let label_error = labelled.err();
     finish_operation(database, &label, label_error.as_deref())
         .map_err(|error| error.to_string())?;
-    if marker_error.is_some() || label_error.is_some() {
-        return Err([marker_error, label_error]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("; "));
+    if let Some(error) = label_error {
+        return Err(error);
+    }
+    let marker = begin_operation(
+        database,
+        &prepared.run.repository_id,
+        &target,
+        "recovery_marker",
+    )
+    .map_err(|error| error.to_string())?;
+    let comment = gh_output(
+        &prepared.clone,
+        &[
+            "pr",
+            "comment",
+            &number.to_string(),
+            "--body",
+            RECOVERY_MARKER_BODY,
+        ],
+        "could not post recovery marker",
+    );
+    let marker_error = comment.err();
+    finish_operation(database, &marker, marker_error.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = marker_error {
+        return Err(error);
     }
     if let Some(issue) = &task.issue {
         let comment = recovery_ticket_comment(number, classification, status, commits);
