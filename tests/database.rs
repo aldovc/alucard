@@ -921,7 +921,7 @@ fn remote_operations_are_durable_and_idempotent() {
 #[test]
 fn migration_is_idempotent_and_enforces_the_ledger_constraints() {
     let path = database_path();
-    assert_eq!(status(&path).unwrap().pending_migrations, 6);
+    assert_eq!(status(&path).unwrap().pending_migrations, 7);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
 
@@ -1005,7 +1005,7 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     assert!(!status.status.success());
     assert!(String::from_utf8(status.stdout)
         .unwrap()
-        .contains("pending migrations: 6"));
+        .contains("pending migrations: 7"));
 
     let migrate = Command::new(binary)
         .args(["--db-path", path.to_str().unwrap(), "db", "migrate"])
@@ -1139,7 +1139,7 @@ fn status_preserves_existing_database_parent_permissions() {
     fs::create_dir(parent).unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(status(&path).unwrap().pending_migrations, 6);
+    assert_eq!(status(&path).unwrap().pending_migrations, 7);
     assert_eq!(
         fs::metadata(parent).unwrap().permissions().mode() & 0o777,
         0o755
