@@ -9,11 +9,13 @@ exec </dev/null
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 if [ -z "${ALUCARD:-}" ]; then
-  # Cargo's merge integration test supplies the Rust binary. The generic shell
-  # suite has no binary to run, so leave this Rust-only contract to Cargo.
-  exit 0
+  ALUCARD="$SCRIPT_DIR/../alucard"
+  # shellcheck disable=SC1090
+  source "$ALUCARD"
+  USES_RUST_BINARY=false
 else
   BOT_REVIEWED_HEAD="Reviewed head:"
+  USES_RUST_BINARY=true
 fi
 
 TEST_DIR=$(mktemp -d /tmp/alucard_test_merge.XXXXXX)
@@ -93,7 +95,11 @@ setup_repos() {
 }
 
 run_merge() {
-  local -a command=("$ALUCARD" --db-path "$LEDGER" merge 9 "$TARGET" --env-file "$TEST_DIR/alucard.env" \
+  local -a command=("$ALUCARD")
+  if "$USES_RUST_BINARY"; then
+    command+=(--db-path "$LEDGER")
+  fi
+  command+=(merge 9 "$TARGET" --env-file "$TEST_DIR/alucard.env" \
     --logs-root "$TEST_DIR/logs" "$@")
   if [ -n "${MERGE_TIMEOUT:-}" ]; then
     command=(timeout --kill-after 1s "$MERGE_TIMEOUT" "${command[@]}")
@@ -114,6 +120,7 @@ run_merge() {
 assert_merge_lifecycle() {
   local expected_status="$1"
   local run_id run
+  "$USES_RUST_BINARY" || return 0
   run_id=$("$ALUCARD" --db-path "$LEDGER" runs | awk -F '\t' '$3 == "merge" && !run_id { run_id=$1 } END { print run_id }')
   run=$("$ALUCARD" --db-path "$LEDGER" runs show "$run_id")
   assert_contains "the merge run is terminal" "status: $expected_status" "$run"
