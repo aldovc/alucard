@@ -2315,12 +2315,19 @@ pub fn abandoned_task_claims(
     let hostname = hostname()?;
     let mut statement = connection.prepare(
         "SELECT claims.id, claims.run_id, claims.resource_key, claims.repository_id,
-                COALESCE(runs.branch, recovery.branch, pull_requests.branch)
+                COALESCE(runs.branch, recovery.branch, (
+                    SELECT branch FROM pull_requests
+                    WHERE pull_requests.task_id = claims.resource_key
+                      AND pull_requests.repository_id = claims.repository_id
+                      AND pull_requests.number = (
+                          SELECT pr_number FROM tasks
+                          WHERE tasks.id = claims.resource_key
+                            AND tasks.repository_id = claims.repository_id
+                      )
+                ))
          FROM claims
          JOIN runs ON runs.id = claims.run_id
          LEFT JOIN recovery ON recovery.original_run_id = runs.id
-         LEFT JOIN pull_requests ON pull_requests.task_id = claims.resource_key
-             AND pull_requests.repository_id = claims.repository_id
          WHERE claims.state = 'active' AND claims.resource_kind = 'task'
              AND claims.repository_id = ?2
              AND runs.hostname = ?1 AND runs.pid IS NOT NULL",
@@ -3103,6 +3110,63 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].task_id, "task-b");
         assert_eq!(claims[0].branch.as_deref(), Some("alucard/run-b"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn abandoned_claim_reconciliation_releases_once_with_pr_history() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        let hostname = hostname().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repository', '', 'repository', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, pid, hostname)
+                 VALUES ('run', 'repository', 'run', 'running', datetime('now'), datetime('now'), ?1, ?2)",
+                params![i64::MAX, hostname],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, pr_number, updated_at)
+                 VALUES ('task', 'repository', 'local', 'task', '', 'claimed', '[]', 2, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                 VALUES ('claim', 'repository', 'task', 'task', 'run', 'active', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        for (number, branch) in [(1, "alucard/old"), (2, "alucard/current")] {
+            connection
+                .execute(
+                    "INSERT INTO pull_requests (id, task_id, repository_id, number, branch, head_sha, kind, remote_state, gate_state)
+                     VALUES (?1, 'task', 'repository', ?2, ?3, 'sha', 'normal', 'open', 'pending')",
+                    params![format!("pr-{number}"), number, branch],
+                )
+                .unwrap();
+        }
+
+        let claims = abandoned_task_claims(&path, "repository").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].branch.as_deref(), Some("alucard/current"));
+        release_abandoned_task_claim(&path, &claims[0]).unwrap();
+        assert!(abandoned_task_claims(&path, "repository")
+            .unwrap()
+            .is_empty());
 
         fs::remove_dir_all(directory).unwrap();
     }
