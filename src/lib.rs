@@ -2578,6 +2578,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("../migrations/0006_retry_owner.sql")),
     (7, include_str!("../migrations/0007_measurements.sql")),
     (8, include_str!("../migrations/0008_review_verdict.sql")),
+    (9, include_str!("../migrations/0009_operation_payload.sql")),
 ];
 
 pub struct DatabaseStatus {
@@ -2637,6 +2638,15 @@ pub struct Recovery {
     pub pull_request_number: Option<i64>,
     pub checkout_path: Option<String>,
     pub failure_reason: Option<String>,
+}
+
+/// A remote side effect that must be reconciled after an interrupted run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PendingOperation {
+    pub id: String,
+    pub target: String,
+    pub operation_type: String,
+    pub payload: Option<String>,
 }
 
 /// An active task claim whose owning process is no longer alive on this host.
@@ -3111,6 +3121,17 @@ pub fn record_recovery_pr(
          ON CONFLICT(original_run_id) DO UPDATE SET pull_request_number = excluded.pull_request_number, branch = excluded.branch, reason = excluded.reason, checkout_path = excluded.checkout_path",
         (Uuid::new_v4().to_string(), task_id, run_id, recovery.branch, recovery.number, recovery.reason, recovery.checkout_path.to_string_lossy()),
     )?;
+    let target = format!("recovery-pr:{}", recovery.number);
+    for operation_type in ["alucard-label", "needs-human-label", "recovery_marker"] {
+        transaction.execute(
+            "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 0, datetime('now'), datetime('now'))
+             ON CONFLICT(repository_id, target, operation_type) DO UPDATE SET
+               phase = CASE WHEN operations.phase = 'failed' THEN 'pending' ELSE operations.phase END,
+               updated_at = datetime('now')",
+            (Uuid::new_v4().to_string(), &repository_id, &target, operation_type),
+        )?;
+    }
     transaction.execute("UPDATE tasks SET status = 'in_flight', pr_number = ?1, updated_at = datetime('now') WHERE id = ?2", (recovery.number, task_id))?;
     transaction.commit()?;
     Ok(())
@@ -3142,18 +3163,84 @@ pub fn begin_operation(
     target: &str,
     operation_type: &str,
 ) -> Result<String, DatabaseError> {
+    begin_operation_with_payload(path, repository_id, target, operation_type, None)
+}
+
+/// Creates a durable remote-operation intent, including any data needed to replay it.
+pub fn begin_operation_with_payload(
+    path: &Path,
+    repository_id: &str,
+    target: &str,
+    operation_type: &str,
+    payload: Option<&str>,
+) -> Result<String, DatabaseError> {
     let connection = open(path)?;
     let id = Uuid::new_v4().to_string();
     connection.execute(
-        "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', 0, datetime('now'), datetime('now'))
-         ON CONFLICT(repository_id, target, operation_type) DO NOTHING",
-        (&id, repository_id, target, operation_type),
+        "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, payload, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, datetime('now'), datetime('now'))
+         ON CONFLICT(repository_id, target, operation_type) DO UPDATE SET
+           payload = COALESCE(operations.payload, excluded.payload),
+           phase = CASE WHEN operations.phase = 'failed' THEN 'pending' ELSE operations.phase END,
+           updated_at = datetime('now')",
+        (&id, repository_id, target, operation_type, payload),
     )?;
     Ok(connection.query_row(
         "SELECT id FROM operations WHERE repository_id = ?1 AND target = ?2 AND operation_type = ?3",
         (repository_id, target, operation_type), |row| row.get(0),
     )?)
+}
+
+/// Lists recovery operations eligible for replay for one repository.
+pub fn pending_operations(
+    path: &Path,
+    repository_id: &str,
+) -> Result<Vec<PendingOperation>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, target, operation_type, payload FROM operations
+         WHERE repository_id = ?1 AND phase = 'pending' ORDER BY created_at, id",
+    )?;
+    let operations = statement
+        .query_map([repository_id], |row| {
+            Ok(PendingOperation {
+                id: row.get(0)?,
+                target: row.get(1)?,
+                operation_type: row.get(2)?,
+                payload: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)?;
+    Ok(operations)
+}
+
+/// Reports whether a recovery operation was journaled, including completed intents.
+pub fn operation_exists(
+    path: &Path,
+    repository_id: &str,
+    target: &str,
+    operation_type: &str,
+) -> Result<bool, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE repository_id = ?1 AND target = ?2 AND operation_type = ?3)",
+            (repository_id, target, operation_type),
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+/// Keeps a failed replay eligible for the next startup attempt.
+pub fn defer_operation(path: &Path, operation_id: &str, error: &str) -> Result<(), DatabaseError> {
+    let connection = open(path)?;
+    connection.execute(
+        "UPDATE operations SET phase = 'pending', attempt_count = attempt_count + 1,
+         last_error = ?1, updated_at = datetime('now') WHERE id = ?2",
+        (error, operation_id),
+    )?;
+    Ok(())
 }
 
 /// Completes or records the failure of a journaled remote operation.
@@ -4041,6 +4128,85 @@ mod tests {
         assert!(abandoned_task_claims(&path, "repository")
             .unwrap()
             .is_empty());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_pr_link_journals_all_annotation_intents() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repository', '', 'repository', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+                 VALUES ('run', 'repository', 'run', 'running', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+                 VALUES ('task', 'repository', 'local', 'task', '', 'claimed', '[]', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                 VALUES ('claim', 'repository', 'task', 'task', 'run', 'active', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+
+        record_recovery_pr(
+            &path,
+            "task",
+            "claim",
+            "run",
+            RecoveryPullRequest {
+                number: 91,
+                branch: "alucard/recovery",
+                head_sha: "sha",
+                reason: "Exhausted",
+                checkout_path: &directory,
+            },
+        )
+        .unwrap();
+
+        let operations = pending_operations(&path, "repository").unwrap();
+        assert_eq!(operations.len(), 3);
+        assert!(operations
+            .iter()
+            .all(|operation| operation.target == "recovery-pr:91"));
+        let mut operation_types = operations
+            .iter()
+            .map(|operation| operation.operation_type.as_str())
+            .collect::<Vec<_>>();
+        operation_types.sort_unstable();
+        assert_eq!(
+            operation_types,
+            ["alucard-label", "needs-human-label", "recovery_marker"]
+        );
+        assert_eq!(
+            open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT pull_request_number FROM recovery WHERE original_run_id = 'run'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            91
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
