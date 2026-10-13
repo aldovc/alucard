@@ -2458,7 +2458,11 @@ fn run_feedback_once(
         output_dir: Some(&output),
         extra_env: &[("ALUCARD_ITER", &cycle_text)],
     }
-    .invoke(settings, &log)?;
+    .invoke(settings, &log)
+    .unwrap_or(AgentResult {
+        status: None,
+        classification: AgentExit::Failed,
+    });
     let after = remote_branch_sha(&prepared.clone, branch);
     let advanced = before.zip(after).map(|(before, after)| before != after);
     let blocked = fs::read_to_string(output.join(".alucard-blocked")).unwrap_or_default();

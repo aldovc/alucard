@@ -306,7 +306,14 @@ esac
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER=codex\nANTHROPIC_API_KEY=test\n",
+        format!(
+            "ALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER={}\nANTHROPIC_API_KEY=test\n",
+            if case.name == "feedback-invocation-failure" {
+                "unsupported"
+            } else {
+                "codex"
+            }
+        ),
     )
     .unwrap();
     let review_args = root.join("review-args");
@@ -633,6 +640,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             expected_state: "review_changes_requested",
         },
         ReviewCase {
+            name: "feedback-invocation-failure",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
             name: "feedback-toolchain-ok",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
@@ -858,7 +878,10 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             assert_eq!(heads.len(), 2);
             assert_ne!(heads[0], heads[1]);
         }
-        if matches!(case.name, "feedback-stall" | "feedback-retained") {
+        if matches!(
+            case.name,
+            "feedback-stall" | "feedback-retained" | "feedback-invocation-failure"
+        ) {
             assert!(trace.contains("feedback agent stopped without publishing"));
             assert_eq!(
                 fs::read_to_string(root.join("review-attempts"))
