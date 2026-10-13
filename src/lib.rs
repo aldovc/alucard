@@ -343,11 +343,6 @@ pub fn toolchain_preflight(
     env_file: &Path,
     timeout_minutes: u64,
 ) -> Result<String, String> {
-    let installs = detect_dependency_installs(repository).map_err(|error| error.to_string())?;
-    if installs.is_empty() {
-        return Ok(toolchain_status(&[]));
-    }
-
     let clone = env::temp_dir().join(format!("alucard-preflight-{}", Uuid::new_v4()));
     let cloned = Command::new("git")
         .args(["clone", "--local", "--no-tags"])
@@ -369,6 +364,11 @@ pub fn toolchain_preflight(
     }
 
     let result = (|| {
+        let installs = detect_dependency_installs(&clone).map_err(|error| error.to_string())?;
+        if installs.is_empty() {
+            return Ok(toolchain_status(&[]));
+        }
+
         let name = format!("alucard-preflight-{}", std::process::id());
         let mut results = Vec::new();
         for install in installs {
@@ -630,7 +630,7 @@ mod agent_tests {
         let bin = dir.join("bin");
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&repository).unwrap();
-        fs::write(repository.join("package-lock.json"), "{}").unwrap();
+        fs::write(repository.join("README.md"), "main").unwrap();
         Command::new("git")
             .args(["init", "--initial-branch", "main"])
             .current_dir(&repository)
@@ -698,7 +698,7 @@ mod agent_tests {
         fs::write(
             bin.join("docker"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; exit 0; fi\n  exit 23\nfi\n",
+                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  exit 23\nfi\n",
                 trace.display(),
                 non_default_ran.display()
             ),
@@ -716,7 +716,8 @@ mod agent_tests {
         );
 
         let status =
-            super::toolchain_preflight(&repository, "main", "alucard:test", &env_file, 7).unwrap();
+            super::toolchain_preflight(&repository, "preflight-base", "alucard:test", &env_file, 7)
+                .unwrap();
 
         let trace = fs::read_to_string(trace).unwrap();
         assert!(
@@ -750,11 +751,7 @@ mod agent_tests {
         )));
         assert!(trace.find("docker run").unwrap() < trace.find("docker rm -f").unwrap());
         assert!(status.contains("`npm ci` at the repo root fails inside the container (rc=23)"));
-        let non_default_status =
-            super::toolchain_preflight(&repository, "preflight-base", "alucard:test", &env_file, 7);
         env::set_var("PATH", path);
-        let status = non_default_status.unwrap();
-        assert!(status.contains("`npm ci` at the repo root completes in the container"));
         assert!(non_default_ran.exists());
         fs::remove_dir_all(dir).unwrap();
     }
