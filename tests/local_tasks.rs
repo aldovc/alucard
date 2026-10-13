@@ -1300,6 +1300,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
         "open-pr",
         "lookup-failure",
         "no-remote-trace",
+        "remote-branch",
     ] {
         let root = temporary_path(&format!("reconciliation-{scenario}"));
         let repository = root.join("repository");
@@ -1315,7 +1316,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
             "## [ ] first: First task\n\nBody\n"
         };
         fs::write(&tasks, task_contents).unwrap();
-        if scenario == "no-remote-trace" {
+        if matches!(scenario, "no-remote-trace" | "remote-branch") {
             let remote = root.join("remote.git");
             run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
             run(Command::new("git").args([
@@ -1326,6 +1327,16 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                 "origin",
                 remote.to_str().unwrap(),
             ]));
+            if scenario == "remote-branch" {
+                run(Command::new("git").args([
+                    "-C",
+                    repository.to_str().unwrap(),
+                    "push",
+                    "-q",
+                    "origin",
+                    "HEAD:refs/heads/first-branch",
+                ]));
+            }
         }
         let database = root.join("ledger.db");
         let docker_trace = root.join("docker-trace");
@@ -1378,8 +1389,19 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                 "first-branch",
                 None,
             ),
+            "remote-branch" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "first-branch",
+                None,
+            ),
             _ => unreachable!(),
         };
+        if scenario == "remote-branch" {
+            fs::write(&tasks, "## [h] first: First task\n\nBody\n").unwrap();
+        }
         let second = (scenario == "lookup-failure").then(|| {
             let first_run: String = open(&database)
                 .unwrap()
@@ -1561,6 +1583,37 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                         .unwrap(),
                     "released"
                 );
+            }
+            "remote-branch" => {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "human"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT state FROM claims WHERE id = ?1",
+                            [&first_claim],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "active"
+                );
+                let runs = Command::new(env!("CARGO_BIN_EXE_alucard"))
+                    .args(["--db-path", database.to_str().unwrap(), "runs"])
+                    .output()
+                    .unwrap();
+                assert!(runs.status.success(), "{runs:?}");
+                assert!(String::from_utf8_lossy(&runs.stdout).contains(
+                    "needs reconciliation: branch first-branch exists without an open pull request"
+                ));
             }
             _ => unreachable!(),
         }
