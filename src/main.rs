@@ -997,46 +997,51 @@ impl CiGate<'_> {
                 failed_run_log(&prepared.clone, branch, head.trim()).unwrap_or_default();
             let checkout = prepared.directory.join(format!("fix-{attempt}"));
             let checkout_text = checkout.display().to_string();
-            let clone = execute_command(
-                "git",
-                &[
-                    "clone",
-                    "--quiet",
-                    "--branch",
-                    branch,
-                    remote,
-                    &checkout_text,
-                ],
-                &prepared.directory,
-                Some(Duration::from_secs(120)),
-            )
-            .map_err(|error| error.to_string())?;
-            if !clone.status.success() {
-                return Err(String::from_utf8_lossy(&clone.stderr).trim().to_string());
-            }
-            let prompt = ci_fix_prompt(self.tools, pr_number, branch, &failure_log)?;
-            let log = prepared
-                .directory
-                .join(format!("iter-{iteration}-fix-{attempt}.jsonl"));
-            let name = format!("alucard-fix-{}-{attempt}", prepared.run.id);
-            let fix_iteration = format!("{iteration}-fix-{attempt}");
-            let _ = AgentInvocation {
-                role: AgentRole::CiFix,
-                name: &name,
-                image: &self.options.image,
-                env_file: &self.options.env_file,
-                worktree: &checkout,
-                prompt: &prompt,
-                timeout_minutes: self.options.timeout_minutes,
-                network: None,
-                playwright_cache: self.playwright_cache,
-                database_url: None,
-                github_repo: self.github_repo,
-                worktree_read_only: false,
-                output_dir: None,
-                extra_env: &[("ALUCARD_ITER", &fix_iteration)],
-            }
-            .invoke(self.settings, &log);
+            let repair = (|| {
+                let clone = execute_command(
+                    "git",
+                    &[
+                        "clone",
+                        "--quiet",
+                        "--branch",
+                        branch,
+                        remote,
+                        &checkout_text,
+                    ],
+                    &prepared.directory,
+                    Some(Duration::from_secs(120)),
+                )
+                .map_err(|error| error.to_string())?;
+                if !clone.status.success() {
+                    return Err(String::from_utf8_lossy(&clone.stderr).trim().to_string());
+                }
+                let prompt = ci_fix_prompt(self.tools, pr_number, branch, &failure_log)?;
+                let log = prepared
+                    .directory
+                    .join(format!("iter-{iteration}-fix-{attempt}.jsonl"));
+                let name = format!("alucard-fix-{}-{attempt}", prepared.run.id);
+                let fix_iteration = format!("{iteration}-fix-{attempt}");
+                let _ = AgentInvocation {
+                    role: AgentRole::CiFix,
+                    name: &name,
+                    image: &self.options.image,
+                    env_file: &self.options.env_file,
+                    worktree: &checkout,
+                    prompt: &prompt,
+                    timeout_minutes: self.options.timeout_minutes,
+                    network: None,
+                    playwright_cache: self.playwright_cache,
+                    database_url: None,
+                    github_repo: self.github_repo,
+                    worktree_read_only: false,
+                    output_dir: None,
+                    extra_env: &[("ALUCARD_ITER", &fix_iteration)],
+                }
+                .invoke(self.settings, &log);
+                Ok(())
+            })();
+            let _ = fs::remove_dir_all(&checkout);
+            repair?;
         }
         Ok(CiResult::Failed)
     }
