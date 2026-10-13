@@ -56,7 +56,7 @@ fn role_settings_and_docker_arguments_match_bash_contract() {
         "opus"
     );
 
-    let invocation = AgentInvocation {
+    let ci_fix_invocation = AgentInvocation {
         role: AgentRole::CiFix,
         name: "alucard-fix-1",
         image: "alucard:test",
@@ -72,7 +72,7 @@ fn role_settings_and_docker_arguments_match_bash_contract() {
         output_dir: None,
         extra_env: &[],
     };
-    let args = invocation.docker_args(&agent_settings).unwrap();
+    let args = ci_fix_invocation.docker_args(&agent_settings).unwrap();
     assert!(args
         .windows(2)
         .any(|pair| pair == ["--network", "alucard-test"]));
@@ -86,6 +86,16 @@ fn role_settings_and_docker_arguments_match_bash_contract() {
             .any(|value| value
                 == "DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres")
     );
+    let worker_args = AgentInvocation {
+        role: AgentRole::Worker,
+        github_repo: Some("example/repo"),
+        ..invocation(AgentRole::Worker)
+    }
+    .docker_args(&agent_settings)
+    .unwrap();
+    assert!(worker_args
+        .iter()
+        .any(|value| value == "GH_REPO=example/repo"));
 }
 
 #[test]

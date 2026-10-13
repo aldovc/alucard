@@ -207,6 +207,18 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
     let root = path.parent().unwrap();
     let repository = root.join("source");
     seed_repository(&repository);
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            repository.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:example/source.git",
+        ])
+        .status()
+        .unwrap()
+        .success());
     let logs = root.join("logs");
     let cache = root.join("cache");
 
@@ -243,6 +255,19 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
     assert!(second.clone.join(".git").is_dir());
     assert!(first.branch.ends_with("-task-alpha"));
     assert!(second.branch.ends_with("-issue-42"));
+    assert_eq!(
+        String::from_utf8(
+            Command::new("git")
+                .args(["remote", "get-url", "origin"])
+                .current_dir(&first.clone)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim(),
+        "https://github.com/example/source.git"
+    );
     assert_eq!(
         open(&path)
             .unwrap()

@@ -2192,6 +2192,12 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
     let repository_id = repository.to_string_lossy().to_string();
+    let origin_url = run_command("git", &["remote", "get-url", "origin"], &repository, None)
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|url| !url.is_empty())
+        .map(|url| github_https_url(&url));
     let cache_key = repository_cache_key(&repository);
     let cache = options.cache_root.join(&cache_key);
     fs::create_dir_all(options.cache_root)?;
@@ -2231,6 +2237,9 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         ],
         &directory,
     )?;
+    if let Some(origin_url) = origin_url.as_deref() {
+        run_checked("git", &["remote", "set-url", "origin", origin_url], &clone)?;
+    }
     FileExt::unlock(&lock)?;
     if !clone.join(".git").is_dir() {
         return Err(RunError::InvalidClone);
@@ -2284,6 +2293,10 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         clone,
         branch,
     })
+}
+
+fn github_https_url(url: &str) -> String {
+    url.replacen("git@github.com:", "https://github.com/", 1)
 }
 
 fn repository_cache_key(repository: &Path) -> String {
