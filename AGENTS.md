@@ -7,4 +7,6 @@ focused on observable outcomes.
 
 For prompt changes, run `bash test/test_engineering_policy.sh` to check assembly.
 For shell changes, run the affected tests and the checks in
-`.github/workflows/test.yml`.
+`.github/workflows/test.yml`. For Rust changes, run `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings` and `cargo test`. The static musl
+build step needs root and runs in CI only.
