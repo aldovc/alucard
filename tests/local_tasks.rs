@@ -454,8 +454,7 @@ fn run_github_recovery_case(root: &Path, scenario: &str) {
 case "$1 $2" in
   'image inspect') echo stamp ;;
   'run '*)
-    printf x >> "$ALUCARD_GITHUB_RECOVERY_DOCKER_TRACE"
-    for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; *:/work-output:rw) output=${argument%:/work-output:rw} ;; esac; done
+    for argument in "$@"; do case "$argument" in alucard-*) printf '%s\n' "$argument" >> "$ALUCARD_GITHUB_RECOVERY_DOCKER_TRACE" ;; *:/work:rw) worktree=${argument%:/work:rw} ;; *:/work-output:rw) output=${argument%:/work-output:rw} ;; esac; done
     if [ -n "$output" ]; then
       printf '%s\n' '## Done' > "$output/.alucard-handoff"
       printf '%s\n' 'Recovery handoff.' >> "$output/.alucard-handoff"
@@ -527,6 +526,7 @@ esac
     .unwrap();
     let database = root.join("ledger.db");
     let logs = root.join("logs");
+    fs::create_dir_all(logs.join("wrapup-output")).unwrap();
     let arguments = [
         "--db-path",
         database.to_str().unwrap(),
@@ -585,7 +585,10 @@ esac
     let output = invoke();
     assert!(output.status.success(), "{scenario}: {output:?}");
     assert_eq!(
-        fs::read_to_string(root.join("docker-trace")).unwrap().len(),
+        fs::read_to_string(root.join("docker-trace"))
+            .unwrap()
+            .lines()
+            .count(),
         if scenario == "timeout" { 1 } else { 2 },
         "{scenario}"
     );
@@ -602,6 +605,9 @@ fn test_worker_recovery() {
     assert!(fs::read_to_string(root.join("body"))
         .unwrap()
         .contains("## Handoff from the wrap-up agent\n\n## Done\nRecovery handoff."));
+    assert!(fs::read_to_string(root.join("docker-trace"))
+        .unwrap()
+        .contains("alucard-wrapup-1-"));
     assert_eq!(
         fs::read_to_string(root.join("marker")).unwrap(),
         "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."

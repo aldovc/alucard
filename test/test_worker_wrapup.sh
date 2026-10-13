@@ -215,17 +215,12 @@ chmod +x "$MOCK_BIN/timeout" "$MOCK_BIN/docker" "$MOCK_BIN/gh"
 WRAPUP_TURNS=9   # not the default, so a frozen number cannot pass
 EXTRA_RUN_ARGS=()
 PRE_RUN_HOOK=""
-STALE_WRAPUP_OUTPUT=no
-
 run_scenario() {
   local name="$1"; shift
   local root="$TEST_DIR/$name" target remote
   target="$root/target"; remote="$root/remote.git"
   STATE="$root/state"
   mkdir -p "$target" "$STATE"
-  if [ "$STALE_WRAPUP_OUTPUT" = yes ]; then
-    mkdir -p "$root/logs/wrapup-output"
-  fi
   : > "$STATE/argv"; : > "$STATE/launches"; : > "$STATE/trace"
   git init -q --bare "$remote"
   git -C "$target" init -q -b main
@@ -259,9 +254,7 @@ run_scenario() {
 
 echo ""
 echo "── exhausted worker, wrap-up writes the handoff ──"
-STALE_WRAPUP_OUTPUT=yes
 run_scenario handoff ALUCARD_TEST_WRAPUP=handoff
-STALE_WRAPUP_OUTPUT=no
 assert_eq "the run completes" "0" "$RC"
 assert_eq "two containers ran: the worker, then the wrap-up" "2" "$(grep -c '^run ' <<<"$LAUNCHES")"
 worker_wt=$(sed -n 's/^run 1 //p' <<<"$LAUNCHES"); wrap_wt=$(sed -n 's/^run 2 //p' <<<"$LAUNCHES")
