@@ -106,3 +106,30 @@ fn doctor_uses_checkout_root_and_checks_installed_manifest() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn doctor_github_mode_ignores_environment_tasks_file_and_accepts_zero_timeout() {
+    let directory = temp_dir();
+    let binary = copy_tool_installation(&directory);
+    let repository = directory.join("repository");
+    fs::create_dir_all(&repository).unwrap();
+
+    let output = Command::new(binary)
+        .args([
+            "doctor",
+            repository.to_str().unwrap(),
+            "--github",
+            "--timeout-minutes",
+            "0",
+        ])
+        .env("ALUCARD_TASKS_FILE", directory.join("missing-tasks.md"))
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("tasks file not found"));
+    assert!(!stderr.contains("timeout must be a positive integer"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("missing: valid target git repo"));
+
+    fs::remove_dir_all(directory).unwrap();
+}

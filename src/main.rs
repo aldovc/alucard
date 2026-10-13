@@ -78,12 +78,7 @@ impl DoctorOptions {
                     let timeout = values
                         .next()
                         .ok_or_else(|| format!("{value} requires a number"))?;
-                    if timeout
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|number| *number > 0)
-                        .is_none()
-                    {
+                    if timeout.is_empty() || !timeout.bytes().all(|byte| byte.is_ascii_digit()) {
                         return Err("timeout must be a positive integer".to_string());
                     }
                 }
@@ -125,9 +120,11 @@ impl DoctorOptions {
         if tasks_from_flag && options.github {
             return Err("--tasks and --github are mutually exclusive".to_string());
         }
-        if let Some(tasks) = &options.tasks {
-            if !tasks.is_file() {
-                return Err(format!("tasks file not found: {}", tasks.display()));
+        if !options.github {
+            if let Some(tasks) = &options.tasks {
+                if !tasks.is_file() {
+                    return Err(format!("tasks file not found: {}", tasks.display()));
+                }
             }
         }
         Ok(options)
