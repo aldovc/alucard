@@ -1,5 +1,5 @@
 use alucard::{
-    begin_operation, begin_operation_with_payload, github_queue, github_ticket_blockers,
+    begin_operation_with_payload, finish_operation, github_queue, github_ticket_blockers,
     import_github_tasks, import_local_tasks, local_queue, local_queue_with_open_issues, migrate,
     open, parse_tasks, resolve_pinned_issue, start_task_retry_run, start_task_run, task_id,
     write_task_headings, GithubPullRequest, GithubTask, TaskHeadingUpdate, TaskState,
@@ -704,11 +704,19 @@ fn startup_replays_pending_recovery_operations_idempotently() {
         "branch",
         "recovery-crash",
     ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "recovery-crash",
+    ]));
 
     let docker = bin.join("docker");
     fs::write(
         &docker,
-        "#!/bin/sh\n[ \"$1 $2\" = 'image inspect' ] && echo stamp\n",
+        "#!/bin/sh\n[ \"$1 $2\" = 'image inspect' ] && echo stamp\nexit 0\n",
     )
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
@@ -747,15 +755,18 @@ esac
         .unwrap()
         .to_string_lossy()
         .to_string();
-    open(&database)
-        .unwrap()
-        .execute(
-            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, 'owner', 'name', 'now')",
-            [&repository_id],
-        )
-        .unwrap();
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "## [ ] recovery: Recovery task\n").unwrap();
+    let (task_id, claim_id, _) = seed_abandoned_task(
+        &database,
+        &repository,
+        &tasks,
+        "recovery",
+        "recovery-crash",
+        None,
+    );
     let target = "recovery:recovery-crash";
-    begin_operation_with_payload(
+    let push = begin_operation_with_payload(
         &database,
         &repository_id,
         target,
@@ -763,6 +774,7 @@ esac
         Some(&serde_json::json!({ "checkout": repository }).to_string()),
     )
     .unwrap();
+    finish_operation(&database, &push, None).unwrap();
     begin_operation_with_payload(
         &database,
         &repository_id,
@@ -771,25 +783,6 @@ esac
         Some(r#"{"base":"main","title":"Recovery","body":"Ledger link"}"#),
     )
     .unwrap();
-    for operation in ["alucard-label", "needs-human-label", "recovery_marker"] {
-        begin_operation(&database, &repository_id, "recovery-pr:91", operation).unwrap();
-    }
-    open(&database)
-        .unwrap()
-        .execute(
-            "UPDATE operations SET created_at = CASE operation_type
-             WHEN 'push' THEN '2026-01-01 00:00:01'
-             WHEN 'create_recovery_pr' THEN '2026-01-01 00:00:02'
-             WHEN 'alucard-label' THEN '2026-01-01 00:00:03'
-             WHEN 'needs-human-label' THEN '2026-01-01 00:00:04'
-             WHEN 'recovery_marker' THEN '2026-01-01 00:00:05'
-             END",
-            [],
-        )
-        .unwrap();
-
-    let tasks = root.join("tasks.md");
-    fs::write(&tasks, "# Tasks\n").unwrap();
     let environment = root.join("agent.env");
     fs::write(
         &environment,
@@ -843,6 +836,26 @@ esac
             .unwrap(),
         "pending"
     );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "in_flight"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&claim_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "released"
+    );
     drop(connection);
     assert!(root.join("pr").exists());
     assert!(root.join("marker").exists());
@@ -868,6 +881,17 @@ esac
             .count(),
         1,
         "{trace}"
+    );
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT number FROM pull_requests WHERE task_id = ?1",
+                [&task_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        91
     );
     assert_eq!(
         trace

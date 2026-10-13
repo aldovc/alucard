@@ -1136,9 +1136,14 @@ fn replay_recovery_operations(
     repository: &Path,
     repository_id: &str,
 ) -> Result<(), String> {
-    for operation in
-        pending_operations(database, repository_id).map_err(|error| error.to_string())?
-    {
+    let mut operations =
+        pending_operations(database, repository_id).map_err(|error| error.to_string())?;
+    operations.sort_by_key(|operation| match operation.operation_type.as_str() {
+        "push" => 0,
+        "create_recovery_pr" => 1,
+        _ => 2,
+    });
+    for operation in operations {
         let replay = match (
             operation.target.strip_prefix("recovery:"),
             operation.operation_type.as_str(),
@@ -1877,6 +1882,36 @@ fn recover_worker_changes(
         Some(&push_payload),
     )
     .map_err(|error| error.to_string())?;
+    let pr = if classification == alucard::AgentExit::Transport && commit_count == 0 {
+        None
+    } else {
+        let title = recovery_title(iteration, classification, status);
+        let body = recovery_body(
+            task,
+            classification,
+            status,
+            commit_count,
+            handoff.as_deref(),
+        );
+        let pr_payload = serde_json::json!({
+            "base": options.base,
+            "title": title,
+            "body": body,
+        })
+        .to_string();
+        Some((
+            begin_operation_with_payload(
+                database,
+                &prepared.run.repository_id,
+                &target,
+                "create_recovery_pr",
+                Some(&pr_payload),
+            )
+            .map_err(|error| error.to_string())?,
+            title,
+            body,
+        ))
+    };
     let pushed = execute_command(
         "git",
         &["push", "-u", "origin", &prepared.branch],
@@ -1887,6 +1922,9 @@ fn recover_worker_changes(
     if !pushed.status.success() {
         let error = String::from_utf8_lossy(&pushed.stderr).trim().to_string();
         let _ = finish_operation(database, &push, Some(&error));
+        if let Some((pr, _, _)) = &pr {
+            let _ = finish_operation(database, pr, Some(&error));
+        }
         record_recovery_failure(
             database,
             &task.ledger_id,
@@ -1914,6 +1952,9 @@ fn recover_worker_changes(
     }
     if let Some((number, branch, sha)) = find_open_pr(&options.queue.repository, &prepared.branch)?
     {
+        if let Some((pr, _, _)) = &pr {
+            finish_operation(database, pr, None).map_err(|error| error.to_string())?;
+        }
         return record_recovery(
             database,
             task,
@@ -1928,28 +1969,7 @@ fn recover_worker_changes(
             status,
         );
     }
-    let title = recovery_title(iteration, classification, status);
-    let body = recovery_body(
-        task,
-        classification,
-        status,
-        commit_count,
-        handoff.as_deref(),
-    );
-    let pr_payload = serde_json::json!({
-        "base": options.base,
-        "title": title,
-        "body": body,
-    })
-    .to_string();
-    let pr = begin_operation_with_payload(
-        database,
-        &prepared.run.repository_id,
-        &target,
-        "create_recovery_pr",
-        Some(&pr_payload),
-    )
-    .map_err(|error| error.to_string())?;
+    let (pr, title, body) = pr.expect("recovery PR intent is required after a non-clean push");
     let output = execute_command(
         "gh",
         &[
