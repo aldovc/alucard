@@ -230,7 +230,7 @@ case "$1 $2" in
   "pr list")     printf '%s\n' "${ALUCARD_TEST_PR:-}" ;;
   "pr view")
     case "$*" in
-      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s"}\n' "${ALUCARD_TEST_BRANCH:-}" ;;
+      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s","headRefOid":"deadbeef","title":"","comments":[]}\n' "${ALUCARD_TEST_BRANCH:-}" ;;
       *comments*)          printf '{"comments":[]}\n' ;;
       *reviews*)           printf '\n' ;;
       *headRefOid*)        printf 'deadbeef\n' ;;

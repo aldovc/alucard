@@ -89,7 +89,10 @@ case "$1 $2" in
   "issue view") printf 'Small fix\n' ;;
   "pr view")
     case "$*" in
-      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s"}\n' "$ALUCARD_TEST_BRANCH" ;;
+      *state,headRefName*)
+        jq -n --arg branch "$ALUCARD_TEST_BRANCH" --arg head "$ALUCARD_TEST_PR_HEAD" \
+          --argjson c "$ALUCARD_TEST_COMMENTS" --arg t "$ALUCARD_TEST_TITLE" \
+          '{state:"OPEN", headRefName:$branch, headRefOid:$head, title:$t, comments:$c}' ;;
       *comments*)
         jq -n --argjson c "$ALUCARD_TEST_COMMENTS" --arg a "$ALUCARD_TEST_PR_AUTHOR" \
           --argjson d "$ALUCARD_TEST_DRAFT" --argjson l "$ALUCARD_TEST_LABELS" \
