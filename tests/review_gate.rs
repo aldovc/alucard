@@ -137,6 +137,16 @@ for argument in "$@"; do
     *:/work-output:rw) output=${argument%:/work-output:rw} ;;
   esac
 done
+case " $* " in
+  *" --name alucard-fix-"*)
+    if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
+      printf '%s\n' "$*" >> "$ALUCARD_CI_FIX_ATTEMPTS"
+      printf 'uncommitted ci repair\n' > "$work/ci-repair.txt"
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+      exit 0
+    fi
+    ;;
+esac
 if [ -n "$output" ]; then
   printf '%s\n' "$@" >> "$ALUCARD_REVIEW_ARGS"
   role=review
@@ -257,6 +267,10 @@ sha() { git --git-dir="$ALUCARD_REMOTE" rev-parse "refs/heads/$branch"; }
 case "$1 $2" in
   'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
   'pr checks')
+    if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
+      echo "checks failed" >&2
+      exit 1
+    fi
     if [ "$ALUCARD_CASE" = feedback-ci-missing-after-push ] && [ ! -s "$ALUCARD_FEEDBACK_ATTEMPTS" ]; then
       exit 0
     fi
@@ -294,6 +308,7 @@ esac
     let review_attempts = root.join("review-attempts");
     fs::write(&review_attempts, "").unwrap();
     fs::write(root.join("feedback-attempts"), "").unwrap();
+    fs::write(root.join("ci-fix-attempts"), "").unwrap();
     let review_heads = root.join("review-heads");
     fs::write(&review_heads, "").unwrap();
     let branch_file = root.join("branch");
@@ -311,6 +326,7 @@ esac
         .env("ALUCARD_REVIEW_ATTEMPTS", &review_attempts)
         .env("ALUCARD_REVIEW_HEADS", &review_heads)
         .env("ALUCARD_FEEDBACK_ATTEMPTS", root.join("feedback-attempts"))
+        .env("ALUCARD_CI_FIX_ATTEMPTS", root.join("ci-fix-attempts"))
         .env("ALUCARD_PROMPTS", {
             let prompts = root.join("prompts");
             fs::create_dir(&prompts).unwrap();
@@ -664,6 +680,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             expected_state: "review_changes_requested",
         },
         ReviewCase {
+            name: "feedback-ci-repair-after-push",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
             name: "feedback-ci-missing-after-push",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
@@ -795,6 +824,12 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                     .count(),
                 2
             );
+        }
+        if case.name == "feedback-ci-repair-after-push" {
+            let repairs = fs::read_to_string(root.join("ci-fix-attempts")).unwrap();
+            assert_eq!(repairs.lines().count(), 4);
+            assert!(repairs.contains("-0-1"), "{repairs}");
+            assert!(repairs.contains("-1-1"), "{repairs}");
         }
         if case.name == "feedback-cycle-exhaustion" {
             assert!(trace.contains("gave up after 2/2 review cycles — needs human"));

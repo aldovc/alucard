@@ -880,6 +880,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &branch,
                         number,
                         iteration,
+                        0,
                         &mut checks_available,
                     ) {
                         Ok(result) => {
@@ -1264,6 +1265,7 @@ impl CiGate<'_> {
         branch: &str,
         pr_number: i64,
         iteration: usize,
+        gate_cycle: usize,
         checks_available: &mut bool,
     ) -> Result<CiResult, String> {
         let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
@@ -1317,7 +1319,9 @@ impl CiGate<'_> {
 
             let failure_log =
                 failed_run_log(&prepared.clone, branch, head.trim()).unwrap_or_default();
-            let checkout = prepared.directory.join(format!("fix-{attempt}"));
+            let checkout = prepared
+                .directory
+                .join(format!("fix-{gate_cycle}-{attempt}"));
             let checkout_text = checkout.display().to_string();
             let mut agent_invoked = false;
             let repair = (|| {
@@ -1341,9 +1345,9 @@ impl CiGate<'_> {
                 let prompt = ci_fix_prompt(self.tools, pr_number, branch, &failure_log)?;
                 let log = prepared
                     .directory
-                    .join(format!("iter-{iteration}-fix-{attempt}.jsonl"));
-                let name = format!("alucard-fix-{}-{attempt}", prepared.run.id);
-                let fix_iteration = format!("{iteration}-fix-{attempt}");
+                    .join(format!("iter-{iteration}-fix-{gate_cycle}-{attempt}.jsonl"));
+                let name = format!("alucard-fix-{}-{gate_cycle}-{attempt}", prepared.run.id);
+                let fix_iteration = format!("{iteration}-fix-{gate_cycle}-{attempt}");
                 agent_invoked = true;
                 let _ = AgentInvocation {
                     role: AgentRole::CiFix,
@@ -2093,6 +2097,7 @@ fn review_gate(
                                 branch,
                                 pr_number,
                                 iteration,
+                                cycle,
                                 &mut feedback_checks_available,
                             )
                             .ok();
