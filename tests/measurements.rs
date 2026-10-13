@@ -1,5 +1,6 @@
 use alucard::{
-    archive_prompt, extract_agent_usage, log_event, write_iteration_measurement,
+    archive_prompt, extract_agent_usage, iteration_usage_comment, iteration_usage_comment_for_dirs,
+    log_event, usage_report, usage_report_for_dirs, write_iteration_measurement,
     write_stage_measurement, IterationMeasurement,
 };
 use std::fs;
@@ -26,7 +27,7 @@ fn git(repository: &PathBuf, args: &[&str]) -> String {
 }
 
 #[test]
-fn extracts_claude_and_codex_usage_without_inventing_a_cost() {
+fn extracts_claude_and_codex_usage() {
     let root = temporary_path("usage");
     fs::create_dir_all(&root).unwrap();
     let claude = root.join("claude.jsonl");
@@ -36,6 +37,131 @@ fn extracts_claude_and_codex_usage_without_inventing_a_cost() {
     fs::write(&codex, "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":3,\"output_tokens\":4}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n").unwrap();
     let usage = extract_agent_usage(&codex).unwrap();
     assert_eq!((usage.input, usage.cache_read, usage.cost), (7, 3, None));
+    let codex_cache_write = root.join("codex-cache-write.jsonl");
+    fs::write(&codex_cache_write, "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10817,\"cached_input_tokens\":0,\"cache_write_input_tokens\":10814,\"output_tokens\":5}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n").unwrap();
+    let usage = extract_agent_usage(&codex_cache_write).unwrap();
+    assert_eq!(
+        (
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+            usage.turns
+        ),
+        (10817, 5, 0, 10814, 1)
+    );
+    let codex_multiple = root.join("codex-multiple.jsonl");
+    fs::write(&codex_multiple, "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1000,\"cached_input_tokens\":400,\"output_tokens\":100}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2000,\"cached_input_tokens\":600,\"output_tokens\":200}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n").unwrap();
+    let usage = extract_agent_usage(&codex_multiple).unwrap();
+    assert_eq!(
+        (usage.input, usage.output, usage.cache_read, usage.turns),
+        (2000, 300, 1000, 2)
+    );
+    assert!(extract_agent_usage(&root.join("missing.jsonl")).is_none());
+    let empty = root.join("empty.jsonl");
+    fs::write(&empty, "{\"type\":\"system\"}\n").unwrap();
+    assert!(extract_agent_usage(&empty).is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn formats_bash_compatible_usage_table_and_iteration_comment() {
+    let root = temporary_path("usage-report");
+    fs::create_dir_all(&root).unwrap();
+    let claude = r#"{"type":"result","num_turns":42,"total_cost_usd":1.234,"modelUsage":{"claude-sonnet-4-5":{"inputTokens":1000,"outputTokens":2000,"cacheReadInputTokens":50000,"cacheCreationInputTokens":9000}}}"#;
+    fs::write(root.join("iter-1-attempt-1.jsonl"), claude).unwrap();
+    fs::write(root.join("iter-1-review-2.jsonl"), claude).unwrap();
+    fs::write(root.join("iter-1-review-2-attempt-2.jsonl"), claude).unwrap();
+    fs::write(root.join("iter-1-feedback-2.jsonl"), "").unwrap();
+    let stale_claude_then_codex = format!(
+        "{{\"type\":\"result\",\"num_turns\":99,\"total_cost_usd\":9.99,\"modelUsage\":{{\"claude\":{{\"inputTokens\":999}}}}}}\n{}{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":10,\"cached_input_tokens\":3,\"output_tokens\":4}}}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\"}}}}\n",
+        "{\"type\":\"system\"}\n".repeat(19)
+    );
+    fs::write(
+        root.join("iter-1-feedback-3.jsonl"),
+        stale_claude_then_codex,
+    )
+    .unwrap();
+    fs::write(root.join("iter-10-review-1.jsonl"), claude).unwrap();
+
+    let comment = root.join("comment");
+    let report = root.join("report");
+    let gh = root.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr view') printf '%s\\n' '' ;;\n  'pr comment') printf '%s' \"$5\" > \"$ALUCARD_COMMENT\" ;;\nesac\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1/alucard"
+print_usage_report "$2" > "$3"
+post_iteration_usage 1 754 "$1" "$2" 754"#,
+            "bash",
+            env!("CARGO_MANIFEST_DIR"),
+            root.to_str().unwrap(),
+            report.to_str().unwrap(),
+        ])
+        .env("ALUCARD_COMMENT", &comment)
+        .env(
+            "PATH",
+            format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(usage_report(&root), fs::read_to_string(&report).unwrap());
+    assert_eq!(
+        iteration_usage_comment(&root, 1, Some(754)).unwrap(),
+        fs::read_to_string(&comment).unwrap()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn transport_retry_usage_includes_every_attempt_in_table_and_comment() {
+    let root = temporary_path("transport-retry-usage");
+    let first = root.join("first-attempt");
+    let final_attempt = root.join("final-attempt");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&final_attempt).unwrap();
+    fs::write(
+        first.join("iter-1-attempt-1.jsonl"),
+        r#"{"type":"result","num_turns":1,"total_cost_usd":0.1,"modelUsage":{"m":{"inputTokens":10,"outputTokens":4}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        final_attempt.join("iter-1-attempt-2.jsonl"),
+        r#"{"type":"result","num_turns":2,"total_cost_usd":0.2,"modelUsage":{"m":{"inputTokens":20,"outputTokens":5}}}"#,
+    )
+    .unwrap();
+    let logs = vec![first, final_attempt];
+
+    let table = usage_report_for_dirs(&logs);
+    assert!(table.contains("worker 1-attempt-1"));
+    assert!(table.contains("worker 1-attempt-2"));
+    let total = table
+        .lines()
+        .find(|line| line.starts_with("TOTAL"))
+        .unwrap();
+    assert_eq!(
+        total.split_whitespace().collect::<Vec<_>>(),
+        ["TOTAL", "30", "9", "0", "0", "3", "$0.300"]
+    );
+
+    let comment = iteration_usage_comment_for_dirs(&logs, 1, None).unwrap();
+    assert!(comment.contains("| worker attempt 1 | 10 | 4 | 0 | 0 | 1 | $0.100 |"));
+    assert!(comment.contains("| worker attempt 2 | 20 | 5 | 0 | 0 | 2 | $0.200 |"));
+    assert!(comment.contains("| **TOTAL** | **30** | **9** | **0** | **0** | **3** | **$0.300** |"));
+
     fs::remove_dir_all(root).unwrap();
 }
 

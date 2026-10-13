@@ -4,14 +4,14 @@ use alucard::{
     abandoned_task_claims, archive_prompt, begin_operation, begin_operation_with_payload,
     build_image, compose_role_prompt, database_path, defer_operation, find_run, finish_operation,
     finish_run, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
-    local_queue_with_open_issues, local_queue_with_open_prs, log_event,
-    mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
+    iteration_usage_comment_for_dirs, local_queue_with_open_issues, local_queue_with_open_prs,
+    log_event, mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
     pending_operations, prepare_run, recent_runs, record_recovery_failure, record_recovery_pr,
     record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
     release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
     run_reconciliation_reason, run_recovery, start_task_retry_run, start_task_run, status,
     task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
-    warn_if_stale_image, write_iteration_measurement, write_run_measurement,
+    usage_report_for_dirs, warn_if_stale_image, write_iteration_measurement, write_run_measurement,
     write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentRole,
     AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
     RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
+
+#[cfg(test)]
+use alucard::usage_report;
 
 const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's.";
 const BLOCKED_FINDINGS_MARKER: &str = "**🤖 Alucard blocked findings**";
@@ -665,6 +668,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         let owner_run_id = run.id.clone();
         let mut attempt_run = run;
         let mut attempt = 1;
+        let iteration_started = Instant::now();
         let mut prepared =
             match prepare_attempt(&database, &options, &cache, &selected, &attempt_run) {
                 Ok(prepared) => prepared,
@@ -680,6 +684,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     return fail(&format!("alucard: {error}"));
                 }
             };
+        let mut usage_log_dirs = vec![prepared.directory.clone()];
         if let Some(issue) = selected.issue.as_ref() {
             if let Err(error) = gh_output(
                 &options.queue.repository,
@@ -846,6 +851,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         );
                         let _ = release(&database, &claim.id, &owner_run_id);
                         let _ = finish_run(&database, &attempt_run.id, "failed");
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
                         return fail(&format!("alucard: {error}"));
                     }
                     if let Some(local_id) = selected.local_id.as_ref() {
@@ -917,12 +923,20 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     ) {
                         eprintln!("alucard: review gate for PR #{number}: {error}");
                     }
+                    report_iteration_usage(
+                        &options.queue.repository,
+                        &usage_log_dirs,
+                        iteration,
+                        number,
+                        iteration_started.elapsed().as_secs(),
+                    );
                     let _ = release(&database, &claim.id, &owner_run_id);
                     let _ = finish_run(&database, &attempt_run.id, "completed");
                     break;
                 }
                 Ok(None) => {
                     if classification == alucard::AgentExit::Billing {
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
                         release_without_pr(
                             &database,
                             &selected,
@@ -957,6 +971,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                     &owner_run_id,
                                     &options.queue.repository,
                                 );
+                                print!("{}", usage_report_for_dirs(&usage_log_dirs));
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
@@ -977,12 +992,14 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                     &options.queue.repository,
                                 );
                                 let _ = finish_run(&database, &attempt_run.id, "failed");
+                                print!("{}", usage_report_for_dirs(&usage_log_dirs));
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
+                        usage_log_dirs.push(prepared.directory.clone());
                         continue;
                     }
-                    if let Err(error) = recover_worker_changes(
+                    match recover_worker_changes(
                         &database,
                         &tools,
                         &options,
@@ -996,15 +1013,26 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         result.as_ref().ok().and_then(|value| value.status),
                         &log,
                     ) {
-                        eprintln!("alucard: recovery requires human attention: {error}");
-                        let _ = transition_task(
-                            &database,
-                            &selected.ledger_id,
-                            &claim.id,
-                            &owner_run_id,
-                            TaskStatus::Human,
-                        );
+                        Ok(Some(number)) => post_iteration_usage(
+                            &options.queue.repository,
+                            &usage_log_dirs,
+                            iteration,
+                            number,
+                            iteration_started.elapsed().as_secs(),
+                        ),
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("alucard: recovery requires human attention: {error}");
+                            let _ = transition_task(
+                                &database,
+                                &selected.ledger_id,
+                                &claim.id,
+                                &owner_run_id,
+                                TaskStatus::Human,
+                            );
+                        }
                     }
+                    print!("{}", usage_report_for_dirs(&usage_log_dirs));
                     let _ = release(&database, &claim.id, &owner_run_id);
                     if let Some(issue) = selected.issue.as_ref() {
                         if let Ok(operation) = begin_operation(
@@ -1048,6 +1076,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &options.queue.repository,
                     );
                     let _ = finish_run(&database, &attempt_run.id, "failed");
+                    print!("{}", usage_report_for_dirs(&usage_log_dirs));
                     return fail(&format!("alucard: {error}"));
                 }
             }
@@ -2342,7 +2371,7 @@ fn recover_worker_changes(
     classification: alucard::AgentExit,
     status: Option<i32>,
     worker_log: &Path,
-) -> Result<(), String> {
+) -> Result<Option<i64>, String> {
     if classification == alucard::AgentExit::Clean
         || (classification == alucard::AgentExit::Transport && status == Some(0))
     {
@@ -2353,7 +2382,8 @@ fn recover_worker_changes(
             run_id,
             &prepared.run.repository_id,
             &options.queue.repository,
-        );
+        )
+        .map(|()| None);
     }
     let base = prepared.run.base_sha.as_deref().unwrap_or("HEAD");
     let commits = execute_command(
@@ -2372,7 +2402,7 @@ fn recover_worker_changes(
     let dirty = !dirty.stdout.is_empty();
     if !dirty && commit_count == 0 {
         if classification == alucard::AgentExit::Transport {
-            return Ok(());
+            return Ok(None);
         }
         return release_pending(
             database,
@@ -2381,7 +2411,8 @@ fn recover_worker_changes(
             run_id,
             &prepared.run.repository_id,
             &options.queue.repository,
-        );
+        )
+        .map(|()| None);
     }
     let handoff = if wrapup_applies(classification) && wrapup_enabled(settings) {
         run_wrapup_agent(
@@ -2502,7 +2533,8 @@ fn recover_worker_changes(
             run_id,
             &prepared.run.repository_id,
             &options.queue.repository,
-        );
+        )
+        .map(|()| None);
     }
     if let Some((number, branch, sha)) = find_open_pr(&options.queue.repository, &prepared.branch)?
     {
@@ -2521,7 +2553,8 @@ fn recover_worker_changes(
             commit_count,
             classification,
             status,
-        );
+        )
+        .map(Some);
     }
     let (pr, title, body) = pr.expect("recovery PR intent is required after a non-clean push");
     let output = execute_command(
@@ -2576,6 +2609,7 @@ fn recover_worker_changes(
         classification,
         status,
     )
+    .map(Some)
 }
 
 fn release_pending(
@@ -2633,7 +2667,7 @@ fn record_recovery(
     commits: usize,
     classification: alucard::AgentExit,
     status: Option<i32>,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     record_recovery_pr(
         database,
         &task.ledger_id,
@@ -2756,7 +2790,7 @@ fn record_recovery(
         finish_operation(database, &label_operation, label_error.as_deref())
             .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    Ok(number)
 }
 
 fn recovery_title(
@@ -3712,6 +3746,69 @@ fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>,
     }
 }
 
+fn post_iteration_usage(
+    repository: &Path,
+    log_dirs: &[PathBuf],
+    iteration: usize,
+    pr: i64,
+    duration: u64,
+) {
+    let Some(body) = iteration_usage_comment_for_dirs(log_dirs, iteration, Some(duration)) else {
+        return;
+    };
+    let pr_number = pr.to_string();
+    let issue = gh_output(
+        repository,
+        &["pr", "view", &pr_number, "--json", "body", "--jq", ".body"],
+        "could not read pull request body for usage comment",
+    )
+    .ok()
+    .and_then(|body| closing_issue_number(&String::from_utf8_lossy(&body)));
+    let (kind, target) = match issue {
+        Some(number) => ("issue", number.to_string()),
+        None => ("PR", pr_number),
+    };
+    println!("Posting token usage to {kind} #{target}...");
+    let command = if kind == "issue" { "issue" } else { "pr" };
+    if let Err(error) = gh_output(
+        repository,
+        &[command, "comment", &target, "--body", &body],
+        "could not post token usage",
+    ) {
+        if let Some(log_dir) = log_dirs.last() {
+            log_event(log_dir, &format!("Measurement: {error} — continuing."));
+        }
+    }
+}
+
+fn report_iteration_usage(
+    repository: &Path,
+    log_dirs: &[PathBuf],
+    iteration: usize,
+    pr: i64,
+    duration: u64,
+) {
+    print!("{}", usage_report_for_dirs(log_dirs));
+    post_iteration_usage(repository, log_dirs, iteration, pr, duration);
+}
+
+fn closing_issue_number(body: &str) -> Option<i64> {
+    let lowercase = body.to_ascii_lowercase();
+    let words = lowercase
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '#'
+            })
+        })
+        .collect::<Vec<_>>();
+    words.windows(2).find_map(|words| {
+        matches!(words[0], "closes" | "fixes" | "resolves")
+            .then(|| words[1].strip_prefix('#')?.parse().ok())
+            .flatten()
+    })
+}
+
 fn fetch_open_local_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
     let output = gh_output(
         repository,
@@ -4077,6 +4174,24 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn no_recovery_pr_still_reports_worker_usage() {
+        let logs =
+            std::env::temp_dir().join(format!("alucard-usage-report-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("iter-1.jsonl"),
+            r#"{"type":"result","modelUsage":{"claude":{"inputTokens":12,"outputTokens":34}},"num_turns":1,"total_cost_usd":0.01}"#,
+        )
+        .unwrap();
+
+        let report = usage_report(&logs);
+
+        assert!(report.contains("=== Alucard Token Usage:"));
+        assert!(report.contains("worker 1"));
+        fs::remove_dir_all(logs).unwrap();
     }
 
     #[test]
