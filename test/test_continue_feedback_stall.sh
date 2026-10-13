@@ -117,21 +117,13 @@ cat > "$MOCK_BIN/gh" <<'MOCK'
 set -euo pipefail
 printf '%s\n' "$*" >> "$ALUCARD_TEST_GH_TRACE"
 case "$1 $2" in
-  "api user")   printf 'bot\n' ;;
   "pr checks")
     echo "no checks reported on the '$ALUCARD_TEST_BRANCH' branch" >&2
     exit 1 ;;
   "pr list")   printf '%s\n' "$ALUCARD_TEST_PR" ;;
   "pr view")
     case "$*" in
-      *state,headRefName*)
-        # Current tip of the branch on the remote — must move when an agent pushes.
-        git -C "$ALUCARD_TEST_TARGET" fetch --quiet origin "$ALUCARD_TEST_BRANCH" 2>/dev/null || true
-        _head=$(git -C "$ALUCARD_TEST_TARGET" rev-parse "origin/$ALUCARD_TEST_BRANCH" 2>/dev/null \
-          || printf 'deadbeef')
-        jq -c --arg branch "$ALUCARD_TEST_BRANCH" --arg head "$_head" \
-          '. + {state:"OPEN",headRefName:$branch,headRefOid:$head,title:"test pull request"}' \
-          <<< "$ALUCARD_TEST_COMMENTS" ;;
+      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s"}\n' "$ALUCARD_TEST_BRANCH" ;;
       *comments*)          printf '%s\n' "$ALUCARD_TEST_COMMENTS" ;;
       *reviews*)           printf '\n' ;;
       *headRefOid*)

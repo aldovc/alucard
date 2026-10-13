@@ -216,7 +216,6 @@ set -euo pipefail
 { printf 'gh'; printf ' %q' "$@"; printf '\n'; } >> "$ALUCARD_TEST_GH_TRACE"
 has_jq=false; for _a in "$@"; do [ "$_a" = "--jq" ] && has_jq=true; done
 case "$1 $2" in
-  "api user")     printf 'bot\n' ;;
   "repo view")   echo "example/api" ;;
   "api graphql") echo "[]" ;;
   "issue list")
@@ -231,7 +230,7 @@ case "$1 $2" in
   "pr list")     printf '%s\n' "${ALUCARD_TEST_PR:-}" ;;
   "pr view")
     case "$*" in
-      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s","headRefOid":"deadbeef","title":"","comments":[]}\n' "${ALUCARD_TEST_BRANCH:-}" ;;
+      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s"}\n' "${ALUCARD_TEST_BRANCH:-}" ;;
       *comments*)          printf '{"comments":[]}\n' ;;
       *reviews*)           printf '\n' ;;
       *headRefOid*)        printf 'deadbeef\n' ;;

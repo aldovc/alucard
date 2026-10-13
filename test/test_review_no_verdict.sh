@@ -86,7 +86,6 @@ cat > "$MOCK_BIN/gh" <<'MOCK'
 set -euo pipefail
 printf '%s\n' "$*" >> "$ALUCARD_TEST_GH_TRACE"
 case "$1 $2" in
-  "api user")   printf 'bot\n' ;;
   "pr checks")
     # No CI configured — the gate treats this as a pass.
     echo "no checks reported on the '$ALUCARD_TEST_BRANCH' branch" >&2
@@ -94,7 +93,7 @@ case "$1 $2" in
   "pr list")   printf '%s\n' "$ALUCARD_TEST_PR" ;;
   "pr view")
     case "$*" in
-      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s","headRefOid":"deadbeef","title":"","comments":[]}\n' "$ALUCARD_TEST_BRANCH" ;;
+      *state,headRefName*) printf '{"state":"OPEN","headRefName":"%s"}\n' "$ALUCARD_TEST_BRANCH" ;;
       *comments*)          printf '{"comments":[]}\n' ;;
       *reviews*)           printf '\n' ;;
       *headRefOid*)        printf 'deadbeef\n' ;;
