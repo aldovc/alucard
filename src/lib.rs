@@ -157,8 +157,13 @@ pub fn build_inputs_hash(tool_dir: &Path) -> io::Result<String> {
 }
 
 pub fn build_image(tool_dir: &Path, image: &str) -> Result<(), String> {
+    build_image_with_docker(tool_dir, image, Path::new("docker"))
+}
+
+fn build_image_with_docker(tool_dir: &Path, image: &str, docker: &Path) -> Result<(), String> {
     let hash = build_inputs_hash(tool_dir).map_err(|error| error.to_string())?;
-    let status = Command::new("docker")
+    let previous_id = docker_image_id(docker, image);
+    let status = Command::new(docker)
         .args([
             "build",
             "--label",
@@ -169,10 +174,115 @@ pub fn build_image(tool_dir: &Path, image: &str) -> Result<(), String> {
         .arg(tool_dir)
         .status()
         .map_err(|error| error.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("docker build failed with {status}"))
+    if !status.success() {
+        return Err(format!("docker build failed with {status}"));
+    }
+    let Some(previous_id) = previous_id else {
+        return Ok(());
+    };
+    let Some(new_id) = docker_image_id(docker, image) else {
+        return Ok(());
+    };
+    if new_id == previous_id || docker_image_tag_count(docker, &previous_id) != Some(0) {
+        return Ok(());
+    }
+
+    let display_id = previous_id.get(7..19).unwrap_or(&previous_id);
+    eprintln!("Removing superseded image {display_id}...");
+    let removed = Command::new(docker)
+        .args(["rmi", &previous_id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !removed {
+        eprintln!("Warning: could not remove superseded image {display_id} (a container may still hold it).");
+    }
+    Ok(())
+}
+
+fn docker_image_id(docker: &Path, image: &str) -> Option<String> {
+    let output = Command::new(docker)
+        .args(["image", "inspect", "-f", "{{.Id}}", image])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn docker_image_tag_count(docker: &Path, image: &str) -> Option<usize> {
+    let output = Command::new(docker)
+        .args(["image", "inspect", "-f", "{{len .RepoTags}}", image])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+        .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_image_with_docker;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn run_build(
+        previous: &str,
+        next: &str,
+        tags: usize,
+        build_rc: i32,
+        rmi_rc: i32,
+    ) -> (Result<(), String>, String) {
+        let dir =
+            std::env::temp_dir().join(format!("alucard-build-image-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(dir.join("entrypoint.sh"), "#!/bin/sh\n").unwrap();
+        let trace = dir.join("trace");
+        let built = dir.join("built");
+        let docker = dir.join("docker");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {trace}\ncase \"$1 $2\" in\n  'image inspect')\n    case \"$*\" in\n      *'{{{{.Id}}}}'*)\n        if [ -f {built} ]; then id='{next}'; else id='{previous}'; fi\n        [ -n \"$id\" ] || exit 1\n        printf '%s\\n' \"$id\" ;;\n      *'{{{{len .RepoTags}}}}'*) printf '%s\\n' '{tags}' ;;\n    esac ;;\n  'build '*) touch {built}; exit {build_rc} ;;\n  'rmi '*) exit {rmi_rc} ;;\nesac\n",
+            trace = trace.display(),
+            built = built.display(),
+        );
+        fs::write(&docker, script).unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        let result = build_image_with_docker(&dir, "alucard:test", &docker);
+        let trace = fs::read_to_string(trace).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        (result, trace)
+    }
+
+    #[test]
+    fn build_cleanup_matches_bash_contract() {
+        let old = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let new = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let (result, trace) = run_build(old, new, 0, 0, 0);
+        assert!(result.is_ok());
+        assert!(trace.contains(&format!("rmi {old}")));
+
+        let (result, trace) = run_build(old, old, 0, 0, 0);
+        assert!(result.is_ok());
+        assert!(!trace.contains("rmi"));
+
+        let (result, trace) = run_build(old, new, 2, 0, 0);
+        assert!(result.is_ok());
+        assert!(!trace.contains("rmi"));
+
+        let (result, trace) = run_build(old, new, 0, 1, 0);
+        assert!(result.is_err());
+        assert!(!trace.contains("rmi"));
+
+        let (result, trace) = run_build(old, new, 0, 0, 1);
+        assert!(result.is_ok());
+        assert!(trace.contains(&format!("rmi {old}")));
     }
 }
 
