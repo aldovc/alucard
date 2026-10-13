@@ -21,6 +21,7 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 MOCK_BIN="$TEST_DIR/bin"
 STATE="$TEST_DIR/state"
 GH_TRACE="$STATE/gh-trace"
+LEDGER="$TEST_DIR/ledger.db"
 TARGET="$TEST_DIR/target"
 REMOTE="$TEST_DIR/remote.git"
 BRANCH="alucard/20261002-090000/iter-1-issue-9"
@@ -92,7 +93,7 @@ setup_repos() {
 }
 
 run_merge() {
-  local -a command=("$ALUCARD" merge 9 "$TARGET" --env-file "$TEST_DIR/alucard.env" \
+  local -a command=("$ALUCARD" --db-path "$LEDGER" merge 9 "$TARGET" --env-file "$TEST_DIR/alucard.env" \
     --logs-root "$TEST_DIR/logs" "$@")
   if [ -n "${MERGE_TIMEOUT:-}" ]; then
     command=(timeout --kill-after 1s "$MERGE_TIMEOUT" "${command[@]}")
@@ -108,6 +109,15 @@ run_merge() {
   TRACE=$(<"$GH_TRACE")
   POSTED=$(cat "$STATE/comments" 2>/dev/null || true)
   REMOTE_HEAD=$(git --git-dir="$REMOTE" rev-parse "refs/heads/$BRANCH")
+}
+
+assert_merge_lifecycle() {
+  local expected_status="$1"
+  local run_id run
+  run_id=$("$ALUCARD" --db-path "$LEDGER" runs | awk -F '\t' '$3 == "merge" { print $1; exit }')
+  run=$("$ALUCARD" --db-path "$LEDGER" runs show "$run_id")
+  assert_contains "the merge run is terminal" "status: $expected_status" "$run"
+  assert_contains "the PR lease is released" "claim: pr 9 released" "$run"
 }
 
 # The check records the tree it ran on, so a test can tell it saw the rebase.
@@ -130,6 +140,7 @@ assert_contains "and carries the check's summary" "== 12 passed ==" "$POSTED"
 assert_contains "squash-merges exactly the commit it checked" \
   "gh pr merge 9 --squash --match-head-commit $REMOTE_HEAD" "$TRACE"
 assert_contains "and deletes the branch" "git/refs/heads/$BRANCH" "$TRACE"
+assert_merge_lifecycle completed
 
 echo ""
 echo "── approved head already contains the base ──"
@@ -148,6 +159,7 @@ assert_eq "nothing is pushed" "$PR_SHA" "$REMOTE_HEAD"
 assert_contains "the comment names the conflicting path" '- `a.txt`' "$POSTED"
 assert_contains "the PR is labelled needs-human" "needs-human" "$(grep -F -- '-X POST' <<<"$TRACE")"
 assert_not_contains "nothing is merged" "pr merge" "$TRACE"
+assert_merge_lifecycle failed
 
 echo ""
 echo "── checks fail after the rebase ──"
