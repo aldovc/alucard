@@ -1035,9 +1035,11 @@ pub fn extract_agent_usage(log: &Path) -> Option<Usage> {
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect::<Vec<_>>();
-    if let Some(claude) = records
-        .iter()
+    if let Some(claude) = contents
+        .lines()
         .rev()
+        .take(20)
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|record| record["type"] == "result")
     {
         let mut usage = Usage::default();

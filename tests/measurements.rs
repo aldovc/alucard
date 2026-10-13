@@ -73,6 +73,15 @@ fn formats_bash_compatible_usage_table_and_iteration_comment() {
     fs::write(root.join("iter-1-review-2.jsonl"), claude).unwrap();
     fs::write(root.join("iter-1-review-2-attempt-2.jsonl"), claude).unwrap();
     fs::write(root.join("iter-1-feedback-2.jsonl"), "").unwrap();
+    let stale_claude_then_codex = format!(
+        "{{\"type\":\"result\",\"num_turns\":99,\"total_cost_usd\":9.99,\"modelUsage\":{{\"claude\":{{\"inputTokens\":999}}}}}}\n{}{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":10,\"cached_input_tokens\":3,\"output_tokens\":4}}}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\"}}}}\n",
+        "{\"type\":\"system\"}\n".repeat(19)
+    );
+    fs::write(
+        root.join("iter-1-feedback-3.jsonl"),
+        stale_claude_then_codex,
+    )
+    .unwrap();
     fs::write(root.join("iter-10-review-1.jsonl"), claude).unwrap();
 
     let comment = root.join("comment");
