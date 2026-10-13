@@ -55,11 +55,23 @@ not part of the literal prefix.
 | Wrapper comment prefix | `**🤖 Alucard` | `review_gate`, `command_continue`, `harness_approved_sha` |
 | Blocked findings | `**🤖 Alucard blocked findings** (cycle {N}/{MAX})` | `review_gate` (comment body starts-with filter) |
 | Parked recovery comment | `**🤖 Alucard recovery PR parked** — opened as a draft and labeled \`needs-human\` by the harness.` | `review_gate` (authenticated comment) |
-| Recovery PR body | `**🤖 Alucard recovery PR** — the worker {stop} (rc={RC}) before opening a PR.` | `review_gate` (authenticated draft/title/body fallback) |
+| Recovery PR body | `{Refs line, if known}\n\n**🤖 Alucard recovery PR** — the worker {stop} (rc={RC}) before opening a PR. Its {COMMIT_COUNT} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.` The body then contains the required next-step text and optional wrap-up handoff. | Human-facing; recovery eligibility is read from the authenticated parked comment or draft/title/label state |
 | Recovery issue comment | `**🤖 Alucard recovery** — the worker on this ticket {stop} (rc={RC}) before opening a PR.` | Human/next worker; GitHub PR occupancy is read by `open_pr_covers_ticket` |
-| Reviewed head | `Reviewed head: \`{40 lowercase hex SHA}\`` in `**🤖 Alucard review cycle {N}/{MAX}: APPROVED**` | `harness_approved_sha` |
+| Review approval | `**🤖 Alucard review cycle {N}/{MAX}: APPROVED**` | `harness_approved_sha` treats this as the latest approval; `review_gate` human-facing audit |
+| Review approval without CI | `**🤖 Alucard review cycle {N}/{MAX}: APPROVED — no CI ran, needs human**` | Human-facing; wrapper prefix filters it |
+| Reviewed head | `Reviewed head: \`{40 lowercase hex SHA}\`` in an approval comment | `harness_approved_sha` |
+| Review blocked | `**🤖 Alucard review cycle {N}/{MAX}: BLOCKED — needs human**` | Human-facing; supersedes an earlier approval because `harness_approved_sha` reads the latest review-cycle comment |
+| No review verdict | `**🤖 Alucard review cycle {N}/{MAX}: no review posted — needs human** (rc={RC}, class={CLASS})` | Human-facing; supersedes an earlier approval because `harness_approved_sha` reads the latest review-cycle comment |
+| Review changes requested | `**🤖 Alucard review cycle {N}/{MAX}: CHANGES_REQUESTED**` | `command_continue` finds the latest such comment; human-facing audit |
+| Review cycles exhausted | `**🤖 Alucard gave up after {MAX}/{MAX} review cycles — needs human**` | Human-facing; wrapper prefix filters it |
+| Feedback stalled in review loop | `**🤖 Alucard review cycle {N}/{MAX}: feedback agent stopped without publishing — needs human** (rc={RC})` | Human-facing; wrapper prefix filters it |
+| Feedback failed after publishing in review loop | `**🤖 Alucard cycle {N}/{MAX}: feedback agent failed after pushing** (rc={RC}, branch advanced={BOOLEAN_OR_UNKNOWN})` | Human-facing; wrapper prefix filters it |
+| Feedback stalled by `continue` | `**🤖 Alucard continue: feedback agent stopped without publishing — needs human** (rc={RC})` | Human-facing; wrapper prefix filters it |
+| Feedback failed after publishing by `continue` | `**🤖 Alucard continue: feedback agent failed after pushing** (rc={RC}, branch advanced={BOOLEAN_OR_UNKNOWN})` | Human-facing; wrapper prefix filters it |
 | Usage comment | `**🤖 Alucard token usage (iteration {N})**` | No semantic reader; excluded as wrapper-authored by the human-comment filters |
 | No-CI comment | `**🤖 Alucard CI gate: no CI ran — not green**` | Human-facing; wrapper prefix filters it |
+| Merge rebase conflict | `**🤖 Alucard merge: rebase conflict — needs human**` | Human-facing; wrapper prefix filters it |
+| Merge check result | `**🤖 Alucard merge: checks passed**` or `**🤖 Alucard merge: checks failed — not merged**` | Human-facing; wrapper prefix filters it |
 | Recovery title | `wip: alucard recovery — iter {N} (worker stopped: {class}, rc={RC})` | `review_gate` recovery identification |
 
 The labels are protocol too: GitHub source reads `ready-for-agent`, skips
@@ -99,9 +111,14 @@ and cache `${XDG_CACHE_HOME:-$HOME/.cache}/alucard`. Task source precedence is
 Environment configuration is `ALUCARD_IMAGE`, `ALUCARD_ENV_FILE`,
 `ALUCARD_BASE_BRANCH`, `ALUCARD_LOG_ROOT`, `ALUCARD_CACHE_DIR`,
 `ALUCARD_TARGET_REPO`, `ALUCARD_TASKS_FILE`, `ALUCARD_CHECK_COMMAND`, global
-provider/model settings `ALUCARD_CLAUDE_MODEL`,
+provider/model settings `ALUCARD_PROVIDER` (default `claude`),
+`ALUCARD_CLAUDE_MODEL`,
 `ALUCARD_CLAUDE_FALLBACK_MODEL`, `ALUCARD_CODEX_MODEL`, `ALUCARD_EFFORT`,
-and per-role `ALUCARD_<ROLE>_{CLAUDE_MODEL,CLAUDE_FALLBACK_MODEL,EFFORT,CODEX_MODEL}`.
+and per-role `ALUCARD_<ROLE>_{PROVIDER,CLAUDE_MODEL,CLAUDE_FALLBACK_MODEL,EFFORT,CODEX_MODEL}`.
+For each role, `ALUCARD_<ROLE>_PROVIDER` overrides `ALUCARD_PROVIDER`; either
+must be `claude` or `codex`, and an unset value falls back to `claude`.
+Model and effort settings resolve independently per role before falling back to
+their global setting and then the built-in default.
 Turn/budget settings are `ALUCARD_{WORKER,CI_FIX,REVIEWER,FEEDBACK,WRAPUP}_MAX_TURNS`
 and `_MAX_BUDGET`; retry count is `ALUCARD_TRANSPORT_RETRY_ATTEMPTS`.
 
