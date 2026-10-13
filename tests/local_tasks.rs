@@ -43,6 +43,29 @@ fn task_heading_write_preserves_non_heading_bytes() {
 }
 
 #[test]
+fn task_heading_write_preserves_previous_attempt_when_opening_pr() {
+    let path = temporary_path("task-heading-previous-attempt");
+    let original = "## [ ] one: First (previous attempt: PR #3)\n";
+    fs::write(&path, original).unwrap();
+    write_task_headings(
+        &path,
+        original,
+        &[TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::InFlight,
+            pr_number: Some(5),
+            previous_pr_number: None,
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "## [>] one: First (previous attempt: PR #3) (PR #5)\n"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn task_heading_write_rejects_changed_file() {
     let path = temporary_path("task-heading-conflict");
     let original = "## [>] one: First (PR #12)\n";

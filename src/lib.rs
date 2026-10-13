@@ -1495,15 +1495,6 @@ impl TaskState {
             Self::Human => "human",
         }
     }
-
-    fn marker(self) -> char {
-        match self {
-            Self::Pending => ' ',
-            Self::InFlight => '>',
-            Self::Done => 'x',
-            Self::Human => 'h',
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1765,23 +1756,30 @@ pub fn write_task_headings(
             } else {
                 ""
             };
-            let suffix = update
-                .pr_number
-                .map(|number| format!(" (PR #{number})"))
-                .or_else(|| {
-                    update
-                        .previous_pr_number
-                        .map(|number| format!(" (previous attempt: PR #{number})"))
-                })
-                .unwrap_or_default();
-            *line = format!(
-                "## [{}] {}: {}{}{}",
-                update.state.marker(),
-                task.id,
-                task.title,
-                suffix,
-                ending
-            );
+            match (update.state, update.pr_number, update.previous_pr_number) {
+                (TaskState::InFlight, Some(number), _) => {
+                    let heading = line.trim_end_matches(['\r', '\n']);
+                    *line = format!(
+                        "{} (PR #{number}){ending}",
+                        heading.replacen("## [ ]", "## [>]", 1)
+                    );
+                }
+                (TaskState::Done, _, _) => {
+                    *line = line.replacen("## [>]", "## [x]", 1);
+                }
+                (TaskState::Pending, _, Some(number)) => {
+                    let heading = line.trim_end_matches(['\r', '\n']);
+                    let suffix = format!("(PR #{number})");
+                    let heading = heading.strip_suffix(&suffix).ok_or_else(|| {
+                        format!("task {} heading is missing PR #{number}", task.id)
+                    })?;
+                    *line = format!(
+                        "{}(previous attempt: PR #{number}){ending}",
+                        heading.replacen("## [>]", "## [ ]", 1)
+                    );
+                }
+                _ => return Err(format!("unsupported heading update for task {}", task.id)),
+            }
         }
         let rewritten = lines.concat();
         let temporary = path.with_extension(format!("tasks-{}.tmp", Uuid::new_v4()));
