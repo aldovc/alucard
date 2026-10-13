@@ -32,6 +32,7 @@ pub enum ClaimResource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskStatus {
+    Pending,
     Claimed,
     InFlight,
     Done,
@@ -41,6 +42,7 @@ pub enum TaskStatus {
 impl TaskStatus {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Claimed => "claimed",
             Self::InFlight => "in_flight",
             Self::Done => "done",

@@ -1,4 +1,7 @@
-use alucard::{acquire_pr, acquire_task, heartbeat, migrate, open, release, status, ClaimError};
+use alucard::{
+    acquire_pr, acquire_task, heartbeat, migrate, open, release, status, transition_task,
+    ClaimError, TaskStatus,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -188,6 +191,22 @@ fn pr_claims_are_exclusive_and_releases_require_the_owning_lease() {
         acquire_pr(&path, "repo", 42, other_run),
         Err(ClaimError::ClaimedBy { run_id: owner })
     );
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn pending_task_can_be_reacquired_after_its_lease_is_released() {
+    let path = database_path();
+    prepare_claims(&path, &["task"]);
+    insert_run(&path, "run-0");
+    insert_run(&path, "run-1");
+
+    let claim = acquire_task(&path, "task", "run-0").unwrap();
+    transition_task(&path, "task", &claim.id, "run-0", TaskStatus::Pending).unwrap();
+    release(&path, &claim.id, "run-0").unwrap();
+
+    let reacquired = acquire_task(&path, "task", "run-1").unwrap();
+    assert_eq!(reacquired.run_id, "run-1");
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
