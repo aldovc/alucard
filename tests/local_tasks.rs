@@ -7,7 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temporary_path(name: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -19,6 +19,18 @@ fn temporary_path(name: &str) -> PathBuf {
 
 fn run(command: &mut Command) {
     assert!(command.status().unwrap().success());
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn git_repository(root: &Path) {
@@ -473,11 +485,12 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
         "Shared context\n\n## [ ] first: First task\n\nFirst body\n\n## [ ] second: Second task\n\nSecond body\n",
     )
     .unwrap();
-    let prompt = root.join("prompt");
+    let prompts = root.join("prompts");
+    fs::create_dir(&prompts).unwrap();
     let docker = bin.join("docker");
     fs::write(
         &docker,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'run '*) cat > \"$ALUCARD_PROMPT\" ;;\n  'rm -f') ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'run '*)\n    if mkdir \"$ALUCARD_DOCKER_HOLD_LOCK\" 2>/dev/null; then\n      : > \"$ALUCARD_DOCKER_STARTED\"\n      while [ ! -f \"$ALUCARD_DOCKER_RELEASE\" ]; do sleep 0.01; done\n    fi\n    cat > \"$ALUCARD_PROMPTS/$$\" ;;\n  'rm -f') ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
@@ -496,32 +509,49 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     .unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let database = root.join("ledger.db");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
-        .env("PATH", path)
-        .env("ALUCARD_PROMPT", &prompt)
-        .env("ALUCARD_CACHE_DIR", root.join("cache"))
-        .args([
-            "--db-path",
-            database.to_str().unwrap(),
-            "run",
-            "--iterations",
-            "1",
-            "--tasks",
-            tasks.to_str().unwrap(),
-            "--env-file",
-            environment.to_str().unwrap(),
-            "--logs-root",
-            root.join("logs").to_str().unwrap(),
-            "--no-build",
-            repository.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let prompt = fs::read_to_string(prompt).unwrap();
-    assert!(prompt.contains("First task"));
-    assert!(!prompt.contains("Second task"));
+    let docker_started = root.join("docker-started");
+    let docker_release = root.join("docker-release");
+    let docker_hold_lock = root.join("docker-hold-lock");
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+        command
+            .env("PATH", &path)
+            .env("ALUCARD_PROMPTS", &prompts)
+            .env("ALUCARD_DOCKER_STARTED", &docker_started)
+            .env("ALUCARD_DOCKER_RELEASE", &docker_release)
+            .env("ALUCARD_DOCKER_HOLD_LOCK", &docker_hold_lock)
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .args([
+                "--db-path",
+                database.to_str().unwrap(),
+                "run",
+                "--iterations",
+                "1",
+                "--tasks",
+                tasks.to_str().unwrap(),
+                "--env-file",
+                environment.to_str().unwrap(),
+                "--logs-root",
+                root.join("logs").to_str().unwrap(),
+                "--no-build",
+                repository.to_str().unwrap(),
+            ]);
+        command
+    };
+    let mut first = command().spawn().unwrap();
+    wait_for_file(&docker_started);
+    let second = command().output().unwrap();
+    assert!(second.status.success(), "{second:?}");
+    fs::write(&docker_release, "").unwrap();
+    let first = first.wait().unwrap();
+    assert!(first.success(), "{first:?}");
+    let prompts = fs::read_dir(prompts)
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts.iter().any(|prompt| prompt.contains("First task")));
+    assert!(prompts.iter().any(|prompt| prompt.contains("Second task")));
     let connection = open(&database).unwrap();
     assert_eq!(
         connection
@@ -560,7 +590,7 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
     let docker = bin.join("docker");
     fs::write(
         &docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in 'image inspect') echo stamp ;; esac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'run '*)\n    if mkdir \"$ALUCARD_DOCKER_HOLD_LOCK\" 2>/dev/null; then\n      : > \"$ALUCARD_DOCKER_STARTED\"\n      while [ ! -f \"$ALUCARD_DOCKER_RELEASE\" ]; do sleep 0.01; done\n    fi ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
@@ -581,6 +611,9 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
     let database = root.join("ledger.db");
     let logs = root.join("logs");
     let return_pr = root.join("return-pr");
+    let docker_started = root.join("docker-started");
+    let docker_release = root.join("docker-release");
+    let docker_hold_lock = root.join("docker-hold-lock");
     let arguments = [
         "--db-path",
         database.to_str().unwrap(),
@@ -596,18 +629,26 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
         repository.to_str().unwrap(),
     ];
     let run = || {
-        Command::new(env!("CARGO_BIN_EXE_alucard"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+        command
             .env("PATH", &path)
             .env("ALUCARD_DOCKER_TRACE", &docker_trace)
             .env("ALUCARD_GH_TRACE", &gh_trace)
             .env("ALUCARD_RETURN_PR", &return_pr)
+            .env("ALUCARD_DOCKER_STARTED", &docker_started)
+            .env("ALUCARD_DOCKER_RELEASE", &docker_release)
+            .env("ALUCARD_DOCKER_HOLD_LOCK", &docker_hold_lock)
             .env("ALUCARD_CACHE_DIR", root.join("cache"))
-            .args(arguments)
-            .output()
-            .unwrap()
+            .args(arguments);
+        command
     };
-    let output = run();
-    assert!(output.status.success(), "{output:?}");
+    let mut first = run().spawn().unwrap();
+    wait_for_file(&docker_started);
+    let second = run().output().unwrap();
+    assert!(second.status.success(), "{second:?}");
+    fs::write(&docker_release, "").unwrap();
+    let first = first.wait().unwrap();
+    assert!(first.success(), "{first:?}");
     let connection = open(&database).unwrap();
     assert_eq!(
         connection
@@ -628,9 +669,9 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
     );
     drop(connection);
     fs::write(&return_pr, "").unwrap();
-    let output = run();
+    let output = run().output().unwrap();
     assert!(output.status.success(), "{output:?}");
-    let output = run();
+    let output = run().output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let docker_trace = fs::read_to_string(docker_trace).unwrap();
     assert_eq!(
