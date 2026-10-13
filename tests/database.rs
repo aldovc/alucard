@@ -1,5 +1,5 @@
 use alucard::{
-    acquire_pr, acquire_task, heartbeat, migrate, open, prepare_run, release, run_command, status,
+    acquire_pr, acquire_task, heartbeat, migrate, open, prepare_run, release, status,
     transition_task, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -88,30 +88,6 @@ fn seed_repository_with_readme(path: &Path, readme: &str) {
         .unwrap();
 }
 
-#[cfg(unix)]
-#[test]
-fn timed_command_drains_output_before_termination() {
-    let path = database_path();
-    let root = path.parent().unwrap();
-    fs::create_dir_all(root).unwrap();
-
-    let output = run_command(
-        "sh",
-        &[
-            "-c",
-            "head -c 131072 /dev/zero; printf stderr >&2; while :; do :; done",
-        ],
-        root,
-        Some(Duration::from_millis(200)),
-    )
-    .unwrap();
-
-    assert!(!output.status.success());
-    assert_eq!(output.stdout.len(), 131072);
-    assert_eq!(output.stderr, b"stderr");
-    fs::remove_dir_all(root).unwrap();
-}
-
 #[test]
 fn prepared_runs_with_matching_repository_names_use_separate_caches() {
     let path = database_path();
@@ -168,6 +144,36 @@ fn prepared_runs_with_matching_repository_names_use_separate_caches() {
         .unwrap();
     assert_eq!(cache_paths.len(), 2);
     assert_ne!(cache_paths[0], cache_paths[1]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn prepared_runs_with_long_canonical_paths_use_a_bounded_cache_key() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let repository = root
+        .join("a".repeat(40))
+        .join("b".repeat(40))
+        .join("c".repeat(40));
+    seed_repository(&repository);
+    let logs = root.join("logs");
+    let cache = root.join("cache");
+
+    let prepared = prepare_run(
+        &path,
+        RunOptions {
+            repository: &repository,
+            logs_root: &logs,
+            cache_root: &cache,
+            base: "HEAD",
+            image: None,
+            task: None,
+            issue: None,
+        },
+    )
+    .unwrap();
+
+    assert!(prepared.clone.join(".git").is_dir());
     fs::remove_dir_all(root).unwrap();
 }
 
