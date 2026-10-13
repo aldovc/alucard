@@ -6,11 +6,10 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
+use std::time::Duration;
 use uuid::Uuid;
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -311,64 +310,15 @@ fn update_active_claim(
 }
 
 /// Executes an external command without involving a shell.
-pub fn run_command(
-    program: &str,
-    arguments: &[&str],
-    cwd: &Path,
-    timeout: Option<Duration>,
-) -> io::Result<Output> {
-    let mut command = Command::new(program);
-    command
+pub fn run_command(program: &str, arguments: &[&str], cwd: &Path) -> io::Result<Output> {
+    Command::new(program)
         .args(arguments)
         .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let stdout = drain(child.stdout.take().expect("stdout is piped"));
-    let stderr = drain(child.stderr.take().expect("stderr is piped"));
-    let status = match timeout {
-        None => child.wait()?,
-        Some(timeout) => {
-            let deadline = Instant::now() + timeout;
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    if let Err(error) = child.kill() {
-                        if error.kind() != io::ErrorKind::InvalidInput {
-                            return Err(error);
-                        }
-                    }
-                    break child.wait()?;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-    };
-    Ok(Output {
-        status,
-        stdout: join_output(stdout)?,
-        stderr: join_output(stderr)?,
-    })
-}
-
-fn drain<R: Read + Send + 'static>(mut reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
-        Ok(output)
-    })
-}
-
-fn join_output(output: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-    output
-        .join()
-        .map_err(|_| io::Error::other("command output reader panicked"))?
+        .output()
 }
 
 fn run_checked(program: &str, arguments: &[&str], cwd: &Path) -> Result<Output, RunError> {
-    let output = run_command(program, arguments, cwd, None)?;
+    let output = run_command(program, arguments, cwd)?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -582,9 +532,11 @@ pub fn run_claims(
 pub fn run_pull_requests(path: &Path, run_id: &str) -> Result<Vec<(i64, String)>, DatabaseError> {
     let connection = open(path)?;
     let mut statement = connection.prepare(
-        "SELECT pull_requests.number, pull_requests.branch
-         FROM pull_requests JOIN claims ON claims.resource_key = pull_requests.task_id
-         WHERE claims.run_id = ?1 AND claims.resource_kind = 'task' ORDER BY pull_requests.number",
+        "SELECT DISTINCT pull_requests.number, pull_requests.branch
+         FROM pull_requests JOIN claims ON claims.repository_id = pull_requests.repository_id
+             AND ((claims.resource_kind = 'task' AND claims.resource_key = pull_requests.task_id)
+                 OR (claims.resource_kind = 'pr' AND claims.resource_key = CAST(pull_requests.number AS TEXT)))
+         WHERE claims.run_id = ?1 ORDER BY pull_requests.number",
     )?;
     let pull_requests = statement
         .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
