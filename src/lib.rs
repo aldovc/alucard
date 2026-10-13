@@ -2359,7 +2359,7 @@ pub fn task_claim_attempts(
     let mut statement = connection.prepare(
         "SELECT id, branch, logs_path FROM runs
          WHERE id = ?1 OR retry_owner_run_id = ?1
-         ORDER BY started_at, id",
+         ORDER BY id != ?1, started_at, rowid",
     )?;
     let attempts = statement
         .query_map([&claim.run_id], |row| {
