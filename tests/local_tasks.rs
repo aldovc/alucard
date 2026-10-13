@@ -482,7 +482,7 @@ case "$1 $2" in
   'pr comment')
     if [ "$ALUCARD_RECOVERY_SCENARIO" = marker ]; then echo 'marker denied' >&2; exit 1; fi
     while [ "$#" -gt 0 ]; do
-      if [ "$1" = --body ]; then printf '%s' "$2" > "$ALUCARD_RECOVERY_MARKER"; break; fi
+      if [ "$1" = --body ]; then printf '%s\n' "$2" >> "$ALUCARD_RECOVERY_MARKER"; break; fi
       shift
     done ;;
   'pr edit')
@@ -598,10 +598,9 @@ esac
                 body.contains("It does not resume implementation."),
                 "{body}"
             );
-            assert_eq!(
-                fs::read_to_string(root.join("recovery-marker")).unwrap(),
-                "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."
-            );
+            let comments = fs::read_to_string(root.join("recovery-marker")).unwrap();
+            assert!(comments.starts_with("**🤖 Alucard recovery PR parked**"));
+            assert!(comments.contains("**🤖 Alucard token usage (iteration 1)**"));
             let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
             assert!(
                 trace.find("pr edit 91 --add-label needs-human")
@@ -1340,6 +1339,7 @@ case "$1 $2" in
       if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = wrapup_dirty ]; then
         printf 'wrap-up fix\n' > "$worktree/wrapup.txt"
       fi
+      printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,"total_cost_usd":0.02,"modelUsage":{"claude":{"inputTokens":5,"outputTokens":6}},"result":"failed"}'
       exit 1
     fi
     case "$ALUCARD_GITHUB_RECOVERY_SCENARIO" in
@@ -1355,9 +1355,9 @@ case "$1 $2" in
         git -C "$worktree" add recovery.txt
         git -C "$worktree" -c user.email=test@example.com -c user.name=Test commit -qm recovery
         if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = turn_budget ]; then
-          printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"limit reached"}'
+          printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":2,"total_cost_usd":0.01,"modelUsage":{"claude":{"inputTokens":12,"outputTokens":34}},"result":"limit reached"}'
         else
-          printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"failed"}'
+          printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":2,"total_cost_usd":0.01,"modelUsage":{"claude":{"inputTokens":12,"outputTokens":34}},"result":"failed"}'
         fi
         exit 1 ;;
     esac ;;
@@ -1393,7 +1393,7 @@ case "$1 $2" in
     : > "$ALUCARD_GITHUB_RECOVERY_CREATED" ;;
   'pr comment')
     while [ "$#" -gt 0 ]; do
-      if [ "$1" = --body ]; then printf '%s' "$2" > "$ALUCARD_GITHUB_RECOVERY_MARKER"; break; fi
+      if [ "$1" = --body ]; then printf '%s\n' "$2" >> "$ALUCARD_GITHUB_RECOVERY_MARKER"; break; fi
       shift
     done ;;
 esac
@@ -1447,6 +1447,22 @@ esac
     };
     let output = invoke();
     assert!(output.status.success(), "{scenario}: {output:?}");
+    if scenario == "worker" {
+        let console = String::from_utf8(output.stdout).unwrap();
+        assert!(console.contains("worker 1-attempt-1"), "{console}");
+        assert!(console.contains("wrap-up 1"), "{console}");
+        let total = console
+            .lines()
+            .find(|line| line.starts_with("TOTAL"))
+            .unwrap_or_default();
+        assert!(
+            total.contains("17")
+                && total.contains("40")
+                && total.contains("5")
+                && total.contains("$0.030"),
+            "{console}"
+        );
+    }
     let connection = open(&database).unwrap();
     assert_eq!(
         connection
@@ -1491,10 +1507,9 @@ fn test_worker_recovery() {
     assert!(fs::read_to_string(root.join("docker-trace"))
         .unwrap()
         .contains("alucard-wrapup-1-"));
-    assert_eq!(
-        fs::read_to_string(root.join("marker")).unwrap(),
-        "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."
-    );
+    let comments = fs::read_to_string(root.join("marker")).unwrap();
+    assert!(comments.starts_with("**🤖 Alucard recovery PR parked**"));
+    assert!(comments.contains("**🤖 Alucard token usage (iteration 1)**"));
     let trace = fs::read_to_string(root.join("gh-trace")).unwrap();
     assert!(
         trace.contains("pr edit 91 --add-label needs-human"),
@@ -2125,6 +2140,107 @@ fn run_leaves_in_flight_task_unchanged_when_pr_lookup_fails() {
 
     assert!(output.status.success(), "{output:?}");
     assert_eq!(fs::read_to_string(&tasks).unwrap(), original);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn run_reports_worker_usage_when_pr_lookup_fails_after_invocation() {
+    let root = temporary_path("run-post-invocation-pr-lookup-failure");
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let bin = root.join("bin");
+    fs::create_dir_all(repository.join(".alucard")).unwrap();
+    fs::create_dir(&bin).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    fs::write(
+        repository.join(".alucard/tasks.md"),
+        "# Usage test\n\n## [ ] 1: A queued task\n\nBlocked by: none\n",
+    )
+    .unwrap();
+    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "task",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "main",
+    ]));
+    for (name, script) in [
+        (
+            "docker",
+            "#!/bin/sh\ncase \"$1\" in\n  image) exit 0 ;;\n  run) touch \"$ALUCARD_TEST_WORKER_RAN\"; printf '%s\\n' '{\"type\":\"result\",\"modelUsage\":{\"claude\":{\"inputTokens\":12,\"outputTokens\":34}},\"num_turns\":1,\"total_cost_usd\":0.01}'; exit 0 ;;\n  rm|kill) exit 0 ;;\nesac\n",
+        ),
+        (
+            "timeout",
+            "#!/bin/sh\n[ \"$1\" = --kill-after ] && shift 2\nshift\nexec \"$@\"\n",
+        ),
+        (
+            "gh",
+            "#!/bin/sh\nif [ ! -f \"$ALUCARD_TEST_WORKER_RAN\" ]; then printf '[]\\n'; exit 0; fi\nprintf 'GitHub unavailable\\n' >&2\nexit 1\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let environment = root.join("alucard.env");
+    fs::write(
+        &environment,
+        "GITHUB_TOKEN=gh_test\nANTHROPIC_API_KEY=sk-ant-test\nOPENAI_API_KEY=sk-openai-test\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .env("ALUCARD_TEST_WORKER_RAN", root.join("worker-ran"))
+        .args([
+            "--db-path",
+            root.join("alucard.db").to_str().unwrap(),
+            "run",
+            repository.to_str().unwrap(),
+            "--iterations",
+            "1",
+            "--no-build",
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(shown.contains("=== Alucard Token Usage:"), "{shown}");
+    assert!(shown.contains("worker 1"), "{shown}");
     fs::remove_dir_all(root).unwrap();
 }
 
