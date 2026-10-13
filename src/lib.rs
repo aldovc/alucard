@@ -1714,14 +1714,30 @@ pub fn write_task_headings(
     if updates.is_empty() {
         return Ok(());
     }
-    let mut file = File::options()
+    let lock_path = path.with_file_name(
+        path.file_name()
+            .map(|name| {
+                let mut name = name.to_os_string();
+                name.push(".lock");
+                name
+            })
+            .unwrap_or_else(|| "tasks.lock".into()),
+    );
+    let lock = File::options()
         .read(true)
         .write(true)
-        .open(path)
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    file.lock_exclusive()
-        .map_err(|error| format!("cannot lock {}: {error}", path.display()))?;
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open {}: {error}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("cannot lock {}: {error}", lock_path.display()))?;
     let result = (|| {
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -1782,7 +1798,7 @@ pub fn write_task_headings(
             .map_err(|error| format!("cannot replace {}: {error}", path.display()))?;
         Ok(())
     })();
-    let _ = FileExt::unlock(&file);
+    let _ = FileExt::unlock(&lock);
     result
 }
 

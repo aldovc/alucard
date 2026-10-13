@@ -7,6 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temporary_path(name: &str) -> PathBuf {
@@ -63,6 +64,58 @@ fn task_heading_write_rejects_changed_file() {
         "## [h] one: Human edit\n"
     );
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn concurrent_task_heading_writes_report_a_conflict() {
+    let root = temporary_path("task-heading-concurrent-write");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("tasks.md");
+    let original = "## [>] one: First (PR #12)\n";
+    fs::write(&path, original).unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+    let writers = [
+        TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::Done,
+            pr_number: Some(12),
+            previous_pr_number: None,
+        },
+        TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::Pending,
+            pr_number: None,
+            previous_pr_number: Some(12),
+        },
+    ]
+    .into_iter()
+    .map(|update| {
+        let path = path.clone();
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            write_task_headings(&path, original, &[update])
+        })
+    })
+    .collect::<Vec<_>>();
+    barrier.wait();
+
+    let results = writers
+        .into_iter()
+        .map(|writer| writer.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert!(results.iter().any(|result| {
+        result
+            .as_ref()
+            .is_err_and(|error| error.contains("changed during reconciliation"))
+    }));
+    assert!([
+        "## [x] one: First (PR #12)\n",
+        "## [ ] one: First (previous attempt: PR #12)\n",
+    ]
+    .contains(&fs::read_to_string(&path).unwrap().as_str()));
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn run(command: &mut Command) {
