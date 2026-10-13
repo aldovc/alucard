@@ -1046,6 +1046,33 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             assert!(repairs.contains("-0-2"), "{repairs}");
             assert!(repairs.contains("-1-1"), "{repairs}");
             assert!(repairs.contains("-1-2"), "{repairs}");
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let records = fs::read_to_string(log_dir.join("measurements.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let stages = records
+                .iter()
+                .filter(|record| record["record"] == "stage")
+                .collect::<Vec<_>>();
+            assert_eq!(stages[0]["stage"], "worker");
+            assert_eq!(stages[1]["stage"], "cifix");
+            assert_eq!(stages[3]["stage"], "feedback");
+            assert_eq!(stages[4]["stage"], "cifix");
+            assert_eq!(stages[0]["head_sha"], stages[1]["prev_sha"]);
+            assert_eq!(stages[3]["head_sha"], stages[4]["prev_sha"]);
+            let iteration = records
+                .iter()
+                .find(|record| record["record"] == "iteration")
+                .unwrap();
+            assert_eq!(iteration["roles"]["cifix"]["invocations"], 4);
+            assert_eq!(iteration["roles"]["feedback"]["invocations"], 1);
         }
         if case.name == "feedback-setup-advance" {
             assert!(!trace.contains("feedback agent stopped without publishing"));

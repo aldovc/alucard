@@ -1,7 +1,7 @@
 use alucard::{
     archive_prompt, extract_agent_usage, iteration_usage_comment, iteration_usage_comment_for_dirs,
     log_event, usage_report, usage_report_for_dirs, write_iteration_measurement,
-    write_stage_measurement, IterationMeasurement,
+    write_stage_measurement, IterationMeasurement, StageMeasurement,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -176,12 +176,20 @@ fn events_prompts_and_usage_summary_are_local_artifacts() {
         "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}\n",
     )
     .unwrap();
+    let retry = root.join("retry");
+    fs::create_dir(&retry).unwrap();
+    fs::write(
+        retry.join("iter-1-attempt-2.jsonl"),
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2}}\n",
+    )
+    .unwrap();
     let database = root.join("ledger.db");
     alucard::migrate(&database).unwrap();
     write_iteration_measurement(IterationMeasurement {
         database: &database,
         run_id: "unknown",
         log_dir: &root,
+        log_dirs: &[&root, &retry],
         iteration: 1,
         pr: None,
         base_sha: "base",
@@ -220,6 +228,7 @@ fn events_prompts_and_usage_summary_are_local_artifacts() {
     assert!(measurements.contains("\"ci_result\":\"green\""));
     assert!(measurements.contains("\"review_verdict\":\"APPROVED\""));
     let measurement: serde_json::Value = serde_json::from_str(&measurements).unwrap();
+    assert_eq!(measurement["roles"]["worker"]["invocations"], 2);
     let timestamp = measurement["ts"].as_str().unwrap();
     assert_eq!(timestamp.len(), 20);
     assert!(timestamp
@@ -261,7 +270,20 @@ fn stage_measurement_buckets_test_paths_and_renames() {
     git(&root, &["commit", "-qm", "changes"]);
     let head = git(&root, &["rev-parse", "HEAD"]);
 
-    write_stage_measurement(&root, &root, "main", 1, None, &base, &head);
+    write_stage_measurement(
+        &root,
+        &root,
+        "main",
+        StageMeasurement {
+            iteration: 1,
+            pr: None,
+            stage: "worker",
+            cycle: 0,
+            base_sha: &base,
+            prev_sha: &base,
+            head_sha: &head,
+        },
+    );
 
     let record: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())
@@ -288,7 +310,20 @@ fn stage_measurement_buckets_test_paths_and_renames() {
     let merge_head = git(&root, &["rev-parse", "HEAD"]);
     fs::remove_file(root.join("measurements.jsonl")).unwrap();
 
-    write_stage_measurement(&root, &root, "main", 1, None, &base, &merge_head);
+    write_stage_measurement(
+        &root,
+        &root,
+        "main",
+        StageMeasurement {
+            iteration: 1,
+            pr: None,
+            stage: "worker",
+            cycle: 0,
+            base_sha: &base,
+            prev_sha: &base,
+            head_sha: &merge_head,
+        },
+    );
 
     let record: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())
@@ -296,7 +331,20 @@ fn stage_measurement_buckets_test_paths_and_renames() {
     assert_eq!(record["is_merge"], true);
     fs::remove_file(root.join("measurements.jsonl")).unwrap();
 
-    write_stage_measurement(&root, &root, "main", 1, None, "missing-base", &merge_head);
+    write_stage_measurement(
+        &root,
+        &root,
+        "main",
+        StageMeasurement {
+            iteration: 1,
+            pr: None,
+            stage: "worker",
+            cycle: 0,
+            base_sha: "missing-base",
+            prev_sha: "missing-base",
+            head_sha: &merge_head,
+        },
+    );
 
     let record: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())
@@ -341,7 +389,20 @@ fn stage_measurement_reports_when_the_tracked_base_advances() {
     );
     git(&root, &["switch", "-q", "worker"]);
 
-    write_stage_measurement(&root, &root, "main", 1, None, &base, &head);
+    write_stage_measurement(
+        &root,
+        &root,
+        "main",
+        StageMeasurement {
+            iteration: 1,
+            pr: None,
+            stage: "worker",
+            cycle: 0,
+            base_sha: &base,
+            prev_sha: &base,
+            head_sha: &head,
+        },
+    );
 
     let record: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())

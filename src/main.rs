@@ -16,7 +16,7 @@ use alucard::{
     warn_if_stale_image, write_iteration_measurement, write_run_measurement,
     write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentResult,
     AgentRole, AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
-    RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
+    RecoveryPullRequest, RunOptions, StageMeasurement, TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -1316,11 +1316,17 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &prepared.directory,
                         &prepared.clone,
                         &options.base,
-                        iteration,
-                        Some(number),
-                        prepared.run.base_sha.as_deref().unwrap_or_default(),
-                        &sha,
+                        StageMeasurement {
+                            iteration,
+                            pr: Some(number),
+                            stage: "worker",
+                            cycle: 0,
+                            base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            prev_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            head_sha: &sha,
+                        },
                     );
+                    let mut previous_stage_sha = sha.clone();
                     log_event(
                         &prepared.directory,
                         &format!(
@@ -1386,9 +1392,15 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &prepared,
                         &branch,
                         number,
-                        iteration,
-                        0,
+                        GateStage {
+                            iteration,
+                            cycle: 0,
+                        },
                         &mut checks_available,
+                        &mut StageProgress {
+                            base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            previous_sha: &mut previous_stage_sha,
+                        },
                     ) {
                         Ok(result) => {
                             if let Err(error) = record_task_pr_gate_state(
@@ -1421,6 +1433,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         ci_result,
                         iteration,
                         &toolchain_status,
+                        &mut StageProgress {
+                            base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            previous_sha: &mut previous_stage_sha,
+                        },
                     ) {
                         Ok(outcome) => outcome,
                         Err(error) => {
@@ -1436,6 +1452,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         database: &database,
                         run_id: &attempt_run.id,
                         log_dir: &prepared.directory,
+                        log_dirs: &usage_log_dirs
+                            .iter()
+                            .map(PathBuf::as_path)
+                            .collect::<Vec<_>>(),
                         iteration,
                         pr: Some(number),
                         base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
@@ -2070,15 +2090,25 @@ struct CiGate<'a> {
     github_repo: Option<&'a str>,
 }
 
+struct StageProgress<'a> {
+    base_sha: &'a str,
+    previous_sha: &'a mut String,
+}
+
+struct GateStage {
+    iteration: usize,
+    cycle: usize,
+}
+
 impl CiGate<'_> {
     fn run(
         &self,
         prepared: &alucard::PreparedRun,
         branch: &str,
         pr_number: i64,
-        iteration: usize,
-        gate_cycle: usize,
+        gate_stage: GateStage,
         checks_available: &mut bool,
+        stage_progress: &mut StageProgress<'_>,
     ) -> Result<CiResult, String> {
         let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
         let remote = remote.trim();
@@ -2133,7 +2163,7 @@ impl CiGate<'_> {
                 failed_run_log(&prepared.clone, branch, head.trim()).unwrap_or_default();
             let checkout = prepared
                 .directory
-                .join(format!("fix-{gate_cycle}-{attempt}"));
+                .join(format!("fix-{}-{attempt}", gate_stage.cycle));
             let checkout_text = checkout.display().to_string();
             let mut agent_invoked = false;
             let repair = (|| {
@@ -2155,11 +2185,18 @@ impl CiGate<'_> {
                     return Err(String::from_utf8_lossy(&clone.stderr).trim().to_string());
                 }
                 let prompt = ci_fix_prompt(self.tools, pr_number, branch, &failure_log)?;
-                let log = prepared
-                    .directory
-                    .join(format!("iter-{iteration}-fix-{gate_cycle}-{attempt}.jsonl"));
-                let name = format!("alucard-fix-{}-{gate_cycle}-{attempt}", prepared.run.id);
-                let fix_iteration = format!("{iteration}-fix-{gate_cycle}-{attempt}");
+                let log = prepared.directory.join(format!(
+                    "iter-{}-fix-{}-{attempt}.jsonl",
+                    gate_stage.iteration, gate_stage.cycle
+                ));
+                let name = format!(
+                    "alucard-fix-{}-{}-{attempt}",
+                    prepared.run.id, gate_stage.cycle
+                );
+                let fix_iteration = format!(
+                    "{}-fix-{}-{attempt}",
+                    gate_stage.iteration, gate_stage.cycle
+                );
                 agent_invoked = true;
                 let _ = AgentInvocation {
                     role: AgentRole::CiFix,
@@ -2182,6 +2219,23 @@ impl CiGate<'_> {
             })();
             if agent_invoked {
                 cleanup_repair_checkout(&checkout);
+                if let Some(head_sha) = remote_branch_sha(&prepared.clone, branch) {
+                    write_stage_measurement(
+                        &prepared.directory,
+                        &prepared.clone,
+                        &self.options.base,
+                        StageMeasurement {
+                            iteration: gate_stage.iteration,
+                            pr: Some(pr_number),
+                            stage: "cifix",
+                            cycle: attempt,
+                            base_sha: stage_progress.base_sha,
+                            prev_sha: stage_progress.previous_sha,
+                            head_sha: &head_sha,
+                        },
+                    );
+                    *stage_progress.previous_sha = head_sha;
+                }
             } else {
                 let _ = fs::remove_dir_all(&checkout);
             }
@@ -2611,14 +2665,10 @@ fn top_level_heading(line: &str) -> Option<&str> {
 }
 
 fn remote_branch_sha(repository: &Path, branch: &str) -> Option<String> {
-    git_output(
-        repository,
-        &["ls-remote", "origin", &format!("refs/heads/{branch}")],
-    )
-    .ok()?
-    .split_whitespace()
-    .next()
-    .map(str::to_string)
+    git_output(repository, &["fetch", "--quiet", "origin", branch]).ok()?;
+    git_output(repository, &["rev-parse", "FETCH_HEAD"])
+        .ok()
+        .map(|sha| sha.trim().to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2795,6 +2845,7 @@ fn review_gate(
     ci_result: Option<CiResult>,
     iteration: usize,
     toolchain_status: &str,
+    stage_progress: &mut StageProgress<'_>,
 ) -> Result<ReviewOutcome, String> {
     println!("Review gate: PR #{pr_number} on {branch}.");
     let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
@@ -3072,6 +3123,23 @@ fn review_gate(
                                 iteration,
                                 toolchain_status,
                             )?;
+                            if let Some(head_sha) = remote_branch_sha(&prepared.clone, branch) {
+                                write_stage_measurement(
+                                    &prepared.directory,
+                                    &prepared.clone,
+                                    &options.base,
+                                    StageMeasurement {
+                                        iteration,
+                                        pr: Some(pr_number),
+                                        stage: "feedback",
+                                        cycle,
+                                        base_sha: stage_progress.base_sha,
+                                        prev_sha: stage_progress.previous_sha,
+                                        head_sha: &head_sha,
+                                    },
+                                );
+                                *stage_progress.previous_sha = head_sha;
+                            }
                             let stalled = advanced == Some(false)
                                 && (feedback.status.unwrap_or(1) != 0 || retained);
                             if stalled {
@@ -3129,9 +3197,9 @@ fn review_gate(
                                 prepared,
                                 branch,
                                 pr_number,
-                                iteration,
-                                cycle,
+                                GateStage { iteration, cycle },
                                 &mut feedback_checks_available,
+                                stage_progress,
                             )
                             .ok();
                             cycle += 1;

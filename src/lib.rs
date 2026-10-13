@@ -1629,24 +1629,41 @@ mod measurement_tests {
     }
 }
 
-/// Writes a worker-stage record, preserving unavailable diffs instead of treating them as zero.
+pub struct StageMeasurement<'a> {
+    pub iteration: usize,
+    pub pr: Option<i64>,
+    pub stage: &'a str,
+    pub cycle: usize,
+    pub base_sha: &'a str,
+    pub prev_sha: &'a str,
+    pub head_sha: &'a str,
+}
+
+/// Writes a stage record, preserving unavailable diffs instead of treating them as zero.
 pub fn write_stage_measurement(
     log_dir: &Path,
     repository: &Path,
     base_branch: &str,
-    iteration: usize,
-    pr: Option<i64>,
-    base_sha: &str,
-    head_sha: &str,
+    measurement: StageMeasurement<'_>,
 ) {
+    let StageMeasurement {
+        iteration,
+        pr,
+        stage,
+        cycle,
+        base_sha,
+        prev_sha,
+        head_sha,
+    } = measurement;
     write_measurement(
         log_dir,
         json!({
             "format": 1, "record": "stage", "ts": timestamp(), "repo_id": repository_id(repository),
             "iter": iteration.to_string(), "pr": pr.map(|number| number.to_string()).unwrap_or_default(),
-            "stage": "worker", "cycle": 0, "base_sha": base_sha, "prev_sha": base_sha, "head_sha": head_sha,
+            "stage": stage, "cycle": cycle, "base_sha": base_sha, "prev_sha": prev_sha, "head_sha": head_sha,
             "is_merge": is_merge_commit(repository, head_sha), "base_drifted": base_drifted(repository, base_branch, base_sha), "baseline_source": "pinned",
-            "from_base": diff_measurement(repository, base_sha, head_sha), "from_prev": diff_measurement(repository, base_sha, head_sha)
+            "from_base": diff_measurement(repository, base_sha, head_sha),
+            "from_prev": if prev_sha == head_sha { json!({}) } else { diff_measurement(repository, prev_sha, head_sha) }
         }),
     );
 }
@@ -1683,6 +1700,7 @@ pub struct IterationMeasurement<'a> {
     pub database: &'a Path,
     pub run_id: &'a str,
     pub log_dir: &'a Path,
+    pub log_dirs: &'a [&'a Path],
     pub iteration: usize,
     pub pr: Option<i64>,
     pub base_sha: &'a str,
@@ -1699,6 +1717,7 @@ pub fn write_iteration_measurement(measurement: IterationMeasurement<'_>) {
         database,
         run_id,
         log_dir,
+        log_dirs,
         iteration,
         pr,
         base_sha,
@@ -1711,7 +1730,10 @@ pub fn write_iteration_measurement(measurement: IterationMeasurement<'_>) {
     let mut roles = Map::new();
     let mut total = 0_u64;
     let mut costed = 0_u64;
-    if let Ok(entries) = fs::read_dir(log_dir) {
+    for log_dir in log_dirs {
+        let Ok(entries) = fs::read_dir(log_dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
