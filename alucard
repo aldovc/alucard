@@ -4674,13 +4674,13 @@ command_continue() {
   _comments_json=$(cd "$REPO_ABS" && \
     gh pr view "$pr_num" --json comments 2>/dev/null || echo '{"comments":[]}')
 
+  # Only a CHANGES_REQUESTED that no later approval superseded: after a base
+  # merge, a stale one sends feedback after fixed findings, which then stalls.
+  local _latest_verdict='.comments | map(select(.body | startswith($prefix) and test("review cycle [0-9]+/[0-9]+: (CHANGES_REQUESTED|APPROVED)"))) | last | select(.body | contains("CHANGES_REQUESTED"))'
   last_bot_cr_body=$(echo "$_comments_json" | jq -r --arg prefix "$BOT_COMMENT_PREFIX" \
-    '.comments | map(select(.body | startswith($prefix) and contains("CHANGES_REQUESTED"))) | last | .body // empty' \
-    2>/dev/null || true)
-  bot_cr_time=$(echo "$_comments_json" | jq -r \
-    --arg prefix "$BOT_COMMENT_PREFIX" \
-    '.comments | map(select(.body | startswith($prefix) and contains("CHANGES_REQUESTED"))) | last | .createdAt // empty' \
-    2>/dev/null || true)
+    "$_latest_verdict | .body // empty" 2>/dev/null || true)
+  bot_cr_time=$(echo "$_comments_json" | jq -r --arg prefix "$BOT_COMMENT_PREFIX" \
+    "$_latest_verdict | .createdAt // empty" 2>/dev/null || true)
 
   if [ -n "${last_bot_cr_body:-}" ]; then
     human_after=""
