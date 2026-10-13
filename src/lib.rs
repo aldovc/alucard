@@ -1495,6 +1495,23 @@ impl TaskState {
             Self::Human => "human",
         }
     }
+
+    fn marker(self) -> char {
+        match self {
+            Self::Pending => ' ',
+            Self::InFlight => '>',
+            Self::Done => 'x',
+            Self::Human => 'h',
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskHeadingUpdate {
+    pub id: String,
+    pub state: TaskState,
+    pub pr_number: Option<i64>,
+    pub previous_pr_number: Option<i64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1669,6 +1686,104 @@ pub fn local_queue_with_open_issues(
         })
         .cloned()
         .collect()
+}
+
+pub fn local_queue_with_open_prs(
+    tasks: &[LocalTask],
+    open_issues: Option<&[i64]>,
+    open_prs: &[GithubPullRequest],
+) -> Vec<LocalTask> {
+    local_queue_with_open_issues(tasks, open_issues)
+        .into_iter()
+        .filter(|task| {
+            !open_prs.iter().any(|pr| {
+                [pr.title.as_str(), pr.body.as_str()].iter().any(|text| {
+                    text.lines()
+                        .any(|line| line.trim() == format!("Task: {}", task.id))
+                })
+            })
+        })
+        .collect()
+}
+
+pub fn write_task_headings(
+    path: &Path,
+    expected_contents: &str,
+    updates: &[TaskHeadingUpdate],
+) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut file = File::options()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    file.lock_exclusive()
+        .map_err(|error| format!("cannot lock {}: {error}", path.display()))?;
+    let result = (|| {
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if contents != expected_contents {
+            return Err(format!(
+                "tasks file changed during reconciliation: {}",
+                path.display()
+            ));
+        }
+        let parsed = parse_tasks(&contents).map_err(|errors| errors.join("\n"))?;
+        let mut lines: Vec<String> = contents.split_inclusive('\n').map(str::to_owned).collect();
+        for update in updates {
+            let task = parsed
+                .tasks
+                .iter()
+                .find(|task| task.id == update.id)
+                .ok_or_else(|| format!("task {} no longer exists", update.id))?;
+            let line = lines
+                .get_mut(task.line - 1)
+                .ok_or_else(|| format!("task {} heading is missing", update.id))?;
+            let ending = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            let suffix = update
+                .pr_number
+                .map(|number| format!(" (PR #{number})"))
+                .or_else(|| {
+                    update
+                        .previous_pr_number
+                        .map(|number| format!(" (previous attempt: PR #{number})"))
+                })
+                .unwrap_or_default();
+            *line = format!(
+                "## [{}] {}: {}{}{}",
+                update.state.marker(),
+                task.id,
+                task.title,
+                suffix,
+                ending
+            );
+        }
+        let rewritten = lines.concat();
+        let temporary = path.with_extension(format!("tasks-{}.tmp", Uuid::new_v4()));
+        fs::write(&temporary, rewritten)
+            .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+        fs::set_permissions(
+            &temporary,
+            file.metadata()
+                .map_err(|error| error.to_string())?
+                .permissions(),
+        )
+        .map_err(|error| format!("cannot set permissions on {}: {error}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .map_err(|error| format!("cannot replace {}: {error}", path.display()))?;
+        Ok(())
+    })();
+    let _ = FileExt::unlock(&file);
+    result
 }
 
 pub fn import_local_tasks(

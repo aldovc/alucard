@@ -1,7 +1,7 @@
 use alucard::{
     github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue,
     local_queue_with_open_issues, migrate, open, parse_tasks, resolve_pinned_issue,
-    GithubPullRequest, GithubTask, TaskState,
+    write_task_headings, GithubPullRequest, GithubTask, TaskHeadingUpdate, TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -15,6 +15,54 @@ fn temporary_path(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("alucard-{name}-{}-{unique}", std::process::id()))
+}
+
+#[test]
+fn task_heading_write_preserves_non_heading_bytes() {
+    let path = temporary_path("task-heading-write");
+    let original =
+        "# Plan\r\n\r\n## [>] one: First (PR #12)\r\n\r\nBody  \r\n\r\n## [ ] two: Second\r\n";
+    fs::write(&path, original).unwrap();
+    write_task_headings(
+        &path,
+        original,
+        &[TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::Pending,
+            pr_number: None,
+            previous_pr_number: Some(12),
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "# Plan\r\n\r\n## [ ] one: First (previous attempt: PR #12)\r\n\r\nBody  \r\n\r\n## [ ] two: Second\r\n"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn task_heading_write_rejects_changed_file() {
+    let path = temporary_path("task-heading-conflict");
+    let original = "## [>] one: First (PR #12)\n";
+    fs::write(&path, "## [h] one: Human edit\n").unwrap();
+    let error = write_task_headings(
+        &path,
+        original,
+        &[TaskHeadingUpdate {
+            id: "one".to_string(),
+            state: TaskState::Done,
+            pr_number: Some(12),
+            previous_pr_number: None,
+        }],
+    )
+    .unwrap_err();
+    assert!(error.contains("changed during reconciliation"));
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "## [h] one: Human edit\n"
+    );
+    fs::remove_file(path).unwrap();
 }
 
 fn run(command: &mut Command) {
