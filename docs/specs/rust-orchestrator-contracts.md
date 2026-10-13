@@ -76,7 +76,10 @@ not part of the literal prefix.
 
 The labels are protocol too: GitHub source reads `ready-for-agent`, skips
 `in-progress` and `wip`, and a blocked/recovery/review outcome adds
-`needs-human`.  `command_run` removes `in-progress` after a stopped worker;
+`needs-human`. Recovery PR creation writes the exact `alucard` label;
+`command_run` reads it in its worker-PR fallback to find an already-open
+worker-created PR when its branch does not match the harness branch.
+`command_run` removes `in-progress` after a stopped worker;
 `unpark_recovery_pr` removes `needs-human` only after current-head approval.
 `ready-for-human` is not selected because the source query requires
 `ready-for-agent`.
