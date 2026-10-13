@@ -597,7 +597,7 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_GH_TRACE\"\ncase \"$1 $2\" in\n  'issue view') echo '{\"number\":42,\"title\":\"Eligible\",\"body\":\"\",\"labels\":[{\"name\":\"ready-for-agent\"}],\"state\":\"OPEN\"}' ;;\n  'pr view') if [ -f \"$ALUCARD_PINNED_PR\" ]; then echo '{\"number\":42}'; else exit 1; fi ;;\n  'issue list') echo '[]' ;;\n  'repo view') echo 'owner/repo' ;;\n  'pr list'|'api graphql') if [ -f \"$ALUCARD_RETURN_PR\" ]; then echo '[{\"number\":77,\"title\":\"\",\"body\":\"\",\"headRefName\":\"agent/task\",\"headRefOid\":\"abc\"}]'; else echo '[]'; fi ;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_GH_TRACE\"\ncase \"$1 $2\" in\n  'issue view') echo '{\"number\":42,\"title\":\"Eligible\",\"body\":\"\",\"labels\":[{\"name\":\"ready-for-agent\"}],\"state\":\"OPEN\"}' ;;\n  'issue list') echo '[]' ;;\n  'repo view') echo 'owner/repo' ;;\n  'api graphql')\n    case \"$*\" in\n      *issueOrPullRequest*)\n        if [ -f \"$ALUCARD_TYPE_LOOKUP_FAIL\" ]; then echo 'lookup failed' >&2; exit 1; elif [ -f \"$ALUCARD_PINNED_PR\" ]; then echo PullRequest; else echo Issue; fi ;;\n      *) if [ -f \"$ALUCARD_RETURN_PR\" ]; then echo '[{\"number\":77,\"title\":\"\",\"body\":\"\",\"headRefName\":\"agent/task\",\"headRefOid\":\"abc\"}]'; else echo '[]'; fi ;;\n    esac ;;\n  'pr list') if [ -f \"$ALUCARD_RETURN_PR\" ]; then echo '[{\"number\":77,\"title\":\"\",\"body\":\"\",\"headRefName\":\"agent/task\",\"headRefOid\":\"abc\"}]'; else echo '[]'; fi ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -612,6 +612,7 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
     let logs = root.join("logs");
     let return_pr = root.join("return-pr");
     let pinned_pr = root.join("pinned-pr");
+    let type_lookup_fail = root.join("type-lookup-fail");
     let docker_started = root.join("docker-started");
     let docker_release = root.join("docker-release");
     let docker_hold_lock = root.join("docker-hold-lock");
@@ -637,6 +638,7 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
             .env("ALUCARD_GH_TRACE", &gh_trace)
             .env("ALUCARD_RETURN_PR", &return_pr)
             .env("ALUCARD_PINNED_PR", &pinned_pr)
+            .env("ALUCARD_TYPE_LOOKUP_FAIL", &type_lookup_fail)
             .env("ALUCARD_DOCKER_STARTED", &docker_started)
             .env("ALUCARD_DOCKER_RELEASE", &docker_release)
             .env("ALUCARD_DOCKER_HOLD_LOCK", &docker_hold_lock)
@@ -680,18 +682,32 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
     assert!(!output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("issue #42 is a pull request; use alucard continue 42"));
-    let docker_trace = fs::read_to_string(docker_trace).unwrap();
+    let docker_trace_contents = fs::read_to_string(&docker_trace).unwrap();
     assert_eq!(
-        docker_trace
+        docker_trace_contents
             .lines()
             .filter(|line| line.starts_with("run "))
             .count(),
         2
     );
-    let gh_trace = fs::read_to_string(gh_trace).unwrap();
-    assert!(gh_trace.contains("issue view 42 --json number,title,body,labels,state"));
-    assert!(gh_trace.contains("pr view 42 --json number"));
-    assert!(gh_trace.contains("issue edit 42 --add-label in-progress"));
-    assert!(gh_trace.contains("issue edit 42 --remove-label in-progress"));
+    let gh_trace_contents = fs::read_to_string(&gh_trace).unwrap();
+    assert!(gh_trace_contents.contains("issue view 42 --json number,title,body,labels,state"));
+    assert!(gh_trace_contents.contains("issueOrPullRequest"));
+    assert!(gh_trace_contents.contains("issue edit 42 --add-label in-progress"));
+    assert!(gh_trace_contents.contains("issue edit 42 --remove-label in-progress"));
+    fs::remove_file(&pinned_pr).unwrap();
+    fs::write(&type_lookup_fail, "").unwrap();
+    let output = run().output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("could not check whether GitHub issue is a pull request: lookup failed"));
+    let docker_trace_contents = fs::read_to_string(&docker_trace).unwrap();
+    assert_eq!(
+        docker_trace_contents
+            .lines()
+            .filter(|line| line.starts_with("run "))
+            .count(),
+        2
+    );
     fs::remove_dir_all(root).unwrap();
 }

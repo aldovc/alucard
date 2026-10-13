@@ -984,16 +984,53 @@ fn fetch_pinned_issue(repository: &Path, number: i64) -> Result<(GithubTask, boo
         "could not view GitHub issue",
     )?)
     .map_err(|error| format!("could not parse GitHub issue: {error}"))?;
-    let is_pull_request = execute_command(
-        "gh",
-        &["pr", "view", &number.to_string(), "--json", "number"],
-        repository,
-        None,
-    )
-    .map_err(|error| format!("could not check whether GitHub issue is a pull request: {error}"))?
-    .status
-    .success();
+    let is_pull_request = pinned_item_is_pull_request(repository, number)?;
     Ok((issue.task, is_pull_request))
+}
+
+fn pinned_item_is_pull_request(repository: &Path, number: i64) -> Result<bool, String> {
+    let owner = String::from_utf8(gh_output(
+        repository,
+        &[
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ],
+        "could not check whether GitHub issue is a pull request",
+    )?)
+    .map_err(|error| format!("could not parse repository name: {error}"))?;
+    let (owner, name) = owner
+        .trim()
+        .split_once('/')
+        .ok_or_else(|| "could not check whether GitHub issue is a pull request".to_string())?;
+    let query = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issueOrPullRequest(number:$number){__typename}}}";
+    let item_type = String::from_utf8(gh_output(
+        repository,
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("repo={name}"),
+            "-F",
+            &format!("number={number}"),
+            "--jq",
+            ".data.repository.issueOrPullRequest.__typename",
+        ],
+        "could not check whether GitHub issue is a pull request",
+    )?)
+    .map_err(|error| format!("could not parse GitHub item type: {error}"))?;
+    match item_type.trim() {
+        "Issue" => Ok(false),
+        "PullRequest" => Ok(true),
+        _ => Err("could not determine whether GitHub issue is a pull request".to_string()),
+    }
 }
 
 fn xml_escape(value: &str) -> String {
