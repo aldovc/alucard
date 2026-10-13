@@ -345,11 +345,9 @@ pub fn toolchain_preflight(
         let mut results = Vec::new();
         for install in installs {
             let working_directory = format!("/work/{}", install.directory.display());
-            let docker_args = vec![
-                "run".into(),
-                "--rm".into(),
-                "--name".into(),
-                name.clone(),
+            let mut docker_args = vec!["run".into(), "--rm".into(), "--name".into(), name.clone()];
+            docker_args.extend(docker_sandbox_args(None));
+            docker_args.extend([
                 "--env-file".into(),
                 env_file.display().to_string(),
                 "-e".into(),
@@ -362,7 +360,7 @@ pub fn toolchain_preflight(
                 "bash".into(),
                 "-lc".into(),
                 install.command.into(),
-            ];
+            ]);
             let status = timeout_docker_command(timeout_minutes, &docker_args).status();
             cleanup_docker_container(&name);
             let rc = status
@@ -665,6 +663,28 @@ mod agent_tests {
         assert!(
             trace.contains("timeout --kill-after 30s 7m docker run --rm --name alucard-preflight-")
         );
+        for argument in [
+            "--network bridge",
+            "--memory 4g",
+            "--cpus 2",
+            "--read-only",
+            "--tmpfs /tmp:exec,size=2g",
+            "--tmpfs /home/alucard:size=2g,uid=",
+            "--ulimit nofile=8192:8192",
+            "--user ",
+            "--security-opt no-new-privileges",
+            "--cap-drop ALL",
+        ] {
+            assert!(
+                trace.contains(argument),
+                "missing sandbox argument {argument}"
+            );
+        }
+        assert!(trace.contains(&format!(
+            "--user {}:{}",
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() }
+        )));
         assert!(trace.contains(&format!(
             "docker rm -f alucard-preflight-{}",
             std::process::id()
@@ -985,35 +1005,43 @@ fn cleanup_docker_container(name: &str) {
     let _ = Command::new("docker").args(["rm", "-f", name]).status();
 }
 
+fn docker_sandbox_args(network: Option<&str>) -> Vec<String> {
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    vec![
+        "--network".into(),
+        network.unwrap_or("bridge").into(),
+        "--memory".into(),
+        "4g".into(),
+        "--cpus".into(),
+        "2".into(),
+        "--read-only".into(),
+        "--tmpfs".into(),
+        "/tmp:exec,size=2g".into(),
+        "--tmpfs".into(),
+        format!("/home/alucard:size=2g,uid={uid},gid={gid}"),
+        "--ulimit".into(),
+        "nofile=8192:8192".into(),
+        "--user".into(),
+        format!("{uid}:{gid}"),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+    ]
+}
+
 impl AgentInvocation<'_> {
     pub fn docker_args(&self, settings: &AgentSettings) -> Result<Vec<String>, String> {
         let provider = settings.provider(self.role)?;
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
         let mut args = vec![
             "run".into(),
             "--rm".into(),
             "--name".into(),
             self.name.into(),
-            "--network".into(),
-            self.network.unwrap_or("bridge").into(),
-            "--memory".into(),
-            "4g".into(),
-            "--cpus".into(),
-            "2".into(),
-            "--read-only".into(),
-            "--tmpfs".into(),
-            "/tmp:exec,size=2g".into(),
-            "--tmpfs".into(),
-            format!("/home/alucard:size=2g,uid={uid},gid={gid}"),
-            "--ulimit".into(),
-            "nofile=8192:8192".into(),
-            "--user".into(),
-            format!("{uid}:{gid}"),
-            "--security-opt".into(),
-            "no-new-privileges".into(),
-            "--cap-drop".into(),
-            "ALL".into(),
+        ];
+        args.extend(docker_sandbox_args(self.network));
+        args.extend([
             "--env-file".into(),
             self.env_file.display().to_string(),
             "-e".into(),
@@ -1028,7 +1056,7 @@ impl AgentInvocation<'_> {
                 self.worktree.display(),
                 if self.worktree_read_only { "ro" } else { "rw" }
             ),
-        ];
+        ]);
         if provider == Provider::Codex {
             args.insert(2, "-i".into());
         }
