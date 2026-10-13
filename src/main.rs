@@ -1,19 +1,22 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    build_image, compose_role_prompt, database_path, find_run, finish_run, github_queue,
-    github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue_with_open_issues,
-    migrate, open, parse_tasks, prepare_run, recent_runs, record_task_pr,
-    record_task_pr_gate_state, release, run_claims, run_command as execute_command,
-    run_pull_requests, start_retry_run, start_task_run, status, task_id, task_is_pending,
-    toolchain_preflight, transition_task, warn_if_stale_image, AgentInvocation, AgentRole,
-    AgentSettings, GithubPullRequest, GithubTask, Provider, RunOptions, TaskStatus,
+    begin_operation, build_image, compose_role_prompt, database_path, find_run, finish_operation,
+    finish_run, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
+    local_queue_with_open_issues, migrate, open, parse_tasks, prepare_run, recent_runs,
+    record_recovery_failure, record_recovery_pr, record_task_pr, record_task_pr_gate_state,
+    release, run_claims, run_command as execute_command, run_pull_requests, run_recovery,
+    start_retry_run, start_task_run, status, task_id, task_is_pending, toolchain_preflight,
+    transition_task, warn_if_stale_image, AgentInvocation, AgentRole, AgentSettings,
+    GithubPullRequest, GithubTask, Provider, RecoveryPullRequest, RunOptions, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
+
+const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -860,26 +863,48 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         };
                         continue;
                     }
-                    let _ = transition_task(
+                    if let Err(error) = recover_worker_changes(
                         &database,
-                        &selected.ledger_id,
+                        &options,
+                        &selected,
                         &claim.id,
                         &owner_run_id,
-                        TaskStatus::Pending,
-                    );
+                        &prepared,
+                        iteration,
+                        classification,
+                        result.as_ref().ok().and_then(|value| value.status),
+                    ) {
+                        eprintln!("alucard: recovery requires human attention: {error}");
+                        let _ = transition_task(
+                            &database,
+                            &selected.ledger_id,
+                            &claim.id,
+                            &owner_run_id,
+                            TaskStatus::Human,
+                        );
+                    }
                     let _ = release(&database, &claim.id, &owner_run_id);
                     if let Some(issue) = selected.issue.as_ref() {
-                        let _ = gh_output(
-                            &options.queue.repository,
-                            &[
-                                "issue",
-                                "edit",
-                                &issue.number.to_string(),
-                                "--remove-label",
-                                "in-progress",
-                            ],
-                            "could not remove GitHub issue label",
-                        );
+                        if let Ok(operation) = begin_operation(
+                            &database,
+                            &prepared.run.repository_id,
+                            &format!("issue:{}", issue.number),
+                            "post_recovery_label_removal",
+                        ) {
+                            let result = gh_output(
+                                &options.queue.repository,
+                                &[
+                                    "issue",
+                                    "edit",
+                                    &issue.number.to_string(),
+                                    "--remove-label",
+                                    "in-progress",
+                                ],
+                                "could not remove GitHub issue label",
+                            );
+                            let _ =
+                                finish_operation(&database, &operation, result.err().as_deref());
+                        }
                     }
                     let _ = finish_run(
                         &database,
@@ -1334,6 +1359,470 @@ fn cleanup_repair_checkout(checkout: &Path) {
             checkout.display()
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_worker_changes(
+    database: &Path,
+    options: &RunCommandOptions,
+    task: &SelectedRunTask,
+    lease_id: &str,
+    run_id: &str,
+    prepared: &alucard::PreparedRun,
+    iteration: usize,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+) -> Result<(), String> {
+    if classification == alucard::AgentExit::Clean
+        || (classification == alucard::AgentExit::Transport && status == Some(0))
+    {
+        return release_pending(
+            database,
+            task,
+            lease_id,
+            run_id,
+            &prepared.run.repository_id,
+            &options.queue.repository,
+        );
+    }
+    let base = prepared.run.base_sha.as_deref().unwrap_or("HEAD");
+    let commits = execute_command(
+        "git",
+        &["rev-list", "--count", &format!("{base}..HEAD")],
+        &prepared.clone,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let commit_count: usize = String::from_utf8_lossy(&commits.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let dirty = execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
+        .map_err(|error| error.to_string())?;
+    let dirty = !dirty.stdout.is_empty();
+    if !dirty && commit_count == 0 {
+        if classification == alucard::AgentExit::Transport {
+            return Ok(());
+        }
+        return release_pending(
+            database,
+            task,
+            lease_id,
+            run_id,
+            &prepared.run.repository_id,
+            &options.queue.repository,
+        );
+    }
+    if dirty {
+        let add = execute_command("git", &["add", "-A"], &prepared.clone, None)
+            .map_err(|error| error.to_string())?;
+        if !add.status.success() {
+            return Err("could not stage worker changes".to_string());
+        }
+        let commit = execute_command(
+            "git",
+            &[
+                "-c",
+                "user.email=alucard@noreply.local",
+                "-c",
+                "user.name=alucard",
+                "commit",
+                "-m",
+                "wip: alucard recovery — uncommitted worker state",
+            ],
+            &prepared.clone,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        if !commit.status.success() {
+            return Err(String::from_utf8_lossy(&commit.stderr).trim().to_string());
+        }
+    }
+    let target = format!("recovery:{}", prepared.branch);
+    let push = begin_operation(database, &prepared.run.repository_id, &target, "push")
+        .map_err(|error| error.to_string())?;
+    let pushed = execute_command(
+        "git",
+        &["push", "-u", "origin", &prepared.branch],
+        &prepared.clone,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if !pushed.status.success() {
+        let error = String::from_utf8_lossy(&pushed.stderr).trim().to_string();
+        let _ = finish_operation(database, &push, Some(&error));
+        record_recovery_failure(
+            database,
+            &task.ledger_id,
+            run_id,
+            &prepared.branch,
+            &prepared.clone,
+            &error,
+        )
+        .map_err(|error| error.to_string())?;
+        return Err(format!(
+            "push failed; checkout retained at {}: {error}",
+            prepared.clone.display()
+        ));
+    }
+    finish_operation(database, &push, None).map_err(|error| error.to_string())?;
+    if classification == alucard::AgentExit::Transport && commit_count == 0 {
+        return release_pending(
+            database,
+            task,
+            lease_id,
+            run_id,
+            &prepared.run.repository_id,
+            &options.queue.repository,
+        );
+    }
+    if let Some((number, branch, sha)) = find_open_pr(&options.queue.repository, &prepared.branch)?
+    {
+        return record_recovery(
+            database,
+            task,
+            lease_id,
+            run_id,
+            prepared,
+            number,
+            &branch,
+            &sha,
+            commit_count,
+            classification,
+            status,
+        );
+    }
+    let title = recovery_title(iteration, classification, status);
+    let body = recovery_body(task, classification, status, commit_count);
+    let pr = begin_operation(
+        database,
+        &prepared.run.repository_id,
+        &target,
+        "create_recovery_pr",
+    )
+    .map_err(|error| error.to_string())?;
+    let output = execute_command(
+        "gh",
+        &[
+            "pr",
+            "create",
+            "--head",
+            &prepared.branch,
+            "--base",
+            &options.base,
+            "--draft",
+            "--title",
+            &title,
+            "--body",
+            &body,
+        ],
+        &options.queue.repository,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = finish_operation(database, &pr, Some(&error));
+        record_recovery_failure(
+            database,
+            &task.ledger_id,
+            run_id,
+            &prepared.branch,
+            &prepared.clone,
+            &error,
+        )
+        .map_err(|error| error.to_string())?;
+        return Err(format!(
+            "recovery PR creation failed; checkout retained at {}: {error}",
+            prepared.clone.display()
+        ));
+    }
+    finish_operation(database, &pr, None).map_err(|error| error.to_string())?;
+    let (number, branch, sha) = find_open_pr(&options.queue.repository, &prepared.branch)?
+        .ok_or("recovery PR was created but cannot be discovered")?;
+    record_recovery(
+        database,
+        task,
+        lease_id,
+        run_id,
+        prepared,
+        number,
+        &branch,
+        &sha,
+        commit_count,
+        classification,
+        status,
+    )
+}
+
+fn release_pending(
+    database: &Path,
+    task: &SelectedRunTask,
+    lease_id: &str,
+    run_id: &str,
+    repository_id: &str,
+    repository: &Path,
+) -> Result<(), String> {
+    transition_task(
+        database,
+        &task.ledger_id,
+        lease_id,
+        run_id,
+        TaskStatus::Pending,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(issue) = &task.issue {
+        let operation = begin_operation(
+            database,
+            repository_id,
+            &format!("issue:{}", issue.number),
+            "release_pending_label_removal",
+        )
+        .map_err(|error| error.to_string())?;
+        let result = gh_output(
+            repository,
+            &[
+                "issue",
+                "edit",
+                &issue.number.to_string(),
+                "--remove-label",
+                "in-progress",
+            ],
+            "could not remove GitHub issue label",
+        );
+        let error = result.err();
+        finish_operation(database, &operation, error.as_deref())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_recovery(
+    database: &Path,
+    task: &SelectedRunTask,
+    lease_id: &str,
+    run_id: &str,
+    prepared: &alucard::PreparedRun,
+    number: i64,
+    branch: &str,
+    sha: &str,
+    commits: usize,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+) -> Result<(), String> {
+    record_recovery_pr(
+        database,
+        &task.ledger_id,
+        lease_id,
+        run_id,
+        RecoveryPullRequest {
+            number,
+            branch,
+            head_sha: sha,
+            reason: &format!("{classification:?}"),
+            checkout_path: &prepared.clone,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let target = format!("recovery-pr:{number}");
+    let alucard_label = begin_operation(
+        database,
+        &prepared.run.repository_id,
+        &target,
+        "alucard-label",
+    )
+    .map_err(|error| error.to_string())?;
+    let alucard_labelled = gh_output(
+        &prepared.clone,
+        &["pr", "edit", &number.to_string(), "--add-label", "alucard"],
+        "could not label recovery PR",
+    );
+    let alucard_label_error = alucard_labelled.err();
+    finish_operation(database, &alucard_label, alucard_label_error.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = alucard_label_error {
+        return Err(error);
+    }
+    let label = begin_operation(
+        database,
+        &prepared.run.repository_id,
+        &target,
+        "needs-human-label",
+    )
+    .map_err(|error| error.to_string())?;
+    let labelled = gh_output(
+        &prepared.clone,
+        &[
+            "pr",
+            "edit",
+            &number.to_string(),
+            "--add-label",
+            "needs-human",
+        ],
+        "could not label recovery PR",
+    );
+    let label_error = labelled.err();
+    finish_operation(database, &label, label_error.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = label_error {
+        return Err(error);
+    }
+    let marker = begin_operation(
+        database,
+        &prepared.run.repository_id,
+        &target,
+        "recovery_marker",
+    )
+    .map_err(|error| error.to_string())?;
+    let comment = gh_output(
+        &prepared.clone,
+        &[
+            "pr",
+            "comment",
+            &number.to_string(),
+            "--body",
+            RECOVERY_MARKER_BODY,
+        ],
+        "could not post recovery marker",
+    );
+    let marker_error = comment.err();
+    finish_operation(database, &marker, marker_error.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = marker_error {
+        return Err(error);
+    }
+    if let Some(issue) = &task.issue {
+        let comment = recovery_ticket_comment(number, classification, status, commits);
+        let comment_operation = begin_operation(
+            database,
+            &prepared.run.repository_id,
+            &format!("issue:{}", issue.number),
+            "recovery_issue_comment",
+        )
+        .map_err(|error| error.to_string())?;
+        let comment_result = gh_output(
+            &prepared.clone,
+            &[
+                "issue",
+                "comment",
+                &issue.number.to_string(),
+                "--body",
+                &comment,
+            ],
+            "could not comment on recovery issue",
+        );
+        let comment_error = comment_result.err();
+        finish_operation(database, &comment_operation, comment_error.as_deref())
+            .map_err(|error| error.to_string())?;
+        let label_operation = begin_operation(
+            database,
+            &prepared.run.repository_id,
+            &format!("issue:{}", issue.number),
+            "recovery_label_removal",
+        )
+        .map_err(|error| error.to_string())?;
+        let label_result = gh_output(
+            &prepared.clone,
+            &[
+                "issue",
+                "edit",
+                &issue.number.to_string(),
+                "--remove-label",
+                "in-progress",
+            ],
+            "could not remove GitHub issue label",
+        );
+        let label_error = label_result.err();
+        finish_operation(database, &label_operation, label_error.as_deref())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn recovery_title(
+    iteration: usize,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+) -> String {
+    format!(
+        "wip: alucard recovery — iter {iteration} (worker stopped: {}, rc={})",
+        recovery_class(classification),
+        status.unwrap_or(1)
+    )
+}
+
+fn recovery_ticket_comment(
+    number: i64,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+    commits: usize,
+) -> String {
+    format!(
+        "**🤖 Alucard recovery** — the worker on this ticket {} (rc={}) before opening a PR. Its {commits} commit(s), plus its uncommitted files, are on draft PR #{number}. Nothing there has been through CI or review.\n\nThe `in-progress` label is removed; PR #{number} alone keeps this ticket out of the queue. Close that PR to hand the remaining work back to a worker, or finish it there.",
+        recovery_stop_description(classification),
+        status.unwrap_or(1),
+    )
+}
+
+fn recovery_stop_description(classification: alucard::AgentExit) -> &'static str {
+    match classification {
+        alucard::AgentExit::Exhausted | alucard::AgentExit::Timeout => {
+            "ran out of turns or hit its time limit"
+        }
+        alucard::AgentExit::Wedged => {
+            "wedged its shell (every tool call failed after /work went missing)"
+        }
+        alucard::AgentExit::Transport => "lost its provider connection",
+        alucard::AgentExit::NoWorktree => {
+            "never started: its checkout was empty when the container mounted it"
+        }
+        _ => "failed",
+    }
+}
+
+fn recovery_class(classification: alucard::AgentExit) -> &'static str {
+    match classification {
+        alucard::AgentExit::Clean => "clean",
+        alucard::AgentExit::Timeout => "timeout",
+        alucard::AgentExit::Exhausted => "exhausted",
+        alucard::AgentExit::Wedged => "wedged",
+        alucard::AgentExit::Transport => "transport",
+        alucard::AgentExit::Billing => "billing",
+        alucard::AgentExit::NoWorktree => "no_worktree",
+        alucard::AgentExit::Failed => "failed",
+    }
+}
+
+fn recovery_body(
+    task: &SelectedRunTask,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+    commits: usize,
+) -> String {
+    let (reference, finish, handback) = match (&task.issue, &task.local_id) {
+        (Some(issue), _) => (
+            format!("Refs #{}", issue.number),
+            "when every acceptance criterion is met, change the `Refs` line above to `Closes` so the ticket closes on merge.",
+            "close this PR and the ticket rejoins the queue on the next run — its `in-progress` label is already off, and this attempt is noted in its comments. `alucard run --issue <N>` starts a fresh attempt on it right away.",
+        ),
+        (None, Some(id)) => (
+            format!("Task: {id}"),
+            "the harness flips the task to `[x]` when this PR merges.",
+            "close this PR and the task flips back to `[ ]` at the next queue build, with this attempt noted in its heading.",
+        ),
+        (None, None) => (String::new(), "", ""),
+    };
+    let stop = recovery_stop_description(classification);
+    let reference = if reference.is_empty() {
+        String::new()
+    } else {
+        format!("{reference}\n\n")
+    };
+    format!(
+        "{reference}**🤖 Alucard recovery PR** — the worker {stop} (rc={}) before opening a PR. Its {commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.\n\nThis is not a finished change. What each next step does:\n\n- **Finish it here** — {finish}\n- **Hand it back** — {handback}\n- **`alucard continue <PR_NUM>`** runs the CI and review gates on what is here. It does not resume implementation.",
+        status.unwrap_or(1)
+    )
 }
 
 fn release_without_pr(
@@ -2161,6 +2650,22 @@ fn runs_command(args: &[String], path: &std::path::Path) -> ExitCode {
                 for (number, branch) in pull_requests {
                     println!("pr: #{number} {branch}");
                 }
+                let recovery = match run_recovery(path, &run.id) {
+                    Ok(recovery) => recovery,
+                    Err(error) => return fail(&format!("alucard: database error: {error}")),
+                };
+                if let Some(recovery) = recovery {
+                    println!("recovery branch: {}", recovery.branch);
+                    if let Some(number) = recovery.pull_request_number {
+                        println!("recovery pr: #{number}");
+                    }
+                    if let Some(checkout_path) = recovery.checkout_path {
+                        println!("recovery checkout: {checkout_path}");
+                    }
+                    if let Some(failure_reason) = recovery.failure_reason {
+                        println!("recovery failure: {failure_reason}");
+                    }
+                }
                 ExitCode::SUCCESS
             }
             Ok(None) => fail(&format!("alucard: run not found: {}", args[1])),
@@ -2649,5 +3154,53 @@ printf '%s' "$_fix_prompt""#,
             CiResult::Missing
         );
         assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn recovery_body_attributes_tasks_by_source() {
+        let github_task = SelectedRunTask {
+            ledger_id: "github".to_string(),
+            issue: Some(GithubTask {
+                number: 42,
+                title: String::new(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: None,
+            }),
+            local_id: None,
+            local_title: String::new(),
+            local_body: String::new(),
+            parent_context: String::new(),
+        };
+        let local_task = SelectedRunTask {
+            ledger_id: "local".to_string(),
+            issue: None,
+            local_id: Some("7".to_string()),
+            local_title: String::new(),
+            local_body: String::new(),
+            parent_context: String::new(),
+        };
+
+        let github = recovery_body(&github_task, alucard::AgentExit::Exhausted, Some(1), 2);
+        assert!(github.starts_with("Refs #42\n\n"));
+        assert!(github.contains("change the `Refs` line above to `Closes`"));
+        assert!(github.contains("`alucard run --issue <N>`"));
+
+        let local = recovery_body(&local_task, alucard::AgentExit::Exhausted, Some(1), 2);
+        assert!(local.starts_with("Task: 7\n\n"));
+        assert!(local.contains("the harness flips the task to `[x]` when this PR merges."));
+        assert!(local.contains("task flips back to `[ ]` at the next queue build"));
+    }
+
+    #[test]
+    fn recovery_github_artifacts_match_the_bash_protocol() {
+        assert_eq!(
+            recovery_title(3, alucard::AgentExit::Exhausted, Some(1)),
+            "wip: alucard recovery — iter 3 (worker stopped: exhausted, rc=1)"
+        );
+        assert_eq!(
+            recovery_ticket_comment(91, alucard::AgentExit::Exhausted, Some(1), 2),
+            "**🤖 Alucard recovery** — the worker on this ticket ran out of turns or hit its time limit (rc=1) before opening a PR. Its 2 commit(s), plus its uncommitted files, are on draft PR #91. Nothing there has been through CI or review.\n\nThe `in-progress` label is removed; PR #91 alone keeps this ticket out of the queue. Close that PR to hand the remaining work back to a worker, or finish it there."
+        );
     }
 }

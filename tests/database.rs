@@ -1,7 +1,7 @@
 use alucard::{
-    acquire_pr, acquire_task, heartbeat, migrate, open, prepare_run, record_task_pr,
-    record_task_pr_gate_state, release, run_command, start_retry_run, status, transition_task,
-    ClaimError, RunOptions, TaskStatus,
+    acquire_pr, acquire_task, begin_operation, finish_operation, heartbeat, migrate, open,
+    prepare_run, record_task_pr, record_task_pr_gate_state, release, run_command, start_retry_run,
+    status, transition_task, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -799,9 +799,46 @@ fn opened_pr_moves_the_claimed_task_to_in_flight() {
 }
 
 #[test]
+fn remote_operations_are_durable_and_idempotent() {
+    let path = database_path();
+    migrate(&path).unwrap();
+    let connection = open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repo', 'owner', 'name', 'now')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let first = begin_operation(&path, "repo", "recovery:branch", "push").unwrap();
+    let second = begin_operation(&path, "repo", "recovery:branch", "push").unwrap();
+    assert_eq!(first, second);
+    finish_operation(&path, &first, Some("network unavailable")).unwrap();
+    let connection = open(&path).unwrap();
+    let operation: (String, i64, Option<String>) = connection
+        .query_row(
+            "SELECT phase, attempt_count, last_error FROM operations WHERE id = ?1",
+            [&first],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        operation,
+        (
+            "failed".to_string(),
+            1,
+            Some("network unavailable".to_string())
+        )
+    );
+    drop(connection);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn migration_is_idempotent_and_enforces_the_ledger_constraints() {
     let path = database_path();
-    assert_eq!(status(&path).unwrap().pending_migrations, 2);
+    assert_eq!(status(&path).unwrap().pending_migrations, 3);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
 
@@ -885,7 +922,7 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     assert!(!status.status.success());
     assert!(String::from_utf8(status.stdout)
         .unwrap()
-        .contains("pending migrations: 2"));
+        .contains("pending migrations: 3"));
 
     let migrate = Command::new(binary)
         .args(["--db-path", path.to_str().unwrap(), "db", "migrate"])
@@ -1019,7 +1056,7 @@ fn status_preserves_existing_database_parent_permissions() {
     fs::create_dir(parent).unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(status(&path).unwrap().pending_migrations, 2);
+    assert_eq!(status(&path).unwrap().pending_migrations, 3);
     assert_eq!(
         fs::metadata(parent).unwrap().permissions().mode() & 0o777,
         0o755
