@@ -1285,7 +1285,6 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             &format!("Iteration {iteration}/{} start", options.iterations),
         );
         loop {
-            let started = std::time::Instant::now();
             let name = format!("alucard-worker-{}-{attempt}", attempt_run.id);
             let log = prepared
                 .directory
@@ -1322,16 +1321,6 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         prepared.run.base_sha.as_deref().unwrap_or_default(),
                         &sha,
                     );
-                    write_iteration_measurement(IterationMeasurement {
-                        database: &database,
-                        run_id: &attempt_run.id,
-                        log_dir: &prepared.directory,
-                        iteration,
-                        pr: Some(number),
-                        base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
-                        status: result.as_ref().ok().and_then(|value| value.status),
-                        duration: started.elapsed().as_secs(),
-                    });
                     log_event(
                         &prepared.directory,
                         &format!(
@@ -1419,7 +1408,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             None
                         }
                     };
-                    if let Err(error) = review_gate(
+                    let review = match review_gate(
                         &database,
                         &tools,
                         &options,
@@ -1433,8 +1422,35 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         iteration,
                         &toolchain_status,
                     ) {
-                        eprintln!("alucard: review gate for PR #{number}: {error}");
-                    }
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            eprintln!("alucard: review gate for PR #{number}: {error}");
+                            ReviewOutcome {
+                                ci_result,
+                                verdict: None,
+                                cycles: 0,
+                            }
+                        }
+                    };
+                    write_iteration_measurement(IterationMeasurement {
+                        database: &database,
+                        run_id: &attempt_run.id,
+                        log_dir: &prepared.directory,
+                        iteration,
+                        pr: Some(number),
+                        base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        status: result.as_ref().ok().and_then(|value| value.status),
+                        duration: iteration_started.elapsed().as_secs(),
+                        ci_result: review
+                            .ci_result
+                            .map(CiResult::measurement_value)
+                            .unwrap_or_default(),
+                        review_verdict: review
+                            .verdict
+                            .map(ReviewVerdict::as_str)
+                            .unwrap_or_default(),
+                        review_cycles: review.cycles,
+                    });
                     report_iteration_usage(
                         &options.queue.repository,
                         &usage_log_dirs,
@@ -2022,6 +2038,14 @@ enum CiResult {
 }
 
 impl CiResult {
+    fn measurement_value(self) -> &'static str {
+        match self {
+            Self::Green => "green",
+            Self::Failed => "failed",
+            Self::Missing => "none",
+        }
+    }
+
     fn gate_state(self) -> &'static str {
         match self {
             Self::Green => "ci_green",
@@ -2029,6 +2053,13 @@ impl CiResult {
             Self::Missing => "ci_missing",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReviewOutcome {
+    ci_result: Option<CiResult>,
+    verdict: Option<ReviewVerdict>,
+    cycles: usize,
 }
 
 struct CiGate<'a> {
@@ -2764,11 +2795,11 @@ fn review_gate(
     ci_result: Option<CiResult>,
     iteration: usize,
     toolchain_status: &str,
-) -> Result<(), String> {
+) -> Result<ReviewOutcome, String> {
     println!("Review gate: PR #{pr_number} on {branch}.");
     let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
     let root = std::env::temp_dir().join(format!("alucard-review-{}", uuid::Uuid::new_v4()));
-    let result = (|| {
+    let result = (|| -> Result<ReviewOutcome, String> {
         let mut cycle = 1;
         let mut ci_result = ci_result;
         let mut feedback_checks_available = true;
@@ -3022,7 +3053,11 @@ fn review_gate(
                                     &prepared.clone,
                                     None,
                                 );
-                                return Ok(());
+                                return Ok(ReviewOutcome {
+                                    ci_result,
+                                    verdict: Some(verdict),
+                                    cycles: cycle,
+                                });
                             }
                             let findings = feedback_findings(&prepared.clone, pr_number, &body)?;
                             let (feedback, blocked, advanced, retained) = run_feedback_once(
@@ -3059,7 +3094,11 @@ fn review_gate(
                                     &prepared.clone,
                                     None,
                                 );
-                                return Ok(());
+                                return Ok(ReviewOutcome {
+                                    ci_result,
+                                    verdict: Some(verdict),
+                                    cycles: cycle,
+                                });
                             }
                             if feedback.status.unwrap_or(0) != 0 {
                                 let comment = format!("**🤖 Alucard cycle {cycle}/{}: feedback agent failed after pushing** (rc={}, branch advanced={})", options.max_review_cycles, feedback.status.unwrap_or(1), advanced.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()));
@@ -3137,11 +3176,19 @@ fn review_gate(
                         .map_err(|error| error.to_string())?;
                     }
                 }
-                return Ok(());
+                return Ok(ReviewOutcome {
+                    ci_result,
+                    verdict,
+                    cycles: cycle,
+                });
             }
             unreachable!("reviewer attempt budget is non-zero")
         }
-        Ok(())
+        Ok(ReviewOutcome {
+            ci_result,
+            verdict: None,
+            cycles: 0,
+        })
     })();
     let _ = fs::remove_dir_all(root);
     result

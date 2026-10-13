@@ -1688,6 +1688,9 @@ pub struct IterationMeasurement<'a> {
     pub base_sha: &'a str,
     pub status: Option<i32>,
     pub duration: u64,
+    pub ci_result: &'a str,
+    pub review_verdict: &'a str,
+    pub review_cycles: usize,
 }
 
 /// Rolls one iteration's attempt logs into a measurement record and SQLite summary.
@@ -1701,6 +1704,9 @@ pub fn write_iteration_measurement(measurement: IterationMeasurement<'_>) {
         base_sha,
         status,
         duration,
+        ci_result,
+        review_verdict,
+        review_cycles,
     } = measurement;
     let mut roles = Map::new();
     let mut total = 0_u64;
@@ -1758,7 +1764,7 @@ pub fn write_iteration_measurement(measurement: IterationMeasurement<'_>) {
             "format": 1, "record": "iteration", "ts": timestamp(), "iter": iteration.to_string(),
             "pr": pr.map(|number| number.to_string()).unwrap_or_default(), "base_sha": base_sha,
             "baseline_source": "pinned", "rc": status.map(|value| value.to_string()).unwrap_or_default(),
-            "duration_s": duration, "ci_result": "", "review_verdict": "", "review_cycles": 0,
+            "duration_s": duration, "ci_result": ci_result, "review_verdict": review_verdict, "review_cycles": review_cycles,
             "cost_complete": complete, "costed_invocations": costed, "total_invocations": total, "roles": roles
         }),
     );

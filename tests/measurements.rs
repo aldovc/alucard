@@ -187,6 +187,9 @@ fn events_prompts_and_usage_summary_are_local_artifacts() {
         base_sha: "base",
         status: Some(0),
         duration: 1,
+        ci_result: "green",
+        review_verdict: "APPROVED",
+        review_cycles: 1,
     });
     let event = fs::read_to_string(root.join("events.log")).unwrap();
     let (timestamp, message) = event.trim_end().split_once('\t').unwrap();
@@ -214,6 +217,8 @@ fn events_prompts_and_usage_summary_are_local_artifacts() {
     let measurements = fs::read_to_string(root.join("measurements.jsonl")).unwrap();
     assert!(measurements.contains("\"usage_missing\":0"));
     assert!(measurements.contains("\"cost_complete\":false"));
+    assert!(measurements.contains("\"ci_result\":\"green\""));
+    assert!(measurements.contains("\"review_verdict\":\"APPROVED\""));
     let measurement: serde_json::Value = serde_json::from_str(&measurements).unwrap();
     let timestamp = measurement["ts"].as_str().unwrap();
     assert_eq!(timestamp.len(), 20);

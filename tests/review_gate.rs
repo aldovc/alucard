@@ -967,6 +967,23 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             );
             assert!(trace.contains("Marked ready for review"), "{trace}");
         }
+        if case.name == "review-missing-ci" {
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let measurement = fs::read_to_string(log_dir.join("measurements.jsonl")).unwrap();
+            let iteration: serde_json::Value = measurement
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .find(|record: &serde_json::Value| record["record"] == "iteration")
+                .unwrap();
+            assert_eq!(iteration["ci_result"], "none");
+            assert_eq!(iteration["review_verdict"], "APPROVED");
+            assert_eq!(iteration["review_cycles"], 1);
+        }
         if case.name == "recovery-missing-ci" {
             assert!(!trace.contains("pr ready 77"), "{trace}");
             assert!(
