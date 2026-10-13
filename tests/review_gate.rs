@@ -299,8 +299,14 @@ printf '%s\n' "$*" >> "$ALUCARD_GH_TRACE"
 branch=$(cat "$ALUCARD_BRANCH_FILE" 2>/dev/null || true)
 sha() { git --git-dir="$ALUCARD_REMOTE" rev-parse "refs/heads/$branch"; }
 case "$1 $2" in
+  'api user') printf '%s\n' alucard-bot ;;
+  'pr ready') : ;;
+  'issue view') printf '%s\n' 'Recovered task' ;;
+  'pr edit') : ;;
+  'api --silent') : ;;
   'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
   'pr checks')
+    case "$ALUCARD_CASE" in recovery-unpark|recovery-old-head|recovery-untrusted|recovery-formal-approved) exit 0 ;; esac
     if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
       feedback_attempts=$(wc -l < "$ALUCARD_FEEDBACK_ATTEMPTS")
       repair_attempts=$(wc -l < "$ALUCARD_CI_FIX_ATTEMPTS")
@@ -318,7 +324,20 @@ case "$1 $2" in
     ;;
   'pr view')
     case "$*" in
-      *headRefOid*) sha ;;
+      *headRefOid*)
+        if [ "$ALUCARD_CASE" = recovery-old-head ]; then
+          printf '%s\n' 0000000000000000000000000000000000000000
+        else
+          sha
+        fi ;;
+      *comments*isDraft*)
+        case "$ALUCARD_CASE" in
+          recovery-unpark|recovery-old-head)
+            printf '%s\n' '{"comments":[{"author":{"login":"alucard-bot"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft"}],"author":{"login":"alucard-bot"},"isDraft":true,"labels":[{"name":"needs-human"}],"title":"wip: alucard recovery — iter 1","body":"Refs #77\n\nunfinished"}' ;;
+          recovery-untrusted)
+            printf '%s\n' '{"comments":[{"author":{"login":"other"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft"}],"author":{"login":"other"},"isDraft":true,"labels":[{"name":"needs-human"}],"title":"wip: alucard recovery — iter 1","body":"Refs #77\n\nunfinished"}' ;;
+          *) printf '%s\n' "$ALUCARD_PR_COMMENTS" ;;
+        esac ;;
       *--json\ comments*)
         if [ "$ALUCARD_CASE" = feedback-blocked ] && [ -s "$ALUCARD_FEEDBACK_ATTEMPTS" ]; then
           printf '%s\n' '{"comments":[{"body":"**🤖 Alucard blocked findings** (cycle 1/2)\n\nblocked finding"}]}'
@@ -461,6 +480,58 @@ esac
 #[test]
 fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
     let cases = [
+        ReviewCase {
+            name: "recovery-unpark",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "recovery-old-head",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "recovery-untrusted",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "recovery-formal-approved",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "",
+            formal_verdict: "APPROVED",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
         ReviewCase {
             name: "review-formal-precedence",
             review_policy: Some("Review policy from the target repository.\n"),
@@ -871,6 +942,30 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             assert!(!trace.contains("Reviewed head:"));
             assert_eq!(shas.0, None);
         }
+        if case.name == "recovery-unpark" {
+            assert!(trace.contains("pr ready 77"), "{trace}");
+            assert!(
+                trace.contains("DELETE repos/{owner}/{repo}/issues/77/labels/needs-human"),
+                "{trace}"
+            );
+            assert!(
+                trace.contains("pr edit 77 --title Recovered task --body Closes #77"),
+                "{trace}"
+            );
+            assert!(trace.contains("Marked ready for review"), "{trace}");
+        }
+        if case.name == "recovery-old-head" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(!trace.contains("labels/needs-human"), "{trace}");
+        }
+        if case.name == "recovery-untrusted" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(!trace.contains("labels/needs-human"), "{trace}");
+        }
+        if case.name == "recovery-formal-approved" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(!trace.contains("labels/needs-human"), "{trace}");
+        }
         if case.name == "findings-handoff" {
             let feedback = fs::read_to_string(root.join("prompts/feedback-1.txt")).unwrap();
             assert!(feedback.contains("KEEP-FINDING"), "{feedback}");
@@ -972,6 +1067,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                 }));
                 assert!(trace.contains("no review posted — needs human"));
             }
+            "review_approved" => assert!(trace.contains("APPROVED")),
             _ => assert!(trace.contains("CHANGES_REQUESTED")),
         }
         fs::remove_dir_all(root).unwrap();

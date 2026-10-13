@@ -28,6 +28,8 @@ use std::{collections::BTreeMap, fs};
 use alucard::usage_report;
 
 const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's.";
+const RECOVERY_MARKER_PREFIX: &str = "**🤖 Alucard recovery PR parked**";
+const RECOVERY_TITLE_PREFIX: &str = "wip: alucard recovery";
 const BLOCKED_FINDINGS_MARKER: &str = "**🤖 Alucard blocked findings**";
 
 fn main() -> ExitCode {
@@ -2198,6 +2200,201 @@ fn review_verdict(formal: &str, decision_file: &str) -> Option<ReviewVerdict> {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryPullRequestMetadata {
+    comments: Vec<RecoveryComment>,
+    author: RecoveryAuthor,
+    is_draft: bool,
+    labels: Vec<RecoveryLabel>,
+    title: String,
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryComment {
+    author: RecoveryAuthor,
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryAuthor {
+    login: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryLabel {
+    name: String,
+}
+
+fn unpark_recovery_pr(
+    repository: &Path,
+    pr_number: i64,
+    reviewed_sha: &str,
+    current_head: &str,
+) -> String {
+    if reviewed_sha != current_head {
+        eprintln!(
+            "Review gate: the approval on PR #{pr_number} is not an approval of its current head — leaving it parked."
+        );
+        return String::new();
+    }
+    let Ok(login) = gh_text(repository, &["api", "user", "--jq", ".login"]) else {
+        eprintln!("Review gate: could not read the harness's GitHub login — a parked recovery PR stays parked.");
+        return String::new();
+    };
+    let login = login.trim();
+    let Ok(metadata) = gh_text(
+        repository,
+        &[
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--json",
+            "comments,author,isDraft,labels,title,body",
+        ],
+    ) else {
+        return String::new();
+    };
+    let Ok(mut pull_request) = serde_json::from_str::<RecoveryPullRequestMetadata>(&metadata)
+    else {
+        return String::new();
+    };
+    let marked = pull_request.comments.iter().any(|comment| {
+        comment.author.login == login && comment.body.starts_with(RECOVERY_MARKER_PREFIX)
+    });
+    let stub = pull_request.author.login == login
+        && pull_request.is_draft
+        && pull_request.title.starts_with(RECOVERY_TITLE_PREFIX)
+        && pull_request
+            .labels
+            .iter()
+            .any(|label| label.name.eq_ignore_ascii_case("needs-human"));
+    if !marked && !stub {
+        return String::new();
+    }
+
+    let mut notes = Vec::<String>::new();
+    if pull_request.is_draft {
+        let ready = execute_command(
+            "gh",
+            &["pr", "ready", &pr_number.to_string()],
+            repository,
+            None,
+        )
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+        if ready {
+            pull_request.is_draft = false;
+            println!("Review gate: PR #{pr_number} marked ready for review — it was a draft.");
+            notes
+                .push("- Marked ready for review: recovery opened this PR as a draft.".to_string());
+        } else {
+            eprintln!("Review gate: could not mark PR #{pr_number} ready — it is still a draft; needs-human stays on it.");
+            notes.push(format!("- Could not mark this PR ready for review, so it is still a draft and `needs-human` stays on it. Run `gh pr ready {pr_number}` and remove the label by hand."));
+        }
+    }
+    if !pull_request.is_draft
+        && pull_request
+            .labels
+            .iter()
+            .any(|label| label.name.eq_ignore_ascii_case("needs-human"))
+    {
+        let removed = execute_command(
+            "gh",
+            &[
+                "api",
+                "--silent",
+                "-X",
+                "DELETE",
+                &format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/labels/needs-human"),
+            ],
+            repository,
+            None,
+        )
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+        if removed {
+            notes.push("- Removed `needs-human`: the step it asked of a human — finishing this recovery PR — is done by this approval.".to_string());
+        } else {
+            notes.push("- Could not remove `needs-human`; take it off by hand, nothing is waiting on a human here.".to_string());
+        }
+    }
+
+    let first_line = pull_request.body.lines().next().unwrap_or_default();
+    let ticket: Option<i64> = first_line
+        .strip_prefix("Refs #")
+        .or_else(|| first_line.strip_prefix("Closes #"))
+        .and_then(|value| {
+            value
+                .chars()
+                .take_while(|value| value.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        });
+    let Some(ticket) = ticket else {
+        return notes.join("\n");
+    };
+    let new_body = if first_line.starts_with("Refs #") {
+        format!("Closes #{ticket}{}", &pull_request.body[first_line.len()..])
+    } else {
+        pull_request.body.clone()
+    };
+    let new_title = if pull_request.title.starts_with(RECOVERY_TITLE_PREFIX) {
+        gh_text(
+            repository,
+            &[
+                "issue",
+                "view",
+                &ticket.to_string(),
+                "--json",
+                "title",
+                "--jq",
+                ".title",
+            ],
+        )
+        .ok()
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| pull_request.title.clone())
+    } else {
+        pull_request.title.clone()
+    };
+    if new_title != pull_request.title || new_body != pull_request.body {
+        let edited = execute_command(
+            "gh",
+            &[
+                "pr",
+                "edit",
+                &pr_number.to_string(),
+                "--title",
+                &new_title,
+                "--body",
+                &new_body,
+            ],
+            repository,
+            None,
+        )
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+        if edited {
+            if new_body != pull_request.body {
+                println!("Review gate: PR #{pr_number} body now closes #{ticket}.");
+                notes.push(format!("- Changed `Refs #{ticket}` to `Closes #{ticket}`: the ticket closes when this merges."));
+            }
+            if new_title != pull_request.title {
+                println!("Review gate: PR #{pr_number} stub title replaced with the ticket's.");
+                notes.push("- Replaced the recovery stub title with the ticket's.".to_string());
+            }
+        } else {
+            eprintln!("Review gate: could not edit PR #{pr_number} title/body.");
+            notes.push("- Could not edit the title or body: the `Refs` line and the stub title are still there.".to_string());
+        }
+    }
+    notes.join("\n")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reviewer_prompt(
     tools: &Path,
@@ -2706,8 +2903,21 @@ fn review_gate(
                             String::new()
                         };
                         let ci_handoff_body = ci_handoff.map_or("", |(_, body)| body);
+                        let unpark_note = if ci_handoff.is_none() && file_verdict == "APPROVED" {
+                            unpark_recovery_pr(
+                                &prepared.clone,
+                                pr_number,
+                                &reviewed_sha,
+                                &current_head,
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let unpark_note = (!unpark_note.is_empty())
+                            .then(|| format!("\n\n{unpark_note}"))
+                            .unwrap_or_default();
                         let comment = format!(
-                        "**🤖 Alucard review cycle {cycle}/{}: {status}**\n\n{marker}{ci_handoff_body}{body}",
+                        "**🤖 Alucard review cycle {cycle}/{}: {status}**\n\n{marker}{ci_handoff_body}{body}{unpark_note}",
                         options.max_review_cycles
                     );
                         let _ = execute_command(
