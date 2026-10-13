@@ -143,6 +143,26 @@ fn stage_measurement_buckets_test_paths_and_renames() {
         .unwrap()
         .iter()
         .any(|path| path == "tests/renamed.rs"));
+    assert_eq!(record["prev_sha"], base);
+    assert_eq!(record["from_prev"], record["from_base"]);
+    assert_eq!(record["is_merge"], false);
+
+    let worker_branch = git(&root, &["branch", "--show-current"]);
+    git(&root, &["switch", "-qc", "side", &base]);
+    fs::write(root.join("side.txt"), "side\n").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "side"]);
+    git(&root, &["switch", "-q", &worker_branch]);
+    git(&root, &["merge", "--no-ff", "side", "-m", "merge side"]);
+    let merge_head = git(&root, &["rev-parse", "HEAD"]);
+    fs::remove_file(root.join("measurements.jsonl")).unwrap();
+
+    write_stage_measurement(&root, &root, "main", 1, None, &base, &merge_head);
+
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())
+            .unwrap();
+    assert_eq!(record["is_merge"], true);
     fs::remove_dir_all(root).unwrap();
 }
 
