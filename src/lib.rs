@@ -350,18 +350,16 @@ pub fn toolchain_preflight(
 
     let clone = env::temp_dir().join(format!("alucard-preflight-{}", Uuid::new_v4()));
     let cloned = Command::new("git")
-        .args([
-            "clone",
-            "--local",
-            "--no-tags",
-            "--single-branch",
-            "--branch",
-            base_branch,
-        ])
+        .args(["clone", "--local", "--no-tags"])
         .arg(repository)
         .arg(&clone)
         .status()
-        .is_ok_and(|status| status.success());
+        .is_ok_and(|status| status.success())
+        && Command::new("git")
+            .args(["reset", "--hard", &format!("origin/{base_branch}")])
+            .current_dir(&clone)
+            .status()
+            .is_ok_and(|status| status.success());
     if !cloned {
         let _ = fs::remove_dir_all(clone);
         return Ok(format!(
@@ -1921,6 +1919,93 @@ pub fn transition_task(
         return Err(ClaimError::LeaseNotActive);
     }
     transaction.commit()?;
+    Ok(())
+}
+
+/// Returns the ledger id for a task imported from the selected source.
+pub fn task_id(
+    path: &Path,
+    repository_id: &str,
+    source: &str,
+    source_path: &str,
+    external_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT id FROM tasks WHERE repository_id = ?1 AND source = ?2 AND source_path = ?3 AND external_id = ?4",
+            (repository_id, source, source_path, external_id),
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Reports whether an imported task remains available for a new lease.
+pub fn task_is_pending(path: &Path, task_id: &str) -> Result<bool, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT status = 'pending' FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|status| status.unwrap_or(false))
+        .map_err(Into::into)
+}
+
+/// Records an opened PR and moves the claimed task into flight.
+pub fn record_task_pr(
+    path: &Path,
+    task_id: &str,
+    lease_id: &str,
+    run_id: &str,
+    number: i64,
+    branch: &str,
+    head_sha: &str,
+) -> Result<(), ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let repository_id: String = transaction
+        .query_row(
+            "SELECT repository_id FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => ClaimError::TaskNotEligible,
+            other => ClaimError::Database(other.into()),
+        })?;
+    let active: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM claims WHERE id = ?1 AND run_id = ?2 AND resource_kind = 'task' AND resource_key = ?3 AND state = 'active')",
+        (lease_id, run_id, task_id),
+        |row| row.get(0),
+    )?;
+    if !active {
+        return Err(ClaimError::LeaseNotActive);
+    }
+    transaction.execute(
+        "INSERT INTO pull_requests (id, task_id, repository_id, number, branch, head_sha, kind, remote_state, gate_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'normal', 'open', 'pending')
+         ON CONFLICT(repository_id, number) DO UPDATE SET task_id = excluded.task_id, branch = excluded.branch, head_sha = excluded.head_sha, remote_state = 'open'",
+        (Uuid::new_v4().to_string(), task_id, repository_id, number, branch, head_sha),
+    )?;
+    transaction.execute(
+        "UPDATE tasks SET status = 'in_flight', pr_number = ?1, updated_at = datetime('now') WHERE id = ?2",
+        (number, task_id),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Marks a run terminal after its worker loop has returned.
+pub fn finish_run(path: &Path, run_id: &str, status: &str) -> Result<(), DatabaseError> {
+    let connection = open(path)?;
+    connection.execute(
+        "UPDATE runs SET status = ?1, heartbeat_at = datetime('now'), ended_at = datetime('now') WHERE id = ?2",
+        (status, run_id),
+    )?;
     Ok(())
 }
 

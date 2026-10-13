@@ -1,10 +1,13 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    build_image, database_path, find_run, github_queue, github_ticket_blockers,
-    import_github_tasks, import_local_tasks, local_queue_with_open_issues, migrate, open,
-    parse_tasks, recent_runs, run_claims, run_command as execute_command, run_pull_requests,
-    status, AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider,
+    acquire_task, build_image, compose_role_prompt, database_path, find_run, finish_run,
+    github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
+    local_queue_with_open_issues, migrate, open, parse_tasks, prepare_run, recent_runs,
+    record_task_pr, release, run_claims, run_command as execute_command, run_pull_requests, status,
+    task_id, task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image,
+    AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider, RunOptions,
+    TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -28,6 +31,7 @@ fn main() -> ExitCode {
         },
         Some("doctor") => doctor_command(&commands[1..], db_path),
         Some("queue") => queue_command(&commands[1..], db_path),
+        Some("run") => run_command(&commands[1..], db_path),
         Some("build") => build_command(&commands[1..]),
         Some("runs") => match database_path(db_path) {
             Ok(path) => runs_command(&commands[1..], &path),
@@ -463,6 +467,575 @@ fn doctor_tasks(path: &std::path::Path, ok: &mut bool) {
         }
         *ok = false;
     }
+}
+
+struct RunCommandOptions {
+    queue: QueueOptions,
+    iterations: usize,
+    timeout_minutes: u64,
+    base: String,
+    image: String,
+    no_build: bool,
+    logs_root: PathBuf,
+    env_file: PathBuf,
+}
+
+impl RunCommandOptions {
+    fn parse(args: &[String], tools: &Path) -> Result<Self, String> {
+        let mut queue_args = Vec::new();
+        let mut iterations = 20;
+        let mut iterations_from_flag = false;
+        let mut timeout_minutes = 30;
+        let mut base = nonempty_environment("ALUCARD_BASE_BRANCH")
+            .and_then(|value| value.into_string().ok())
+            .unwrap_or_else(|| "main".to_string());
+        let mut image = nonempty_environment("ALUCARD_IMAGE")
+            .and_then(|value| value.into_string().ok())
+            .unwrap_or_else(|| "ghcr.io/aldovc/alucard:latest".to_string());
+        let mut no_build = false;
+        let mut logs_root = nonempty_environment("ALUCARD_LOG_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| {
+                nonempty_environment("XDG_STATE_HOME")
+                    .map(|root| PathBuf::from(root).join("alucard/logs"))
+            })
+            .or_else(|| {
+                nonempty_environment("HOME")
+                    .map(|root| PathBuf::from(root).join(".local/state/alucard/logs"))
+            })
+            .ok_or("log root is not set; use --logs-root or ALUCARD_LOG_ROOT")?;
+        let mut env_file = nonempty_environment("ALUCARD_ENV_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| tools.join("alucard.env"));
+        let mut values = args.iter();
+        while let Some(value) = values.next() {
+            match value.as_str() {
+                "-n" | "--iterations" => {
+                    iterations_from_flag = true;
+                    iterations = values
+                        .next()
+                        .ok_or("--iterations requires a number")?
+                        .parse()
+                        .ok()
+                        .filter(|value: &usize| *value > 0)
+                        .ok_or("iterations must be greater than zero")?
+                }
+                "-t" | "--timeout-minutes" => {
+                    timeout_minutes = values
+                        .next()
+                        .ok_or("--timeout-minutes requires a number")?
+                        .parse()
+                        .ok()
+                        .filter(|value: &u64| *value > 0)
+                        .ok_or("timeout must be greater than zero")?
+                }
+                "--base" => base = values.next().ok_or("--base requires a branch")?.clone(),
+                "--image" => {
+                    image = values
+                        .next()
+                        .ok_or("--image requires an image name")?
+                        .clone()
+                }
+                "--no-build" => no_build = true,
+                "--logs-root" => {
+                    logs_root = PathBuf::from(values.next().ok_or("--logs-root requires a path")?)
+                }
+                "--env-file" => {
+                    env_file = PathBuf::from(values.next().ok_or("--env-file requires a path")?)
+                }
+                _ => queue_args.push(value.clone()),
+            }
+        }
+        let queue = QueueOptions::parse(&queue_args)?;
+        if queue.issue.is_some() {
+            if iterations_from_flag && iterations != 1 {
+                return Err("--issue runs exactly one iteration".to_string());
+            }
+            iterations = 1;
+        }
+        Ok(Self {
+            queue,
+            iterations,
+            timeout_minutes,
+            base,
+            image,
+            no_build,
+            logs_root,
+            env_file,
+        })
+    }
+}
+
+fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
+    let Some(tools) = tool_dir() else {
+        return fail("alucard: could not locate tool files");
+    };
+    let options = match RunCommandOptions::parse(args, &tools) {
+        Ok(options) => options,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let database = match database_path(db_path) {
+        Ok(path) => path,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    if !options.env_file.is_file() {
+        return fail(&format!(
+            "alucard: env file not found: {}",
+            options.env_file.display()
+        ));
+    }
+    let settings = match AgentSettings::from_environment(Some(&options.env_file)) {
+        Ok(settings) => settings,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    if !options.no_build {
+        if let Err(error) = build_image(&tools, &options.image) {
+            return fail(&format!("alucard: {error}"));
+        }
+    } else if let Err(error) = warn_if_stale_image(&tools, &options.image) {
+        return fail(&format!("alucard: {error}"));
+    }
+    let task_file = match options.queue.task_file() {
+        Ok(file) => file,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    for iteration in 1..=options.iterations {
+        let selected = match select_run_task(&options.queue, task_file.as_deref(), &database) {
+            Ok(Some(task)) => task,
+            Ok(None) => break,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        };
+        let prepared = match prepare_run(
+            &database,
+            RunOptions {
+                repository: &options.queue.repository,
+                logs_root: &options.logs_root,
+                cache_root: &cache_root(),
+                base: &options.base,
+                image: Some(&options.image),
+                task: selected.local_id.as_deref(),
+                issue: selected.issue.as_ref().map(|issue| issue.number),
+            },
+        ) {
+            Ok(run) => run,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        };
+        let claim = match acquire_task(&database, &selected.ledger_id, &prepared.run.id) {
+            Ok(claim) => claim,
+            Err(alucard::ClaimError::ClaimedBy { .. }) => {
+                let _ = finish_run(&database, &prepared.run.id, "failed");
+                continue;
+            }
+            Err(error) => {
+                let _ = finish_run(&database, &prepared.run.id, "failed");
+                return fail(&format!("alucard: cannot claim task: {error}"));
+            }
+        };
+        if let Some(issue) = selected.issue.as_ref() {
+            if let Err(error) = gh_output(
+                &options.queue.repository,
+                &[
+                    "issue",
+                    "edit",
+                    &issue.number.to_string(),
+                    "--add-label",
+                    "in-progress",
+                ],
+                "could not label GitHub issue",
+            ) {
+                let _ = transition_task(
+                    &database,
+                    &selected.ledger_id,
+                    &claim.id,
+                    &prepared.run.id,
+                    TaskStatus::Pending,
+                );
+                let _ = release(&database, &claim.id, &prepared.run.id);
+                let _ = finish_run(&database, &prepared.run.id, "failed");
+                return fail(&format!("alucard: {error}"));
+            }
+        }
+        let prompt = match worker_prompt(
+            &tools,
+            &selected,
+            &options.base,
+            &toolchain_preflight(
+                &options.queue.repository,
+                &options.base,
+                &options.image,
+                &options.env_file,
+                options.timeout_minutes,
+            )
+            .unwrap_or_else(|error| format!("Preflight unavailable: {error}")),
+        ) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                release_without_pr(
+                    &database,
+                    &selected,
+                    &claim.id,
+                    &prepared.run.id,
+                    &options.queue.repository,
+                );
+                let _ = finish_run(&database, &prepared.run.id, "failed");
+                return fail(&format!("alucard: {error}"));
+            }
+        };
+        let name = format!("alucard-worker-{}-{iteration}", prepared.run.id);
+        let log = prepared.directory.join(format!("iter-{iteration}.jsonl"));
+        let result = AgentInvocation {
+            role: AgentRole::Worker,
+            name: &name,
+            image: &options.image,
+            env_file: &options.env_file,
+            worktree: &prepared.clone,
+            prompt: &prompt,
+            timeout_minutes: options.timeout_minutes,
+            network: None,
+            playwright_cache: None,
+            database_url: None,
+            github_repo: None,
+            worktree_read_only: false,
+            output_dir: None,
+            extra_env: &[],
+        }
+        .invoke(&settings, &log);
+        match find_open_pr(&options.queue.repository, &prepared.branch) {
+            Ok(Some((number, branch, sha))) => {
+                if let Err(error) = record_task_pr(
+                    &database,
+                    &selected.ledger_id,
+                    &claim.id,
+                    &prepared.run.id,
+                    number,
+                    &branch,
+                    &sha,
+                ) {
+                    let _ = transition_task(
+                        &database,
+                        &selected.ledger_id,
+                        &claim.id,
+                        &prepared.run.id,
+                        TaskStatus::InFlight,
+                    );
+                    let _ = release(&database, &claim.id, &prepared.run.id);
+                    let _ = finish_run(&database, &prepared.run.id, "failed");
+                    return fail(&format!("alucard: {error}"));
+                }
+                let _ = release(&database, &claim.id, &prepared.run.id);
+                let _ = finish_run(&database, &prepared.run.id, "completed");
+            }
+            Ok(None) => {
+                let _ = transition_task(
+                    &database,
+                    &selected.ledger_id,
+                    &claim.id,
+                    &prepared.run.id,
+                    TaskStatus::Pending,
+                );
+                let _ = release(&database, &claim.id, &prepared.run.id);
+                if let Some(issue) = selected.issue.as_ref() {
+                    let _ = gh_output(
+                        &options.queue.repository,
+                        &[
+                            "issue",
+                            "edit",
+                            &issue.number.to_string(),
+                            "--remove-label",
+                            "in-progress",
+                        ],
+                        "could not remove GitHub issue label",
+                    );
+                }
+                let _ = finish_run(
+                    &database,
+                    &prepared.run.id,
+                    if result.is_ok() {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                );
+            }
+            Err(error) => {
+                release_without_pr(
+                    &database,
+                    &selected,
+                    &claim.id,
+                    &prepared.run.id,
+                    &options.queue.repository,
+                );
+                let _ = finish_run(&database, &prepared.run.id, "failed");
+                return fail(&format!("alucard: {error}"));
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn release_without_pr(
+    database: &Path,
+    task: &SelectedRunTask,
+    lease_id: &str,
+    run_id: &str,
+    repository: &Path,
+) {
+    if let Err(error) = transition_task(
+        database,
+        &task.ledger_id,
+        lease_id,
+        run_id,
+        TaskStatus::Pending,
+    ) {
+        eprintln!("alucard: could not return task to pending: {error}");
+    }
+    if let Err(error) = release(database, lease_id, run_id) {
+        eprintln!("alucard: could not release task claim: {error}");
+    }
+    if let Some(issue) = task.issue.as_ref() {
+        if let Err(error) = gh_output(
+            repository,
+            &[
+                "issue",
+                "edit",
+                &issue.number.to_string(),
+                "--remove-label",
+                "in-progress",
+            ],
+            "could not remove GitHub issue label",
+        ) {
+            eprintln!("alucard: {error}");
+        }
+    }
+}
+
+struct SelectedRunTask {
+    ledger_id: String,
+    issue: Option<GithubTask>,
+    local_id: Option<String>,
+    local_title: String,
+    local_body: String,
+    parent_context: String,
+}
+
+fn select_run_task(
+    options: &QueueOptions,
+    task_file: Option<&Path>,
+    database: &Path,
+) -> Result<Option<SelectedRunTask>, String> {
+    if let Some(file) = task_file {
+        let parsed = parse_tasks(&fs::read_to_string(file).map_err(|error| error.to_string())?)
+            .map_err(|errors| errors.join("\n"))?;
+        let tasks = local_queue_with_open_issues(
+            &parsed.tasks,
+            fetch_open_issue_numbers(&options.repository).as_deref(),
+        );
+        migrate(database).map_err(|error| error.to_string())?;
+        let mut connection = open(database).map_err(|error| error.to_string())?;
+        import_local_tasks(
+            &mut connection,
+            &options.repository.display().to_string(),
+            file,
+            &parsed.tasks,
+        )
+        .map_err(|error| error.to_string())?;
+        let task = tasks.into_iter().find(|task| {
+            task_id(
+                database,
+                &options.repository.display().to_string(),
+                "local",
+                &file.display().to_string(),
+                &task.id,
+            )
+            .and_then(|id| id.map(|id| task_is_pending(database, &id)).transpose())
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+        });
+        let Some(task) = task else {
+            return Ok(None);
+        };
+        let id = task_id(
+            database,
+            &options.repository.display().to_string(),
+            "local",
+            &file.display().to_string(),
+            &task.id,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or("imported local task is missing")?;
+        return Ok(Some(SelectedRunTask {
+            ledger_id: id,
+            issue: None,
+            local_id: Some(task.id),
+            local_title: task.title,
+            local_body: task.body,
+            parent_context: parsed.parent_context,
+        }));
+    }
+    let (issues, pinned_is_pr) = if let Some(number) = options.issue {
+        let (issue, is_pr) = fetch_pinned_issue(&options.repository, number)?;
+        (vec![issue], is_pr)
+    } else {
+        (fetch_github_issues(&options.repository)?, false)
+    };
+    let open_issues = fetch_open_issue_numbers_required(&options.repository)?;
+    let prs = fetch_open_prs(&options.repository)?;
+    let issues = if options.issue.is_some() {
+        vec![alucard::resolve_pinned_issue(
+            issues.into_iter().next().unwrap(),
+            pinned_is_pr,
+            &open_issues,
+            &prs,
+        )?]
+    } else {
+        github_queue(issues, &open_issues, &prs)
+    };
+    migrate(database).map_err(|error| error.to_string())?;
+    let mut connection = open(database).map_err(|error| error.to_string())?;
+    import_github_tasks(
+        &mut connection,
+        &options.repository.display().to_string(),
+        &issues,
+    )
+    .map_err(|error| error.to_string())?;
+    let issue = if options.issue.is_some() {
+        issues.into_iter().next()
+    } else {
+        issues.into_iter().find(|issue| {
+            task_id(
+                database,
+                &options.repository.display().to_string(),
+                "github",
+                "",
+                &issue.number.to_string(),
+            )
+            .and_then(|id| id.map(|id| task_is_pending(database, &id)).transpose())
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+        })
+    };
+    let Some(issue) = issue else {
+        return Ok(None);
+    };
+    let id = task_id(
+        database,
+        &options.repository.display().to_string(),
+        "github",
+        "",
+        &issue.number.to_string(),
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or("imported GitHub task is missing")?;
+    Ok(Some(SelectedRunTask {
+        ledger_id: id,
+        issue: Some(issue),
+        local_id: None,
+        local_title: String::new(),
+        local_body: String::new(),
+        parent_context: String::new(),
+    }))
+}
+
+fn worker_prompt(
+    tools: &Path,
+    task: &SelectedRunTask,
+    base: &str,
+    status: &str,
+) -> Result<String, String> {
+    let trailer = if task.issue.is_some() {
+        "alucard-worker-github-issue-prompt.md"
+    } else {
+        "alucard-worker-local-prompt.md"
+    };
+    let instructions = compose_role_prompt(tools, "alucard-worker-prompt.md", Some(trailer))
+        .map_err(|error| error.to_string())?;
+    let context = if let Some(issue) = &task.issue {
+        format!(
+            "<issue>{}</issue>",
+            xml_escape(&serde_json::json!({"number": issue.number, "title": issue.title, "labels": issue.labels.iter().map(|label| &label.name).collect::<Vec<_>>() }).to_string())
+        )
+    } else {
+        format!(
+            "<parent_context>{}</parent_context>\n<task>{}</task>",
+            xml_escape(&task.parent_context),
+            xml_escape(&serde_json::json!({"id": task.local_id, "title": task.local_title, "body": task.local_body}).to_string())
+        )
+    };
+    Ok(format!("<instructions>{instructions}</instructions>\n<base_branch>{base}</base_branch>\n<toolchain_status>\n{status}\n</toolchain_status>\n{context}"))
+}
+
+fn fetch_pinned_issue(repository: &Path, number: i64) -> Result<(GithubTask, bool), String> {
+    #[derive(serde::Deserialize)]
+    struct PinnedIssue {
+        #[serde(flatten)]
+        task: GithubTask,
+        #[serde(rename = "isPullRequest")]
+        is_pull_request: bool,
+    }
+    let issue: PinnedIssue = serde_json::from_slice(&gh_output(
+        repository,
+        &[
+            "issue",
+            "view",
+            &number.to_string(),
+            "--json",
+            "number,title,body,labels,state,isPullRequest",
+        ],
+        "could not view GitHub issue",
+    )?)
+    .map_err(|error| format!("could not parse GitHub issue: {error}"))?;
+    Ok((issue.task, issue.is_pull_request))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn find_open_pr(repository: &Path, branch: &str) -> Result<Option<(i64, String, String)>, String> {
+    #[derive(serde::Deserialize)]
+    struct Pull {
+        number: i64,
+        #[serde(rename = "headRefName")]
+        branch: String,
+        #[serde(rename = "headRefOid")]
+        sha: String,
+    }
+    let pulls: Vec<Pull> = serde_json::from_slice(&gh_output(
+        repository,
+        &[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--head",
+            branch,
+            "--json",
+            "number,headRefName,headRefOid",
+        ],
+        "could not discover pull request",
+    )?)
+    .map_err(|error| format!("could not parse pull requests: {error}"))?;
+    Ok(pulls
+        .into_iter()
+        .next()
+        .map(|pull| (pull.number, pull.branch, pull.sha)))
+}
+
+fn cache_root() -> PathBuf {
+    nonempty_environment("ALUCARD_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            nonempty_environment("XDG_CACHE_HOME").map(|root| PathBuf::from(root).join("alucard"))
+        })
+        .or_else(|| {
+            nonempty_environment("HOME").map(|root| PathBuf::from(root).join(".cache/alucard"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".alucard-cache"))
 }
 
 fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {

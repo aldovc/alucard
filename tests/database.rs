@@ -1,6 +1,6 @@
 use alucard::{
-    acquire_pr, acquire_task, heartbeat, migrate, open, prepare_run, release, run_command, status,
-    transition_task, ClaimError, RunOptions, TaskStatus,
+    acquire_pr, acquire_task, heartbeat, migrate, open, prepare_run, record_task_pr, release,
+    run_command, status, transition_task, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -671,6 +671,36 @@ fn pending_task_can_be_reacquired_after_its_lease_is_released() {
     let reacquired = acquire_task(&path, "task", "run-1").unwrap();
     assert_eq!(reacquired.run_id, "run-1");
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn opened_pr_moves_the_claimed_task_to_in_flight() {
+    let path = database_path();
+    prepare_claims(&path, &["task"]);
+    insert_run(&path, "run");
+    let claim = acquire_task(&path, "task", "run").unwrap();
+
+    record_task_pr(&path, "task", &claim.id, "run", 42, "agent/task", "abc123").unwrap();
+
+    let connection = open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT status FROM tasks WHERE id = 'task'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "in_flight"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT number FROM pull_requests WHERE task_id = 'task'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        42
+    );
 }
 
 #[test]
