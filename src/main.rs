@@ -733,6 +733,9 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             } else {
                 "local"
             },
+            &tools,
+            &options.image,
+            &settings,
         );
         archive_prompt(
             &prepared.directory,

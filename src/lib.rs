@@ -1088,15 +1088,230 @@ pub fn write_run_measurement(
     repository: &Path,
     base_branch: &str,
     task_source: &str,
+    tool_dir: &Path,
+    image: &str,
+    settings: &AgentSettings,
 ) {
     write_measurement(
         log_dir,
-        json!({
-            "format": 1, "record": "run", "ts": timestamp(),
-            "repo": repository, "repo_id": repository_id(repository),
-            "base_branch": base_branch, "task_source": task_source,
-        }),
+        run_measurement_record(
+            repository,
+            base_branch,
+            task_source,
+            RunMeasurementMetadata {
+                alucard_rev: tool_revision(tool_dir),
+                alucard_dirty: tool_is_dirty(tool_dir),
+                prompt_digest: prompt_digest(tool_dir),
+                image: image.to_string(),
+                image_id: image_id(image),
+                roles: role_settings(settings),
+            },
+        ),
     );
+}
+
+struct RunMeasurementMetadata {
+    alucard_rev: String,
+    alucard_dirty: bool,
+    prompt_digest: String,
+    image: String,
+    image_id: String,
+    roles: Map<String, Value>,
+}
+
+fn run_measurement_record(
+    repository: &Path,
+    base_branch: &str,
+    task_source: &str,
+    metadata: RunMeasurementMetadata,
+) -> Value {
+    json!({
+        "format": 1, "record": "run", "ts": timestamp(),
+        "repo": repository, "repo_id": repository_id(repository),
+        "base_branch": base_branch, "task_source": task_source,
+        "alucard_rev": metadata.alucard_rev, "alucard_dirty": metadata.alucard_dirty,
+        "prompt_digest": metadata.prompt_digest, "image": metadata.image, "image_id": metadata.image_id,
+        "roles": metadata.roles,
+    })
+}
+
+fn tool_revision(tool_dir: &Path) -> String {
+    Command::new("git")
+        .args(["-C", &tool_dir.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn tool_is_dirty(tool_dir: &Path) -> bool {
+    Command::new("git")
+        .args([
+            "-C",
+            &tool_dir.to_string_lossy(),
+            "diff",
+            "--quiet",
+            "HEAD",
+            "--",
+        ])
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(true)
+}
+
+fn prompt_digest(tool_dir: &Path) -> String {
+    let Ok(entries) = fs::read_dir(tool_dir) else {
+        return String::new();
+    };
+    let mut prompts = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("alucard-") && name.ends_with("-prompt.md"))
+        })
+        .collect::<Vec<_>>();
+    prompts.sort();
+    if prompts.is_empty() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    for prompt in prompts {
+        let Ok(contents) = fs::read(prompt) else {
+            return String::new();
+        };
+        hasher.update(contents);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn image_id(image: &str) -> String {
+    Command::new("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn role_settings(settings: &AgentSettings) -> Map<String, Value> {
+    [
+        ("WORKER", AgentRole::Worker),
+        ("CI_FIX", AgentRole::CiFix),
+        ("REVIEWER", AgentRole::Reviewer),
+        ("FEEDBACK", AgentRole::Feedback),
+    ]
+    .into_iter()
+    .map(|(name, role)| {
+        (
+            name.to_string(),
+            json!({
+                "provider": settings.provider(role).map(|provider| match provider {
+                    Provider::Claude => "claude",
+                    Provider::Codex => "codex",
+                }).unwrap_or("unknown"),
+                "claude_model": settings.setting(role, "CLAUDE_MODEL", "sonnet"),
+                "codex_model": settings.setting(role, "CODEX_MODEL", "gpt-5.6-terra"),
+                "effort": settings.setting(role, "EFFORT", ""),
+            }),
+        )
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::{role_settings, run_measurement_record, AgentSettings, RunMeasurementMetadata};
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    #[test]
+    fn run_measurement_has_the_complete_bash_compatible_schema() {
+        let settings = AgentSettings::from_values(
+            [
+                ("ALUCARD_PROVIDER".to_string(), "codex".to_string()),
+                (
+                    "ALUCARD_REVIEWER_CLAUDE_MODEL".to_string(),
+                    "review-model".to_string(),
+                ),
+                ("ALUCARD_EFFORT".to_string(), "high".to_string()),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            None,
+        )
+        .unwrap();
+        let record = run_measurement_record(
+            Path::new("/repository"),
+            "main",
+            "github",
+            RunMeasurementMetadata {
+                alucard_rev: "revision".to_string(),
+                alucard_dirty: true,
+                prompt_digest: "digest".to_string(),
+                image: "alucard:test".to_string(),
+                image_id: "sha256:image".to_string(),
+                roles: role_settings(&settings),
+            },
+        );
+        let object = record.as_object().unwrap();
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "alucard_dirty",
+                "alucard_rev",
+                "base_branch",
+                "format",
+                "image",
+                "image_id",
+                "prompt_digest",
+                "record",
+                "repo",
+                "repo_id",
+                "roles",
+                "task_source",
+                "ts",
+            ]
+        );
+        assert!(object["format"].is_u64());
+        assert!(object["alucard_dirty"].is_boolean());
+        for field in [
+            "record",
+            "ts",
+            "repo",
+            "repo_id",
+            "base_branch",
+            "task_source",
+            "alucard_rev",
+            "prompt_digest",
+            "image",
+            "image_id",
+        ] {
+            assert!(object[field].is_string(), "{field} must be a string");
+        }
+        let roles = object["roles"].as_object().unwrap();
+        assert_eq!(roles.len(), 4);
+        for role in ["WORKER", "CI_FIX", "REVIEWER", "FEEDBACK"] {
+            let role = roles[role].as_object().unwrap();
+            let mut keys = role.keys().map(String::as_str).collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(keys, ["claude_model", "codex_model", "effort", "provider"]);
+            for field in ["provider", "claude_model", "codex_model", "effort"] {
+                assert!(role[field].is_string(), "{field} must be a string");
+            }
+        }
+        assert_eq!(object["roles"]["REVIEWER"]["claude_model"], "review-model");
+        assert_eq!(
+            object["roles"]["WORKER"]["provider"],
+            Value::String("codex".to_string())
+        );
+    }
 }
 
 /// Writes a worker-stage record, preserving unavailable diffs instead of treating them as zero.
