@@ -3,7 +3,7 @@
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::CStr;
@@ -994,6 +994,668 @@ pub struct AgentResult {
     pub classification: AgentExit,
 }
 
+/// Appends a Bash-compatible event line without allowing log failures to affect a run.
+pub fn log_event(log_dir: &Path, message: &str) {
+    let timestamp = event_timestamp();
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("events.log"))
+        .and_then(|mut file| writeln!(file, "{timestamp}\t{message}"));
+}
+
+fn event_timestamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    let mut utc = unsafe { std::mem::zeroed::<libc::tm>() };
+    let mut formatted = [0 as libc::c_char; 21];
+    unsafe {
+        if libc::gmtime_r(&seconds, &mut utc).is_null()
+            || libc::strftime(
+                formatted.as_mut_ptr(),
+                formatted.len(),
+                c"%Y-%m-%dT%H:%M:%SZ".as_ptr(),
+                &utc,
+            ) == 0
+        {
+            return "1970-01-01T00:00:00Z".to_owned();
+        }
+        CStr::from_ptr(formatted.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Extracts the provider-independent usage fields written by Claude and Codex JSONL streams.
+pub fn extract_agent_usage(log: &Path) -> Option<Usage> {
+    let contents = fs::read_to_string(log).ok()?;
+    let records = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    if let Some(claude) = records
+        .iter()
+        .rev()
+        .find(|record| record["type"] == "result")
+    {
+        if let Some(models) = claude.get("modelUsage").and_then(Value::as_object) {
+            let mut usage = Usage::default();
+            for model in models.values() {
+                usage.input += model["inputTokens"].as_u64().unwrap_or(0);
+                usage.output += model["outputTokens"].as_u64().unwrap_or(0);
+                usage.cache_read += model["cacheReadInputTokens"].as_u64().unwrap_or(0);
+                usage.cache_write += model["cacheCreationInputTokens"].as_u64().unwrap_or(0);
+            }
+            usage.turns = claude["num_turns"].as_u64().unwrap_or(0);
+            usage.cost = claude["total_cost_usd"].as_f64();
+            return Some(usage);
+        }
+    }
+    let mut usage = Usage::default();
+    let mut found = false;
+    for record in &records {
+        if record["type"] == "turn.completed" {
+            let value = &record["usage"];
+            let input = value["input_tokens"].as_u64().unwrap_or(0);
+            usage.cache_read += value["cached_input_tokens"].as_u64().unwrap_or(0);
+            usage.input += input.saturating_sub(value["cached_input_tokens"].as_u64().unwrap_or(0));
+            usage.output += value["output_tokens"].as_u64().unwrap_or(0);
+            usage.cache_write += value["cache_write_input_tokens"].as_u64().unwrap_or(0);
+            found = true;
+        }
+        if record["type"] == "item.completed" && record["item"]["type"] == "command_execution" {
+            usage.turns += 1;
+        }
+    }
+    found.then_some(usage)
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub turns: u64,
+    pub cost: Option<f64>,
+}
+
+/// Writes the stable run summary used by Bash measurement consumers.
+pub fn write_run_measurement(
+    log_dir: &Path,
+    repository: &Path,
+    base_branch: &str,
+    task_source: &str,
+    tool_dir: &Path,
+    image: &str,
+    settings: &AgentSettings,
+) {
+    write_measurement(
+        log_dir,
+        run_measurement_record(
+            repository,
+            base_branch,
+            task_source,
+            RunMeasurementMetadata {
+                alucard_rev: tool_revision(tool_dir),
+                alucard_dirty: tool_is_dirty(tool_dir),
+                prompt_digest: prompt_digest(tool_dir),
+                image: image.to_string(),
+                image_id: image_id(image),
+                roles: role_settings(settings),
+            },
+        ),
+    );
+}
+
+struct RunMeasurementMetadata {
+    alucard_rev: String,
+    alucard_dirty: bool,
+    prompt_digest: String,
+    image: String,
+    image_id: String,
+    roles: Map<String, Value>,
+}
+
+fn run_measurement_record(
+    repository: &Path,
+    base_branch: &str,
+    task_source: &str,
+    metadata: RunMeasurementMetadata,
+) -> Value {
+    json!({
+        "format": 1, "record": "run", "ts": timestamp(),
+        "repo": repository, "repo_id": repository_id(repository),
+        "base_branch": base_branch, "task_source": task_source,
+        "alucard_rev": metadata.alucard_rev, "alucard_dirty": metadata.alucard_dirty,
+        "prompt_digest": metadata.prompt_digest, "image": metadata.image, "image_id": metadata.image_id,
+        "roles": metadata.roles,
+    })
+}
+
+fn tool_revision(tool_dir: &Path) -> String {
+    Command::new("git")
+        .args(["-C", &tool_dir.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn tool_is_dirty(tool_dir: &Path) -> bool {
+    Command::new("git")
+        .args([
+            "-C",
+            &tool_dir.to_string_lossy(),
+            "diff",
+            "--quiet",
+            "HEAD",
+            "--",
+        ])
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(true)
+}
+
+fn prompt_digest(tool_dir: &Path) -> String {
+    let Ok(entries) = fs::read_dir(tool_dir) else {
+        return String::new();
+    };
+    let mut prompts = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("alucard-") && name.ends_with("-prompt.md"))
+        })
+        .collect::<Vec<_>>();
+    prompts.sort();
+    if prompts.is_empty() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    for prompt in prompts {
+        let Ok(contents) = fs::read(prompt) else {
+            return String::new();
+        };
+        hasher.update(contents);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn image_id(image: &str) -> String {
+    Command::new("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn role_settings(settings: &AgentSettings) -> Map<String, Value> {
+    [
+        ("WORKER", AgentRole::Worker),
+        ("CI_FIX", AgentRole::CiFix),
+        ("REVIEWER", AgentRole::Reviewer),
+        ("FEEDBACK", AgentRole::Feedback),
+    ]
+    .into_iter()
+    .map(|(name, role)| {
+        (
+            name.to_string(),
+            json!({
+                "provider": settings.provider(role).map(|provider| match provider {
+                    Provider::Claude => "claude",
+                    Provider::Codex => "codex",
+                }).unwrap_or("unknown"),
+                "claude_model": settings.setting(role, "CLAUDE_MODEL", "sonnet"),
+                "codex_model": settings.setting(role, "CODEX_MODEL", "gpt-5.6-terra"),
+                "effort": settings.setting(role, "EFFORT", ""),
+            }),
+        )
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::{
+        repository_id, role_settings, run_measurement_record, AgentSettings, RunMeasurementMetadata,
+    };
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn run_measurement_has_the_complete_bash_compatible_schema() {
+        let settings = AgentSettings::from_values(
+            [
+                ("ALUCARD_PROVIDER".to_string(), "codex".to_string()),
+                (
+                    "ALUCARD_REVIEWER_CLAUDE_MODEL".to_string(),
+                    "review-model".to_string(),
+                ),
+                ("ALUCARD_EFFORT".to_string(), "high".to_string()),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            None,
+        )
+        .unwrap();
+        let record = run_measurement_record(
+            Path::new("/repository"),
+            "main",
+            "github",
+            RunMeasurementMetadata {
+                alucard_rev: "revision".to_string(),
+                alucard_dirty: true,
+                prompt_digest: "digest".to_string(),
+                image: "alucard:test".to_string(),
+                image_id: "sha256:image".to_string(),
+                roles: role_settings(&settings),
+            },
+        );
+        let object = record.as_object().unwrap();
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "alucard_dirty",
+                "alucard_rev",
+                "base_branch",
+                "format",
+                "image",
+                "image_id",
+                "prompt_digest",
+                "record",
+                "repo",
+                "repo_id",
+                "roles",
+                "task_source",
+                "ts",
+            ]
+        );
+        assert!(object["format"].is_u64());
+        assert!(object["alucard_dirty"].is_boolean());
+        for field in [
+            "record",
+            "ts",
+            "repo",
+            "repo_id",
+            "base_branch",
+            "task_source",
+            "alucard_rev",
+            "prompt_digest",
+            "image",
+            "image_id",
+        ] {
+            assert!(object[field].is_string(), "{field} must be a string");
+        }
+        let roles = object["roles"].as_object().unwrap();
+        assert_eq!(roles.len(), 4);
+        for role in ["WORKER", "CI_FIX", "REVIEWER", "FEEDBACK"] {
+            let role = roles[role].as_object().unwrap();
+            let mut keys = role.keys().map(String::as_str).collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(keys, ["claude_model", "codex_model", "effort", "provider"]);
+            for field in ["provider", "claude_model", "codex_model", "effort"] {
+                assert!(role[field].is_string(), "{field} must be a string");
+            }
+        }
+        assert_eq!(object["roles"]["REVIEWER"]["claude_model"], "review-model");
+        assert_eq!(
+            object["roles"]["WORKER"]["provider"],
+            Value::String("codex".to_string())
+        );
+    }
+
+    #[test]
+    fn repository_id_uses_the_origin_across_checkout_paths() {
+        let directory =
+            std::env::temp_dir().join(format!("alucard-repository-id-{}", uuid::Uuid::new_v4()));
+        let https_checkout = directory.join("checkout");
+        let cached_checkout = directory.join("cache/example/web");
+        let ssh_checkout = directory.join("ssh-checkout");
+        let no_remote = directory.join("no-remote");
+        for (checkout, origin) in [
+            (&https_checkout, "https://github.com/example/web.git"),
+            (&cached_checkout, "https://github.com/example/web.git"),
+            (&ssh_checkout, "git@github.com:example/web.git"),
+            (&no_remote, ""),
+        ] {
+            fs::create_dir_all(checkout).unwrap();
+            assert!(Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(checkout)
+                .status()
+                .unwrap()
+                .success());
+            if !origin.is_empty() {
+                assert!(Command::new("git")
+                    .args(["remote", "add", "origin", origin])
+                    .current_dir(checkout)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+        }
+
+        assert_eq!(repository_id(&https_checkout), "example/web");
+        assert_eq!(repository_id(&cached_checkout), "example/web");
+        assert_eq!(repository_id(&ssh_checkout), "example/web");
+        assert_eq!(repository_id(&no_remote), "no-remote");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+/// Writes a worker-stage record, preserving unavailable diffs instead of treating them as zero.
+pub fn write_stage_measurement(
+    log_dir: &Path,
+    repository: &Path,
+    base_branch: &str,
+    iteration: usize,
+    pr: Option<i64>,
+    base_sha: &str,
+    head_sha: &str,
+) {
+    write_measurement(
+        log_dir,
+        json!({
+            "format": 1, "record": "stage", "ts": timestamp(), "repo_id": repository_id(repository),
+            "iter": iteration.to_string(), "pr": pr.map(|number| number.to_string()).unwrap_or_default(),
+            "stage": "worker", "cycle": 0, "base_sha": base_sha, "prev_sha": base_sha, "head_sha": head_sha,
+            "is_merge": is_merge_commit(repository, head_sha), "base_drifted": base_drifted(repository, base_branch, base_sha), "baseline_source": "pinned",
+            "from_base": diff_measurement(repository, base_sha, head_sha), "from_prev": diff_measurement(repository, base_sha, head_sha)
+        }),
+    );
+}
+
+fn base_drifted(repository: &Path, base_branch: &str, base_sha: &str) -> bool {
+    if base_sha.is_empty() {
+        return false;
+    }
+    let remote_base = format!("origin/{base_branch}");
+    run_command("git", &["rev-parse", &remote_base], repository, None)
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() != base_sha)
+}
+
+fn is_merge_commit(repository: &Path, head_sha: &str) -> bool {
+    run_command(
+        "git",
+        &["show", "-s", "--format=%P", head_sha],
+        repository,
+        None,
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .is_some_and(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .count()
+            > 1
+    })
+}
+
+pub struct IterationMeasurement<'a> {
+    pub database: &'a Path,
+    pub run_id: &'a str,
+    pub log_dir: &'a Path,
+    pub iteration: usize,
+    pub pr: Option<i64>,
+    pub base_sha: &'a str,
+    pub status: Option<i32>,
+    pub duration: u64,
+}
+
+/// Rolls one iteration's attempt logs into a measurement record and SQLite summary.
+pub fn write_iteration_measurement(measurement: IterationMeasurement<'_>) {
+    let IterationMeasurement {
+        database,
+        run_id,
+        log_dir,
+        iteration,
+        pr,
+        base_sha,
+        status,
+        duration,
+    } = measurement;
+    let mut roles = Map::new();
+    let mut total = 0_u64;
+    let mut costed = 0_u64;
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(&format!("iter-{iteration}-")) {
+                continue;
+            }
+            total += 1;
+            let role = if name.contains("review") {
+                "review"
+            } else if name.contains("feedback") {
+                "feedback"
+            } else if name.contains("fix") {
+                "cifix"
+            } else {
+                "worker"
+            };
+            let usage = extract_agent_usage(&path);
+            if usage.as_ref().is_some_and(|usage| usage.cost.is_some()) {
+                costed += 1;
+            }
+            let item = roles.entry(role.to_string()).or_insert_with(|| json!({"invocations":0,"usage_missing":0,"input":0,"output":0,"cache_read":0,"cache_write":0,"turns":0,"cost":null}));
+            item["invocations"] = json!(item["invocations"].as_u64().unwrap_or(0) + 1);
+            if let Some(usage) = usage {
+                for (key, value) in [
+                    ("input", usage.input),
+                    ("output", usage.output),
+                    ("cache_read", usage.cache_read),
+                    ("cache_write", usage.cache_write),
+                    ("turns", usage.turns),
+                ] {
+                    item[key] = json!(item[key].as_u64().unwrap_or(0) + value);
+                }
+                if let Some(cost) = usage.cost {
+                    item["cost"] = json!(item["cost"].as_f64().unwrap_or(0.0) + cost);
+                }
+            } else {
+                item["usage_missing"] = json!(item["usage_missing"].as_u64().unwrap_or(0) + 1);
+            }
+        }
+    }
+    let complete = total > 0 && total == costed;
+    write_measurement(
+        log_dir,
+        json!({
+            "format": 1, "record": "iteration", "ts": timestamp(), "iter": iteration.to_string(),
+            "pr": pr.map(|number| number.to_string()).unwrap_or_default(), "base_sha": base_sha,
+            "baseline_source": "pinned", "rc": status.map(|value| value.to_string()).unwrap_or_default(),
+            "duration_s": duration, "ci_result": "", "review_verdict": "", "review_cycles": 0,
+            "cost_complete": complete, "costed_invocations": costed, "total_invocations": total, "roles": roles
+        }),
+    );
+    if let Ok(connection) = open(database) {
+        let _ = connection.execute(
+            "INSERT OR REPLACE INTO measurement_summaries (run_id, iteration, measurements_path, total_invocations, costed_invocations, created_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            (run_id, iteration as i64, log_dir.join("measurements.jsonl").to_string_lossy().to_string(), total as i64, costed as i64),
+        );
+    }
+}
+
+pub fn archive_prompt(log_dir: &Path, name: &str, prompt: &str) {
+    let directory = log_dir.join("prompts");
+    let _ = fs::create_dir_all(&directory);
+    let _ = fs::write(directory.join(format!("{name}.txt")), prompt);
+}
+
+fn write_measurement(log_dir: &Path, value: Value) {
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("measurements.jsonl"))
+        .and_then(|mut file| writeln!(file, "{value}"));
+}
+
+fn timestamp() -> String {
+    event_timestamp()
+}
+fn repository_id(repository: &Path) -> String {
+    let fallback = || {
+        repository
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    let Ok(output) = run_command("git", &["remote", "get-url", "origin"], repository, None) else {
+        return fallback();
+    };
+    if !output.status.success() {
+        return fallback();
+    }
+    let url = String::from_utf8_lossy(&output.stdout);
+    let url = url
+        .trim()
+        .strip_suffix(".git")
+        .unwrap_or(url.trim())
+        .trim_end_matches('/');
+    let url = url.split_once("://").map_or(url, |(_, url)| url);
+    let url = url.split_once('@').map_or(url, |(_, url)| url);
+    let url = url.split_once(':').map_or(url, |(_, url)| url);
+    let mut segments = url.rsplit('/');
+    let Some(name) = segments.next().filter(|name| !name.is_empty()) else {
+        return fallback();
+    };
+    let Some(owner) = segments.next().filter(|owner| !owner.is_empty()) else {
+        return fallback();
+    };
+    format!("{owner}/{name}")
+}
+
+fn diff_measurement(repository: &Path, base: &str, head: &str) -> Value {
+    let Ok(output) = run_command(
+        "git",
+        &["diff", "--numstat", "--find-renames", "-z", base, head],
+        repository,
+        None,
+    ) else {
+        return json!({"unavailable": true, "reason": "git failed", "from": base, "to": head});
+    };
+    if !output.status.success() {
+        return json!({"unavailable": true, "reason": "unavailable ref", "from": base, "to": head});
+    }
+    let mut buckets = [[0_u64; 3]; 4];
+    let mut files = 0_u64;
+    let mut binary_files = 0_u64;
+    let mut renames = 0_u64;
+    let mut paths = Vec::new();
+    let mut entries = output.stdout.split(|byte| *byte == b'\0');
+    while let Some(entry) = entries.next() {
+        let mut fields = entry.splitn(3, |byte| *byte == b'\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            let _ = entries.next();
+            renames += 1;
+            match entries.next() {
+                Some(destination) => destination,
+                None => continue,
+            }
+        } else {
+            path
+        };
+        let path = String::from_utf8_lossy(path).into_owned();
+        let bucket = diff_bucket(&path);
+        files += 1;
+        paths.push(path);
+        if added == b"-" || deleted == b"-" {
+            binary_files += 1;
+            buckets[bucket][2] += 1;
+        } else {
+            buckets[bucket][0] += std::str::from_utf8(added)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            buckets[bucket][1] += std::str::from_utf8(deleted)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    json!({"files":files,"added":buckets.iter().map(|bucket| bucket[0]).sum::<u64>(),"deleted":buckets.iter().map(|bucket| bucket[1]).sum::<u64>(),"binary_files":binary_files,"renames":renames,"paths":paths,"impl":{"added":buckets[0][0],"deleted":buckets[0][1],"binary_files":buckets[0][2]},"tests":{"added":buckets[1][0],"deleted":buckets[1][1],"binary_files":buckets[1][2]},"confdoc":{"added":buckets[2][0],"deleted":buckets[2][1],"binary_files":buckets[2][2]},"generated":{"added":buckets[3][0],"deleted":buckets[3][1],"binary_files":buckets[3][2]}})
+}
+
+fn diff_bucket(path: &str) -> usize {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if path
+        .split('/')
+        .any(|part| matches!(part, "test" | "tests" | "__tests__"))
+        || ["test", "spec"].iter().any(|kind| {
+            ["ts", "tsx", "js", "jsx"]
+                .iter()
+                .any(|extension| name.ends_with(&format!(".{kind}.{extension}")))
+        })
+        || (name.starts_with("test_") && (name.ends_with(".py") || name.ends_with(".sh")))
+    {
+        return 1;
+    }
+    if [
+        "package-lock.json",
+        "uv.lock",
+        "poetry.lock",
+        "yarn.lock",
+        "Cargo.lock",
+        "go.sum",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
+        || path
+            .split('/')
+            .any(|part| matches!(part, "dist" | "build" | "node_modules" | "vendor"))
+    {
+        return 3;
+    }
+    if path.starts_with("docs/")
+        || [
+            "md",
+            "json",
+            "yaml",
+            "yml",
+            "toml",
+            "sql",
+            "css",
+            "ini",
+            "cfg",
+            "properties",
+            "gradle",
+            "xml",
+        ]
+        .iter()
+        .any(|extension| name.ends_with(&format!(".{extension}")))
+    {
+        return 2;
+    }
+    0
+}
+
 /// Classifies an agent process exit from its final provider result record.
 pub fn classify_agent_output(provider: Provider, status: Option<i32>, log: &str) -> AgentExit {
     if log.contains("Shell cwd was reset to /work (deleted)") {
@@ -1911,7 +2573,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_run_owners.sql")),
     (3, include_str!("../migrations/0003_recovery_checkout.sql")),
-    (4, include_str!("../migrations/0004_review_verdict.sql")),
+    (4, include_str!("../migrations/0004_reconciliation.sql")),
+    (5, include_str!("../migrations/0005_run_branch.sql")),
+    (6, include_str!("../migrations/0006_retry_owner.sql")),
+    (7, include_str!("../migrations/0007_measurements.sql")),
+    (8, include_str!("../migrations/0008_review_verdict.sql")),
 ];
 
 pub struct DatabaseStatus {
@@ -1971,6 +2637,24 @@ pub struct Recovery {
     pub pull_request_number: Option<i64>,
     pub checkout_path: Option<String>,
     pub failure_reason: Option<String>,
+}
+
+/// An active task claim whose owning process is no longer alive on this host.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AbandonedTaskClaim {
+    pub lease_id: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub repository_id: String,
+    pub branch: Option<String>,
+}
+
+/// A run that may still be working on a task claimed by an earlier run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TaskClaimAttempt {
+    pub run_id: String,
+    pub branch: Option<String>,
+    pub logs_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2168,6 +2852,18 @@ pub fn start_retry_run(
     cache_root: &Path,
     image: Option<&str>,
 ) -> Result<Run, DatabaseError> {
+    start_task_retry_run(path, repository, logs_root, cache_root, image, None)
+}
+
+/// Creates a retry attempt associated with the task claim that owns it.
+pub fn start_task_retry_run(
+    path: &Path,
+    repository: &Path,
+    logs_root: &Path,
+    cache_root: &Path,
+    image: Option<&str>,
+    owner_run_id: Option<&str>,
+) -> Result<Run, DatabaseError> {
     let repository = repository.canonicalize()?;
     let repository_name = repository
         .file_name()
@@ -2184,8 +2880,8 @@ pub fn start_retry_run(
         params![repository_id, repository_name, cache.to_string_lossy()],
     )?;
     connection.execute(
-        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, pid, hostname)
-         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6)",
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, pid, hostname, retry_owner_run_id)
+         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
         params![
             run_id,
             repository_id,
@@ -2193,6 +2889,7 @@ pub fn start_retry_run(
             logs_path,
             std::process::id(),
             hostname()?,
+            owner_run_id,
         ],
     )?;
     Ok(Run {
@@ -2483,6 +3180,125 @@ pub fn finish_run(path: &Path, run_id: &str, status: &str) -> Result<(), Databas
     Ok(())
 }
 
+/// Lists task claims whose local owner process has exited.
+pub fn abandoned_task_claims(
+    path: &Path,
+    repository_id: &str,
+) -> Result<Vec<AbandonedTaskClaim>, DatabaseError> {
+    let connection = open(path)?;
+    let hostname = hostname()?;
+    let mut statement = connection.prepare(
+        "SELECT claims.id, claims.run_id, claims.resource_key, claims.repository_id,
+                COALESCE(runs.branch, recovery.branch, (
+                    SELECT branch FROM pull_requests
+                    WHERE pull_requests.task_id = claims.resource_key
+                      AND pull_requests.repository_id = claims.repository_id
+                      AND pull_requests.number = (
+                          SELECT pr_number FROM tasks
+                          WHERE tasks.id = claims.resource_key
+                            AND tasks.repository_id = claims.repository_id
+                      )
+                ))
+         FROM claims
+         JOIN runs ON runs.id = claims.run_id
+         LEFT JOIN recovery ON recovery.original_run_id = runs.id
+         WHERE claims.state = 'active' AND claims.resource_kind = 'task'
+             AND claims.repository_id = ?2
+             AND runs.hostname = ?1 AND runs.pid IS NOT NULL",
+    )?;
+    let claims = statement
+        .query_map((hostname, repository_id), |row| {
+            Ok(AbandonedTaskClaim {
+                lease_id: row.get(0)?,
+                run_id: row.get(1)?,
+                task_id: row.get(2)?,
+                repository_id: row.get(3)?,
+                branch: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|claim| {
+            connection
+                .query_row(
+                    "SELECT pid FROM runs WHERE id = ?1",
+                    [&claim.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok_and(|pid| !process_is_alive(pid))
+        })
+        .collect();
+    Ok(claims)
+}
+
+/// Lists the claim owner and every retry run that can still be working on its task.
+pub fn task_claim_attempts(
+    path: &Path,
+    claim: &AbandonedTaskClaim,
+) -> Result<Vec<TaskClaimAttempt>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, branch, logs_path FROM runs
+         WHERE id = ?1 OR retry_owner_run_id = ?1
+         ORDER BY id != ?1, started_at, rowid",
+    )?;
+    let attempts = statement
+        .query_map([&claim.run_id], |row| {
+            Ok(TaskClaimAttempt {
+                run_id: row.get(0)?,
+                branch: row.get(1)?,
+                logs_path: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)?;
+    Ok(attempts)
+}
+
+/// Returns a safely abandoned task to the queue and releases its claim.
+pub fn release_abandoned_task_claim(
+    path: &Path,
+    claim: &AbandonedTaskClaim,
+) -> Result<(), ClaimError> {
+    transition_task(
+        path,
+        &claim.task_id,
+        &claim.lease_id,
+        &claim.run_id,
+        TaskStatus::Pending,
+    )?;
+    release(path, &claim.lease_id, &claim.run_id)?;
+    finish_run(path, &claim.run_id, "interrupted")?;
+    Ok(())
+}
+
+/// Keeps an ambiguous claim out of dispatch and makes its reason visible in runs output.
+pub fn mark_claim_needs_reconciliation(
+    path: &Path,
+    claim: &AbandonedTaskClaim,
+    reason: &str,
+) -> Result<(), ClaimError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE tasks SET status = 'human', updated_at = datetime('now')
+         WHERE id = ?1 AND EXISTS (
+             SELECT 1 FROM claims WHERE id = ?2 AND run_id = ?3 AND state = 'active'
+         )",
+        (&claim.task_id, &claim.lease_id, &claim.run_id),
+    )?;
+    if changed != 1 {
+        return Err(ClaimError::LeaseNotActive);
+    }
+    transaction.execute(
+        "UPDATE runs SET status = 'interrupted', ended_at = datetime('now'), reconciliation_reason = ?1
+         WHERE id = ?2",
+        (reason, &claim.run_id),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn acquire(
     transaction: &rusqlite::Transaction<'_>,
     repository_id: &str,
@@ -2719,19 +3535,20 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
     )?;
     if options.run_id.is_some() {
         transaction.execute(
-            "UPDATE runs SET base_sha = ?1, image = ?2, logs_path = ?3, heartbeat_at = datetime('now') WHERE id = ?4",
-            params![base_sha, options.image, directory.to_string_lossy(), run_id],
+            "UPDATE runs SET base_sha = ?1, image = ?2, logs_path = ?3, branch = ?4, heartbeat_at = datetime('now') WHERE id = ?5",
+            params![base_sha, options.image, directory.to_string_lossy(), branch, run_id],
         )?;
     } else {
         transaction.execute(
-            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, pid, hostname)
-             VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, branch, pid, hostname)
+             VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 run_id,
                 repository_id,
                 base_sha,
                 options.image,
                 directory.to_string_lossy(),
+                branch,
                 std::process::id(),
                 hostname()?,
             ],
@@ -2837,6 +3654,23 @@ pub fn find_run(path: &Path, run_id: &str) -> Result<Option<Run>, DatabaseError>
             run_from_row,
         )
         .optional()
+        .map_err(Into::into)
+}
+
+/// Returns the recorded reason a crashed run still needs human reconciliation.
+pub fn run_reconciliation_reason(
+    path: &Path,
+    run_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT reconciliation_reason FROM runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|reason| reason.flatten())
         .map_err(Into::into)
 }
 
@@ -3094,8 +3928,8 @@ impl std::error::Error for DatabaseError {}
 
 #[cfg(test)]
 mod tests {
-    use super::journal_mode;
-    use rusqlite::Connection;
+    use super::*;
+    use rusqlite::{params, Connection};
 
     #[test]
     fn journal_mode_reports_non_wal_for_in_memory_databases() {
@@ -3103,5 +3937,111 @@ mod tests {
             journal_mode(&Connection::open_in_memory().unwrap()).unwrap(),
             "wal"
         );
+    }
+
+    #[test]
+    fn abandoned_claims_are_limited_to_the_requested_repository() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        let hostname = hostname().unwrap();
+        for (repository_id, run_id, task_id, branch) in [
+            ("repository-a", "run-a", "task-a", "alucard/run-a"),
+            ("repository-b", "run-b", "task-b", "alucard/run-b"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', ?1, datetime('now'))",
+                    [repository_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, branch, pid, hostname)
+                     VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5)",
+                    params![run_id, repository_id, branch, i64::MAX, hostname],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+                     VALUES (?1, ?2, 'local', ?1, '', 'claimed', '[]', datetime('now'))",
+                    params![task_id, repository_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                     VALUES (?1, ?2, 'task', ?3, ?4, 'active', datetime('now'), datetime('now'))",
+                    params![format!("claim-{task_id}"), repository_id, task_id, run_id],
+                )
+                .unwrap();
+        }
+
+        let claims = abandoned_task_claims(&path, "repository-b").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].task_id, "task-b");
+        assert_eq!(claims[0].branch.as_deref(), Some("alucard/run-b"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn abandoned_claim_reconciliation_releases_once_with_pr_history() {
+        let directory = env::temp_dir().join(format!("alucard-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.db");
+        migrate(&path).unwrap();
+        let connection = open(&path).unwrap();
+        let hostname = hostname().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repository', '', 'repository', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, pid, hostname)
+                 VALUES ('run', 'repository', 'run', 'running', datetime('now'), datetime('now'), ?1, ?2)",
+                params![i64::MAX, hostname],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, pr_number, updated_at)
+                 VALUES ('task', 'repository', 'local', 'task', '', 'claimed', '[]', 2, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+                 VALUES ('claim', 'repository', 'task', 'task', 'run', 'active', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        for (number, branch) in [(1, "alucard/old"), (2, "alucard/current")] {
+            connection
+                .execute(
+                    "INSERT INTO pull_requests (id, task_id, repository_id, number, branch, head_sha, kind, remote_state, gate_state)
+                     VALUES (?1, 'task', 'repository', ?2, ?3, 'sha', 'normal', 'open', 'pending')",
+                    params![format!("pr-{number}"), number, branch],
+                )
+                .unwrap();
+        }
+
+        let claims = abandoned_task_claims(&path, "repository").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].branch.as_deref(), Some("alucard/current"));
+        release_abandoned_task_claim(&path, &claims[0]).unwrap();
+        assert!(abandoned_task_claims(&path, "repository")
+            .unwrap()
+            .is_empty());
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }

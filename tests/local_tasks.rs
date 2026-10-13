@@ -1,7 +1,8 @@
 use alucard::{
     github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue,
     local_queue_with_open_issues, migrate, open, parse_tasks, resolve_pinned_issue,
-    write_task_headings, GithubPullRequest, GithubTask, TaskHeadingUpdate, TaskState,
+    start_task_retry_run, start_task_run, task_id, write_task_headings, GithubPullRequest,
+    GithubTask, TaskHeadingUpdate, TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -172,6 +173,98 @@ fn git_repository(root: &Path) {
         "-qm",
         "initial",
     ]));
+}
+
+fn seed_abandoned_task(
+    database: &Path,
+    repository: &Path,
+    tasks: &Path,
+    external_id: &str,
+    branch: &str,
+    retry_branch: Option<&str>,
+) -> (String, String, Option<String>) {
+    migrate(database).unwrap();
+    let parsed = parse_tasks(&fs::read_to_string(tasks).unwrap()).unwrap();
+    let repository_id = repository.display().to_string();
+    import_local_tasks(
+        &mut open(database).unwrap(),
+        &repository_id,
+        tasks,
+        &parsed.tasks,
+    )
+    .unwrap();
+    let task_id = task_id(
+        database,
+        &repository_id,
+        "local",
+        &tasks.display().to_string(),
+        external_id,
+    )
+    .unwrap()
+    .unwrap();
+    let logs = repository.parent().unwrap().join("logs");
+    let cache = repository.parent().unwrap().join("cache");
+    let (owner, claim) =
+        start_task_run(database, repository, &logs, &cache, None, &task_id).unwrap();
+    let retry = retry_branch.map(|branch| {
+        let retry =
+            start_task_retry_run(database, repository, &logs, &cache, None, Some(&owner.id))
+                .unwrap();
+        open(database)
+            .unwrap()
+            .execute(
+                "UPDATE runs SET branch = ?1 WHERE id = ?2",
+                (branch, &retry.id),
+            )
+            .unwrap();
+        retry.id
+    });
+    open(database)
+        .unwrap()
+        .execute(
+            "UPDATE runs SET branch = ?1, pid = 999999 WHERE id = ?2",
+            (branch, &owner.id),
+        )
+        .unwrap();
+    (task_id, claim.id, retry)
+}
+
+fn reconciliation_run(
+    root: &Path,
+    repository: &Path,
+    database: &Path,
+    tasks: &Path,
+    bin: &Path,
+) -> Command {
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+    command
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "run",
+            "--iterations",
+            "1",
+            "--tasks",
+            tasks.to_str().unwrap(),
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            repository.to_str().unwrap(),
+        ]);
+    command
 }
 
 fn run_transport_case(root: &Path, scenario: &str, retries: usize) -> std::process::Output {
@@ -1507,6 +1600,335 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     );
     drop(connection);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
+    for scenario in [
+        "active-retry",
+        "open-pr",
+        "lookup-failure",
+        "no-remote-trace",
+        "remote-branch",
+    ] {
+        let root = temporary_path(&format!("reconciliation-{scenario}"));
+        let repository = root.join("repository");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        git_repository(&repository);
+        let tasks = root.join("tasks.md");
+        let task_contents = if scenario == "lookup-failure" {
+            "## [ ] first: First task\n\nBody\n\n## [ ] second: Second task\n\nBody\n"
+        } else if scenario == "no-remote-trace" {
+            "## [ ] first: First task\n\nBlocked by: second\n\n## [ ] second: Second task\n\nBlocked by: first\n"
+        } else {
+            "## [ ] first: First task\n\nBody\n"
+        };
+        fs::write(&tasks, task_contents).unwrap();
+        if matches!(scenario, "no-remote-trace" | "remote-branch") {
+            let remote = root.join("remote.git");
+            run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+            run(Command::new("git").args([
+                "-C",
+                repository.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().unwrap(),
+            ]));
+            if scenario == "remote-branch" {
+                run(Command::new("git").args([
+                    "-C",
+                    repository.to_str().unwrap(),
+                    "push",
+                    "-q",
+                    "origin",
+                    "HEAD:refs/heads/first-branch",
+                ]));
+            }
+        }
+        let database = root.join("ledger.db");
+        let docker_trace = root.join("docker-trace");
+        let gh_calls = root.join("gh-calls");
+        let docker = bin.join("docker");
+        fs::write(
+            &docker,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'ps --format') [ -z \"${ALUCARD_ACTIVE_RUN:-}\" ] || echo \"alucard-worker-$ALUCARD_ACTIVE_RUN-1\" ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        let gh = bin.join("gh");
+        fs::write(
+            &gh,
+            "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list') echo '[]' ;;\n  'pr list')\n    calls=$(cat \"$ALUCARD_GH_CALLS\" 2>/dev/null || echo 0)\n    calls=$((calls + 1))\n    printf '%s' \"$calls\" > \"$ALUCARD_GH_CALLS\"\n    if [ \"$ALUCARD_SCENARIO\" = lookup-failure ] && [ \"$calls\" -eq 2 ]; then echo 'lookup failed' >&2; exit 1; fi\n    case \"$ALUCARD_SCENARIO:$*\" in\n      open-pr:*retry-branch*) echo '[{\"number\":77,\"headRefName\":\"retry-branch\",\"headRefOid\":\"abc\"}]' ;;\n      lookup-failure:*) echo '[{\"number\":77,\"headRefName\":\"first-branch\",\"headRefOid\":\"abc\"}]' ;;\n      *) echo '[]' ;;\n    esac ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (first_task, first_claim, retry) = match scenario {
+            "active-retry" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "owner-branch",
+                Some("retry-branch"),
+            ),
+            "open-pr" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "owner-branch",
+                Some("retry-branch"),
+            ),
+            "lookup-failure" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "first-branch",
+                None,
+            ),
+            "no-remote-trace" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "first-branch",
+                None,
+            ),
+            "remote-branch" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "first-branch",
+                None,
+            ),
+            _ => unreachable!(),
+        };
+        if scenario == "remote-branch" {
+            fs::write(&tasks, "## [h] first: First task\n\nBody\n").unwrap();
+        }
+        let second = (scenario == "lookup-failure").then(|| {
+            let first_run: String = open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT run_id FROM claims WHERE id = ?1",
+                    [&first_claim],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            open(&database)
+                .unwrap()
+                .execute(
+                    "UPDATE runs SET pid = ?1 WHERE id = ?2",
+                    (std::process::id(), first_run),
+                )
+                .unwrap();
+            seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "second",
+                "second-branch",
+                None,
+            )
+        });
+        if scenario == "lookup-failure" {
+            open(&database)
+                .unwrap()
+                .execute("UPDATE runs SET pid = 999999", [])
+                .unwrap();
+        }
+
+        let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+            .env("ALUCARD_DOCKER_TRACE", &docker_trace)
+            .env("ALUCARD_GH_CALLS", &gh_calls)
+            .env("ALUCARD_SCENARIO", scenario)
+            .env(
+                "ALUCARD_ACTIVE_RUN",
+                if scenario == "active-retry" {
+                    retry.as_deref().unwrap_or("")
+                } else {
+                    ""
+                },
+            )
+            .output()
+            .unwrap();
+
+        let connection = open(&database).unwrap();
+        match scenario {
+            "active-retry" => {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "claimed"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT state FROM claims WHERE id = ?1",
+                            [&first_claim],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "active"
+                );
+                assert!(!fs::read_to_string(&docker_trace)
+                    .unwrap()
+                    .lines()
+                    .any(|line| line.starts_with("run ")));
+            }
+            "open-pr" => {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "in_flight"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT number FROM pull_requests WHERE task_id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    77
+                );
+            }
+            "lookup-failure" => {
+                assert!(!output.status.success(), "{output:?}");
+                assert!(String::from_utf8_lossy(&output.stderr).contains("lookup failed"));
+                let (second_task, second_claim, _) = second.unwrap();
+                for (task, claim) in [(first_task, first_claim), (second_task, second_claim)] {
+                    assert_eq!(
+                        connection
+                            .query_row("SELECT status FROM tasks WHERE id = ?1", [&task], |row| row
+                                .get::<_, String>(0))
+                            .unwrap(),
+                        "claimed"
+                    );
+                    assert_eq!(
+                        connection
+                            .query_row("SELECT state FROM claims WHERE id = ?1", [&claim], |row| {
+                                row.get::<_, String>(0)
+                            })
+                            .unwrap(),
+                        "active"
+                    );
+                }
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM runs WHERE status = 'running'",
+                            [],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    2
+                );
+            }
+            "no-remote-trace" => {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "pending"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT state FROM claims WHERE id = ?1",
+                            [&first_claim],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "released"
+                );
+                let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+                    .env("ALUCARD_DOCKER_TRACE", &docker_trace)
+                    .env("ALUCARD_GH_CALLS", &gh_calls)
+                    .env("ALUCARD_SCENARIO", scenario)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let connection = open(&database).unwrap();
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "pending"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT state FROM claims WHERE id = ?1",
+                            [&first_claim],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "released"
+                );
+            }
+            "remote-branch" => {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "human"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT state FROM claims WHERE id = ?1",
+                            [&first_claim],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "active"
+                );
+                let runs = Command::new(env!("CARGO_BIN_EXE_alucard"))
+                    .args(["--db-path", database.to_str().unwrap(), "runs"])
+                    .output()
+                    .unwrap();
+                assert!(runs.status.success(), "{runs:?}");
+                assert!(String::from_utf8_lossy(&runs.stdout).contains(
+                    "needs reconciliation: branch first-branch exists without an open pull request"
+                ));
+            }
+            _ => unreachable!(),
+        }
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

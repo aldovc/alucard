@@ -1,16 +1,19 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    begin_operation, build_image, compose_role_prompt, database_path, find_run, finish_operation,
-    finish_run, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
-    local_queue_with_open_issues, local_queue_with_open_prs, migrate, open, parse_tasks,
-    prepare_run, recent_runs, record_recovery_failure, record_recovery_pr, record_task_pr,
-    record_task_pr_gate_state, record_task_pr_review, release, run_claims,
-    run_command as execute_command, run_pull_requests, run_recovery, start_retry_run,
-    start_task_run, status, task_id, task_is_pending, toolchain_preflight, transition_task,
-    warn_if_stale_image, write_task_headings, AgentExit, AgentInvocation, AgentRole, AgentSettings,
-    GithubPullRequest, GithubTask, Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate,
-    TaskState, TaskStatus,
+    abandoned_task_claims, archive_prompt, begin_operation, build_image, compose_role_prompt,
+    database_path, find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
+    import_github_tasks, import_local_tasks, local_queue_with_open_issues,
+    local_queue_with_open_prs, log_event, mark_claim_needs_reconciliation, migrate, open,
+    parse_tasks, prepare_run, recent_runs, record_recovery_failure, record_recovery_pr,
+    record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
+    release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
+    run_reconciliation_reason, run_recovery, start_task_retry_run, start_task_run, status,
+    task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
+    warn_if_stale_image, write_iteration_measurement, write_run_measurement,
+    write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentRole,
+    AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
+    RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -608,6 +611,9 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
+    if let Err(error) = reconcile_startup(&database, &options.queue.repository) {
+        return fail(&format!("alucard: reconciliation failed: {error}"));
+    }
     if !options.env_file.is_file() {
         return fail(&format!(
             "alucard: env file not found: {}",
@@ -738,7 +744,30 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 return fail(&format!("alucard: {error}"));
             }
         };
+        write_run_measurement(
+            &prepared.directory,
+            &options.queue.repository,
+            &options.base,
+            if selected.issue.is_some() {
+                "github"
+            } else {
+                "local"
+            },
+            &tools,
+            &options.image,
+            &settings,
+        );
+        archive_prompt(
+            &prepared.directory,
+            &format!("iter-{iteration}-attempt-1"),
+            &prompt,
+        );
+        log_event(
+            &prepared.directory,
+            &format!("Iteration {iteration}/{} start", options.iterations),
+        );
         loop {
+            let started = std::time::Instant::now();
             let name = format!("alucard-worker-{}-{attempt}", attempt_run.id);
             let log = prepared
                 .directory
@@ -766,6 +795,37 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 .unwrap_or(alucard::AgentExit::Failed);
             match find_attempt_pr(&options.queue.repository, &prepared) {
                 Ok(Some((number, branch, sha))) => {
+                    write_stage_measurement(
+                        &prepared.directory,
+                        &prepared.clone,
+                        &options.base,
+                        iteration,
+                        Some(number),
+                        prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        &sha,
+                    );
+                    write_iteration_measurement(IterationMeasurement {
+                        database: &database,
+                        run_id: &attempt_run.id,
+                        log_dir: &prepared.directory,
+                        iteration,
+                        pr: Some(number),
+                        base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        status: result.as_ref().ok().and_then(|value| value.status),
+                        duration: started.elapsed().as_secs(),
+                    });
+                    log_event(
+                        &prepared.directory,
+                        &format!(
+                            "Iteration {iteration}/{} end: rc={}",
+                            options.iterations,
+                            result
+                                .as_ref()
+                                .ok()
+                                .and_then(|value| value.status)
+                                .unwrap_or(1)
+                        ),
+                    );
                     if let Err(error) = record_task_pr(
                         &database,
                         &selected.ledger_id,
@@ -878,12 +938,13 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     {
                         let _ = finish_run(&database, &attempt_run.id, "failed");
                         attempt += 1;
-                        attempt_run = match start_retry_run(
+                        attempt_run = match start_task_retry_run(
                             &database,
                             &options.queue.repository,
                             &options.logs_root,
                             &cache,
                             Some(&options.image),
+                            Some(&owner_run_id),
                         ) {
                             Ok(run) => run,
                             Err(error) => {
@@ -992,6 +1053,182 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         iteration += 1;
     }
     ExitCode::SUCCESS
+}
+
+enum ReconciliationAction {
+    Record {
+        claim: alucard::AbandonedTaskClaim,
+        number: i64,
+        branch: String,
+        sha: String,
+    },
+    Human {
+        claim: alucard::AbandonedTaskClaim,
+        reason: String,
+    },
+    Release(alucard::AbandonedTaskClaim),
+}
+
+fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
+    migrate(database).map_err(|error| error.to_string())?;
+    let repository_id = repository
+        .canonicalize()
+        .map_err(|error| error.to_string())?
+        .to_string_lossy()
+        .to_string();
+    let mut actions = Vec::new();
+    for claim in
+        abandoned_task_claims(database, &repository_id).map_err(|error| error.to_string())?
+    {
+        let attempts = task_claim_attempts(database, &claim).map_err(|error| error.to_string())?;
+        if attempts
+            .iter()
+            .map(|attempt| docker_run_is_active(&attempt.run_id))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|active| active)
+        {
+            continue;
+        }
+        let mut branches = claim.branch.clone().into_iter().collect::<Vec<_>>();
+        for attempt in &attempts {
+            if let Some(branch) = attempt.branch.clone().or_else(|| abandoned_branch(attempt)) {
+                if !branches.contains(&branch) {
+                    branches.push(branch);
+                }
+            }
+        }
+        let remotes = branches
+            .iter()
+            .map(|branch| reconcile_remote_pr(repository, branch).map(|remote| (branch, remote)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some((_, Some((number, branch, sha)))) =
+            remotes.iter().find(|(_, remote)| remote.is_some())
+        {
+            actions.push(ReconciliationAction::Record {
+                claim,
+                number: *number,
+                branch: branch.clone(),
+                sha: sha.clone(),
+            });
+        } else if let Some(branch) = branches
+            .iter()
+            .map(|branch| remote_branch_exists(repository, branch).map(|exists| (branch, exists)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|(branch, exists)| exists.then_some(branch))
+        {
+            actions.push(ReconciliationAction::Human {
+                claim,
+                reason: format!("branch {branch} exists without an open pull request"),
+            });
+        } else if branches.is_empty() {
+            actions.push(ReconciliationAction::Human {
+                claim,
+                reason: "branch identity is unavailable".to_string(),
+            });
+        } else {
+            actions.push(ReconciliationAction::Release(claim));
+        }
+    }
+    for action in actions {
+        match action {
+            ReconciliationAction::Record {
+                claim,
+                number,
+                branch,
+                sha,
+            } => {
+                record_task_pr(
+                    database,
+                    &claim.task_id,
+                    &claim.lease_id,
+                    &claim.run_id,
+                    number,
+                    &branch,
+                    &sha,
+                )
+                .map_err(|error| error.to_string())?;
+                release(database, &claim.lease_id, &claim.run_id)
+                    .map_err(|error| error.to_string())?;
+                finish_run(database, &claim.run_id, "interrupted")
+                    .map_err(|error| error.to_string())?;
+            }
+            ReconciliationAction::Human { claim, reason } => {
+                mark_claim_needs_reconciliation(database, &claim, &reason)
+                    .map_err(|error| error.to_string())?;
+            }
+            ReconciliationAction::Release(claim) => {
+                release_abandoned_task_claim(database, &claim)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn abandoned_branch(attempt: &alucard::TaskClaimAttempt) -> Option<String> {
+    let clone = PathBuf::from(attempt.logs_path.as_ref()?).join("repository");
+    execute_command("git", &["branch", "--show-current"], &clone, None)
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|branch| !branch.is_empty())
+}
+
+fn docker_run_is_active(run_id: &str) -> Result<bool, String> {
+    let output = execute_command(
+        "docker",
+        &["ps", "--format", "{{.Names}}"],
+        Path::new("."),
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    docker_run_is_active_output(run_id, &output)
+}
+
+fn docker_run_is_active_output(
+    run_id: &str,
+    output: &std::process::Output,
+) -> Result<bool, String> {
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if error.is_empty() {
+            format!("docker ps failed with {}", output.status)
+        } else {
+            error
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|name| name.starts_with(&format!("alucard-worker-{run_id}-"))))
+}
+
+fn reconcile_remote_pr(
+    repository: &Path,
+    branch: &str,
+) -> Result<Option<(i64, String, String)>, String> {
+    find_open_pr(repository, branch)
+}
+
+fn remote_branch_exists(repository: &Path, branch: &str) -> Result<bool, String> {
+    let output = execute_command(
+        "git",
+        &[
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ],
+        repository,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if output.status.success() || output.status.code() == Some(2) {
+        Ok(output.status.success())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3391,13 +3628,21 @@ fn runs_command(args: &[String], path: &std::path::Path) -> ExitCode {
         return match recent_runs(path) {
             Ok(runs) => {
                 for run in runs {
-                    println!(
+                    let mut line = format!(
                         "{}\t{}\t{}\t{}",
                         run.id,
                         run.status,
                         run.command,
                         run.logs_path.unwrap_or_default()
                     );
+                    match run_reconciliation_reason(path, &run.id) {
+                        Ok(Some(reason)) => {
+                            line.push_str(&format!("\tneeds reconciliation: {reason}"))
+                        }
+                        Ok(None) => {}
+                        Err(error) => return fail(&format!("alucard: database error: {error}")),
+                    }
+                    println!("{line}");
                 }
                 ExitCode::SUCCESS
             }
@@ -3414,6 +3659,11 @@ fn runs_command(args: &[String], path: &std::path::Path) -> ExitCode {
                 println!("base sha: {}", run.base_sha.unwrap_or_default());
                 println!("image: {}", run.image.unwrap_or_default());
                 println!("logs: {}", run.logs_path.unwrap_or_default());
+                match run_reconciliation_reason(path, &run.id) {
+                    Ok(Some(reason)) => println!("needs reconciliation: {reason}"),
+                    Ok(None) => {}
+                    Err(error) => return fail(&format!("alucard: database error: {error}")),
+                }
                 let claims = match run_claims(path, &run.id) {
                     Ok(claims) => claims,
                     Err(error) => return fail(&format!("alucard: database error: {error}")),
@@ -4150,5 +4400,11 @@ printf '%s' "$prompt""#,
             recovery_ticket_comment(91, alucard::AgentExit::Exhausted, Some(1), 2),
             "**🤖 Alucard recovery** — the worker on this ticket ran out of turns or hit its time limit (rc=1) before opening a PR. Its 2 commit(s), plus its uncommitted files, are on draft PR #91. Nothing there has been through CI or review.\n\nThe `in-progress` label is removed; PR #91 alone keeps this ticket out of the queue. Close that PR to hand the remaining work back to a worker, or finish it there."
         );
+    }
+
+    #[test]
+    fn failed_docker_inspection_is_not_treated_as_no_worker() {
+        let output = Command::new("sh").args(["-c", "exit 1"]).output().unwrap();
+        assert!(docker_run_is_active_output("run", &output).is_err());
     }
 }
