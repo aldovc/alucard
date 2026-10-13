@@ -1,12 +1,17 @@
 //! SQLite ledger support for the Alucard orchestrator.
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use fs2::FileExt;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::env;
-use std::fs;
-use std::io;
+use std::ffi::CStr;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -466,11 +471,42 @@ pub fn import_github_tasks(
     Ok(())
 }
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_run_owners.sql")),
+];
 
 pub struct DatabaseStatus {
     pub schema_version: i64,
     pub pending_migrations: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Run {
+    pub id: String,
+    pub repository_id: String,
+    pub command: String,
+    pub status: String,
+    pub base_sha: Option<String>,
+    pub image: Option<String>,
+    pub logs_path: Option<String>,
+}
+
+pub struct PreparedRun {
+    pub run: Run,
+    pub directory: PathBuf,
+    pub clone: PathBuf,
+    pub branch: String,
+}
+
+pub struct RunOptions<'a> {
+    pub repository: &'a Path,
+    pub logs_root: &'a Path,
+    pub cache_root: &'a Path,
+    pub base: &'a str,
+    pub image: Option<&'a str>,
+    pub task: Option<&'a str>,
+    pub issue: Option<i64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -731,6 +767,340 @@ fn update_active_claim(
         Err(ClaimError::LeaseNotActive)
     }
 }
+
+/// Executes an external command without involving a shell.
+pub fn run_command(
+    program: &str,
+    arguments: &[&str],
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> io::Result<Output> {
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = drain(child.stdout.take().expect("stdout is piped"));
+    let stderr = drain(child.stderr.take().expect("stderr is piped"));
+    let status = match timeout {
+        None => child.wait()?,
+        Some(timeout) => {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    if let Err(error) = child.kill() {
+                        if error.kind() != io::ErrorKind::InvalidInput {
+                            return Err(error);
+                        }
+                    }
+                    break child.wait()?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: join_output(stdout)?,
+        stderr: join_output(stderr)?,
+    })
+}
+
+fn drain<R: Read + Send + 'static>(mut reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_output(output: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    output
+        .join()
+        .map_err(|_| io::Error::other("command output reader panicked"))?
+}
+
+fn run_checked(program: &str, arguments: &[&str], cwd: &Path) -> Result<Output, RunError> {
+    let output = run_command(program, arguments, cwd, None)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(RunError::Command {
+            program: program.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+}
+
+pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, RunError> {
+    migrate(path)?;
+    interrupt_running_runs(path)?;
+
+    let repository = options.repository.canonicalize()?;
+    let repository_name = repository
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
+    let repository_id = repository.to_string_lossy().to_string();
+    let cache_key = repository_cache_key(&repository);
+    let cache = options.cache_root.join(&cache_key);
+    fs::create_dir_all(options.cache_root)?;
+    let lock = File::create(options.cache_root.join(format!("{cache_key}.lock")))?;
+    lock.lock_exclusive()?;
+    if cache.exists() {
+        run_checked("git", &["fetch", "--quiet", "origin"], &cache)?;
+    } else {
+        run_checked(
+            "git",
+            &[
+                "clone",
+                "--quiet",
+                repository.to_str().unwrap_or_default(),
+                cache.to_str().unwrap_or_default(),
+            ],
+            options.cache_root,
+        )?;
+    }
+    let remote_base = format!("origin/{}", options.base);
+    let base_sha =
+        String::from_utf8_lossy(&run_checked("git", &["rev-parse", &remote_base], &cache)?.stdout)
+            .trim()
+            .to_string();
+
+    let run_id = Uuid::new_v4().to_string();
+    let directory = options.logs_root.join(&run_id);
+    fs::create_dir_all(&directory)?;
+    let clone = directory.join("repository");
+    run_checked(
+        "git",
+        &[
+            "clone",
+            "--quiet",
+            cache.to_str().unwrap_or_default(),
+            clone.to_str().unwrap_or_default(),
+        ],
+        &directory,
+    )?;
+    FileExt::unlock(&lock)?;
+    if !clone.join(".git").is_dir() {
+        return Err(RunError::InvalidClone);
+    }
+    let suffix = options
+        .issue
+        .map(|issue| format!("issue-{issue}"))
+        .or_else(|| options.task.map(|task| format!("task-{task}")));
+    let branch = format!(
+        "alucard/{run_id}/iter-1{}",
+        suffix.map(|value| format!("-{value}")).unwrap_or_default()
+    );
+    run_checked(
+        "git",
+        &["switch", "--quiet", "-c", &branch, &base_sha],
+        &clone,
+    )?;
+
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
+         VALUES (?1, '', ?2, ?3, datetime('now'))",
+        params![repository_id, repository_name, cache.to_string_lossy()],
+    )?;
+    transaction.execute(
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, pid, hostname)
+         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
+        params![
+            run_id,
+            repository_id,
+            base_sha,
+            options.image,
+            directory.to_string_lossy(),
+            std::process::id(),
+            hostname()?,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(PreparedRun {
+        run: Run {
+            id: run_id,
+            repository_id,
+            command: "run".to_string(),
+            status: "running".to_string(),
+            base_sha: Some(base_sha),
+            image: options.image.map(str::to_string),
+            logs_path: Some(directory.to_string_lossy().to_string()),
+        },
+        directory,
+        clone,
+        branch,
+    })
+}
+
+fn repository_cache_key(repository: &Path) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(repository.as_os_str().as_encoded_bytes())
+    )
+}
+
+pub fn interrupt_running_runs(path: &Path) -> Result<usize, DatabaseError> {
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let hostname = hostname()?;
+    let mut statement = transaction.prepare(
+        "SELECT id, pid FROM runs WHERE status = 'running' AND hostname = ?1 AND pid IS NOT NULL",
+    )?;
+    let abandoned = statement
+        .query_map([hostname], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, pid)| !process_is_alive(*pid))
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    drop(statement);
+    let mut interrupted = 0;
+    for run_id in abandoned {
+        interrupted += transaction.execute(
+            "UPDATE runs SET status = 'interrupted', ended_at = datetime('now') WHERE id = ?1 AND status = 'running'",
+            [run_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(interrupted)
+}
+
+fn hostname() -> io::Result<String> {
+    let mut value = [0; 256];
+    if unsafe { libc::gethostname(value.as_mut_ptr().cast(), value.len()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { CStr::from_ptr(value.as_ptr().cast()) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn process_is_alive(pid: i64) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        libc::kill(pid, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+pub fn recent_runs(path: &Path) -> Result<Vec<Run>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, repository_id, command, status, base_sha, image, logs_path
+         FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 20",
+    )?;
+    let runs = statement
+        .query_map([], run_from_row)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)?;
+    Ok(runs)
+}
+
+pub fn find_run(path: &Path, run_id: &str) -> Result<Option<Run>, DatabaseError> {
+    let connection = open(path)?;
+    connection
+        .query_row(
+            "SELECT id, repository_id, command, status, base_sha, image, logs_path FROM runs WHERE id = ?1",
+            [run_id],
+            run_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+pub fn run_claims(
+    path: &Path,
+    run_id: &str,
+) -> Result<Vec<(String, String, String)>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT resource_kind, resource_key, state FROM claims WHERE run_id = ?1 ORDER BY acquired_at",
+    )?;
+    let claims = statement
+        .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(claims)
+}
+
+pub fn run_pull_requests(path: &Path, run_id: &str) -> Result<Vec<(i64, String)>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT pull_requests.number, pull_requests.branch
+         FROM pull_requests JOIN claims ON claims.repository_id = pull_requests.repository_id
+             AND ((claims.resource_kind = 'task' AND claims.resource_key = pull_requests.task_id)
+                 OR (claims.resource_kind = 'pr' AND claims.resource_key = CAST(pull_requests.number AS TEXT)))
+         WHERE claims.run_id = ?1 ORDER BY pull_requests.number",
+    )?;
+    let pull_requests = statement
+        .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(pull_requests)
+}
+
+fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    Ok(Run {
+        id: row.get(0)?,
+        repository_id: row.get(1)?,
+        command: row.get(2)?,
+        status: row.get(3)?,
+        base_sha: row.get(4)?,
+        image: row.get(5)?,
+        logs_path: row.get(6)?,
+    })
+}
+
+#[derive(Debug)]
+pub enum RunError {
+    Database(DatabaseError),
+    Io(io::Error),
+    Command { program: String, stderr: String },
+    InvalidClone,
+}
+
+impl From<DatabaseError> for RunError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error)
+    }
+}
+impl From<io::Error> for RunError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+impl From<rusqlite::Error> for RunError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.into())
+    }
+}
+impl std::fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => error.fmt(formatter),
+            Self::Io(error) => error.fmt(formatter),
+            Self::Command { program, stderr } => write!(formatter, "{program} failed: {stderr}"),
+            Self::InvalidClone => write!(
+                formatter,
+                "git clone did not create a self-contained repository"
+            ),
+        }
+    }
+}
+impl std::error::Error for RunError {}
 
 pub fn database_path(override_path: Option<PathBuf>) -> io::Result<PathBuf> {
     override_path

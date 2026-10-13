@@ -1,12 +1,13 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    database_path, github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks,
-    local_queue_with_open_issues, migrate, open, parse_tasks, status, GithubPullRequest,
+    database_path, find_run, github_queue, github_ticket_blockers, import_github_tasks,
+    import_local_tasks, local_queue_with_open_issues, migrate, open, parse_tasks, recent_runs,
+    run_claims, run_command as execute_command, run_pull_requests, status, GithubPullRequest,
     GithubTask,
 };
-use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,8 +25,12 @@ fn main() -> ExitCode {
             Err(error) => fail(&format!("alucard: {error}")),
         },
         Some("queue") => queue_command(&commands[1..], db_path),
+        Some("runs") => match database_path(db_path) {
+            Ok(path) => runs_command(&commands[1..], &path),
+            Err(error) => fail(&format!("alucard: {error}")),
+        },
         Some(cmd) => fail(&format!("alucard: unknown command: {cmd}")),
-        None => fail("usage: alucard [--db-path PATH] {version|queue|db migrate|db status}"),
+        None => fail("usage: alucard [--db-path PATH] {version|queue|runs|db migrate|db status}"),
     }
 }
 
@@ -139,11 +144,8 @@ fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> Exi
     }
 }
 
-fn gh_output(repository: &PathBuf, args: &[&str], context: &str) -> Result<Vec<u8>, String> {
-    let output = Command::new("gh")
-        .current_dir(repository)
-        .args(args)
-        .output()
+fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>, String> {
+    let output = execute_command("gh", args, repository, None)
         .map_err(|error| format!("{context}: {error}"))?;
     if output.status.success() {
         Ok(output.stdout)
@@ -157,7 +159,7 @@ fn gh_output(repository: &PathBuf, args: &[&str], context: &str) -> Result<Vec<u
     }
 }
 
-fn fetch_github_issues(repository: &PathBuf) -> Result<Vec<GithubTask>, String> {
+fn fetch_github_issues(repository: &Path) -> Result<Vec<GithubTask>, String> {
     serde_json::from_slice(&gh_output(
         repository,
         &[
@@ -177,7 +179,7 @@ fn fetch_github_issues(repository: &PathBuf) -> Result<Vec<GithubTask>, String> 
     .map_err(|error| format!("could not parse GitHub issues: {error}"))
 }
 
-fn fetch_open_issue_numbers_required(repository: &PathBuf) -> Result<Vec<i64>, String> {
+fn fetch_open_issue_numbers_required(repository: &Path) -> Result<Vec<i64>, String> {
     let values: Vec<serde_json::Value> = serde_json::from_slice(&gh_output(
         repository,
         &[
@@ -197,7 +199,7 @@ fn fetch_open_issue_numbers_required(repository: &PathBuf) -> Result<Vec<i64>, S
         .collect()
 }
 
-fn fetch_open_prs(repository: &PathBuf) -> Result<Vec<GithubPullRequest>, String> {
+fn fetch_open_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
     let owner = String::from_utf8(gh_output(
         repository,
         &[
@@ -236,14 +238,16 @@ fn fetch_open_prs(repository: &PathBuf) -> Result<Vec<GithubPullRequest>, String
         .map_err(|error| format!("could not parse open pull requests: {error}"))
 }
 
-fn fetch_open_issue_numbers(repository: &PathBuf) -> Option<Vec<i64>> {
-    let output = Command::new("gh")
-        .current_dir(repository)
-        .args([
+fn fetch_open_issue_numbers(repository: &Path) -> Option<Vec<i64>> {
+    let output = execute_command(
+        "gh",
+        &[
             "issue", "list", "--state", "open", "--json", "number", "--limit", "1000",
-        ])
-        .output()
-        .ok()?;
+        ],
+        repository,
+        None,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -336,6 +340,57 @@ impl QueueOptions {
     }
 }
 
+fn runs_command(args: &[String], path: &std::path::Path) -> ExitCode {
+    if args.is_empty() {
+        return match recent_runs(path) {
+            Ok(runs) => {
+                for run in runs {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        run.id,
+                        run.status,
+                        run.command,
+                        run.logs_path.unwrap_or_default()
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(&format!("alucard: database error: {error}")),
+        };
+    }
+    if args.len() == 2 && args[0] == "show" {
+        return match find_run(path, &args[1]) {
+            Ok(Some(run)) => {
+                println!("id: {}", run.id);
+                println!("repository: {}", run.repository_id);
+                println!("command: {}", run.command);
+                println!("status: {}", run.status);
+                println!("base sha: {}", run.base_sha.unwrap_or_default());
+                println!("image: {}", run.image.unwrap_or_default());
+                println!("logs: {}", run.logs_path.unwrap_or_default());
+                let claims = match run_claims(path, &run.id) {
+                    Ok(claims) => claims,
+                    Err(error) => return fail(&format!("alucard: database error: {error}")),
+                };
+                for (kind, key, state) in claims {
+                    println!("claim: {kind} {key} {state}");
+                }
+                let pull_requests = match run_pull_requests(path, &run.id) {
+                    Ok(pull_requests) => pull_requests,
+                    Err(error) => return fail(&format!("alucard: database error: {error}")),
+                };
+                for (number, branch) in pull_requests {
+                    println!("pr: #{number} {branch}");
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(None) => fail(&format!("alucard: run not found: {}", args[1])),
+            Err(error) => fail(&format!("alucard: database error: {error}")),
+        };
+    }
+    fail("usage: alucard [--db-path PATH] runs [show RUN_ID]")
+}
+
 fn parse_db_path(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
     let mut path = None;
     let mut commands = Vec::new();
@@ -395,12 +450,13 @@ fn tool_dir() -> Option<PathBuf> {
 fn version() -> String {
     tool_dir()
         .and_then(|dir| {
-            Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(["describe", "--tags", "--always", "--dirty"])
-                .output()
-                .ok()
+            execute_command(
+                "git",
+                &["describe", "--tags", "--always", "--dirty"],
+                &dir,
+                None,
+            )
+            .ok()
         })
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
