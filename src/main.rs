@@ -1391,7 +1391,7 @@ fn run_wrapup_agent(
     status: Option<i32>,
     worker_log: &Path,
 ) -> Option<String> {
-    let output_dir = prepared.directory.parent()?.join("wrapup-output");
+    let output_dir = prepared.directory.join("wrapup-output");
     if fs::create_dir(&output_dir).is_err() {
         return None;
     }
