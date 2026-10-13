@@ -1,9 +1,9 @@
 use alucard::{
     abandoned_task_claims, acquire_pr, acquire_task, begin_operation, begin_operation_with_payload,
     defer_operation, finish_operation, heartbeat, migrate, open, pending_operations, prepare_run,
-    record_task_pr, record_task_pr_gate_state, release, release_abandoned_task_claim, run_command,
-    start_retry_run, start_task_retry_run, status, task_claim_attempts, transition_task,
-    AbandonedTaskClaim, ClaimError, RunOptions, TaskStatus,
+    record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
+    release_abandoned_task_claim, run_command, start_retry_run, start_task_retry_run, status,
+    task_claim_attempts, transition_task, AbandonedTaskClaim, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -828,6 +828,31 @@ fn opened_pr_moves_the_claimed_task_to_in_flight() {
             .unwrap(),
         "ci_missing"
     );
+    record_task_pr_review(
+        &path,
+        "task",
+        42,
+        "APPROVED",
+        "review_needs_human",
+        Some("abc123"),
+        "def456",
+    )
+    .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT review_verdict, gate_state, reviewer_approved_sha, head_sha FROM pull_requests WHERE task_id = 'task'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap(),
+        (
+            "APPROVED".to_string(),
+            "review_needs_human".to_string(),
+            Some("abc123".to_string()),
+            "def456".to_string()
+        )
+    );
 }
 
 #[test]
@@ -961,7 +986,7 @@ fn recovery_operations_replay_only_deferred_failures() {
 #[test]
 fn migration_is_idempotent_and_enforces_the_ledger_constraints() {
     let path = database_path();
-    assert_eq!(status(&path).unwrap().pending_migrations, 7);
+    assert_eq!(status(&path).unwrap().pending_migrations, 9);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
 
@@ -1045,7 +1070,7 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     assert!(!status.status.success());
     assert!(String::from_utf8(status.stdout)
         .unwrap()
-        .contains("pending migrations: 7"));
+        .contains("pending migrations: 9"));
 
     let migrate = Command::new(binary)
         .args(["--db-path", path.to_str().unwrap(), "db", "migrate"])
@@ -1179,7 +1204,7 @@ fn status_preserves_existing_database_parent_permissions() {
     fs::create_dir(parent).unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(status(&path).unwrap().pending_migrations, 7);
+    assert_eq!(status(&path).unwrap().pending_migrations, 9);
     assert_eq!(
         fs::metadata(parent).unwrap().permissions().mode() & 0o777,
         0o755
