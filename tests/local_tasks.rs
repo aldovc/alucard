@@ -680,6 +680,7 @@ case "$1 $2" in
       if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = wrapup_dirty ]; then
         printf 'wrap-up fix\n' > "$worktree/wrapup.txt"
       fi
+      printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,"total_cost_usd":0.02,"modelUsage":{"claude":{"inputTokens":5,"outputTokens":6}},"result":"failed"}'
       exit 1
     fi
     case "$ALUCARD_GITHUB_RECOVERY_SCENARIO" in
@@ -695,9 +696,9 @@ case "$1 $2" in
         git -C "$worktree" add recovery.txt
         git -C "$worktree" -c user.email=test@example.com -c user.name=Test commit -qm recovery
         if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = turn_budget ]; then
-          printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"limit reached"}'
+          printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":2,"total_cost_usd":0.01,"modelUsage":{"claude":{"inputTokens":12,"outputTokens":34}},"result":"limit reached"}'
         else
-          printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"failed"}'
+          printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":2,"total_cost_usd":0.01,"modelUsage":{"claude":{"inputTokens":12,"outputTokens":34}},"result":"failed"}'
         fi
         exit 1 ;;
     esac ;;
@@ -787,6 +788,22 @@ esac
     };
     let output = invoke();
     assert!(output.status.success(), "{scenario}: {output:?}");
+    if scenario == "worker" {
+        let console = String::from_utf8(output.stdout).unwrap();
+        assert!(console.contains("worker 1-attempt-1"), "{console}");
+        assert!(console.contains("wrap-up 1"), "{console}");
+        let total = console
+            .lines()
+            .find(|line| line.starts_with("TOTAL"))
+            .unwrap_or_default();
+        assert!(
+            total.contains("17")
+                && total.contains("40")
+                && total.contains("5")
+                && total.contains("$0.030"),
+            "{console}"
+        );
+    }
     let connection = open(&database).unwrap();
     assert_eq!(
         connection

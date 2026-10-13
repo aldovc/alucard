@@ -895,8 +895,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     break;
                 }
                 Ok(None) => {
-                    print!("{}", usage_report(&prepared.directory));
                     if classification == alucard::AgentExit::Billing {
+                        print!("{}", usage_report(&prepared.directory));
                         release_without_pr(
                             &database,
                             &selected,
@@ -989,6 +989,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             );
                         }
                     }
+                    print!("{}", usage_report(&prepared.directory));
                     let _ = release(&database, &claim.id, &owner_run_id);
                     if let Some(issue) = selected.issue.as_ref() {
                         if let Ok(operation) = begin_operation(
