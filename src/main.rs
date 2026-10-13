@@ -1,8 +1,8 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    database_path, find_run, interrupt_running_runs, migrate, prepare_run, recent_runs, run_claims,
-    run_command as execute_command, run_pull_requests, status, RunOptions,
+    database_path, find_run, migrate, recent_runs, run_claims, run_command as execute_command,
+    run_pull_requests, status,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,14 +26,8 @@ fn main() -> ExitCode {
             Ok(path) => runs_command(&commands[1..], &path),
             Err(error) => fail(&format!("alucard: {error}")),
         },
-        Some("run") => match database_path(db_path) {
-            Ok(path) => run_command(&commands[1..], &path),
-            Err(error) => fail(&format!("alucard: {error}")),
-        },
         Some(cmd) => fail(&format!("alucard: unknown command: {cmd}")),
-        None => fail(
-            "usage: alucard [--db-path PATH] {version|db migrate|db status|runs|run REPOSITORY}",
-        ),
+        None => fail("usage: alucard [--db-path PATH] {version|db migrate|db status|runs}"),
     }
 }
 
@@ -86,49 +80,6 @@ fn runs_command(args: &[String], path: &std::path::Path) -> ExitCode {
         };
     }
     fail("usage: alucard [--db-path PATH] runs [show RUN_ID]")
-}
-
-fn run_command(args: &[String], path: &std::path::Path) -> ExitCode {
-    let Some(repository) = args.first() else {
-        return fail("usage: alucard run REPOSITORY");
-    };
-    if args.len() != 1 {
-        return fail("usage: alucard run REPOSITORY");
-    }
-    if let Err(error) = migrate(path).and_then(|_| interrupt_running_runs(path)) {
-        return fail(&format!("alucard: database error: {error}"));
-    }
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    match prepare_run(
-        path,
-        RunOptions {
-            repository: std::path::Path::new(repository),
-            logs_root: &state.join("alucard/logs"),
-            cache_root: &cache.join("alucard/repos"),
-            base: "HEAD",
-            image: None,
-            task: None,
-            issue: None,
-        },
-    ) {
-        Ok(run) => {
-            println!(
-                "run: {}\nbranch: {}\nclone: {}",
-                run.run.id,
-                run.branch,
-                run.clone.display()
-            );
-            ExitCode::SUCCESS
-        }
-        Err(error) => fail(&format!("alucard: run preparation failed: {error}")),
-    }
 }
 
 fn parse_db_path(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
@@ -190,13 +141,7 @@ fn tool_dir() -> Option<PathBuf> {
 fn version() -> String {
     tool_dir()
         .and_then(|dir| {
-            execute_command(
-                "git",
-                &["describe", "--tags", "--always", "--dirty"],
-                &dir,
-                None,
-            )
-            .ok()
+            execute_command("git", &["describe", "--tags", "--always", "--dirty"], &dir).ok()
         })
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())

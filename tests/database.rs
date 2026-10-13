@@ -326,6 +326,16 @@ fn startup_interrupts_unfinished_runs() {
     let path = database_path();
     prepare_claims(&path, &[]);
     insert_run(&path, "stopped");
+    open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE runs SET pid = ?1, hostname = ?2 WHERE id = 'stopped'",
+            (
+                i64::MAX,
+                std::fs::read_to_string("/etc/hostname").unwrap().trim(),
+            ),
+        )
+        .unwrap();
 
     assert_eq!(interrupt_running_runs(&path).unwrap(), 1);
     assert_eq!(
@@ -336,6 +346,35 @@ fn startup_interrupts_unfinished_runs() {
             })
             .unwrap(),
         "interrupted"
+    );
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn startup_keeps_runs_owned_by_live_processes() {
+    let path = database_path();
+    prepare_claims(&path, &[]);
+    insert_run(&path, "live");
+    open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE runs SET pid = ?1, hostname = ?2 WHERE id = 'live'",
+            (
+                i64::from(std::process::id()),
+                std::fs::read_to_string("/etc/hostname").unwrap().trim(),
+            ),
+        )
+        .unwrap();
+
+    assert_eq!(interrupt_running_runs(&path).unwrap(), 0);
+    assert_eq!(
+        open(&path)
+            .unwrap()
+            .query_row("SELECT status FROM runs WHERE id = 'live'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "running"
     );
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
@@ -566,7 +605,7 @@ fn pending_task_can_be_reacquired_after_its_lease_is_released() {
 #[test]
 fn migration_is_idempotent_and_enforces_the_ledger_constraints() {
     let path = database_path();
-    assert_eq!(status(&path).unwrap().pending_migrations, 1);
+    assert_eq!(status(&path).unwrap().pending_migrations, 2);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
 
@@ -650,7 +689,7 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     assert!(!status.status.success());
     assert!(String::from_utf8(status.stdout)
         .unwrap()
-        .contains("pending migrations: 1"));
+        .contains("pending migrations: 2"));
 
     let migrate = Command::new(binary)
         .args(["--db-path", path.to_str().unwrap(), "db", "migrate"])
@@ -749,7 +788,7 @@ fn status_preserves_existing_database_parent_permissions() {
     fs::create_dir(parent).unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(status(&path).unwrap().pending_migrations, 1);
+    assert_eq!(status(&path).unwrap().pending_migrations, 2);
     assert_eq!(
         fs::metadata(parent).unwrap().permissions().mode() & 0o777,
         0o755

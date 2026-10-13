@@ -19,6 +19,7 @@ name = "alucard"
 version = "0.0.0"
 dependencies = [
  "fs2",
+ "libc",
  "rusqlite",
  "uuid",
 ]

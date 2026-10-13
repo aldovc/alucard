@@ -3,14 +3,18 @@
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::env;
+use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_run_owners.sql")),
+];
 
 pub struct DatabaseStatus {
     pub schema_version: i64,
@@ -305,34 +309,18 @@ fn update_active_claim(
 }
 
 /// Executes an external command without involving a shell.
-pub fn run_command(
-    program: &str,
-    arguments: &[&str],
-    cwd: &Path,
-    timeout: Option<Duration>,
-) -> io::Result<Output> {
+pub fn run_command(program: &str, arguments: &[&str], cwd: &Path) -> io::Result<Output> {
     let mut command = Command::new(program);
     command
         .args(arguments)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    if let Some(timeout) = timeout {
-        let started = Instant::now();
-        while child.try_wait()?.is_none() {
-            if started.elapsed() >= timeout {
-                child.kill()?;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-    child.wait_with_output()
+    command.output()
 }
 
 fn run_checked(program: &str, arguments: &[&str], cwd: &Path) -> Result<Output, RunError> {
-    let output = run_command(program, arguments, cwd, None)?;
+    let output = run_command(program, arguments, cwd)?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -417,9 +405,17 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         params![repository_id, repository_name, cache.to_string_lossy()],
     )?;
     transaction.execute(
-        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path)
-         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5)",
-        params![run_id, repository_id, base_sha, options.image, directory.to_string_lossy()],
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, pid, hostname)
+         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
+        params![
+            run_id,
+            repository_id,
+            base_sha,
+            options.image,
+            directory.to_string_lossy(),
+            std::process::id(),
+            hostname()?,
+        ],
     )?;
     transaction.commit()?;
     Ok(PreparedRun {
@@ -450,11 +446,53 @@ fn repository_cache_key(repository: &Path) -> String {
 }
 
 pub fn interrupt_running_runs(path: &Path) -> Result<usize, DatabaseError> {
-    let connection = open(path)?;
-    Ok(connection.execute(
-        "UPDATE runs SET status = 'interrupted', ended_at = datetime('now') WHERE status = 'running'",
-        [],
-    )?)
+    let mut connection = open(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let hostname = hostname()?;
+    let mut statement = transaction.prepare(
+        "SELECT id, pid FROM runs WHERE status = 'running' AND hostname = ?1 AND pid IS NOT NULL",
+    )?;
+    let abandoned = statement
+        .query_map([hostname], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, pid)| !process_is_alive(*pid))
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    drop(statement);
+    let mut interrupted = 0;
+    for run_id in abandoned {
+        interrupted += transaction.execute(
+            "UPDATE runs SET status = 'interrupted', ended_at = datetime('now') WHERE id = ?1 AND status = 'running'",
+            [run_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(interrupted)
+}
+
+fn hostname() -> io::Result<String> {
+    let mut value = [0; 256];
+    if unsafe { libc::gethostname(value.as_mut_ptr().cast(), value.len()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { CStr::from_ptr(value.as_ptr().cast()) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn process_is_alive(pid: i64) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        libc::kill(pid, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
 }
 
 pub fn recent_runs(path: &Path) -> Result<Vec<Run>, DatabaseError> {
