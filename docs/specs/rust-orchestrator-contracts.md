@@ -117,11 +117,18 @@ Environment configuration is `ALUCARD_IMAGE`, `ALUCARD_ENV_FILE`,
 provider/model settings `ALUCARD_PROVIDER` (default `claude`),
 `ALUCARD_CLAUDE_MODEL`,
 `ALUCARD_CLAUDE_FALLBACK_MODEL`, `ALUCARD_CODEX_MODEL`, `ALUCARD_EFFORT`,
-and per-role `ALUCARD_<ROLE>_{PROVIDER,CLAUDE_MODEL,CLAUDE_FALLBACK_MODEL,EFFORT,CODEX_MODEL}`.
+and per-role `ALUCARD_<ROLE>_{PROVIDER,CLAUDE_MODEL,CLAUDE_FALLBACK_MODEL,EFFORT,CODEX_MODEL}`, where
+`<ROLE>` is only `WORKER`, `CI_FIX`, `REVIEWER`, or `FEEDBACK`.
 For each role, `ALUCARD_<ROLE>_PROVIDER` overrides `ALUCARD_PROVIDER`; either
 must be `claude` or `codex`, and an unset value falls back to `claude`.
 Model and effort settings resolve independently per role before falling back to
-their global setting and then the built-in default.
+their global setting and then the built-in default. The wrap-up agent inherits
+the worker provider and model settings; it has no role-specific provider or
+model variables.
+Credentials are `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, and `OPENAI_API_KEY`.
+`GITHUB_TOKEN` is always required. `ANTHROPIC_API_KEY` is required only when
+at least one configured role uses Claude, and `OPENAI_API_KEY` only when at
+least one configured role uses Codex.
 Turn/budget settings are `ALUCARD_{WORKER,CI_FIX,REVIEWER,FEEDBACK,WRAPUP}_MAX_TURNS`
 and `_MAX_BUDGET`; retry count is `ALUCARD_TRANSPORT_RETRY_ATTEMPTS`.
 
