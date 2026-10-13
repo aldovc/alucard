@@ -163,6 +163,18 @@ fn stage_measurement_buckets_test_paths_and_renames() {
         serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())
             .unwrap();
     assert_eq!(record["is_merge"], true);
+    fs::remove_file(root.join("measurements.jsonl")).unwrap();
+
+    write_stage_measurement(&root, &root, "main", 1, None, "missing-base", &merge_head);
+
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("measurements.jsonl")).unwrap())
+            .unwrap();
+    let diff = &record["from_base"];
+    assert_eq!(diff["unavailable"], true);
+    assert_eq!(diff["from"], "missing-base");
+    assert_eq!(diff["to"], merge_head);
+    assert_eq!(record["from_prev"], record["from_base"]);
     fs::remove_dir_all(root).unwrap();
 }
 

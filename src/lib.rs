@@ -1554,10 +1554,10 @@ fn diff_measurement(repository: &Path, base: &str, head: &str) -> Value {
         repository,
         None,
     ) else {
-        return json!({"unavailable": true, "reason": "git failed"});
+        return json!({"unavailable": true, "reason": "git failed", "from": base, "to": head});
     };
     if !output.status.success() {
-        return json!({"unavailable": true, "reason": "unavailable ref"});
+        return json!({"unavailable": true, "reason": "unavailable ref", "from": base, "to": head});
     }
     let mut buckets = [[0_u64; 3]; 4];
     let mut files = 0_u64;
