@@ -1788,7 +1788,7 @@ fn review_gate(
         let mut feedback_checks_available = true;
         'cycles: while cycle <= options.max_review_cycles {
             for attempt in 1..=options.transport_attempts {
-                let attempt_root = root.join(format!("attempt-{attempt}"));
+                let attempt_root = root.join(format!("cycle-{cycle}-attempt-{attempt}"));
                 let checkout = attempt_root.join("checkout");
                 let output_dir = attempt_root.join("output");
                 fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;

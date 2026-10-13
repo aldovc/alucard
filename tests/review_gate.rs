@@ -56,6 +56,24 @@ fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (Option<S
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir(&repository).unwrap();
     git_repository(&repository);
+    if matches!(
+        case.name,
+        "feedback-toolchain-ok" | "feedback-toolchain-broken"
+    ) {
+        fs::write(repository.join("package-lock.json"), "{}\n").unwrap();
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "manifest",
+        ]));
+    }
     if let Some(policy) = case.review_policy {
         fs::write(
             repository.join("REVIEW.md"),
@@ -109,6 +127,9 @@ if [ "${1:-} ${2:-}" = "image inspect" ]; then
   echo stamp
   exit 0
 fi
+case " $* " in
+  *" --name alucard-preflight-"*) exit "${ALUCARD_PREFLIGHT_RC:-0}" ;;
+esac
 work= output=
 for argument in "$@"; do
   case "$argument" in
@@ -130,6 +151,7 @@ if [ -n "$output" ]; then
   printf '%s\n' "$attempt" >> "$attempts"
   outcome=$(printf '%s\n' "$outcomes" | sed -n "${attempt}p")
   if [ "$role" = feedback ] && [ -z "$outcome" ]; then outcome=push; fi
+  if [ "$role" = review ] && [ -z "$outcome" ]; then outcome=verdict; fi
   if [ "$role" = feedback ]; then
     case "$ALUCARD_CASE" in
       feedback-stall) outcome=stall-fail ;;
@@ -142,6 +164,9 @@ if [ -n "$output" ]; then
     for argument in "$@"; do prompt=$argument; done
   fi
   printf '%s' "$prompt" > "$ALUCARD_PROMPTS/$role-$attempt.txt"
+  if [ "$role" = review ]; then
+    git -C "$work" rev-parse HEAD >> "$ALUCARD_REVIEW_HEADS"
+  fi
   if [ "$role" = feedback ]; then
     case "$outcome" in
       *blocked*) printf '%s\n' 'blocked finding' > "$output/.alucard-blocked" ;;
@@ -232,7 +257,12 @@ case "$1 $2" in
   'pr view')
     case "$*" in
       *headRefOid*) sha ;;
-      *--json\ comments*) printf '%s\n' "$ALUCARD_PR_COMMENTS" ;;
+      *--json\ comments*)
+        if [ "$ALUCARD_CASE" = feedback-blocked ] && [ -s "$ALUCARD_FEEDBACK_ATTEMPTS" ]; then
+          printf '%s\n' '{"comments":[{"body":"**🤖 Alucard blocked findings** (cycle 1/2)\n\nblocked finding"}]}'
+        else
+          printf '%s\n' "$ALUCARD_PR_COMMENTS"
+        fi ;;
       *reviews*'.body'*) printf '%s\n' "$ALUCARD_FORMAL_BODY" ;;
       *reviews*) printf '%s\n' "$ALUCARD_FORMAL_VERDICT" ;;
     esac ;;
@@ -255,6 +285,8 @@ esac
     let review_attempts = root.join("review-attempts");
     fs::write(&review_attempts, "").unwrap();
     fs::write(root.join("feedback-attempts"), "").unwrap();
+    let review_heads = root.join("review-heads");
+    fs::write(&review_heads, "").unwrap();
     let branch_file = root.join("branch");
     let gh_trace = root.join("gh-trace");
     let database = root.join("ledger.db");
@@ -268,6 +300,7 @@ esac
         .env("ALUCARD_BRANCH_FILE", &branch_file)
         .env("ALUCARD_REVIEW_ARGS", &review_args)
         .env("ALUCARD_REVIEW_ATTEMPTS", &review_attempts)
+        .env("ALUCARD_REVIEW_HEADS", &review_heads)
         .env("ALUCARD_FEEDBACK_ATTEMPTS", root.join("feedback-attempts"))
         .env("ALUCARD_PROMPTS", {
             let prompts = root.join("prompts");
@@ -285,7 +318,22 @@ esac
             case.review_policy_max_bytes.unwrap_or(16_384).to_string(),
         )
         .env("ALUCARD_REVIEW_OUTCOMES", case.reviewer_outcomes)
-        .env("ALUCARD_FEEDBACK_OUTCOMES", "push")
+        .env(
+            "ALUCARD_FEEDBACK_OUTCOMES",
+            match case.name {
+                "feedback-blocked" => "push-blocked",
+                "feedback-fails-after-push" => "push-fail",
+                _ => "push",
+            },
+        )
+        .env(
+            "ALUCARD_PREFLIGHT_RC",
+            if case.name == "feedback-toolchain-broken" {
+                "23"
+            } else {
+                "0"
+            },
+        )
         .env(
             "ALUCARD_ADVANCE_HEAD",
             if case.advance_head { "1" } else { "0" },
@@ -541,6 +589,71 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             expected_verdict: "CHANGES_REQUESTED",
             expected_state: "review_changes_requested",
         },
+        ReviewCase {
+            name: "feedback-toolchain-ok",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-toolchain-broken",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-blocked",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-fails-after-push",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-cycle-exhaustion",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
     ];
 
     for case in &cases {
@@ -620,6 +733,49 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             assert!(!feedback.contains("DROP-TOO-LARGE"));
             assert!(!feedback.contains("DROP-NON-BLOCKING"));
             assert!(feedback.contains("No Python or Node manifest found"));
+        }
+        if matches!(
+            case.name,
+            "feedback-toolchain-ok" | "feedback-toolchain-broken"
+        ) {
+            let feedback = fs::read_to_string(root.join("prompts/feedback-1.txt")).unwrap();
+            let expected = if case.name == "feedback-toolchain-ok" {
+                "OK — `npm ci` at the repo root completes"
+            } else {
+                "BROKEN — `npm ci` at the repo root fails inside the container (rc=23)"
+            };
+            assert!(feedback.contains(expected));
+        }
+        if case.name == "feedback-blocked" {
+            let second_review = fs::read_to_string(root.join("prompts/review-2.txt")).unwrap();
+            assert!(trace.contains("Alucard blocked findings"));
+            assert!(second_review.contains("blocked finding"));
+        }
+        if case.name == "feedback-fails-after-push" {
+            assert!(trace.contains("feedback agent failed after pushing"));
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+        if case.name == "feedback-cycle-exhaustion" {
+            assert!(trace.contains("gave up after 2/2 review cycles — needs human"));
+            assert_eq!(
+                fs::read_to_string(root.join("feedback-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        if case.name == "feedback-toolchain-ok" {
+            let heads = fs::read_to_string(root.join("review-heads")).unwrap();
+            let heads = heads.lines().collect::<Vec<_>>();
+            assert_eq!(heads.len(), 2);
+            assert_ne!(heads[0], heads[1]);
         }
         if case.name == "feedback-stall" {
             assert!(trace.contains("feedback agent stopped without publishing"));
