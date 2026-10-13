@@ -1099,7 +1099,11 @@ fn timeout_docker_command(timeout_minutes: u64, docker_args: &[String]) -> Comma
 }
 
 fn cleanup_docker_container(name: &str) {
-    let _ = Command::new("docker").args(["rm", "-f", name]).status();
+    let _ = Command::new("docker")
+        .args(["rm", "-f", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn docker_sandbox_args(network: Option<&str>) -> Vec<String> {
@@ -1962,6 +1966,52 @@ pub fn start_task_run(
         },
         claim,
     ))
+}
+
+/// Creates a retry attempt while its original task claim remains active.
+pub fn start_retry_run(
+    path: &Path,
+    repository: &Path,
+    logs_root: &Path,
+    cache_root: &Path,
+    image: Option<&str>,
+) -> Result<Run, DatabaseError> {
+    let repository = repository.canonicalize()?;
+    let repository_name = repository
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
+    let repository_id = repository.to_string_lossy().to_string();
+    let run_id = Uuid::new_v4().to_string();
+    let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
+    let cache = cache_root.join(repository_cache_key(&repository));
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
+         VALUES (?1, '', ?2, ?3, datetime('now'))",
+        params![repository_id, repository_name, cache.to_string_lossy()],
+    )?;
+    connection.execute(
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, pid, hostname)
+         VALUES (?1, ?2, 'run', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6)",
+        params![
+            run_id,
+            repository_id,
+            image,
+            logs_path,
+            std::process::id(),
+            hostname()?,
+        ],
+    )?;
+    Ok(Run {
+        id: run_id,
+        repository_id,
+        command: "run".to_string(),
+        status: "running".to_string(),
+        base_sha: None,
+        image: image.map(str::to_string),
+        logs_path: Some(logs_path),
+    })
 }
 
 pub fn acquire_pr(

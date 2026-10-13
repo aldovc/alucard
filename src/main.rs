@@ -4,9 +4,10 @@ use alucard::{
     build_image, compose_role_prompt, database_path, find_run, finish_run, github_queue,
     github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue_with_open_issues,
     migrate, open, parse_tasks, prepare_run, recent_runs, record_task_pr, release, run_claims,
-    run_command as execute_command, run_pull_requests, start_task_run, status, task_id,
-    task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image, AgentInvocation,
-    AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider, RunOptions, TaskStatus,
+    run_command as execute_command, run_pull_requests, start_retry_run, start_task_run, status,
+    task_id, task_is_pending, toolchain_preflight, transition_task, warn_if_stale_image,
+    AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider, RunOptions,
+    TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -478,6 +479,7 @@ struct RunCommandOptions {
     no_build: bool,
     logs_root: PathBuf,
     env_file: PathBuf,
+    transport_attempts: usize,
 }
 
 impl RunCommandOptions {
@@ -553,6 +555,16 @@ impl RunCommandOptions {
             }
             iterations = 1;
         }
+        let transport_attempts = nonempty_environment("ALUCARD_TRANSPORT_RETRY_ATTEMPTS")
+            .and_then(|value| value.into_string().ok())
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| "ALUCARD_TRANSPORT_RETRY_ATTEMPTS must be a non-negative integer")
+            })
+            .transpose()?
+            .unwrap_or(2)
+            .saturating_add(1);
         Ok(Self {
             queue,
             iterations,
@@ -562,6 +574,7 @@ impl RunCommandOptions {
             no_build,
             logs_root,
             env_file,
+            transport_attempts,
         })
     }
 }
@@ -624,32 +637,24 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             Err(alucard::ClaimError::ClaimedBy { .. }) => continue,
             Err(error) => return fail(&format!("alucard: {error}")),
         };
-        let prepared = match prepare_run(
-            &database,
-            RunOptions {
-                repository: &options.queue.repository,
-                logs_root: &options.logs_root,
-                cache_root: &cache,
-                base: &options.base,
-                image: Some(&options.image),
-                task: selected.local_id.as_deref(),
-                issue: selected.issue.as_ref().map(|issue| issue.number),
-                run_id: Some(&run.id),
-            },
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                release_without_pr(
-                    &database,
-                    &selected,
-                    &claim.id,
-                    &run.id,
-                    &options.queue.repository,
-                );
-                let _ = finish_run(&database, &run.id, "failed");
-                return fail(&format!("alucard: {error}"));
-            }
-        };
+        let owner_run_id = run.id.clone();
+        let mut attempt_run = run;
+        let mut attempt = 1;
+        let mut prepared =
+            match prepare_attempt(&database, &options, &cache, &selected, &attempt_run) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    release_without_pr(
+                        &database,
+                        &selected,
+                        &claim.id,
+                        &owner_run_id,
+                        &options.queue.repository,
+                    );
+                    let _ = finish_run(&database, &attempt_run.id, "failed");
+                    return fail(&format!("alucard: {error}"));
+                }
+            };
         if let Some(issue) = selected.issue.as_ref() {
             if let Err(error) = gh_output(
                 &options.queue.repository,
@@ -666,11 +671,11 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     &database,
                     &selected.ledger_id,
                     &claim.id,
-                    &prepared.run.id,
+                    &owner_run_id,
                     TaskStatus::Pending,
                 );
-                let _ = release(&database, &claim.id, &prepared.run.id);
-                let _ = finish_run(&database, &prepared.run.id, "failed");
+                let _ = release(&database, &claim.id, &owner_run_id);
+                let _ = finish_run(&database, &attempt_run.id, "failed");
                 return fail(&format!("alucard: {error}"));
             }
         }
@@ -681,10 +686,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     &database,
                     &selected,
                     &claim.id,
-                    &prepared.run.id,
+                    &owner_run_id,
                     &options.queue.repository,
                 );
-                let _ = finish_run(&database, &prepared.run.id, "failed");
+                let _ = finish_run(&database, &attempt_run.id, "failed");
                 return fail(&format!("alucard: {error}"));
             }
         };
@@ -708,110 +713,184 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     &database,
                     &selected,
                     &claim.id,
-                    &prepared.run.id,
+                    &owner_run_id,
                     &options.queue.repository,
                 );
-                let _ = finish_run(&database, &prepared.run.id, "failed");
+                let _ = finish_run(&database, &attempt_run.id, "failed");
                 return fail(&format!("alucard: {error}"));
             }
         };
-        let name = format!("alucard-worker-{}-{iteration}", prepared.run.id);
-        let log = prepared.directory.join(format!("iter-{iteration}.jsonl"));
-        let result = AgentInvocation {
-            role: AgentRole::Worker,
-            name: &name,
-            image: &options.image,
-            env_file: &options.env_file,
-            worktree: &prepared.clone,
-            prompt: &prompt,
-            timeout_minutes: options.timeout_minutes,
-            network: None,
-            playwright_cache: playwright_cache.as_deref(),
-            database_url: None,
-            github_repo: github_repo.as_deref(),
-            worktree_read_only: false,
-            output_dir: None,
-            extra_env: &[],
-        }
-        .invoke(&settings, &log);
-        match find_open_pr(&options.queue.repository, &prepared.branch) {
-            Ok(Some((number, branch, sha))) => {
-                if let Err(error) = record_task_pr(
-                    &database,
-                    &selected.ledger_id,
-                    &claim.id,
-                    &prepared.run.id,
-                    number,
-                    &branch,
-                    &sha,
-                ) {
+        loop {
+            let name = format!("alucard-worker-{}-{attempt}", attempt_run.id);
+            let log = prepared
+                .directory
+                .join(format!("iter-{iteration}-attempt-{attempt}.jsonl"));
+            let result = AgentInvocation {
+                role: AgentRole::Worker,
+                name: &name,
+                image: &options.image,
+                env_file: &options.env_file,
+                worktree: &prepared.clone,
+                prompt: &prompt,
+                timeout_minutes: options.timeout_minutes,
+                network: None,
+                playwright_cache: playwright_cache.as_deref(),
+                database_url: None,
+                github_repo: github_repo.as_deref(),
+                worktree_read_only: false,
+                output_dir: None,
+                extra_env: &[],
+            }
+            .invoke(&settings, &log);
+            let classification = result
+                .as_ref()
+                .map(|result| result.classification)
+                .unwrap_or(alucard::AgentExit::Failed);
+            match find_attempt_pr(&options.queue.repository, &prepared) {
+                Ok(Some((number, branch, sha))) => {
+                    if let Err(error) = record_task_pr(
+                        &database,
+                        &selected.ledger_id,
+                        &claim.id,
+                        &owner_run_id,
+                        number,
+                        &branch,
+                        &sha,
+                    ) {
+                        let _ = transition_task(
+                            &database,
+                            &selected.ledger_id,
+                            &claim.id,
+                            &owner_run_id,
+                            TaskStatus::InFlight,
+                        );
+                        let _ = release(&database, &claim.id, &owner_run_id);
+                        let _ = finish_run(&database, &attempt_run.id, "failed");
+                        return fail(&format!("alucard: {error}"));
+                    }
+                    if let Err(error) = (CiGate {
+                        tools: &tools,
+                        settings: &settings,
+                        options: &options,
+                        playwright_cache: playwright_cache.as_deref(),
+                        github_repo: github_repo.as_deref(),
+                    })
+                    .run(
+                        &prepared,
+                        &branch,
+                        number,
+                        iteration,
+                        &mut checks_available,
+                    ) {
+                        eprintln!("alucard: CI gate for PR #{number}: {error}");
+                    }
+                    let _ = release(&database, &claim.id, &owner_run_id);
+                    let _ = finish_run(&database, &attempt_run.id, "completed");
+                    break;
+                }
+                Ok(None) => {
+                    if classification == alucard::AgentExit::Billing {
+                        release_without_pr(
+                            &database,
+                            &selected,
+                            &claim.id,
+                            &owner_run_id,
+                            &options.queue.repository,
+                        );
+                        let _ = finish_run(&database, &attempt_run.id, "failed");
+                        return fail(
+                            "alucard: provider returned billing_error (credit balance too low)",
+                        );
+                    }
+                    if classification == alucard::AgentExit::Transport
+                        && attempt < options.transport_attempts
+                    {
+                        let _ = finish_run(&database, &attempt_run.id, "failed");
+                        attempt += 1;
+                        attempt_run = match start_retry_run(
+                            &database,
+                            &options.queue.repository,
+                            &options.logs_root,
+                            &cache,
+                            Some(&options.image),
+                        ) {
+                            Ok(run) => run,
+                            Err(error) => {
+                                release_without_pr(
+                                    &database,
+                                    &selected,
+                                    &claim.id,
+                                    &owner_run_id,
+                                    &options.queue.repository,
+                                );
+                                return fail(&format!("alucard: {error}"));
+                            }
+                        };
+                        prepared = match prepare_attempt(
+                            &database,
+                            &options,
+                            &cache,
+                            &selected,
+                            &attempt_run,
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                release_without_pr(
+                                    &database,
+                                    &selected,
+                                    &claim.id,
+                                    &owner_run_id,
+                                    &options.queue.repository,
+                                );
+                                let _ = finish_run(&database, &attempt_run.id, "failed");
+                                return fail(&format!("alucard: {error}"));
+                            }
+                        };
+                        continue;
+                    }
                     let _ = transition_task(
                         &database,
                         &selected.ledger_id,
                         &claim.id,
-                        &prepared.run.id,
-                        TaskStatus::InFlight,
+                        &owner_run_id,
+                        TaskStatus::Pending,
                     );
-                    let _ = release(&database, &claim.id, &prepared.run.id);
-                    let _ = finish_run(&database, &prepared.run.id, "failed");
+                    let _ = release(&database, &claim.id, &owner_run_id);
+                    if let Some(issue) = selected.issue.as_ref() {
+                        let _ = gh_output(
+                            &options.queue.repository,
+                            &[
+                                "issue",
+                                "edit",
+                                &issue.number.to_string(),
+                                "--remove-label",
+                                "in-progress",
+                            ],
+                            "could not remove GitHub issue label",
+                        );
+                    }
+                    let _ = finish_run(
+                        &database,
+                        &attempt_run.id,
+                        if result.is_ok() {
+                            "completed"
+                        } else {
+                            "failed"
+                        },
+                    );
+                    break;
+                }
+                Err(error) => {
+                    release_without_pr(
+                        &database,
+                        &selected,
+                        &claim.id,
+                        &owner_run_id,
+                        &options.queue.repository,
+                    );
+                    let _ = finish_run(&database, &attempt_run.id, "failed");
                     return fail(&format!("alucard: {error}"));
                 }
-                if let Err(error) = (CiGate {
-                    tools: &tools,
-                    settings: &settings,
-                    options: &options,
-                    playwright_cache: playwright_cache.as_deref(),
-                    github_repo: github_repo.as_deref(),
-                })
-                .run(&prepared, &branch, number, iteration, &mut checks_available)
-                {
-                    eprintln!("alucard: CI gate for PR #{number}: {error}");
-                }
-                let _ = release(&database, &claim.id, &prepared.run.id);
-                let _ = finish_run(&database, &prepared.run.id, "completed");
-            }
-            Ok(None) => {
-                let _ = transition_task(
-                    &database,
-                    &selected.ledger_id,
-                    &claim.id,
-                    &prepared.run.id,
-                    TaskStatus::Pending,
-                );
-                let _ = release(&database, &claim.id, &prepared.run.id);
-                if let Some(issue) = selected.issue.as_ref() {
-                    let _ = gh_output(
-                        &options.queue.repository,
-                        &[
-                            "issue",
-                            "edit",
-                            &issue.number.to_string(),
-                            "--remove-label",
-                            "in-progress",
-                        ],
-                        "could not remove GitHub issue label",
-                    );
-                }
-                let _ = finish_run(
-                    &database,
-                    &prepared.run.id,
-                    if result.is_ok() {
-                        "completed"
-                    } else {
-                        "failed"
-                    },
-                );
-            }
-            Err(error) => {
-                release_without_pr(
-                    &database,
-                    &selected,
-                    &claim.id,
-                    &prepared.run.id,
-                    &options.queue.repository,
-                );
-                let _ = finish_run(&database, &prepared.run.id, "failed");
-                return fail(&format!("alucard: {error}"));
             }
         }
         iteration += 1;
@@ -1422,6 +1501,85 @@ fn recent_base_commits(repository: &Path, base: &str) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&output.stdout)
         .trim_end_matches('\n')
         .to_string())
+}
+
+fn prepare_attempt(
+    database: &Path,
+    options: &RunCommandOptions,
+    cache: &Path,
+    selected: &SelectedRunTask,
+    run: &alucard::Run,
+) -> Result<alucard::PreparedRun, alucard::RunError> {
+    prepare_run(
+        database,
+        RunOptions {
+            repository: &options.queue.repository,
+            logs_root: &options.logs_root,
+            cache_root: cache,
+            base: &options.base,
+            image: Some(&options.image),
+            task: selected.local_id.as_deref(),
+            issue: selected.issue.as_ref().map(|issue| issue.number),
+            run_id: Some(&run.id),
+        },
+    )
+}
+
+fn find_attempt_pr(
+    repository: &Path,
+    prepared: &alucard::PreparedRun,
+) -> Result<Option<(i64, String, String)>, String> {
+    if let Some(pull) = find_open_pr(repository, &prepared.branch)? {
+        return Ok(Some(pull));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Pull {
+        number: i64,
+        #[serde(rename = "headRefName")]
+        branch: String,
+        #[serde(rename = "headRefOid")]
+        sha: String,
+    }
+    let pulls: Vec<Pull> = serde_json::from_slice(&gh_output(
+        repository,
+        &[
+            "pr",
+            "list",
+            "--label",
+            "alucard",
+            "--state",
+            "open",
+            "--json",
+            "number,headRefName,headRefOid",
+        ],
+        "could not discover pull request",
+    )?)
+    .map_err(|error| format!("could not parse pull requests: {error}"))?;
+    let output = execute_command(
+        "git",
+        &[
+            "rev-list",
+            &format!(
+                "{}..HEAD",
+                prepared.run.base_sha.as_deref().unwrap_or("HEAD")
+            ),
+        ],
+        &prepared.clone,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let commits_output = String::from_utf8_lossy(&output.stdout);
+    let commits = commits_output
+        .lines()
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(pulls
+        .into_iter()
+        .find(|pull| commits.contains(pull.sha.as_str()))
+        .map(|pull| (pull.number, pull.branch, pull.sha)))
 }
 
 fn github_repo_slug(repository: &Path) -> Option<String> {

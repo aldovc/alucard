@@ -1,6 +1,6 @@
 use alucard::{
     acquire_pr, acquire_task, heartbeat, migrate, open, prepare_run, record_task_pr, release,
-    run_command, status, transition_task, ClaimError, RunOptions, TaskStatus,
+    run_command, start_retry_run, status, transition_task, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -109,6 +109,31 @@ fn timed_command_drains_output_before_termination() {
     assert!(!output.status.success());
     assert_eq!(output.stdout.len(), 131072);
     assert_eq!(output.stderr, b"stderr");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retry_attempts_have_distinct_run_records_and_workspaces() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let repository = root.join("source");
+    seed_repository(&repository);
+    let logs = root.join("logs");
+    let cache = root.join("cache");
+    migrate(&path).unwrap();
+
+    let first = start_retry_run(&path, &repository, &logs, &cache, None).unwrap();
+    let second = start_retry_run(&path, &repository, &logs, &cache, None).unwrap();
+
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.logs_path, second.logs_path);
+    assert_eq!(
+        open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
