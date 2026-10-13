@@ -1,6 +1,6 @@
 use alucard::{
-    archive_prompt, extract_agent_usage, log_event, write_iteration_measurement,
-    write_stage_measurement, IterationMeasurement,
+    archive_prompt, extract_agent_usage, iteration_usage_comment, log_event, usage_report,
+    write_iteration_measurement, write_stage_measurement, IterationMeasurement,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ fn git(repository: &PathBuf, args: &[&str]) -> String {
 }
 
 #[test]
-fn extracts_claude_and_codex_usage_without_inventing_a_cost() {
+fn extracts_claude_and_codex_usage() {
     let root = temporary_path("usage");
     fs::create_dir_all(&root).unwrap();
     let claude = root.join("claude.jsonl");
@@ -36,6 +36,55 @@ fn extracts_claude_and_codex_usage_without_inventing_a_cost() {
     fs::write(&codex, "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"cached_input_tokens\":3,\"output_tokens\":4}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n").unwrap();
     let usage = extract_agent_usage(&codex).unwrap();
     assert_eq!((usage.input, usage.cache_read, usage.cost), (7, 3, None));
+    let codex_cache_write = root.join("codex-cache-write.jsonl");
+    fs::write(&codex_cache_write, "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10817,\"cached_input_tokens\":0,\"cache_write_input_tokens\":10814,\"output_tokens\":5}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n").unwrap();
+    let usage = extract_agent_usage(&codex_cache_write).unwrap();
+    assert_eq!(
+        (
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+            usage.turns
+        ),
+        (10817, 5, 0, 10814, 1)
+    );
+    let codex_multiple = root.join("codex-multiple.jsonl");
+    fs::write(&codex_multiple, "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1000,\"cached_input_tokens\":400,\"output_tokens\":100}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2000,\"cached_input_tokens\":600,\"output_tokens\":200}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n").unwrap();
+    let usage = extract_agent_usage(&codex_multiple).unwrap();
+    assert_eq!(
+        (usage.input, usage.output, usage.cache_read, usage.turns),
+        (2000, 300, 1000, 2)
+    );
+    assert!(extract_agent_usage(&root.join("missing.jsonl")).is_none());
+    let empty = root.join("empty.jsonl");
+    fs::write(&empty, "{\"type\":\"system\"}\n").unwrap();
+    assert!(extract_agent_usage(&empty).is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn formats_bash_compatible_usage_table_and_iteration_comment() {
+    let root = temporary_path("usage-report");
+    fs::create_dir_all(&root).unwrap();
+    let claude = r#"{"type":"result","num_turns":42,"total_cost_usd":1.234,"modelUsage":{"claude-sonnet-4-5":{"inputTokens":1000,"outputTokens":2000,"cacheReadInputTokens":50000,"cacheCreationInputTokens":9000}}}"#;
+    fs::write(root.join("iter-1-attempt-1.jsonl"), claude).unwrap();
+    fs::write(root.join("iter-1-review-2.jsonl"), claude).unwrap();
+    fs::write(root.join("iter-1-review-2-attempt-2.jsonl"), claude).unwrap();
+    fs::write(root.join("iter-1-feedback-2.jsonl"), "").unwrap();
+    fs::write(root.join("iter-10-review-1.jsonl"), claude).unwrap();
+
+    assert_eq!(
+        usage_report(&root),
+        format!(
+            "\n=== Alucard Token Usage: {} ===\nAgent                        Input    Output    Cache Read   Cache Write  Turns      Cost\n--------------------------------------------------------------------------------------\nworker 1-attempt-1            1000      2000         50000          9000     42    $1.234\nreview 1.2                    1000      2000         50000          9000     42    $1.234\nreview 1.2-attempt-2          1000      2000         50000          9000     42    $1.234\nreview 10.1                   1000      2000         50000          9000     42    $1.234\n--------------------------------------------------------------------------------------\nTOTAL                         4000      8000        200000         36000    168    $4.936\n\n",
+            root.file_name().unwrap().to_str().unwrap()
+        )
+    );
+    assert_eq!(
+        iteration_usage_comment(&root, 1, Some(754)).unwrap(),
+        "**🤖 Alucard token usage (iteration 1)**\n\nDuration: 12m 34s · Review rounds: 1 · Feedback rounds: 1\n\n<details><summary>Per-agent breakdown</summary>\n\n| Agent | Input | Output | Cache Read | Cache Write | Turns | Cost |\n|-------|------:|-------:|-----------:|------------:|------:|-----:|\n| worker attempt 1 | 1000 | 2000 | 50000 | 9000 | 42 | $1.234 |\n| review 1.2 | 1000 | 2000 | 50000 | 9000 | 42 | $1.234 |\n| review 1.2-attempt-2 | 1000 | 2000 | 50000 | 9000 | 42 | $1.234 |\n| **TOTAL** | **3000** | **6000** | **150000** | **27000** | **126** | **$3.702** |\n\n</details>"
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

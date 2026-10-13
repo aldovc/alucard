@@ -1040,18 +1040,18 @@ pub fn extract_agent_usage(log: &Path) -> Option<Usage> {
         .rev()
         .find(|record| record["type"] == "result")
     {
+        let mut usage = Usage::default();
         if let Some(models) = claude.get("modelUsage").and_then(Value::as_object) {
-            let mut usage = Usage::default();
             for model in models.values() {
                 usage.input += model["inputTokens"].as_u64().unwrap_or(0);
                 usage.output += model["outputTokens"].as_u64().unwrap_or(0);
                 usage.cache_read += model["cacheReadInputTokens"].as_u64().unwrap_or(0);
                 usage.cache_write += model["cacheCreationInputTokens"].as_u64().unwrap_or(0);
             }
-            usage.turns = claude["num_turns"].as_u64().unwrap_or(0);
-            usage.cost = claude["total_cost_usd"].as_f64();
-            return Some(usage);
         }
+        usage.turns = claude["num_turns"].as_u64().unwrap_or(0);
+        usage.cost = Some(claude["total_cost_usd"].as_f64().unwrap_or(0.0));
+        return Some(usage);
     }
     let mut usage = Usage::default();
     let mut found = false;
@@ -1080,6 +1080,252 @@ pub struct Usage {
     pub cache_write: u64,
     pub turns: u64,
     pub cost: Option<f64>,
+}
+
+/// Formats the end-of-run token table emitted by the Bash orchestrator.
+pub fn usage_report(log_dir: &Path) -> String {
+    let mut rows = usage_rows(log_dir, None);
+    if rows.is_empty() {
+        return String::new();
+    }
+    rows.sort_by(|left, right| version_cmp(&left.name, &right.name));
+    let totals = usage_totals(&rows);
+    let separator = "-".repeat(86);
+    let mut report = format!(
+        "\n=== Alucard Token Usage: {} ===\n",
+        log_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+    );
+    report.push_str(&usage_header());
+    report.push_str(&format!("{separator}\n"));
+    for row in &rows {
+        report.push_str(&usage_console_row(&row.label, &row.usage));
+    }
+    report.push_str(&format!("{separator}\n"));
+    report.push_str(&usage_console_row("TOTAL", &totals));
+    report.push('\n');
+    report
+}
+
+/// Builds the Bash-compatible token-usage comment for one iteration.
+pub fn iteration_usage_comment(
+    log_dir: &Path,
+    iteration: usize,
+    duration: Option<u64>,
+) -> Option<String> {
+    let rows = usage_rows(log_dir, Some(iteration));
+    if rows.is_empty() {
+        return None;
+    }
+    let totals = usage_totals(&rows);
+    let mut review_rounds = std::collections::BTreeSet::new();
+    let mut feedback_rounds = std::collections::BTreeSet::new();
+    for name in jsonl_names(log_dir) {
+        let name = name.strip_suffix(".jsonl").unwrap_or(&name);
+        let prefix = format!("iter-{iteration}-");
+        if let Some(rest) = name.strip_prefix(&prefix) {
+            if let Some(round) = rest.strip_prefix("review-") {
+                review_rounds.insert(round.split('-').next().unwrap_or_default().to_string());
+            } else if let Some(round) = rest.strip_prefix("feedback-") {
+                feedback_rounds.insert(round.split('-').next().unwrap_or_default().to_string());
+            }
+        }
+    }
+    let summary = match duration {
+        Some(seconds) if seconds >= 3600 => {
+            format!("Duration: {}h {}m · ", seconds / 3600, seconds % 3600 / 60)
+        }
+        Some(seconds) => format!("Duration: {}m {}s · ", seconds / 60, seconds % 60),
+        None => String::new(),
+    } + &format!(
+        "Review rounds: {} · Feedback rounds: {}",
+        review_rounds.len(),
+        feedback_rounds.len()
+    );
+    let mut body = format!(
+        "**🤖 Alucard token usage (iteration {iteration})**\n\n{summary}\n\n<details><summary>Per-agent breakdown</summary>\n\n| Agent | Input | Output | Cache Read | Cache Write | Turns | Cost |\n|-------|------:|-------:|-----------:|------------:|------:|-----:|\n"
+    );
+    for row in rows {
+        body.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            row.label,
+            row.usage.input,
+            row.usage.output,
+            row.usage.cache_read,
+            row.usage.cache_write,
+            row.usage.turns,
+            display_cost(row.usage.cost)
+        ));
+    }
+    body.push_str(&format!(
+        "| **TOTAL** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** |\n\n</details>",
+        totals.input,
+        totals.output,
+        totals.cache_read,
+        totals.cache_write,
+        totals.turns,
+        display_cost(totals.cost)
+    ));
+    Some(body)
+}
+
+#[derive(Clone)]
+struct UsageRow {
+    name: String,
+    label: String,
+    usage: Usage,
+}
+
+fn usage_rows(log_dir: &Path, iteration: Option<usize>) -> Vec<UsageRow> {
+    let mut rows = Vec::new();
+    for name in jsonl_names(log_dir) {
+        let Some(label) = usage_label(&name, iteration) else {
+            continue;
+        };
+        if let Some(usage) = extract_agent_usage(&log_dir.join(&name)) {
+            rows.push(UsageRow { name, label, usage });
+        }
+    }
+    rows
+}
+
+fn jsonl_names(log_dir: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(log_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".jsonl"))
+        .collect::<Vec<_>>();
+    names.sort_by(|left, right| version_cmp(left, right));
+    names
+}
+
+fn usage_label(name: &str, iteration: Option<usize>) -> Option<String> {
+    let base = name.strip_suffix(".jsonl")?;
+    if let Some(iteration) = iteration {
+        let prefix = format!("iter-{iteration}");
+        if base == prefix {
+            return Some(format!("worker {iteration}"));
+        }
+        let rest = base.strip_prefix(&(prefix + "-"))?;
+        return match rest {
+            value if value.starts_with("fix-") => {
+                Some(format!("ci-fix {iteration}.{}", &value[4..]))
+            }
+            value if value.starts_with("review-") => {
+                Some(format!("review {iteration}.{}", &value[7..]))
+            }
+            value if value.starts_with("feedback-") => {
+                Some(format!("feedback {iteration}.{}", &value[9..]))
+            }
+            value if value.starts_with("attempt-") => {
+                Some(format!("worker attempt {}", &value[8..]))
+            }
+            "wrapup" => Some("wrap-up".to_string()),
+            _ => None,
+        };
+    }
+    let rest = base.strip_prefix("iter-");
+    Some(match rest {
+        Some(value) if value.contains("-fix-") => {
+            format!("ci-fix {}", value.replacen("-fix-", ".", 1))
+        }
+        Some(value) if value.contains("-review-") => {
+            format!("review {}", value.replacen("-review-", ".", 1))
+        }
+        Some(value) if value.contains("-feedback-") => {
+            format!("feedback {}", value.replacen("-feedback-", ".", 1))
+        }
+        Some(value) if value.ends_with("-wrapup") => {
+            format!("wrap-up {}", value.trim_end_matches("-wrapup"))
+        }
+        Some(value) => format!("worker {value}"),
+        None => base.to_string(),
+    })
+}
+
+fn usage_totals(rows: &[UsageRow]) -> Usage {
+    rows.iter().fold(Usage::default(), |mut total, row| {
+        total.input += row.usage.input;
+        total.output += row.usage.output;
+        total.cache_read += row.usage.cache_read;
+        total.cache_write += row.usage.cache_write;
+        total.turns += row.usage.turns;
+        if let Some(cost) = row.usage.cost {
+            total.cost = Some(
+                format!("{:.4}", total.cost.unwrap_or(0.0) + cost)
+                    .parse()
+                    .unwrap_or(0.0),
+            );
+        }
+        total
+    })
+}
+
+fn usage_header() -> String {
+    format!(
+        "{:<22}  {:>10}  {:>8}  {:>12}  {:>12}  {:>5}  {:>8}\n",
+        "Agent", "Input", "Output", "Cache Read", "Cache Write", "Turns", "Cost"
+    )
+}
+
+fn usage_console_row(label: &str, usage: &Usage) -> String {
+    format!(
+        "{label:<22}  {:>10}  {:>8}  {:>12}  {:>12}  {:>5}  {:>8}\n",
+        usage.input,
+        usage.output,
+        usage.cache_read,
+        usage.cache_write,
+        usage.turns,
+        display_cost(usage.cost)
+    )
+}
+
+fn display_cost(cost: Option<f64>) -> String {
+    cost.map(|value| format!("${value:.3}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    fn parts(value: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut digits = value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit());
+        for (index, character) in value.char_indices().skip(1) {
+            if character.is_ascii_digit() != digits {
+                parts.push(&value[start..index]);
+                start = index;
+                digits = !digits;
+            }
+        }
+        parts.push(&value[start..]);
+        parts
+    }
+    let left = left.strip_suffix(".jsonl").unwrap_or(left);
+    let right = right.strip_suffix(".jsonl").unwrap_or(right);
+    let left_parts = parts(left);
+    let right_parts = parts(right);
+    for (left_part, right_part) in left_parts.iter().zip(right_parts.iter()) {
+        let order = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
+            (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
+            _ => left_part.cmp(right_part),
+        };
+        if order != std::cmp::Ordering::Equal {
+            return order;
+        }
+    }
+    match left_parts.len().cmp(&right_parts.len()) {
+        std::cmp::Ordering::Equal => {}
+        order => return order,
+    }
+    left.cmp(right)
 }
 
 /// Writes the stable run summary used by Bash measurement consumers.

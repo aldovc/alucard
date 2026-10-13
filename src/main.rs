@@ -3,16 +3,17 @@
 use alucard::{
     abandoned_task_claims, archive_prompt, begin_operation, build_image, compose_role_prompt,
     database_path, find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
-    import_github_tasks, import_local_tasks, local_queue_with_open_issues,
+    import_github_tasks, import_local_tasks, iteration_usage_comment, local_queue_with_open_issues,
     local_queue_with_open_prs, log_event, mark_claim_needs_reconciliation, migrate, open,
     parse_tasks, prepare_run, recent_runs, record_recovery_failure, record_recovery_pr,
     record_task_pr, record_task_pr_gate_state, release, release_abandoned_task_claim, run_claims,
     run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
     start_task_retry_run, start_task_run, status, task_claim_attempts, task_id, task_is_pending,
-    toolchain_preflight, transition_task, warn_if_stale_image, write_iteration_measurement,
-    write_run_measurement, write_stage_measurement, write_task_headings, AgentInvocation,
-    AgentRole, AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
-    RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
+    toolchain_preflight, transition_task, usage_report, warn_if_stale_image,
+    write_iteration_measurement, write_run_measurement, write_stage_measurement,
+    write_task_headings, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask,
+    IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState,
+    TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -650,6 +651,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         let owner_run_id = run.id.clone();
         let mut attempt_run = run;
         let mut attempt = 1;
+        let iteration_started = Instant::now();
         let mut prepared =
             match prepare_attempt(&database, &options, &cache, &selected, &attempt_run) {
                 Ok(prepared) => prepared,
@@ -881,6 +883,14 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         }
                         Err(error) => eprintln!("alucard: CI gate for PR #{number}: {error}"),
                     }
+                    print!("{}", usage_report(&prepared.directory));
+                    post_iteration_usage(
+                        &options.queue.repository,
+                        &prepared.directory,
+                        iteration,
+                        number,
+                        iteration_started.elapsed().as_secs(),
+                    );
                     let _ = release(&database, &claim.id, &owner_run_id);
                     let _ = finish_run(&database, &attempt_run.id, "completed");
                     break;
@@ -2980,6 +2990,56 @@ fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>,
             format!("{context}: {error}")
         })
     }
+}
+
+fn post_iteration_usage(
+    repository: &Path,
+    log_dir: &Path,
+    iteration: usize,
+    pr: i64,
+    duration: u64,
+) {
+    let Some(body) = iteration_usage_comment(log_dir, iteration, Some(duration)) else {
+        return;
+    };
+    let pr_number = pr.to_string();
+    let issue = gh_output(
+        repository,
+        &["pr", "view", &pr_number, "--json", "body", "--jq", ".body"],
+        "could not read pull request body for usage comment",
+    )
+    .ok()
+    .and_then(|body| closing_issue_number(&String::from_utf8_lossy(&body)));
+    let (kind, target) = match issue {
+        Some(number) => ("issue", number.to_string()),
+        None => ("PR", pr_number),
+    };
+    println!("Posting token usage to {kind} #{target}...");
+    let command = if kind == "issue" { "issue" } else { "pr" };
+    if let Err(error) = gh_output(
+        repository,
+        &[command, "comment", &target, "--body", &body],
+        "could not post token usage",
+    ) {
+        log_event(log_dir, &format!("Measurement: {error} — continuing."));
+    }
+}
+
+fn closing_issue_number(body: &str) -> Option<i64> {
+    let lowercase = body.to_ascii_lowercase();
+    let words = lowercase
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '#'
+            })
+        })
+        .collect::<Vec<_>>();
+    words.windows(2).find_map(|words| {
+        matches!(words[0], "closes" | "fixes" | "resolves")
+            .then(|| words[1].strip_prefix('#')?.parse().ok())
+            .flatten()
+    })
 }
 
 fn fetch_open_local_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
