@@ -1641,7 +1641,10 @@ fn review_gate(
             let formal = formal.trim();
             let verdict = review_verdict(formal, &file_verdict);
             if verdict.is_none()
-                && agent.classification == AgentExit::Transport
+                && matches!(
+                    agent.classification,
+                    AgentExit::Transport | AgentExit::NoWorktree
+                )
                 && attempt < options.transport_attempts
             {
                 continue;

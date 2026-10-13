@@ -138,6 +138,7 @@ if [ -n "$output" ]; then
   fi
   case "$outcome" in
     transport|transport-verdict) printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500}'; exit 1 ;;
+    no-worktree) exit 78 ;;
     exhausted) printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true}'; exit 1 ;;
     timeout) exit 124 ;;
     *) printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}' ;;
@@ -328,6 +329,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             expected_state: "review_needs_human",
         },
         ReviewCase {
+            name: "review-no-worktree-then-verdict",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "no-worktree\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
             name: "review-transport-exhausted",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
@@ -335,6 +349,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "",
             formal_verdict: "",
             reviewer_outcomes: "transport\ntransport\ntransport",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "",
+            expected_state: "review_missing",
+        },
+        ReviewCase {
+            name: "review-no-worktree-exhausted",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "",
+            formal_verdict: "",
+            reviewer_outcomes: "no-worktree\nno-worktree\nno-worktree",
             comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "",
@@ -433,7 +460,10 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                 prompt.contains("<review_policy>\nReview policy from the target repository.")
             ),
         }
-        if case.name == "review-transport-then-verdict" {
+        if matches!(
+            case.name,
+            "review-transport-then-verdict" | "review-no-worktree-then-verdict"
+        ) {
             assert_eq!(
                 fs::read_to_string(root.join("review-attempts"))
                     .unwrap()
@@ -447,7 +477,10 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                 "<known_blockers>\n**🤖 Alucard blocked findings** (cycle 1/10)\n\nunfixable &lt;finding&gt;\n</known_blockers>"
             ));
         }
-        if case.name == "review-transport-exhausted" {
+        if matches!(
+            case.name,
+            "review-transport-exhausted" | "review-no-worktree-exhausted"
+        ) {
             assert_eq!(
                 fs::read_to_string(root.join("review-attempts"))
                     .unwrap()
@@ -455,7 +488,11 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                     .count(),
                 3
             );
-            assert!(trace.contains("class=transport"));
+            assert!(trace.contains(match case.name {
+                "review-transport-exhausted" => "class=transport",
+                "review-no-worktree-exhausted" => "class=no_worktree",
+                _ => unreachable!(),
+            }));
         }
         if case.name == "review-transport-with-verdict" {
             assert_eq!(
@@ -487,13 +524,11 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                 assert!(trace.contains("APPROVED — no CI ran, needs human"));
             }
             "review_missing" => {
-                assert!(
-                    trace.contains(if case.name == "review-transport-exhausted" {
-                        "class=transport"
-                    } else {
-                        "class=exhausted"
-                    })
-                );
+                assert!(trace.contains(match case.name {
+                    "review-transport-exhausted" => "class=transport",
+                    "review-no-worktree-exhausted" => "class=no_worktree",
+                    _ => "class=exhausted",
+                }));
                 assert!(trace.contains("no review posted — needs human"));
             }
             _ => assert!(trace.contains("CHANGES_REQUESTED")),
