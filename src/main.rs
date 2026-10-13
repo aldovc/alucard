@@ -74,6 +74,24 @@ impl DoctorOptions {
                 "--image" => {
                     options.image = values.next().ok_or("--image requires a name")?.clone()
                 }
+                "-t" | "--timeout-minutes" => {
+                    let timeout = values
+                        .next()
+                        .ok_or_else(|| format!("{value} requires a number"))?;
+                    if timeout
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|number| *number > 0)
+                        .is_none()
+                    {
+                        return Err("timeout must be a positive integer".to_string());
+                    }
+                }
+                "--logs-root" => {
+                    values
+                        .next()
+                        .ok_or_else(|| format!("{value} requires a path"))?;
+                }
                 "--tasks" => {
                     options.tasks = Some(PathBuf::from(
                         values.next().ok_or("--tasks requires a path")?,
@@ -184,21 +202,18 @@ fn doctor_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             }
         }
     }
-    let repository = options.repository.canonicalize().ok();
-    if let Some(repository) = repository.as_ref().filter(|path| path.is_dir()) {
-        if command_success("git", repository, &["rev-parse", "--show-toplevel"]) {
-            println!("ok: target repo {}", repository.display());
-            if command_success("git", repository, &["config", "--get", "remote.origin.url"]) {
-                println!("ok: target repo has origin remote");
-            } else {
-                println!("missing: target repo origin remote");
-                ok = false;
-            }
+    let repository = options
+        .repository
+        .canonicalize()
+        .ok()
+        .filter(|path| path.is_dir())
+        .and_then(|path| git_repository_root(&path));
+    if let Some(repository) = repository.as_ref() {
+        println!("ok: target repo {}", repository.display());
+        if command_success("git", repository, &["config", "--get", "remote.origin.url"]) {
+            println!("ok: target repo has origin remote");
         } else {
-            println!(
-                "missing: valid target git repo at {} (or a GitHub ref like owner/repo)",
-                options.repository.display()
-            );
+            println!("missing: target repo origin remote");
             ok = false;
         }
     } else if let Some(github_ref) = github_ref(&options.repository) {
@@ -291,6 +306,18 @@ fn command_success(command: &str, directory: &std::path::Path, args: &[&str]) ->
         .args(args)
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+fn git_repository_root(directory: &std::path::Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .current_dir(directory)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    output.status.success().then(|| {
+        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!root.is_empty()).then(|| PathBuf::from(root))
+    })?
 }
 
 fn read_environment(path: &std::path::Path) -> Result<BTreeMap<String, String>, std::io::Error> {

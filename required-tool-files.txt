@@ -1,3 +1,4 @@
+required-tool-files.txt
 Dockerfile
 entrypoint.sh
 alucard-worker-prompt.md
