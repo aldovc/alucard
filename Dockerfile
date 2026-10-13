@@ -28,12 +28,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
 # The toolchain lives under /opt because the root is read-only at run time;
 # CARGO_HOME moves to the tmpfs home so cargo can still fill its registry
 # cache. The version must match the repo's rust-toolchain.toml, or rustup tries
-# to download it into the read-only RUSTUP_HOME and fails.
-ENV RUSTUP_HOME=/opt/rustup PATH=/opt/cargo/bin:$PATH
+# to download it into the read-only RUSTUP_HOME and fails. The binaries are
+# linked into /usr/local/bin because agents run commands in a login shell,
+# whose /etc/profile resets PATH.
+ENV RUSTUP_HOME=/opt/rustup
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | CARGO_HOME=/opt/cargo sh -s -- -y --no-modify-path --profile minimal \
           --default-toolchain 1.85.0 --component clippy,rustfmt \
- && chmod -R a+rX /opt/rustup /opt/cargo
+ && chmod -R a+rX /opt/rustup /opt/cargo \
+ && ln -s /opt/cargo/bin/* /usr/local/bin/
 ENV CARGO_HOME=/home/alucard/.cargo
 
 # Pre-install Python 3.12 to a system path so it survives --read-only + tmpfs home dirs
