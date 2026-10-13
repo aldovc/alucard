@@ -34,6 +34,9 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(options) => options,
         Err(message) => return fail(&format!("alucard: {message}")),
     };
+    if options.issue.is_some() {
+        return fail("alucard: --issue is only valid with alucard run");
+    }
     let task_file = match options.task_file() {
         Ok(Some(path)) => path,
         Ok(None) => return github_queue_command(&options, db_path),
@@ -92,15 +95,9 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
 }
 
 fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> ExitCode {
-    let issues = match options.issue {
-        Some(number) => match fetch_pinned_issue(&options.repository, number) {
-            Ok(issue) => vec![issue],
-            Err(error) => return fail(&format!("alucard: {error}")),
-        },
-        None => match fetch_github_issues(&options.repository) {
-            Ok(issues) => issues,
-            Err(error) => return fail(&format!("alucard: {error}")),
-        },
+    let issues = match fetch_github_issues(&options.repository) {
+        Ok(issues) => issues,
+        Err(error) => return fail(&format!("alucard: {error}")),
     };
     let needs_blockers = issues
         .iter()
@@ -118,19 +115,7 @@ fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> Exi
         Err(error) => return fail(&format!("alucard: {error}")),
     };
     let imported_tasks = issues.clone();
-    let queue = if options.issue.is_some() {
-        match validate_pinned_issue(
-            &options.repository,
-            issues.into_iter().next().expect("pinned issue"),
-            &open_issues,
-            &open_prs,
-        ) {
-            Ok(issue) => vec![issue],
-            Err(error) => return fail(&format!("alucard: {error}")),
-        }
-    } else {
-        github_queue(issues, &open_issues, &open_prs)
-    };
+    let queue = github_queue(issues, &open_issues, &open_prs);
     let path = match database_path(db_path) {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
@@ -249,74 +234,6 @@ fn fetch_open_prs(repository: &PathBuf) -> Result<Vec<GithubPullRequest>, String
     )?;
     serde_json::from_slice(&output)
         .map_err(|error| format!("could not parse open pull requests: {error}"))
-}
-
-fn fetch_pinned_issue(repository: &PathBuf, number: i64) -> Result<GithubTask, String> {
-    let output = gh_output(
-        repository,
-        &[
-            "issue",
-            "view",
-            &number.to_string(),
-            "--json",
-            "number,title,body,labels,state",
-        ],
-        &format!("issue #{number} not found in target repo"),
-    )?;
-    serde_json::from_slice(&output)
-        .map_err(|error| format!("could not parse issue #{number}: {error}"))
-}
-
-fn validate_pinned_issue(
-    repository: &PathBuf,
-    issue: GithubTask,
-    open_issues: &[i64],
-    open_prs: &[GithubPullRequest],
-) -> Result<GithubTask, String> {
-    if issue.state.as_deref() != Some("OPEN") {
-        return Err(format!("issue #{} is closed", issue.number));
-    }
-    let issue_number = issue.number.to_string();
-    if Command::new("gh")
-        .current_dir(repository)
-        .args(["pr", "view", &issue_number])
-        .output()
-        .map_err(|error| {
-            format!(
-                "could not check whether issue #{} is a pull request: {error}",
-                issue.number
-            )
-        })?
-        .status
-        .success()
-    {
-        return Err(format!(
-            "issue #{} is a pull request; use alucard continue {}",
-            issue.number, issue.number
-        ));
-    }
-    let open_blockers: Vec<_> = github_ticket_blockers(&issue.body)
-        .into_iter()
-        .filter(|number| open_issues.contains(number))
-        .collect();
-    if !open_blockers.is_empty() {
-        return Err(format!(
-            "issue #{} is blocked by {}",
-            issue.number,
-            open_blockers
-                .iter()
-                .map(|number| format!("#{number}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if let Some(pr) = open_prs.iter().find(|pr| pr.covers(issue.number)) {
-        return Err(format!(
-            "issue #{} is occupied by PR #{}; use alucard continue {}",
-            issue.number, pr.number, pr.number
-        ));
-    }
-    Ok(issue)
 }
 
 fn fetch_open_issue_numbers(repository: &PathBuf) -> Option<Vec<i64>> {

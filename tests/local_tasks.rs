@@ -1,7 +1,7 @@
 use alucard::{
-    github_queue, github_ticket_blockers, import_local_tasks, local_queue,
-    local_queue_with_open_issues, migrate, open, parse_tasks, GithubPullRequest, GithubTask,
-    TaskState,
+    github_queue, github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue,
+    local_queue_with_open_issues, migrate, open, parse_tasks, resolve_pinned_issue,
+    GithubPullRequest, GithubTask, TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -187,6 +187,39 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
 }
 
 #[test]
+fn reimport_preserves_claimed_task_status() {
+    let database = temporary_path("claimed-reimport").join("ledger.db");
+    migrate(&database).unwrap();
+    let mut connection = open(&database).unwrap();
+    let repository = "repo";
+    let path = PathBuf::from("tasks.md");
+    let tasks = parse_tasks("## [ ] task: Local task\n").unwrap().tasks;
+    let issues = vec![serde_json::from_str::<GithubTask>(
+        r#"{"number":42,"title":"GitHub task","body":"","labels":[]}"#,
+    )
+    .unwrap()];
+
+    import_local_tasks(&mut connection, repository, &path, &tasks).unwrap();
+    import_github_tasks(&mut connection, repository, &issues).unwrap();
+    connection
+        .execute("UPDATE tasks SET status = 'claimed'", [])
+        .unwrap();
+    import_local_tasks(&mut connection, repository, &path, &tasks).unwrap();
+    import_github_tasks(&mut connection, repository, &issues).unwrap();
+
+    let statuses: Vec<String> = connection
+        .prepare("SELECT status FROM tasks ORDER BY source")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(statuses, ["claimed", "claimed"]);
+    drop(connection);
+    fs::remove_dir_all(database.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn queue_resolves_explicit_environment_and_detected_task_sources() {
     let root = temporary_path("task-source");
     let task_directory = root.join(".alucard");
@@ -306,7 +339,7 @@ fn github_queue_matches_contract_and_orders_high_priority_first() {
 }
 
 #[test]
-fn github_queue_cli_reports_gh_failures_and_pinned_refusals() {
+fn github_queue_cli_reports_gh_failures_and_rejects_pins() {
     let root = temporary_path("github-queue");
     fs::create_dir_all(&root).unwrap();
     let gh = root.join("gh");
@@ -365,57 +398,42 @@ esac
     assert!(!failed.status.success());
     assert!(String::from_utf8_lossy(&failed.stderr).contains("gh stub failed"));
 
-    let missing = Command::new(binary)
+    let pinned = Command::new(binary)
         .env("PATH", &root)
-        .env("ALUCARD_GH_FAIL", "1")
         .args(["queue", "--issue", "42", root.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("issue #42 not found"));
-
-    for (issue, pr_exit, refusal) in [
-        (
-            r#"{"number":42,"title":"Closed","body":"","labels":[],"state":"CLOSED"}"#,
-            "1",
-            "closed",
-        ),
-        (
-            r#"{"number":42,"title":"PR","body":"","labels":[],"state":"OPEN"}"#,
-            "0",
-            "pull request; use alucard continue 42",
-        ),
-        (
-            r#"{"number":42,"title":"Blocked","body":"Blocked by #10","labels":[],"state":"OPEN"}"#,
-            "1",
-            "blocked by #10",
-        ),
-    ] {
-        let output = Command::new(binary)
-            .env("PATH", &root)
-            .env("ALUCARD_ISSUE_JSON", issue)
-            .env("ALUCARD_PR_VIEW_EXIT", pr_exit)
-            .args(["queue", "--issue", "42", root.to_str().unwrap()])
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains(refusal));
-    }
-    let occupied = Command::new(binary)
-        .env("PATH", &root)
-        .env(
-            "ALUCARD_ISSUE_JSON",
-            r#"{"number":42,"title":"Occupied","body":"","labels":[],"state":"OPEN"}"#,
-        )
-        .env(
-            "ALUCARD_OPEN_PRS",
-            r#"[{"number":5,"title":"","body":"Refs #42","closingIssuesReferences":{"nodes":[]}}]"#,
-        )
-        .args(["queue", "--issue", "42", root.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(!occupied.status.success());
-    assert!(String::from_utf8_lossy(&occupied.stderr)
-        .contains("occupied by PR #5; use alucard continue 5"));
+    assert!(!pinned.status.success());
+    assert!(
+        String::from_utf8_lossy(&pinned.stderr).contains("--issue is only valid with alucard run")
+    );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pinned_issue_resolution_rejects_ineligible_issues() {
+    let issue = |body: &str| GithubTask {
+        number: 42,
+        title: "Pinned".to_string(),
+        body: body.to_string(),
+        labels: vec![],
+        state: Some("OPEN".to_string()),
+    };
+
+    assert_eq!(
+        resolve_pinned_issue(issue(""), true, &[], &[]),
+        Err("issue #42 is a pull request; use alucard continue 42".to_string())
+    );
+    assert_eq!(
+        resolve_pinned_issue(issue("Blocked by #10"), false, &[10], &[]),
+        Err("issue #42 is blocked by #10".to_string())
+    );
+    let open_prs = vec![serde_json::from_str(
+        r#"{"number":5,"title":"","body":"Refs #42","closingIssuesReferences":{"nodes":[]}}"#,
+    )
+    .unwrap()];
+    assert_eq!(
+        resolve_pinned_issue(issue(""), false, &[], &open_prs),
+        Err("issue #42 is occupied by PR #5; use alucard continue 5".to_string())
+    );
 }

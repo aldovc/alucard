@@ -119,6 +119,45 @@ pub fn github_queue(
     queue
 }
 
+pub fn resolve_pinned_issue(
+    issue: GithubTask,
+    is_pull_request: bool,
+    open_issues: &[i64],
+    open_prs: &[GithubPullRequest],
+) -> Result<GithubTask, String> {
+    if issue.state.as_deref() != Some("OPEN") {
+        return Err(format!("issue #{} is closed", issue.number));
+    }
+    if is_pull_request {
+        return Err(format!(
+            "issue #{} is a pull request; use alucard continue {}",
+            issue.number, issue.number
+        ));
+    }
+    let open_blockers: Vec<_> = github_ticket_blockers(&issue.body)
+        .into_iter()
+        .filter(|number| open_issues.contains(number))
+        .collect();
+    if !open_blockers.is_empty() {
+        return Err(format!(
+            "issue #{} is blocked by {}",
+            issue.number,
+            open_blockers
+                .iter()
+                .map(|number| format!("#{number}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(pr) = open_prs.iter().find(|pr| pr.covers(issue.number)) {
+        return Err(format!(
+            "issue #{} is occupied by PR #{}; use alucard continue {}",
+            issue.number, pr.number, pr.number
+        ));
+    }
+    Ok(issue)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct GithubPullRequest {
     pub number: i64,
@@ -384,7 +423,9 @@ pub fn import_local_tasks(
             "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, pr_number, previous_pr_number, updated_at)
              VALUES (lower(hex(randomblob(16))), ?1, 'local', ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              ON CONFLICT(repository_id, source, source_path, external_id) DO UPDATE SET
-               title = excluded.title, status = excluded.status, blockers_json = excluded.blockers_json,
+               title = excluded.title,
+               status = CASE WHEN tasks.status IN ('claimed', 'in_flight') THEN tasks.status ELSE excluded.status END,
+               blockers_json = excluded.blockers_json,
                pr_number = excluded.pr_number, previous_pr_number = excluded.previous_pr_number,
                updated_at = excluded.updated_at
              WHERE title IS NOT excluded.title OR status IS NOT excluded.status OR blockers_json IS NOT excluded.blockers_json
@@ -413,7 +454,9 @@ pub fn import_github_tasks(
             "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, updated_at)
              VALUES (lower(hex(randomblob(16))), ?1, 'github', '', ?2, ?3, 'pending', ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              ON CONFLICT(repository_id, source, source_path, external_id) DO UPDATE SET
-               title = excluded.title, status = excluded.status, blockers_json = excluded.blockers_json,
+               title = excluded.title,
+               status = CASE WHEN tasks.status IN ('claimed', 'in_flight') THEN tasks.status ELSE excluded.status END,
+               blockers_json = excluded.blockers_json,
                updated_at = excluded.updated_at
              WHERE title IS NOT excluded.title OR status IS NOT excluded.status OR blockers_json IS NOT excluded.blockers_json",
             rusqlite::params![repository, task.number.to_string(), task.title, blockers],
