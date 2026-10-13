@@ -400,6 +400,230 @@ esac
     }
 }
 
+fn run_github_recovery_case(root: &Path, scenario: &str) {
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&repository).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "main",
+    ]));
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        r#"#!/bin/sh
+case "$1 $2" in
+  'image inspect') echo stamp ;;
+  'run '*)
+    printf x >> "$ALUCARD_GITHUB_RECOVERY_DOCKER_TRACE"
+    for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; esac; done
+    case "$ALUCARD_GITHUB_RECOVERY_SCENARIO" in
+      timeout)
+        printf 'unfinished\n' > "$worktree/recovery.txt"
+        exit 124 ;;
+      *)
+        printf 'unfinished\n' > "$worktree/recovery.txt"
+        git -C "$worktree" add recovery.txt
+        git -C "$worktree" -c user.email=test@example.com -c user.name=Test commit -qm recovery
+        if [ "$ALUCARD_GITHUB_RECOVERY_SCENARIO" = turn_budget ]; then
+          printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"limit reached"}'
+        else
+          printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"failed"}'
+        fi
+        exit 1 ;;
+    esac ;;
+  'rm -f') ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$ALUCARD_GITHUB_RECOVERY_GH_TRACE"
+case "$1 $2" in
+  'issue list')
+    case "$*" in
+      *--label*) echo '[{"number":134,"title":"Recovery task","body":"","labels":[{"name":"ready-for-agent"}]}]' ;;
+      *) echo '[{"number":134}]' ;;
+    esac ;;
+  'repo view') echo 'owner/repo' ;;
+  'api graphql') echo '[]' ;;
+  'pr list')
+    if [ -f "$ALUCARD_GITHUB_RECOVERY_CREATED" ]; then echo '[{"number":91,"headRefName":"recovery","headRefOid":"abc"}]'; else echo '[]'; fi ;;
+  'pr create')
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --body) printf '%s' "$2" > "$ALUCARD_GITHUB_RECOVERY_BODY"; shift 2 ;;
+        --title) printf '%s' "$2" > "$ALUCARD_GITHUB_RECOVERY_TITLE"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    : > "$ALUCARD_GITHUB_RECOVERY_CREATED" ;;
+  'pr comment')
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --body ]; then printf '%s' "$2" > "$ALUCARD_GITHUB_RECOVERY_MARKER"; break; fi
+      shift
+    done ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+    )
+    .unwrap();
+    let database = root.join("ledger.db");
+    let logs = root.join("logs");
+    let arguments = [
+        "--db-path",
+        database.to_str().unwrap(),
+        "run",
+        "--github",
+        "--iterations",
+        "1",
+        "--env-file",
+        environment.to_str().unwrap(),
+        "--logs-root",
+        logs.to_str().unwrap(),
+        "--no-build",
+        repository.to_str().unwrap(),
+    ];
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("ALUCARD_GITHUB_RECOVERY_SCENARIO", scenario)
+            .env(
+                "ALUCARD_GITHUB_RECOVERY_DOCKER_TRACE",
+                root.join("docker-trace"),
+            )
+            .env("ALUCARD_GITHUB_RECOVERY_GH_TRACE", root.join("gh-trace"))
+            .env("ALUCARD_GITHUB_RECOVERY_CREATED", root.join("created"))
+            .env("ALUCARD_GITHUB_RECOVERY_BODY", root.join("body"))
+            .env("ALUCARD_GITHUB_RECOVERY_TITLE", root.join("title"))
+            .env("ALUCARD_GITHUB_RECOVERY_MARKER", root.join("marker"))
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let output = invoke();
+    assert!(output.status.success(), "{scenario}: {output:?}");
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT status FROM tasks", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "in_flight",
+        "{scenario}"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT pr_number FROM tasks", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        91,
+        "{scenario}"
+    );
+    drop(connection);
+    let output = invoke();
+    assert!(output.status.success(), "{scenario}: {output:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("docker-trace")).unwrap().len(),
+        1,
+        "{scenario}"
+    );
+}
+
+#[test]
+fn test_worker_recovery() {
+    let root = temporary_path("github-worker-recovery");
+    fs::create_dir(&root).unwrap();
+    run_github_recovery_case(&root, "worker");
+    assert!(fs::read_to_string(root.join("body"))
+        .unwrap()
+        .starts_with("Refs #134\n\n"));
+    assert_eq!(
+        fs::read_to_string(root.join("marker")).unwrap(),
+        "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's."
+    );
+    let trace = fs::read_to_string(root.join("gh-trace")).unwrap();
+    assert!(
+        trace.contains("pr edit 91 --add-label needs-human"),
+        "{trace}"
+    );
+    assert!(
+        trace.contains("issue edit 134 --remove-label in-progress"),
+        "{trace}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_timeout_recovery() {
+    let root = temporary_path("github-timeout-recovery");
+    fs::create_dir(&root).unwrap();
+    run_github_recovery_case(&root, "timeout");
+    assert_eq!(
+        fs::read_to_string(root.join("title")).unwrap(),
+        "wip: alucard recovery — iter 1 (worker stopped: timeout, rc=124)"
+    );
+    let commits = Command::new("git")
+        .args([
+            "--git-dir",
+            root.join("remote.git").to_str().unwrap(),
+            "log",
+            "--all",
+            "--format=%s",
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8(commits.stdout)
+        .unwrap()
+        .contains("wip: alucard recovery — uncommitted worker state"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_turn_budget() {
+    let root = temporary_path("github-turn-budget-recovery");
+    fs::create_dir(&root).unwrap();
+    run_github_recovery_case(&root, "turn_budget");
+    assert_eq!(
+        fs::read_to_string(root.join("title")).unwrap(),
+        "wip: alucard recovery — iter 1 (worker stopped: exhausted, rc=1)"
+    );
+    assert!(fs::read_to_string(root.join("body"))
+        .unwrap()
+        .contains("ran out of turns or hit its time limit"));
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn parser_preserves_task_structure_and_queue_eligibility() {
     let contents = fs::read_to_string("test/fixtures/tasks-basic.md").unwrap();
