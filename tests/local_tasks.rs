@@ -1244,6 +1244,60 @@ fn pinned_issue_resolution_rejects_ineligible_issues() {
 }
 
 #[test]
+fn run_leaves_in_flight_task_unchanged_when_pr_lookup_fails() {
+    let root = temporary_path("run-local-pr-lookup-failure");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&repository).unwrap();
+    git_repository(&repository);
+    let tasks = root.join("tasks.md");
+    let original = "## [>] task: In flight (PR #12)\n";
+    fs::write(&tasks, original).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr view') echo 'lookup failed' >&2; exit 1 ;;\n  'pr list') echo '[]' ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let docker = bin.join("docker");
+    fs::write(&docker, "#!/bin/sh\necho stamp\n").unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "run",
+            "--tasks",
+            tasks.to_str().unwrap(),
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            repository.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(&tasks).unwrap(), original);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     let root = temporary_path("run-local");
     let repository = root.join("repository");
