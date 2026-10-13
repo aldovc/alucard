@@ -268,6 +268,9 @@ case "$1 $2" in
   'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
   'pr checks')
     if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
+      if [ ! -s "$ALUCARD_FEEDBACK_ATTEMPTS" ] && [ "$(wc -l < "$ALUCARD_CI_FIX_ATTEMPTS")" -eq 2 ]; then
+        exit 0
+      fi
       echo "checks failed" >&2
       exit 1
     fi
@@ -829,7 +832,9 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             let repairs = fs::read_to_string(root.join("ci-fix-attempts")).unwrap();
             assert_eq!(repairs.lines().count(), 4);
             assert!(repairs.contains("-0-1"), "{repairs}");
+            assert!(repairs.contains("-0-2"), "{repairs}");
             assert!(repairs.contains("-1-1"), "{repairs}");
+            assert!(repairs.contains("-1-2"), "{repairs}");
         }
         if case.name == "feedback-cycle-exhaustion" {
             assert!(trace.contains("gave up after 2/2 review cycles — needs human"));
