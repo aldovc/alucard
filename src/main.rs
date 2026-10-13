@@ -895,6 +895,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     break;
                 }
                 Ok(None) => {
+                    print!("{}", usage_report(&prepared.directory));
                     if classification == alucard::AgentExit::Billing {
                         release_without_pr(
                             &database,
@@ -969,7 +970,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         result.as_ref().ok().and_then(|value| value.status),
                         &log,
                     ) {
-                        Ok(Some(number)) => report_iteration_usage(
+                        Ok(Some(number)) => post_iteration_usage(
                             &options.queue.repository,
                             &prepared.directory,
                             iteration,
@@ -3432,6 +3433,24 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn no_recovery_pr_still_reports_worker_usage() {
+        let logs =
+            std::env::temp_dir().join(format!("alucard-usage-report-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("iter-1.jsonl"),
+            r#"{"type":"result","modelUsage":{"claude":{"inputTokens":12,"outputTokens":34}},"num_turns":1,"total_cost_usd":0.01}"#,
+        )
+        .unwrap();
+
+        let report = usage_report(&logs);
+
+        assert!(report.contains("=== Alucard Token Usage:"));
+        assert!(report.contains("worker 1"));
+        fs::remove_dir_all(logs).unwrap();
     }
 
     #[test]
