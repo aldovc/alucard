@@ -912,8 +912,15 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
 
 fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
     migrate(database).map_err(|error| error.to_string())?;
-    for claim in abandoned_task_claims(database).map_err(|error| error.to_string())? {
-        if docker_run_is_active(&claim.run_id) {
+    let repository_id = repository
+        .canonicalize()
+        .map_err(|error| error.to_string())?
+        .to_string_lossy()
+        .to_string();
+    for claim in
+        abandoned_task_claims(database, &repository_id).map_err(|error| error.to_string())?
+    {
+        if docker_run_is_active(&claim.run_id)? {
             continue;
         }
         let branch = claim
@@ -955,7 +962,8 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
                 }
             }
             (None, None) => {
-                release_abandoned_task_claim(database, &claim).map_err(|error| error.to_string())?
+                mark_claim_needs_reconciliation(database, &claim, "branch identity is unavailable")
+                    .map_err(|error| error.to_string())?
             }
         }
     }
@@ -972,20 +980,32 @@ fn abandoned_branch(database: &Path, run_id: &str) -> Option<String> {
         .filter(|branch| !branch.is_empty())
 }
 
-fn docker_run_is_active(run_id: &str) -> bool {
-    execute_command(
+fn docker_run_is_active(run_id: &str) -> Result<bool, String> {
+    let output = execute_command(
         "docker",
         &["ps", "--format", "{{.Names}}"],
         Path::new("."),
         None,
     )
-    .ok()
-    .filter(|output| output.status.success())
-    .is_some_and(|output| {
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|name| name.starts_with(&format!("alucard-worker-{run_id}-")))
-    })
+    .map_err(|error| error.to_string())?;
+    docker_run_is_active_output(run_id, &output)
+}
+
+fn docker_run_is_active_output(
+    run_id: &str,
+    output: &std::process::Output,
+) -> Result<bool, String> {
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if error.is_empty() {
+            format!("docker ps failed with {}", output.status)
+        } else {
+            error
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|name| name.starts_with(&format!("alucard-worker-{run_id}-"))))
 }
 
 fn reconcile_remote_pr(
@@ -2582,5 +2602,11 @@ printf '%s' "$FULL_PROMPT""#,
             recovery_ticket_comment(91, alucard::AgentExit::Exhausted, Some(1), 2),
             "**🤖 Alucard recovery** — the worker on this ticket ran out of turns or hit its time limit (rc=1) before opening a PR. Its 2 commit(s), plus its uncommitted files, are on draft PR #91. Nothing there has been through CI or review.\n\nThe `in-progress` label is removed; PR #91 alone keeps this ticket out of the queue. Close that PR to hand the remaining work back to a worker, or finish it there."
         );
+    }
+
+    #[test]
+    fn failed_docker_inspection_is_not_treated_as_no_worker() {
+        let output = Command::new("sh").args(["-c", "exit 1"]).output().unwrap();
+        assert!(docker_run_is_active_output("run", &output).is_err());
     }
 }

@@ -333,6 +333,17 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
             .unwrap(),
         "running"
     );
+    assert_eq!(
+        open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT branch FROM runs WHERE id = ?1",
+                [&first.run.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        first.branch
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -812,7 +823,7 @@ fn abandoned_claims_only_include_dead_local_owners_and_can_be_released() {
     let dead = acquire_task(&path, "dead", "dead-run").unwrap();
     acquire_task(&path, "live", "live-run").unwrap();
 
-    let abandoned = abandoned_task_claims(&path).unwrap();
+    let abandoned = abandoned_task_claims(&path, "repo").unwrap();
     assert_eq!(abandoned.len(), 1);
     assert_eq!(abandoned[0].lease_id, dead.id);
     release_abandoned_task_claim(&path, &abandoned[0]).unwrap();
@@ -879,7 +890,7 @@ fn remote_operations_are_durable_and_idempotent() {
 #[test]
 fn migration_is_idempotent_and_enforces_the_ledger_constraints() {
     let path = database_path();
-    assert_eq!(status(&path).unwrap().pending_migrations, 4);
+    assert_eq!(status(&path).unwrap().pending_migrations, 5);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
 
@@ -963,7 +974,7 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     assert!(!status.status.success());
     assert!(String::from_utf8(status.stdout)
         .unwrap()
-        .contains("pending migrations: 4"));
+        .contains("pending migrations: 5"));
 
     let migrate = Command::new(binary)
         .args(["--db-path", path.to_str().unwrap(), "db", "migrate"])
@@ -1097,7 +1108,7 @@ fn status_preserves_existing_database_parent_permissions() {
     fs::create_dir(parent).unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(status(&path).unwrap().pending_migrations, 4);
+    assert_eq!(status(&path).unwrap().pending_migrations, 5);
     assert_eq!(
         fs::metadata(parent).unwrap().permissions().mode() & 0o777,
         0o755
