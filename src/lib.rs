@@ -577,12 +577,14 @@ pub fn classify_agent_output(provider: Provider, status: Option<i32>, log: &str)
 
 fn has_transport_error(message: &str, anchored: bool) -> bool {
     let message = message.to_ascii_lowercase();
+    if has_rate_limit_error(&message, anchored) {
+        return true;
+    }
+
     [
         "connection closed",
         "network error",
         "overloaded",
-        "rate limit",
-        "rate-limit",
         "gateway",
         "reset by peer",
         "econnreset",
@@ -597,6 +599,27 @@ fn has_transport_error(message: &str, anchored: bool) -> bool {
             message.contains(marker)
         }
     })
+}
+
+fn has_rate_limit_error(message: &str, anchored: bool) -> bool {
+    let matches_rate_limit = |suffix: &str| {
+        let Some(after_rate) = suffix.strip_prefix("rate") else {
+            return false;
+        };
+        after_rate.starts_with("limit")
+            || after_rate
+                .chars()
+                .next()
+                .is_some_and(|separator| after_rate[separator.len_utf8()..].starts_with("limit"))
+    };
+
+    if anchored {
+        matches_rate_limit(message)
+    } else {
+        message
+            .match_indices("rate")
+            .any(|(index, _)| matches_rate_limit(&message[index..]))
+    }
 }
 
 impl AgentInvocation<'_> {
