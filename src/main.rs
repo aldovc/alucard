@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
 
 const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's.";
+const BLOCKED_FINDINGS_MARKER: &str = "**🤖 Alucard blocked findings**";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1422,12 +1423,18 @@ fn reviewer_prompt(
     max_cycles: usize,
     toolchain_status: &str,
     review_policy: &str,
+    known_blockers: &str,
 ) -> Result<String, String> {
     let instructions = compose_role_prompt(tools, "alucard-reviewer-prompt.md", None)
         .map_err(|error| error.to_string())?;
     let mut prompt = format!(
-        "<instructions>\n{instructions}\n</instructions>\n<pr_num>{pr_number}</pr_num>\n<review_cycle>{cycle} of {max_cycles}</review_cycle>\n<toolchain_status>\n{}\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blockers>",
+        "<instructions>\n{instructions}\n</instructions>\n<pr_num>{pr_number}</pr_num>\n<review_cycle>{cycle} of {max_cycles}</review_cycle>\n<toolchain_status>\n{}\n</toolchain_status>\n<known_blockers>\n{}\n</known_blockers>",
         xml_escape(toolchain_status),
+        xml_escape(if known_blockers.is_empty() {
+            "None recorded."
+        } else {
+            known_blockers
+        }),
     );
     if task.issue.is_none() {
         let local_task = WorkerLocalTaskPrompt {
@@ -1443,6 +1450,22 @@ fn reviewer_prompt(
     }
     append_review_policy(&mut prompt, review_policy);
     Ok(prompt)
+}
+
+fn known_blockers(repository: &Path, pr_number: i64) -> Result<String, String> {
+    let response: serde_json::Value = serde_json::from_str(&gh_text(
+        repository,
+        &["pr", "view", &pr_number.to_string(), "--json", "comments"],
+    )?)
+    .map_err(|error| error.to_string())?;
+    Ok(response["comments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|comment| comment["body"].as_str())
+        .filter(|body| body.starts_with(BLOCKED_FINDINGS_MARKER))
+        .collect::<Vec<_>>()
+        .join("\n\n"))
 }
 
 const DEFAULT_REVIEW_POLICY_MAX_BYTES: usize = 16_384;
@@ -1559,6 +1582,7 @@ fn review_gate(
                 .trim()
                 .to_string();
             let review_policy = read_review_policy(&checkout)?;
+            let known_blockers = known_blockers(&prepared.clone, pr_number)?;
             let prompt = reviewer_prompt(
                 tools,
                 task,
@@ -1567,6 +1591,7 @@ fn review_gate(
                 options.max_review_cycles,
                 toolchain_status,
                 &review_policy,
+                &known_blockers,
             )?;
             let log = prepared
                 .directory
@@ -3849,7 +3874,7 @@ printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blocker
             String::from_utf8_lossy(&bash.stderr)
         );
         assert_eq!(
-            reviewer_prompt(tools, &task, 17, 1, 10, status, "").unwrap(),
+            reviewer_prompt(tools, &task, 17, 1, 10, status, "", "").unwrap(),
             String::from_utf8(bash.stdout).unwrap()
         );
     }
@@ -3865,11 +3890,21 @@ printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blocker
             local_body: "Body & details".to_string(),
             parent_context: "Parent <context>".to_string(),
         };
-        let prompt =
-            reviewer_prompt(tools, &task, 17, 1, 10, "status", "Policy </review_policy>").unwrap();
+        let prompt = reviewer_prompt(
+            tools,
+            &task,
+            17,
+            1,
+            10,
+            "status",
+            "Policy </review_policy>",
+            "Blocked <finding>",
+        )
+        .unwrap();
         assert!(prompt.contains("<task>{\"id\":\"7\",\"title\":\"Fix &lt;tag&gt;\",\"body\":\"Body &amp; details\"}</task>"));
         assert!(prompt.contains("<parent_context>Parent &lt;context&gt;</parent_context>"));
         assert!(prompt.contains("<review_policy>\nPolicy &lt;/review_policy&gt;\n</review_policy>"));
+        assert!(prompt.contains("<known_blockers>\nBlocked &lt;finding&gt;\n</known_blockers>"));
 
         let directory =
             std::env::temp_dir().join(format!("alucard-review-policy-{}", uuid::Uuid::new_v4()));

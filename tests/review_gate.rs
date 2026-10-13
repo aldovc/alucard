@@ -42,6 +42,7 @@ struct ReviewCase<'a> {
     file_verdict: &'a str,
     formal_verdict: &'a str,
     reviewer_outcomes: &'a str,
+    comments_json: &'a str,
     advance_head: bool,
     expected_verdict: &'a str,
     expected_state: &'a str,
@@ -171,6 +172,7 @@ case "$1 $2" in
   'pr view')
     case "$*" in
       *headRefOid*) sha ;;
+      *--json\ comments*) printf '%s\n' "$ALUCARD_PR_COMMENTS" ;;
       *reviews*'.body'*) printf '%s\n' "$ALUCARD_FORMAL_BODY" ;;
       *reviews*) printf '%s\n' "$ALUCARD_FORMAL_VERDICT" ;;
     esac ;;
@@ -209,6 +211,7 @@ esac
         .env("ALUCARD_REVIEW_VERDICT", case.file_verdict)
         .env("ALUCARD_FORMAL_VERDICT", case.formal_verdict)
         .env("ALUCARD_FORMAL_BODY", "formal body")
+        .env("ALUCARD_PR_COMMENTS", case.comments_json)
         .env(
             "REVIEW_POLICY_MAX_BYTES",
             case.review_policy_max_bytes.unwrap_or(16_384).to_string(),
@@ -267,6 +270,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "APPROVED",
             formal_verdict: "CHANGES_REQUESTED",
             reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "CHANGES_REQUESTED",
             expected_state: "review_changes_requested",
@@ -279,6 +283,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "BLOCKED",
             formal_verdict: "APPROVED",
             reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[{\"body\":\"**🤖 Alucard blocked findings** (cycle 1/10)\\n\\nunfixable <finding>\"}]}",
             advance_head: false,
             expected_verdict: "BLOCKED",
             expected_state: "review_blocked",
@@ -291,6 +296,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "APPROVED",
             formal_verdict: "",
             reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "APPROVED",
             expected_state: "review_needs_human",
@@ -303,6 +309,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "not-a-verdict",
             formal_verdict: "",
             reviewer_outcomes: "exhausted",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "",
             expected_state: "review_missing",
@@ -315,6 +322,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "APPROVED",
             formal_verdict: "",
             reviewer_outcomes: "transport\nverdict",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "APPROVED",
             expected_state: "review_needs_human",
@@ -327,6 +335,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "",
             formal_verdict: "",
             reviewer_outcomes: "transport\ntransport\ntransport",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "",
             expected_state: "review_missing",
@@ -339,6 +348,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "APPROVED",
             formal_verdict: "",
             reviewer_outcomes: "transport-verdict",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "APPROVED",
             expected_state: "review_needs_human",
@@ -351,6 +361,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "",
             formal_verdict: "",
             reviewer_outcomes: "timeout",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "",
             expected_state: "review_missing",
@@ -363,6 +374,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "CHANGES_REQUESTED",
             formal_verdict: "",
             reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "CHANGES_REQUESTED",
             expected_state: "review_changes_requested",
@@ -375,6 +387,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "CHANGES_REQUESTED",
             formal_verdict: "",
             reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "CHANGES_REQUESTED",
             expected_state: "review_changes_requested",
@@ -387,6 +400,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "APPROVED",
             formal_verdict: "",
             reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
             advance_head: true,
             expected_verdict: "APPROVED",
             expected_state: "review_needs_human",
@@ -399,6 +413,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             file_verdict: "",
             formal_verdict: "APPROVED",
             reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "APPROVED",
             expected_state: "review_needs_human",
@@ -426,6 +441,11 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                     .count(),
                 2
             );
+        }
+        if case.name == "review-blocked-precedence" {
+            assert!(prompt.contains(
+                "<known_blockers>\n**🤖 Alucard blocked findings** (cycle 1/10)\n\nunfixable &lt;finding&gt;\n</known_blockers>"
+            ));
         }
         if case.name == "review-transport-exhausted" {
             assert_eq!(
