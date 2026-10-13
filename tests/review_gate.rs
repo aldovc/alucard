@@ -268,7 +268,9 @@ case "$1 $2" in
   'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
   'pr checks')
     if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
-      if [ ! -s "$ALUCARD_FEEDBACK_ATTEMPTS" ] && [ "$(wc -l < "$ALUCARD_CI_FIX_ATTEMPTS")" -eq 2 ]; then
+      feedback_attempts=$(wc -l < "$ALUCARD_FEEDBACK_ATTEMPTS")
+      repair_attempts=$(wc -l < "$ALUCARD_CI_FIX_ATTEMPTS")
+      if [ "$repair_attempts" -eq $(((feedback_attempts + 1) * 2)) ]; then
         exit 0
       fi
       echo "checks failed" >&2
