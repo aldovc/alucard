@@ -1882,7 +1882,7 @@ fn review_gate(
                 }
                 let body = if verdict.is_some()
                     && !file_verdict.is_empty()
-                    && formal != file_verdict
+                    && (!file_body.trim().is_empty() || formal != file_verdict)
                 {
                     file_body
                 } else if !formal.is_empty() {

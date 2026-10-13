@@ -569,7 +569,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             oversized_policy: false,
             review_policy_max_bytes: None,
             file_verdict: "CHANGES_REQUESTED",
-            formal_verdict: "",
+            formal_verdict: "CHANGES_REQUESTED",
             reviewer_outcomes: "verdict\nverdict",
             comments_json: "{\"comments\":[{\"body\":\"HUMAN-COMMENT\",\"author\":{\"login\":\"person\"},\"createdAt\":\"now\"}]}",
             advance_head: false,
