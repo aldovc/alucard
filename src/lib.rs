@@ -28,6 +28,180 @@ pub struct LocalTask {
     pub issue_blockers: Vec<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct GithubTask {
+    pub number: i64,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<GithubLabel>,
+    #[serde(default, skip_serializing)]
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct GithubLabel {
+    pub name: String,
+}
+
+pub fn github_ticket_blockers(body: &str) -> Vec<i64> {
+    let mut blockers = Vec::new();
+    for line in body.lines() {
+        let mut rest = line;
+        while let Some(index) = rest.find("Blocked by #") {
+            rest = &rest[index + "Blocked by #".len()..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if let Ok(number) = rest[..digits].parse() {
+                blockers.push(number);
+            }
+            rest = &rest[digits..];
+        }
+    }
+    let mut in_section = false;
+    for line in body.lines() {
+        if let Some(heading) = line.strip_prefix("##") {
+            in_section = heading
+                .trim_start_matches(char::is_whitespace)
+                .strip_prefix("Blocked by")
+                .is_some_and(|rest| {
+                    rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+                });
+            continue;
+        }
+        if in_section {
+            let mut rest = line;
+            while let Some(index) = rest.find('#') {
+                rest = &rest[index + 1..];
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                if let Ok(number) = rest[..digits].parse() {
+                    blockers.push(number);
+                }
+                rest = &rest[digits..];
+            }
+        }
+    }
+    blockers.sort_unstable();
+    blockers.dedup();
+    blockers
+}
+
+pub fn github_queue(
+    issues: Vec<GithubTask>,
+    open_issue_numbers: &[i64],
+    open_prs: &[GithubPullRequest],
+) -> Vec<GithubTask> {
+    let mut queue: Vec<_> = issues
+        .into_iter()
+        .filter(|issue| {
+            let labels: Vec<_> = issue
+                .labels
+                .iter()
+                .map(|label| label.name.as_str())
+                .collect();
+            labels.contains(&"ready-for-agent")
+                && !labels
+                    .iter()
+                    .any(|label| matches!(*label, "ready-for-human" | "in-progress" | "wip"))
+                && github_ticket_blockers(&issue.body)
+                    .iter()
+                    .all(|blocker| !open_issue_numbers.contains(blocker))
+                && !open_prs.iter().any(|pr| pr.covers(issue.number))
+        })
+        .collect();
+    queue.sort_by_key(|issue| {
+        (
+            !issue
+                .labels
+                .iter()
+                .any(|label| label.name == "priority:high"),
+            issue.number,
+        )
+    });
+    queue
+}
+
+pub fn resolve_pinned_issue(
+    issue: GithubTask,
+    is_pull_request: bool,
+    open_issues: &[i64],
+    open_prs: &[GithubPullRequest],
+) -> Result<GithubTask, String> {
+    if issue.state.as_deref() != Some("OPEN") {
+        return Err(format!("issue #{} is closed", issue.number));
+    }
+    if is_pull_request {
+        return Err(format!(
+            "issue #{} is a pull request; use alucard continue {}",
+            issue.number, issue.number
+        ));
+    }
+    let open_blockers: Vec<_> = github_ticket_blockers(&issue.body)
+        .into_iter()
+        .filter(|number| open_issues.contains(number))
+        .collect();
+    if !open_blockers.is_empty() {
+        return Err(format!(
+            "issue #{} is blocked by {}",
+            issue.number,
+            open_blockers
+                .iter()
+                .map(|number| format!("#{number}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(pr) = open_prs.iter().find(|pr| pr.covers(issue.number)) {
+        return Err(format!(
+            "issue #{} is occupied by PR #{}; use alucard continue {}",
+            issue.number, pr.number, pr.number
+        ));
+    }
+    Ok(issue)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GithubPullRequest {
+    pub number: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, rename = "closingIssuesReferences")]
+    pub closing_issues_references: ClosingIssuesReferences,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct ClosingIssuesReferences {
+    #[serde(default)]
+    pub nodes: Vec<IssueReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct IssueReference {
+    pub number: i64,
+}
+
+impl GithubPullRequest {
+    pub fn covers(&self, issue_number: i64) -> bool {
+        self.closing_issues_references
+            .nodes
+            .iter()
+            .any(|issue| issue.number == issue_number)
+            || [self.title.as_str(), self.body.as_str()]
+                .iter()
+                .any(|text| references_issue(text, issue_number))
+    }
+}
+
+fn references_issue(text: &str, issue_number: i64) -> bool {
+    let reference = format!("#{issue_number}");
+    text.match_indices(&reference).any(|(index, _)| {
+        !text[index + reference.len()..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Pending,
@@ -249,12 +423,43 @@ pub fn import_local_tasks(
             "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, pr_number, previous_pr_number, updated_at)
              VALUES (lower(hex(randomblob(16))), ?1, 'local', ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              ON CONFLICT(repository_id, source, source_path, external_id) DO UPDATE SET
-               title = excluded.title, status = excluded.status, blockers_json = excluded.blockers_json,
+               title = excluded.title,
+               status = CASE WHEN tasks.status IN ('claimed', 'in_flight') THEN tasks.status ELSE excluded.status END,
+               blockers_json = excluded.blockers_json,
                pr_number = excluded.pr_number, previous_pr_number = excluded.previous_pr_number,
                updated_at = excluded.updated_at
              WHERE title IS NOT excluded.title OR status IS NOT excluded.status OR blockers_json IS NOT excluded.blockers_json
                OR pr_number IS NOT excluded.pr_number OR previous_pr_number IS NOT excluded.previous_pr_number",
             rusqlite::params![repository, source_path, task.id, task.title, task.state.ledger_status(), blockers, task.pr_number, task.previous_pr_number],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+pub fn import_github_tasks(
+    connection: &mut Connection,
+    repository: &str,
+    tasks: &[GithubTask],
+) -> Result<(), DatabaseError> {
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at) VALUES (?1, ?1, ?1, ?1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        [repository],
+    )?;
+    for task in tasks {
+        let blockers = serde_json::to_string(&github_ticket_blockers(&task.body))
+            .expect("issue blockers serialize");
+        transaction.execute(
+            "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, updated_at)
+             VALUES (lower(hex(randomblob(16))), ?1, 'github', '', ?2, ?3, 'pending', ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             ON CONFLICT(repository_id, source, source_path, external_id) DO UPDATE SET
+               title = excluded.title,
+               status = CASE WHEN tasks.status IN ('claimed', 'in_flight') THEN tasks.status ELSE excluded.status END,
+               blockers_json = excluded.blockers_json,
+               updated_at = excluded.updated_at
+             WHERE title IS NOT excluded.title OR status IS NOT excluded.status OR blockers_json IS NOT excluded.blockers_json",
+            rusqlite::params![repository, task.number.to_string(), task.title, blockers],
         )?;
     }
     transaction.commit()?;

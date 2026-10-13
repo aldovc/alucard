@@ -196,7 +196,7 @@ The target defaults to the current directory. You can also select it with `--rep
 
 ### GitHub issues
 
-The default queue contains open issues labeled `ready-for-agent`. Alucard filters out issues labeled `in-progress` or `wip`, blocked issues, and issues already referenced by an open PR. Keep human work labeled `ready-for-human` instead of `ready-for-agent`. Use `Blocked by #N` in an issue body to declare a dependency on another issue.
+The default queue contains open issues labeled `ready-for-agent`. Alucard filters out issues labeled `ready-for-human`, `in-progress`, or `wip`, blocked issues, and issues already referenced by an open PR. Keep human work labeled `ready-for-human` instead of `ready-for-agent`. Use `Blocked by #N` in an issue body to declare a dependency on another issue. It orders `priority:high` issues first, then by ascending issue number.
 
 The worker picks one eligible issue and labels it `in-progress`. Complete work uses `Closes #N` in the PR body; partial work uses `Refs #N`. The issue closes when a complete PR merges. In queue mode, a worker that judges an issue too large proposes a split in an issue comment and moves it to `ready-for-human`.
 
