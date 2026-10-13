@@ -8,7 +8,13 @@ exec </dev/null
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
-ALUCARD="$SCRIPT_DIR/../alucard"
+if [ -z "${ALUCARD:-}" ]; then
+  ALUCARD="$SCRIPT_DIR/../alucard"
+  # shellcheck disable=SC1090
+  source "$ALUCARD"
+else
+  BOT_REVIEWED_HEAD="Reviewed head:"
+fi
 
 TEST_DIR=$(mktemp -d /tmp/alucard_test_merge.XXXXXX)
 trap 'rm -rf "$TEST_DIR"' EXIT
@@ -22,9 +28,6 @@ mkdir -p "$MOCK_BIN" "$STATE"
 : > "$TEST_DIR/alucard.env"
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
-
-# shellcheck disable=SC1090
-source "$ALUCARD"
 
 # gh: PR metadata and comments come from the scenario; the head is read from
 # the bare remote, as GitHub would report it after a push.

@@ -152,6 +152,11 @@ impl AgentSettings {
         self.get(key).is_some()
     }
 
+    /// Returns an operator-provided setting loaded from the environment or env file.
+    pub fn value(&self, key: &str) -> Option<&str> {
+        self.get(key)
+    }
+
     pub fn setting(&self, role: AgentRole, suffix: &str, default: &str) -> String {
         let role_key = format!("ALUCARD_{}_{}", role.setting_name(), suffix);
         self.get(&role_key)
@@ -2920,6 +2925,43 @@ pub fn acquire_pr(
     )?;
     transaction.commit()?;
     Ok(claim)
+}
+
+/// Creates a manual merge run before acquiring its pull request lease.
+pub fn start_merge_run(
+    path: &Path,
+    repository: &Path,
+    logs_root: &Path,
+) -> Result<Run, DatabaseError> {
+    migrate(path)?;
+    let repository = repository.canonicalize()?;
+    let repository_name = repository
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
+    let repository_id = repository.to_string_lossy().to_string();
+    let run_id = Uuid::new_v4().to_string();
+    let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
+    let connection = open(path)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
+         VALUES (?1, '', ?2, '', datetime('now'))",
+        params![repository_id, repository_name],
+    )?;
+    connection.execute(
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, logs_path, pid, hostname)
+         VALUES (?1, ?2, 'merge', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5)",
+        params![run_id, repository_id, logs_path, std::process::id(), hostname()?],
+    )?;
+    Ok(Run {
+        id: run_id,
+        repository_id,
+        command: "merge".to_string(),
+        status: "running".to_string(),
+        base_sha: None,
+        image: None,
+        logs_path: Some(logs_path),
+    })
 }
 
 pub fn heartbeat(path: &Path, lease_id: &str, run_id: &str) -> Result<(), ClaimError> {
