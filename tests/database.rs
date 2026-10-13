@@ -1,8 +1,8 @@
 use alucard::{
     abandoned_task_claims, acquire_pr, acquire_task, begin_operation, finish_operation, heartbeat,
-    migrate, open, prepare_run, record_task_pr, release, release_abandoned_task_claim, run_command,
-    start_retry_run, start_task_retry_run, status, task_claim_attempts, transition_task,
-    AbandonedTaskClaim, ClaimError, RunOptions, TaskStatus,
+    migrate, open, prepare_run, record_task_pr, record_task_pr_gate_state, release,
+    release_abandoned_task_claim, run_command, start_retry_run, start_task_retry_run, status,
+    task_claim_attempts, transition_task, AbandonedTaskClaim, ClaimError, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -815,6 +815,17 @@ fn opened_pr_moves_the_claimed_task_to_in_flight() {
             )
             .unwrap(),
         42
+    );
+    record_task_pr_gate_state(&path, "task", 42, "ci_missing").unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT gate_state FROM pull_requests WHERE task_id = 'task'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "ci_missing"
     );
 }
 

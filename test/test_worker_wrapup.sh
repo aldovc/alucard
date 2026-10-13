@@ -215,7 +215,6 @@ chmod +x "$MOCK_BIN/timeout" "$MOCK_BIN/docker" "$MOCK_BIN/gh"
 WRAPUP_TURNS=9   # not the default, so a frozen number cannot pass
 EXTRA_RUN_ARGS=()
 PRE_RUN_HOOK=""
-
 run_scenario() {
   local name="$1"; shift
   local root="$TEST_DIR/$name" target remote

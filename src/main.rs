@@ -4,17 +4,19 @@ use alucard::{
     abandoned_task_claims, begin_operation, build_image, compose_role_prompt, database_path,
     find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
     import_github_tasks, import_local_tasks, local_queue_with_open_issues,
-    mark_claim_needs_reconciliation, migrate, open, parse_tasks, prepare_run, recent_runs,
-    record_recovery_failure, record_recovery_pr, record_task_pr, release,
-    release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
-    run_reconciliation_reason, run_recovery, start_task_retry_run, start_task_run, status,
-    task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
-    warn_if_stale_image, AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask,
-    Provider, RecoveryPullRequest, RunOptions, TaskStatus,
+    local_queue_with_open_prs, mark_claim_needs_reconciliation, migrate, open, parse_tasks,
+    prepare_run, recent_runs, record_recovery_failure, record_recovery_pr, record_task_pr,
+    record_task_pr_gate_state, release, release_abandoned_task_claim, run_claims,
+    run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
+    start_task_retry_run, start_task_run, status, task_claim_attempts, task_id, task_is_pending,
+    toolchain_preflight, transition_task, warn_if_stale_image, write_task_headings,
+    AgentInvocation, AgentRole, AgentSettings, GithubPullRequest, GithubTask, Provider,
+    RecoveryPullRequest, RunOptions, TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
 
 const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket's.";
@@ -613,6 +615,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         .ok()
         .map(|()| cache.join("playwright-browsers"));
     let github_repo = github_repo_slug(&options.queue.repository);
+    let mut checks_available = true;
     if !options.no_build {
         if let Err(error) = build_image(&tools, &options.image) {
             return fail(&format!("alucard: {error}"));
@@ -774,6 +777,55 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         let _ = finish_run(&database, &attempt_run.id, "failed");
                         return fail(&format!("alucard: {error}"));
                     }
+                    if let Some(local_id) = selected.local_id.as_ref() {
+                        let Some(file) = task_file.as_deref() else {
+                            unreachable!("local task has a task file");
+                        };
+                        let contents = fs::read_to_string(file).map_err(|error| error.to_string());
+                        match contents.and_then(|contents| {
+                            write_task_headings(
+                                file,
+                                &contents,
+                                &[TaskHeadingUpdate {
+                                    id: local_id.clone(),
+                                    state: TaskState::InFlight,
+                                    pr_number: Some(number),
+                                    previous_pr_number: None,
+                                }],
+                            )
+                        }) {
+                            Ok(()) => {}
+                            Err(error) => eprintln!("alucard: {error}"),
+                        }
+                    }
+                    match (CiGate {
+                        tools: &tools,
+                        settings: &settings,
+                        options: &options,
+                        playwright_cache: playwright_cache.as_deref(),
+                        github_repo: github_repo.as_deref(),
+                    })
+                    .run(
+                        &prepared,
+                        &branch,
+                        number,
+                        iteration,
+                        &mut checks_available,
+                    ) {
+                        Ok(result) => {
+                            if let Err(error) = record_task_pr_gate_state(
+                                &database,
+                                &selected.ledger_id,
+                                number,
+                                result.gate_state(),
+                            ) {
+                                eprintln!(
+                                    "alucard: could not record CI gate for PR #{number}: {error}"
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!("alucard: CI gate for PR #{number}: {error}"),
+                    }
                     let _ = release(&database, &claim.id, &owner_run_id);
                     let _ = finish_run(&database, &attempt_run.id, "completed");
                     break;
@@ -841,7 +893,9 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     }
                     if let Err(error) = recover_worker_changes(
                         &database,
+                        &tools,
                         &options,
+                        &settings,
                         &selected,
                         &claim.id,
                         &owner_run_id,
@@ -849,6 +903,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         iteration,
                         classification,
                         result.as_ref().ok().and_then(|value| value.status),
+                        &log,
                     ) {
                         eprintln!("alucard: recovery requires human attention: {error}");
                         let _ = transition_task(
@@ -1087,10 +1142,438 @@ fn remote_branch_exists(repository: &Path, branch: &str) -> Result<bool, String>
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CiResult {
+    Green,
+    Failed,
+    Missing,
+}
+
+impl CiResult {
+    fn gate_state(self) -> &'static str {
+        match self {
+            Self::Green => "ci_green",
+            Self::Failed => "ci_failed",
+            Self::Missing => "ci_missing",
+        }
+    }
+}
+
+struct CiGate<'a> {
+    tools: &'a Path,
+    settings: &'a AgentSettings,
+    options: &'a RunCommandOptions,
+    playwright_cache: Option<&'a Path>,
+    github_repo: Option<&'a str>,
+}
+
+impl CiGate<'_> {
+    fn run(
+        &self,
+        prepared: &alucard::PreparedRun,
+        branch: &str,
+        pr_number: i64,
+        iteration: usize,
+        checks_available: &mut bool,
+    ) -> Result<CiResult, String> {
+        let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
+        let remote = remote.trim();
+        for attempt in 1..=3 {
+            let head = gh_text(
+                &prepared.clone,
+                &[
+                    "pr",
+                    "view",
+                    &pr_number.to_string(),
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+            )?;
+            match probe_ci(
+                &prepared.clone,
+                pr_number,
+                branch,
+                head.trim(),
+                checks_available,
+            )? {
+                CiResult::Green => {
+                    println!("CI gate: PR #{pr_number} green — ready for review.");
+                    return Ok(CiResult::Green);
+                }
+                CiResult::Missing => {
+                    eprintln!("CI gate: no CI ran for PR #{pr_number} — not green; review must not treat this PR as ready to merge.");
+                    let _ = execute_command(
+                        "gh",
+                        &[
+                            "pr",
+                            "comment",
+                            &pr_number.to_string(),
+                            "--body",
+                            no_ci_comment(),
+                        ],
+                        &prepared.clone,
+                        Some(Duration::from_secs(2700)),
+                    );
+                    return Ok(CiResult::Missing);
+                }
+                CiResult::Failed if attempt == 3 => {
+                    eprintln!("CI gate: PR #{pr_number} still failing after 3 check attempts.");
+                    return Ok(CiResult::Failed);
+                }
+                CiResult::Failed => {}
+            }
+
+            let failure_log =
+                failed_run_log(&prepared.clone, branch, head.trim()).unwrap_or_default();
+            let checkout = prepared.directory.join(format!("fix-{attempt}"));
+            let checkout_text = checkout.display().to_string();
+            let mut agent_invoked = false;
+            let repair = (|| {
+                let clone = execute_command(
+                    "git",
+                    &[
+                        "clone",
+                        "--quiet",
+                        "--branch",
+                        branch,
+                        remote,
+                        &checkout_text,
+                    ],
+                    &prepared.directory,
+                    Some(Duration::from_secs(120)),
+                )
+                .map_err(|error| error.to_string())?;
+                if !clone.status.success() {
+                    return Err(String::from_utf8_lossy(&clone.stderr).trim().to_string());
+                }
+                let prompt = ci_fix_prompt(self.tools, pr_number, branch, &failure_log)?;
+                let log = prepared
+                    .directory
+                    .join(format!("iter-{iteration}-fix-{attempt}.jsonl"));
+                let name = format!("alucard-fix-{}-{attempt}", prepared.run.id);
+                let fix_iteration = format!("{iteration}-fix-{attempt}");
+                agent_invoked = true;
+                let _ = AgentInvocation {
+                    role: AgentRole::CiFix,
+                    name: &name,
+                    image: &self.options.image,
+                    env_file: &self.options.env_file,
+                    worktree: &checkout,
+                    prompt: &prompt,
+                    timeout_minutes: self.options.timeout_minutes,
+                    network: None,
+                    playwright_cache: self.playwright_cache,
+                    database_url: None,
+                    github_repo: self.github_repo,
+                    worktree_read_only: false,
+                    output_dir: None,
+                    extra_env: &[("ALUCARD_ITER", &fix_iteration)],
+                }
+                .invoke(self.settings, &log);
+                Ok(())
+            })();
+            if agent_invoked {
+                cleanup_repair_checkout(&checkout);
+            } else {
+                let _ = fs::remove_dir_all(&checkout);
+            }
+            repair?;
+        }
+        Ok(CiResult::Failed)
+    }
+}
+
+fn probe_ci(
+    repository: &Path,
+    pr_number: i64,
+    branch: &str,
+    head: &str,
+    checks_available: &mut bool,
+) -> Result<CiResult, String> {
+    probe_ci_with(
+        repository,
+        pr_number,
+        branch,
+        head,
+        checks_available,
+        &mut |args, timeout| {
+            execute_command("gh", args, repository, Some(timeout))
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn probe_ci_with<F>(
+    repository: &Path,
+    pr_number: i64,
+    branch: &str,
+    head: &str,
+    checks_available: &mut bool,
+    command: &mut F,
+) -> Result<CiResult, String>
+where
+    F: FnMut(&[&str], Duration) -> Result<std::process::Output, String>,
+{
+    if !*checks_available {
+        return poll_ci_run_list_with(
+            repository,
+            pr_number,
+            branch,
+            head,
+            command,
+            &mut Instant::now,
+            &mut std::thread::sleep,
+        );
+    }
+    let checks = command(
+        &[
+            "pr",
+            "checks",
+            &pr_number.to_string(),
+            "--watch",
+            "--interval",
+            "30",
+        ],
+        Duration::from_secs(2700),
+    )?;
+    if checks.status.success() {
+        return Ok(CiResult::Green);
+    }
+    let error = String::from_utf8_lossy(&checks.stderr);
+    if error.contains("no checks reported") {
+        return Ok(CiResult::Missing);
+    }
+    if !error.contains("Resource not accessible") {
+        return Ok(CiResult::Failed);
+    }
+    *checks_available = false;
+    poll_ci_run_list_with(
+        repository,
+        pr_number,
+        branch,
+        head,
+        command,
+        &mut Instant::now,
+        &mut std::thread::sleep,
+    )
+}
+
+fn poll_ci_run_list_with<F, N, S>(
+    _repository: &Path,
+    pr_number: i64,
+    branch: &str,
+    head: &str,
+    command: &mut F,
+    now: &mut N,
+    sleep: &mut S,
+) -> Result<CiResult, String>
+where
+    F: FnMut(&[&str], Duration) -> Result<std::process::Output, String>,
+    N: FnMut() -> Instant,
+    S: FnMut(Duration),
+{
+    let deadline = now() + Duration::from_secs(2700);
+    let mut absent_probes = 0;
+    loop {
+        let output = command(
+            &[
+                "run",
+                "list",
+                "--branch",
+                branch,
+                "--json",
+                "status,conclusion,databaseId,headSha",
+            ],
+            Duration::from_secs(2700),
+        )?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let mut runs: Vec<serde_json::Value> = serde_json::from_str(&output)
+            .map_err(|error| format!("invalid gh run list response: {error}"))?;
+        runs.retain(|run| run["status"].as_str() != Some("queued"));
+        let branch_has_runs = !runs.is_empty();
+        if let Some(result) = current_head_ci_result(&runs, head) {
+            return Ok(result);
+        }
+        if runs.iter().all(|run| run["headSha"].as_str() != Some(head)) {
+            let limit = if branch_has_runs { 2 } else { 4 };
+            absent_probes += 1;
+            if absent_probes >= limit {
+                if branch_has_runs {
+                    eprintln!("CI gate: no run for current HEAD {head}; older SHAs on this branch did run.");
+                } else {
+                    eprintln!("CI gate: no CI runs visible for PR #{pr_number}.");
+                }
+                return Ok(CiResult::Missing);
+            }
+        }
+        if now() >= deadline {
+            return Ok(CiResult::Missing);
+        }
+        sleep(Duration::from_secs(30));
+    }
+}
+
+fn current_head_ci_result(runs: &[serde_json::Value], head: &str) -> Option<CiResult> {
+    let current = runs
+        .iter()
+        .filter(|run| run["headSha"].as_str() == Some(head))
+        .collect::<Vec<_>>();
+    if current.is_empty()
+        || current
+            .iter()
+            .any(|run| run["status"].as_str() != Some("completed"))
+    {
+        return None;
+    }
+    if current
+        .iter()
+        .any(|run| matches!(run["conclusion"].as_str(), Some("failure" | "timed_out")))
+    {
+        Some(CiResult::Failed)
+    } else {
+        Some(CiResult::Green)
+    }
+}
+
+fn failed_run_log(repository: &Path, branch: &str, head: &str) -> Result<String, String> {
+    failed_run_log_with(repository, branch, head, &mut |args, timeout| {
+        execute_command("gh", args, repository, Some(timeout)).map_err(|error| error.to_string())
+    })
+}
+
+fn failed_run_log_with<F>(
+    _repository: &Path,
+    branch: &str,
+    head: &str,
+    command: &mut F,
+) -> Result<String, String>
+where
+    F: FnMut(&[&str], Duration) -> Result<std::process::Output, String>,
+{
+    let output = command(
+        &[
+            "run",
+            "list",
+            "--branch",
+            branch,
+            "--json",
+            "databaseId,conclusion,headSha",
+        ],
+        Duration::from_secs(2700),
+    )?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let output = String::from_utf8_lossy(&output.stdout).to_string();
+    let runs: Vec<serde_json::Value> = serde_json::from_str(&output)
+        .map_err(|error| format!("invalid gh run list response: {error}"))?;
+    let Some(id) = runs.iter().find_map(|run| {
+        (run["conclusion"].as_str() == Some("failure") && run["headSha"].as_str() == Some(head))
+            .then(|| run["databaseId"].as_i64())
+            .flatten()
+    }) else {
+        return Ok(String::new());
+    };
+    command(
+        &["run", "view", &id.to_string(), "--log-failed"],
+        Duration::from_secs(2700),
+    )
+    .and_then(|output| {
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .take(400)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    })
+}
+
+fn ci_fix_prompt(
+    tools: &Path,
+    pr_number: i64,
+    branch: &str,
+    failure_log: &str,
+) -> Result<String, String> {
+    let instructions = fs::read_to_string(tools.join("alucard-ci-fix-prompt.md"))
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "<instructions>\n{}\n</instructions>\n<pr_num>{pr_number}</pr_num>\n<branch>{branch}</branch>\n<failure_log>\n{}\n</failure_log>",
+        instructions.trim_end_matches('\n'),
+        xml_escape(failure_log),
+    ))
+}
+
+fn no_ci_comment() -> &'static str {
+    "**🤖 Alucard CI gate: no CI ran — not green**\n\nNo CI checks reported for this PR's head commit. Workflows may be missing or disabled, or the token cannot see their runs. The agents ran only the checks the container can run, so nothing has run this repository's full suite.\n\nReview continues, but an approval will not mark this PR ready to merge. Run the full checks before merging."
+}
+
+fn gh_text(repository: &Path, args: &[&str]) -> Result<String, String> {
+    let output = execute_command("gh", args, repository, Some(Duration::from_secs(2700)))
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn git_output(repository: &Path, args: &[&str]) -> Result<String, String> {
+    let output = execute_command("git", args, repository, Some(Duration::from_secs(120)))
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn cleanup_repair_checkout(checkout: &Path) {
+    if !checkout.is_dir() {
+        return;
+    }
+    let dirty = git_output(
+        checkout,
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
+    let unpublished = git_output(
+        checkout,
+        &[
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--branches",
+            "--not",
+            "--remotes=origin",
+        ],
+    );
+    let stashes = git_output(checkout, &["stash", "list"]);
+    let clean = dirty.is_ok_and(|value| value.is_empty())
+        && unpublished.is_ok_and(|value| value.trim() == "0")
+        && stashes.is_ok_and(|value| value.is_empty());
+    if clean {
+        let _ = fs::remove_dir_all(checkout);
+    } else {
+        eprintln!(
+            "CI gate: unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
+            checkout.display()
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn recover_worker_changes(
     database: &Path,
+    tools: &Path,
     options: &RunCommandOptions,
+    settings: &AgentSettings,
     task: &SelectedRunTask,
     lease_id: &str,
     run_id: &str,
@@ -1098,6 +1581,7 @@ fn recover_worker_changes(
     iteration: usize,
     classification: alucard::AgentExit,
     status: Option<i32>,
+    worker_log: &Path,
 ) -> Result<(), String> {
     if classification == alucard::AgentExit::Clean
         || (classification == alucard::AgentExit::Transport && status == Some(0))
@@ -1139,6 +1623,24 @@ fn recover_worker_changes(
             &options.queue.repository,
         );
     }
+    let handoff = if wrapup_applies(classification) && wrapup_enabled(settings) {
+        run_wrapup_agent(
+            tools,
+            options,
+            settings,
+            task,
+            prepared,
+            iteration,
+            classification,
+            status,
+            worker_log,
+        )
+    } else {
+        None
+    };
+    let dirty = execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
+        .map_err(|error| error.to_string())?;
+    let dirty = !dirty.stdout.is_empty();
     if dirty {
         let add = execute_command("git", &["add", "-A"], &prepared.clone, None)
             .map_err(|error| error.to_string())?;
@@ -1219,7 +1721,13 @@ fn recover_worker_changes(
         );
     }
     let title = recovery_title(iteration, classification, status);
-    let body = recovery_body(task, classification, status, commit_count);
+    let body = recovery_body(
+        task,
+        classification,
+        status,
+        commit_count,
+        handoff.as_deref(),
+    );
     let pr = begin_operation(
         database,
         &prepared.run.repository_id,
@@ -1520,11 +2028,177 @@ fn recovery_class(classification: alucard::AgentExit) -> &'static str {
     }
 }
 
+fn wrapup_applies(classification: alucard::AgentExit) -> bool {
+    matches!(
+        classification,
+        alucard::AgentExit::Exhausted | alucard::AgentExit::Failed
+    )
+}
+
+fn wrapup_enabled(settings: &AgentSettings) -> bool {
+    let turns = settings.turns(AgentRole::Wrapup);
+    !turns.is_empty()
+        && turns.bytes().all(|byte| byte.is_ascii_digit())
+        && turns.parse::<u64>().is_ok_and(|turns| turns > 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_wrapup_agent(
+    tools: &Path,
+    options: &RunCommandOptions,
+    settings: &AgentSettings,
+    task: &SelectedRunTask,
+    prepared: &alucard::PreparedRun,
+    iteration: usize,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+    worker_log: &Path,
+) -> Option<String> {
+    let output_dir = prepared.directory.join("wrapup-output");
+    if fs::create_dir(&output_dir).is_err() {
+        return None;
+    }
+    let log = prepared
+        .directory
+        .join(format!("iter-{iteration}-wrapup.jsonl"));
+    let name = format!("alucard-wrapup-{iteration}-{}", prepared.run.id);
+    let agent_iteration = format!("{iteration}-wrapup");
+    let base = prepared.run.base_sha.as_deref().unwrap_or("HEAD");
+    let prompt = wrapup_prompt(
+        tools,
+        task,
+        &options.base,
+        base,
+        classification,
+        status,
+        &worker_last_words(worker_log, settings.provider(AgentRole::Worker).ok()),
+    )
+    .ok();
+    if let Some(prompt) = prompt {
+        let _ = AgentInvocation {
+            role: AgentRole::Wrapup,
+            name: &name,
+            image: &options.image,
+            env_file: &options.env_file,
+            worktree: &prepared.clone,
+            prompt: &prompt,
+            timeout_minutes: options.timeout_minutes,
+            network: None,
+            playwright_cache: None,
+            database_url: None,
+            github_repo: None,
+            worktree_read_only: false,
+            output_dir: Some(&output_dir),
+            extra_env: &[("ALUCARD_ITER", &agent_iteration)],
+        }
+        .invoke(settings, &log);
+    }
+    let handoff = fs::read_to_string(output_dir.join(".alucard-handoff"))
+        .ok()
+        .filter(|handoff| !handoff.is_empty());
+    let _ = fs::remove_dir_all(output_dir);
+    handoff
+}
+
+fn worker_last_words(log: &Path, provider: Option<Provider>) -> String {
+    let Ok(log) = fs::read_to_string(log) else {
+        return "No narration was captured from the worker.".to_string();
+    };
+    let mut words = Vec::new();
+    for line in log.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match provider {
+            Some(Provider::Codex)
+                if record["type"] == "item.completed"
+                    && record["item"]["type"] == "agent_message" =>
+            {
+                if let Some(text) = record["item"]["text"].as_str() {
+                    words.push(text.to_string());
+                }
+            }
+            Some(Provider::Claude) if record["type"] == "assistant" => {
+                if let Some(content) = record["message"]["content"].as_array() {
+                    words.extend(content.iter().filter_map(|item| {
+                        (item["type"] == "text")
+                            .then(|| item["text"].as_str())
+                            .flatten()
+                            .map(str::to_string)
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    let words = words.join("\n");
+    if words.is_empty() {
+        return "No narration was captured from the worker.".to_string();
+    }
+    if words.chars().count() > 4000 {
+        return format!(
+            "…{}",
+            words
+                .chars()
+                .rev()
+                .take(4000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
+    }
+    words
+}
+
+fn wrapup_prompt(
+    tools: &Path,
+    task: &SelectedRunTask,
+    base_branch: &str,
+    base_sha: &str,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+    last_words: &str,
+) -> Result<String, String> {
+    let instructions = fs::read_to_string(tools.join("alucard-wrapup-prompt.md"))
+        .map_err(|error| error.to_string())?
+        .trim_end_matches('\n')
+        .to_string();
+    let ticket = match (&task.issue, &task.local_id) {
+        (Some(issue), _) => format!("issue #{}", issue.number),
+        (None, Some(id)) => format!("task {id}"),
+        (None, None) => "unknown — the worker did not claim a ticket".to_string(),
+    };
+    let mut prompt = format!(
+        "<instructions>\n{instructions}\n</instructions>\n<ticket>{}</ticket>\n<stop_reason>The worker {} (rc={}) before opening a PR.</stop_reason>\n<base_branch>{}</base_branch>\n<base_sha>{}</base_sha>\n<worker_last_words>\n{}\n</worker_last_words>",
+        xml_escape(&ticket),
+        recovery_stop_description(classification),
+        status.unwrap_or(1),
+        xml_escape(base_branch),
+        xml_escape(base_sha),
+        xml_escape(last_words),
+    );
+    if task.issue.is_none() {
+        let local = WorkerLocalTaskPrompt {
+            id: task.local_id.as_deref(),
+            title: &task.local_title,
+            body: &task.local_body,
+        };
+        prompt.push_str(&format!(
+            "\n<task>{}</task>\n<parent_context>{}</parent_context>",
+            xml_escape(&serde_json::to_string(&local).expect("local task is serializable")),
+            xml_escape(&task.parent_context),
+        ));
+    }
+    Ok(prompt)
+}
+
 fn recovery_body(
     task: &SelectedRunTask,
     classification: alucard::AgentExit,
     status: Option<i32>,
     commits: usize,
+    handoff: Option<&str>,
 ) -> String {
     let (reference, finish, handback) = match (&task.issue, &task.local_id) {
         (Some(issue), _) => (
@@ -1545,8 +2219,12 @@ fn recovery_body(
     } else {
         format!("{reference}\n\n")
     };
+    let handoff = handoff
+        .filter(|handoff| !handoff.is_empty())
+        .map(|handoff| format!("\n\n## Handoff from the wrap-up agent\n\n{handoff}"))
+        .unwrap_or_default();
     format!(
-        "{reference}**🤖 Alucard recovery PR** — the worker {stop} (rc={}) before opening a PR. Its {commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.\n\nThis is not a finished change. What each next step does:\n\n- **Finish it here** — {finish}\n- **Hand it back** — {handback}\n- **`alucard continue <PR_NUM>`** runs the CI and review gates on what is here. It does not resume implementation.",
+        "{reference}**🤖 Alucard recovery PR** — the worker {stop} (rc={}) before opening a PR. Its {commits} commit(s), plus whatever was still uncommitted, are pushed here so the work isn't lost. Nothing on this branch has been through CI or review, and the last commit may be mid-edit.{handoff}\n\nThis is not a finished change. What each next step does:\n\n- **Finish it here** — {finish}\n- **Hand it back** — {handback}\n- **`alucard continue <PR_NUM>`** runs the CI and review gates on what is here. It does not resume implementation.",
         status.unwrap_or(1)
     )
 }
@@ -1616,11 +2294,22 @@ fn select_run_task(
     database: &Path,
 ) -> Result<Option<SelectedRunTask>, String> {
     if let Some(file) = task_file {
-        let parsed = parse_tasks(&fs::read_to_string(file).map_err(|error| error.to_string())?)
-            .map_err(|errors| errors.join("\n"))?;
-        let tasks = local_queue_with_open_issues(
+        let contents = fs::read_to_string(file).map_err(|error| error.to_string())?;
+        let mut parsed = parse_tasks(&contents).map_err(|errors| errors.join("\n"))?;
+        reconcile_local_tasks(file, &contents, &parsed, &options.repository)?;
+        if parsed
+            .tasks
+            .iter()
+            .any(|task| task.state == TaskState::InFlight && task.pr_number.is_some())
+        {
+            parsed = parse_tasks(&fs::read_to_string(file).map_err(|error| error.to_string())?)
+                .map_err(|errors| errors.join("\n"))?;
+        }
+        let open_prs = fetch_open_local_prs(&options.repository)?;
+        let tasks = local_queue_with_open_prs(
             &parsed.tasks,
             fetch_open_issue_numbers(&options.repository).as_deref(),
+            &open_prs,
         );
         migrate(database).map_err(|error| error.to_string())?;
         let mut connection = open(database).map_err(|error| error.to_string())?;
@@ -1724,6 +2413,54 @@ fn select_run_task(
         local_body: String::new(),
         parent_context: String::new(),
     }))
+}
+
+fn reconcile_local_tasks(
+    file: &Path,
+    contents: &str,
+    parsed: &alucard::ParsedTasks,
+    repository: &Path,
+) -> Result<(), String> {
+    let mut updates = Vec::new();
+    for task in parsed
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::InFlight && task.pr_number.is_some())
+    {
+        let number = task.pr_number.expect("filtered above");
+        let output = match gh_output(
+            repository,
+            &[
+                "pr",
+                "view",
+                &number.to_string(),
+                "--json",
+                "state",
+                "--jq",
+                ".state",
+            ],
+            "could not inspect pull request",
+        ) {
+            Ok(output) => output,
+            Err(_) => return Ok(()),
+        };
+        match String::from_utf8_lossy(&output).trim() {
+            "MERGED" => updates.push(TaskHeadingUpdate {
+                id: task.id.clone(),
+                state: TaskState::Done,
+                pr_number: Some(number),
+                previous_pr_number: None,
+            }),
+            "CLOSED" => updates.push(TaskHeadingUpdate {
+                id: task.id.clone(),
+                state: TaskState::Pending,
+                pr_number: None,
+                previous_pr_number: Some(number),
+            }),
+            _ => {}
+        }
+    }
+    write_task_headings(file, contents, &updates)
 }
 
 fn worker_prompt(
@@ -2050,7 +2787,7 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             ))
         }
     };
-    let parsed = match parse_tasks(&contents) {
+    let mut parsed = match parse_tasks(&contents) {
         Ok(parsed) => parsed,
         Err(errors) => {
             return fail(&format!(
@@ -2060,6 +2797,34 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             ))
         }
     };
+    if let Err(error) = reconcile_local_tasks(&task_file, &contents, &parsed, &options.repository) {
+        return fail(&format!("alucard: {error}"));
+    }
+    if parsed
+        .tasks
+        .iter()
+        .any(|task| task.state == TaskState::InFlight && task.pr_number.is_some())
+    {
+        let current = match fs::read_to_string(&task_file) {
+            Ok(contents) => contents,
+            Err(error) => {
+                return fail(&format!(
+                    "alucard: cannot read {}: {error}",
+                    task_file.display()
+                ))
+            }
+        };
+        parsed = match parse_tasks(&current) {
+            Ok(parsed) => parsed,
+            Err(errors) => {
+                return fail(&format!(
+                    "alucard: invalid tasks file {}:\n{}",
+                    task_file.display(),
+                    errors.join("\n")
+                ))
+            }
+        };
+    }
     let path = match database_path(db_path) {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
@@ -2081,9 +2846,18 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         .any(|task| !task.issue_blockers.is_empty())
         .then(|| fetch_open_issue_numbers(&options.repository))
         .flatten();
-    match serde_json::to_string_pretty(&local_queue_with_open_issues(
+    let open_prs = if locally_eligible.is_empty() {
+        Vec::new()
+    } else {
+        match fetch_open_local_prs(&options.repository) {
+            Ok(pull_requests) => pull_requests,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        }
+    };
+    match serde_json::to_string_pretty(&local_queue_with_open_prs(
         &parsed.tasks,
         open_issues.as_deref(),
+        &open_prs,
     )) {
         Ok(queue) => {
             println!("{queue}");
@@ -2151,6 +2925,25 @@ fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>,
             format!("{context}: {error}")
         })
     }
+}
+
+fn fetch_open_local_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
+    let output = gh_output(
+        repository,
+        &[
+            "api",
+            "--paginate",
+            "--slurp",
+            "repos/{owner}/{repo}/pulls?state=open&per_page=100",
+        ],
+        "could not list open pull requests",
+    )?;
+    if output.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice::<Vec<Vec<GithubPullRequest>>>(&output)
+        .map(|pages| pages.into_iter().flatten().collect())
+        .map_err(|error| format!("could not parse open pull requests: {error}"))
 }
 
 fn fetch_github_issues(repository: &Path) -> Result<Vec<GithubTask>, String> {
@@ -2488,6 +3281,18 @@ fn version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Output;
+
+    fn command_output(stdout: &str, stderr: &str, status: i32) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
 
     #[test]
     fn worker_prompt_matches_bash_for_pinned_issues_and_local_tasks() {
@@ -2609,6 +3414,281 @@ printf '%s' "$FULL_PROMPT""#,
     }
 
     #[test]
+    fn ci_run_list_uses_only_the_current_head() {
+        let runs = serde_json::json!([
+            {"headSha": "old", "status": "completed", "conclusion": "failure"},
+            {"headSha": "head", "status": "completed", "conclusion": "success"}
+        ]);
+        assert_eq!(
+            current_head_ci_result(runs.as_array().unwrap(), "head"),
+            Some(CiResult::Green)
+        );
+        assert_eq!(
+            current_head_ci_result(runs.as_array().unwrap(), "other"),
+            None
+        );
+    }
+
+    #[test]
+    fn ci_checks_denial_uses_run_list_for_later_gates() {
+        let repository = Path::new(".");
+        let mut available = true;
+        let checks_calls = Cell::new(0);
+        let mut outputs = VecDeque::from([
+            command_output("", "Resource not accessible by integration", 1),
+            command_output(
+                r#"[{"headSha":"head","status":"completed","conclusion":"success"}]"#,
+                "",
+                0,
+            ),
+            command_output(
+                r#"[{"headSha":"head","status":"completed","conclusion":"success"}]"#,
+                "",
+                0,
+            ),
+        ]);
+        let mut command = |args: &[&str], _timeout| {
+            if args.starts_with(&["pr", "checks"]) {
+                checks_calls.set(checks_calls.get() + 1);
+            }
+            Ok(outputs.pop_front().unwrap())
+        };
+
+        assert_eq!(
+            probe_ci_with(
+                repository,
+                1,
+                "branch",
+                "head",
+                &mut available,
+                &mut command,
+            )
+            .unwrap(),
+            CiResult::Green
+        );
+        assert_eq!(
+            probe_ci_with(
+                repository,
+                2,
+                "branch",
+                "head",
+                &mut available,
+                &mut command,
+            )
+            .unwrap(),
+            CiResult::Green
+        );
+
+        assert!(!available);
+        assert_eq!(checks_calls.get(), 1);
+    }
+
+    #[test]
+    fn ci_fix_prompt_uses_the_current_head_failed_run_log() {
+        let mut outputs = VecDeque::from([
+            command_output(
+                r#"[{"databaseId":11,"headSha":"old","conclusion":"failure"},{"databaseId":22,"headSha":"head","conclusion":"failure"}]"#,
+                "",
+                0,
+            ),
+            command_output("selected <failure> log", "", 0),
+        ]);
+        let mut command = |args: &[&str], _timeout| {
+            if args[1] == "view" {
+                assert_eq!(args[2], "22");
+            }
+            Ok(outputs.pop_front().unwrap())
+        };
+
+        let log = failed_run_log_with(Path::new("."), "branch", "head", &mut command).unwrap();
+        let prompt =
+            ci_fix_prompt(Path::new(env!("CARGO_MANIFEST_DIR")), 1, "branch", &log).unwrap();
+
+        assert!(prompt.contains("<failure_log>\nselected &lt;failure&gt; log\n</failure_log>"));
+    }
+
+    #[test]
+    fn ci_fix_failed_run_log_is_limited_to_400_lines() {
+        let mut outputs = VecDeque::from([
+            command_output(
+                r#"[{"databaseId":22,"headSha":"head","conclusion":"failure"}]"#,
+                "",
+                0,
+            ),
+            command_output(
+                &(0..401)
+                    .map(|line| format!("failure line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "",
+                0,
+            ),
+        ]);
+        let mut command = |_args: &[&str], _timeout| Ok(outputs.pop_front().unwrap());
+
+        let log = failed_run_log_with(Path::new("."), "branch", "head", &mut command).unwrap();
+
+        assert_eq!(log.lines().count(), 400);
+        assert!(log.starts_with("failure line 0"));
+        assert!(log.contains("failure line 399"));
+        assert!(!log.contains("failure line 400"));
+    }
+
+    #[test]
+    fn ci_fix_prompt_matches_bash() {
+        let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let failure_log = "selected <failure> & log";
+        let bash = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1/alucard"
+TOOL_DIR="$1"
+pr_num="$2"
+branch="$3"
+failure_log="$4"
+template=$(sed -n '/^    _fix_prompt="<instructions>$/,/^<\/failure_log>"$/p' "$1/alucard")
+eval "$template"
+printf '%s' "$_fix_prompt""#,
+                "bash",
+                tools.to_str().unwrap(),
+                "17",
+                "agent/test",
+                failure_log,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            bash.status.success(),
+            "{}",
+            String::from_utf8_lossy(&bash.stderr)
+        );
+        assert_eq!(
+            ci_fix_prompt(tools, 17, "agent/test", failure_log).unwrap(),
+            String::from_utf8(bash.stdout).unwrap()
+        );
+    }
+
+    #[test]
+    fn ci_fix_cleanup_retains_dirty_and_unpublished_checkouts() {
+        let root =
+            std::env::temp_dir().join(format!("alucard-ci-cleanup-{}", uuid::Uuid::new_v4()));
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let checkout = root.join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        let git = |directory: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(directory)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&root, &["init", "--bare", remote.to_str().unwrap()]);
+        git(&root, &["init", seed.to_str().unwrap()]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        git(&seed, &["config", "user.name", "Test"]);
+        fs::write(seed.join("tracked"), "initial\n").unwrap();
+        git(&seed, &["add", "tracked"]);
+        git(&seed, &["commit", "-m", "initial"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "HEAD:main"]);
+        git(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        fs::write(checkout.join("tracked"), "dirty\n").unwrap();
+        cleanup_repair_checkout(&checkout);
+        assert!(checkout.is_dir());
+
+        fs::write(checkout.join("tracked"), "committed locally\n").unwrap();
+        git(&checkout, &["config", "user.email", "test@example.com"]);
+        git(&checkout, &["config", "user.name", "Test"]);
+        git(&checkout, &["add", "tracked"]);
+        git(&checkout, &["commit", "-m", "unpublished"]);
+        cleanup_repair_checkout(&checkout);
+        assert!(checkout.is_dir());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ci_run_list_waits_for_a_pending_current_head_past_four_probes() {
+        let pending = r#"[{"headSha":"old","status":"completed","conclusion":"failure"},{"headSha":"head","status":"in_progress","conclusion":null}]"#;
+        let completed = r#"[{"headSha":"old","status":"completed","conclusion":"failure"},{"headSha":"head","status":"completed","conclusion":"success"}]"#;
+        let mut outputs = VecDeque::from([
+            command_output(pending, "", 0),
+            command_output(pending, "", 0),
+            command_output(pending, "", 0),
+            command_output(pending, "", 0),
+            command_output(completed, "", 0),
+        ]);
+        let clock = Cell::new(Instant::now());
+        let mut command = |_args: &[&str], _timeout| Ok(outputs.pop_front().unwrap());
+        let mut now = || clock.get();
+        let mut sleep = |duration| clock.set(clock.get() + duration);
+
+        assert_eq!(
+            poll_ci_run_list_with(
+                Path::new("."),
+                1,
+                "branch",
+                "head",
+                &mut command,
+                &mut now,
+                &mut sleep,
+            )
+            .unwrap(),
+            CiResult::Green
+        );
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn ci_run_list_treats_a_queued_current_head_as_missing() {
+        let queued = r#"[{"headSha":"head","status":"queued","conclusion":null}]"#;
+        let mut outputs = VecDeque::from([
+            command_output(queued, "", 0),
+            command_output(queued, "", 0),
+            command_output(queued, "", 0),
+            command_output(queued, "", 0),
+        ]);
+        let clock = Cell::new(Instant::now());
+        let mut command = |_args: &[&str], _timeout| Ok(outputs.pop_front().unwrap());
+        let mut now = || clock.get();
+        let mut sleep = |duration| clock.set(clock.get() + duration);
+
+        assert_eq!(
+            poll_ci_run_list_with(
+                Path::new("."),
+                1,
+                "branch",
+                "head",
+                &mut command,
+                &mut now,
+                &mut sleep,
+            )
+            .unwrap(),
+            CiResult::Missing
+        );
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
     fn recovery_body_attributes_tasks_by_source() {
         let github_task = SelectedRunTask {
             ledger_id: "github".to_string(),
@@ -2633,15 +3713,76 @@ printf '%s' "$FULL_PROMPT""#,
             parent_context: String::new(),
         };
 
-        let github = recovery_body(&github_task, alucard::AgentExit::Exhausted, Some(1), 2);
+        let github = recovery_body(
+            &github_task,
+            alucard::AgentExit::Exhausted,
+            Some(1),
+            2,
+            None,
+        );
         assert!(github.starts_with("Refs #42\n\n"));
         assert!(github.contains("change the `Refs` line above to `Closes`"));
         assert!(github.contains("`alucard run --issue <N>`"));
 
-        let local = recovery_body(&local_task, alucard::AgentExit::Exhausted, Some(1), 2);
+        let local = recovery_body(&local_task, alucard::AgentExit::Exhausted, Some(1), 2, None);
         assert!(local.starts_with("Task: 7\n\n"));
         assert!(local.contains("the harness flips the task to `[x]` when this PR merges."));
         assert!(local.contains("task flips back to `[ ]` at the next queue build"));
+    }
+
+    #[test]
+    fn wrapup_prompt_matches_bash() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let task = SelectedRunTask {
+            ledger_id: String::new(),
+            issue: Some(GithubTask {
+                number: 42,
+                title: String::new(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: None,
+            }),
+            local_id: None,
+            local_title: String::new(),
+            local_body: String::new(),
+            parent_context: String::new(),
+        };
+        let bash = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1/alucard"
+TOOL_DIR="$1"
+BASE_BRANCH=main
+prompt="<instructions>
+$(<"$TOOL_DIR/alucard-wrapup-prompt.md")
+</instructions>
+<ticket>$(printf '%s' 'issue #42' | xml_escape)</ticket>
+<stop_reason>The worker ran out of turns or hit its time limit (rc=1) before opening a PR.</stop_reason>
+<base_branch>${BASE_BRANCH}</base_branch>
+<base_sha>abc</base_sha>
+<worker_last_words>
+$(printf '%s' 'last & <words>' | xml_escape)
+</worker_last_words>"
+printf '%s' "$prompt""#,
+                "bash",
+                root.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(bash.status.success());
+        assert_eq!(
+            wrapup_prompt(
+                root,
+                &task,
+                "main",
+                "abc",
+                alucard::AgentExit::Exhausted,
+                Some(1),
+                "last & <words>",
+            )
+            .unwrap(),
+            String::from_utf8(bash.stdout).unwrap()
+        );
     }
 
     #[test]
