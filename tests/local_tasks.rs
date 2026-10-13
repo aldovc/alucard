@@ -833,7 +833,11 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     let gh_root = temporary_path("queue-gh");
     fs::create_dir_all(&gh_root).unwrap();
     let gh = gh_root.join("gh");
-    fs::write(&gh, "#!/bin/sh\necho 'gh stub failed' >&2\nexit 1\n").unwrap();
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr list') printf '%s\\n' '[]' ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
+    )
+    .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     let binary = env!("CARGO_BIN_EXE_alucard");
     let contract = PathBuf::from("test/fixtures/contracts/local-tasks.md")
@@ -997,6 +1001,41 @@ fn queue_does_not_fetch_issues_for_locally_blocked_tasks() {
         serde_json::from_str::<serde_json::Value>("[]").unwrap()
     );
     assert!(!invoked.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn queue_excludes_reset_task_with_matching_open_pr() {
+    let root = temporary_path("reset-task-open-pr");
+    fs::create_dir_all(&root).unwrap();
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "## [ ] task: Reset task\n").unwrap();
+    let gh = root.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr list') printf '%s\\n' '[{\"number\":12,\"title\":\"Open work\",\"body\":\"Task: task\"}]' ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = env!("CARGO_BIN_EXE_alucard");
+
+    let output = Command::new(binary)
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "queue",
+            "--tasks",
+            tasks.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!([])
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
