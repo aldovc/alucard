@@ -5,10 +5,11 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -309,18 +310,64 @@ fn update_active_claim(
 }
 
 /// Executes an external command without involving a shell.
-pub fn run_command(program: &str, arguments: &[&str], cwd: &Path) -> io::Result<Output> {
+pub fn run_command(
+    program: &str,
+    arguments: &[&str],
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> io::Result<Output> {
     let mut command = Command::new(program);
     command
         .args(arguments)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.output()
+    let mut child = command.spawn()?;
+    let stdout = drain(child.stdout.take().expect("stdout is piped"));
+    let stderr = drain(child.stderr.take().expect("stderr is piped"));
+    let status = match timeout {
+        None => child.wait()?,
+        Some(timeout) => {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    if let Err(error) = child.kill() {
+                        if error.kind() != io::ErrorKind::InvalidInput {
+                            return Err(error);
+                        }
+                    }
+                    break child.wait()?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: join_output(stdout)?,
+        stderr: join_output(stderr)?,
+    })
+}
+
+fn drain<R: Read + Send + 'static>(mut reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_output(output: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    output
+        .join()
+        .map_err(|_| io::Error::other("command output reader panicked"))?
 }
 
 fn run_checked(program: &str, arguments: &[&str], cwd: &Path) -> Result<Output, RunError> {
-    let output = run_command(program, arguments, cwd)?;
+    let output = run_command(program, arguments, cwd, None)?;
     if output.status.success() {
         Ok(output)
     } else {
