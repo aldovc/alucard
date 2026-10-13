@@ -5,6 +5,7 @@ use alucard::{
     local_queue_with_open_issues, migrate, open, parse_tasks, status, GithubPullRequest,
     GithubTask,
 };
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::{collections::BTreeMap, fs};
@@ -33,6 +34,10 @@ fn main() -> ExitCode {
 
 const REQUIRED_TOOL_FILES: &str = include_str!("../required-tool-files.txt");
 
+fn nonempty_environment(name: &str) -> Option<OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
 struct DoctorOptions {
     repository: PathBuf,
     env_file: PathBuf,
@@ -45,15 +50,16 @@ struct DoctorOptions {
 impl DoctorOptions {
     fn parse(args: &[String], tools: &std::path::Path) -> Result<Self, String> {
         let mut options = Self {
-            repository: std::env::var_os("ALUCARD_TARGET_REPO")
+            repository: nonempty_environment("ALUCARD_TARGET_REPO")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().expect("current directory")),
-            env_file: std::env::var_os("ALUCARD_ENV_FILE")
+            env_file: nonempty_environment("ALUCARD_ENV_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| tools.join("alucard.env")),
-            image: std::env::var("ALUCARD_IMAGE")
-                .unwrap_or_else(|_| "ghcr.io/aldovc/alucard:latest".to_string()),
-            tasks: std::env::var_os("ALUCARD_TASKS_FILE").map(PathBuf::from),
+            image: nonempty_environment("ALUCARD_IMAGE")
+                .and_then(|value| value.into_string().ok())
+                .unwrap_or_else(|| "ghcr.io/aldovc/alucard:latest".to_string()),
+            tasks: nonempty_environment("ALUCARD_TASKS_FILE").map(PathBuf::from),
             github: false,
             issue: false,
         };
@@ -417,7 +423,7 @@ fn github_ref(path: &std::path::Path) -> Option<String> {
 }
 
 fn cache_path(repository: &str) -> PathBuf {
-    std::env::var_os("ALUCARD_CACHE_DIR")
+    nonempty_environment("ALUCARD_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("XDG_CACHE_HOME").map(|path| PathBuf::from(path).join("alucard"))
@@ -729,10 +735,10 @@ struct QueueOptions {
 impl QueueOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut options = Self {
-            repository: std::env::var_os("ALUCARD_TARGET_REPO")
+            repository: nonempty_environment("ALUCARD_TARGET_REPO")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().expect("current directory")),
-            tasks: std::env::var_os("ALUCARD_TASKS_FILE").map(PathBuf::from),
+            tasks: nonempty_environment("ALUCARD_TASKS_FILE").map(PathBuf::from),
             repository_set: false,
             tasks_from_flag: false,
             github: false,

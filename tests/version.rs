@@ -4,6 +4,24 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn empty_environment_defaults(command: &mut Command) -> &mut Command {
+    command
+        .env("ALUCARD_TARGET_REPO", "")
+        .env("ALUCARD_ENV_FILE", "")
+        .env("ALUCARD_IMAGE", "")
+        .env("ALUCARD_TASKS_FILE", "")
+        .env("ALUCARD_CACHE_DIR", "")
+}
+
+fn without_ledger_check(output: std::process::Output) -> String {
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with("ok: ledger "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn version_matches_bash() {
     let root = env!("CARGO_MANIFEST_DIR");
@@ -63,13 +81,87 @@ fn doctor_matches_bash_before_ledger_checks() {
         .current_dir(root)
         .output()
         .unwrap();
-    let rust = String::from_utf8(rust.stdout)
-        .unwrap()
-        .lines()
-        .filter(|line| !line.starts_with("ok: ledger "))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let rust = without_ledger_check(rust);
     assert_eq!(String::from_utf8(bash.stdout).unwrap().trim(), rust);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn doctor_empty_environment_defaults_match_bash() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let directory = std::env::temp_dir().join(format!(
+        "alucard-doctor-empty-defaults-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let database = directory.join("ledger.db");
+    assert!(Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .args(["--db-path", database.to_str().unwrap(), "db", "migrate"])
+        .status()
+        .unwrap()
+        .success());
+
+    let mut bash = Command::new("bash");
+    bash.args(["alucard", "doctor"]).current_dir(root);
+    let bash = empty_environment_defaults(&mut bash).output().unwrap();
+    let mut rust = Command::new(env!("CARGO_BIN_EXE_alucard"));
+    rust.args(["--db-path", database.to_str().unwrap(), "doctor"])
+        .current_dir(root);
+    let rust = empty_environment_defaults(&mut rust).output().unwrap();
+
+    assert!(!String::from_utf8_lossy(&rust.stderr).contains("tasks file not found"));
+    assert_eq!(
+        String::from_utf8(bash.stdout).unwrap().trim(),
+        without_ledger_check(rust)
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_empty_cache_directory_matches_bash() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let directory =
+        std::env::temp_dir().join(format!("alucard-doctor-empty-cache-{}", std::process::id()));
+    let bin = directory.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let database = directory.join("ledger.db");
+    assert!(Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .args(["--db-path", database.to_str().unwrap(), "db", "migrate"])
+        .status()
+        .unwrap()
+        .success());
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+
+    let bash = Command::new("bash")
+        .args(["alucard", "doctor", "owner/repo"])
+        .current_dir(root)
+        .env("ALUCARD_CACHE_DIR", "")
+        .env("XDG_CACHE_HOME", directory.join("cache"))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let rust = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "doctor",
+            "owner/repo",
+        ])
+        .current_dir(root)
+        .env("ALUCARD_CACHE_DIR", "")
+        .env("XDG_CACHE_HOME", directory.join("cache"))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        String::from_utf8(bash.stdout).unwrap().trim(),
+        without_ledger_check(rust)
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 
