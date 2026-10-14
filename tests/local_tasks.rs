@@ -1927,6 +1927,54 @@ fn reimport_preserves_claimed_task_status() {
 }
 
 #[test]
+fn reimport_preserves_in_flight_task_with_active_claim() {
+    let database = temporary_path("in-flight-claim-reimport").join("ledger.db");
+    migrate(&database).unwrap();
+    let mut connection = open(&database).unwrap();
+    let repository = "repo";
+    let path = PathBuf::from("tasks.md");
+    let in_flight = parse_tasks("## [>] task: Local task (PR #12)\n")
+        .unwrap()
+        .tasks;
+
+    import_local_tasks(&mut connection, repository, &path, &in_flight).unwrap();
+    let task_id: String = connection
+        .query_row("SELECT id FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+             VALUES ('run', ?1, 'run', 'running', datetime('now'), datetime('now'))",
+            [repository],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+             VALUES ('claim', ?1, 'task', ?2, 'run', 'active', datetime('now'), datetime('now'))",
+            (repository, &task_id),
+        )
+        .unwrap();
+    let reconciled = parse_tasks("## [ ] task: Local task (previous attempt: PR #12)\n")
+        .unwrap()
+        .tasks;
+
+    import_local_tasks(&mut connection, repository, &path, &reconciled).unwrap();
+
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [&task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "in_flight");
+    assert_ne!(status, "pending");
+    drop(connection);
+    fs::remove_dir_all(database.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn reimport_updates_closed_and_merged_local_pull_request_tasks() {
     let database = temporary_path("closed-local-pr-reimport").join("ledger.db");
     migrate(&database).unwrap();
