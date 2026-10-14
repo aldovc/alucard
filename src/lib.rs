@@ -574,6 +574,7 @@ mod agent_tests {
 
     #[test]
     fn build_cleanup_matches_bash_contract() {
+        let _path_lock = PATH_LOCK.lock().unwrap();
         let old = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let new = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1816,7 +1817,8 @@ fn write_measurement(log_dir: &Path, value: Value) {
 fn timestamp() -> String {
     event_timestamp()
 }
-fn repository_id(repository: &Path) -> String {
+/// Returns the ledger identity shared by checkouts of the same remote repository.
+pub fn repository_id(repository: &Path) -> String {
     let fallback = || {
         repository
             .file_name()
@@ -1846,6 +1848,32 @@ fn repository_id(repository: &Path) -> String {
         return fallback();
     };
     format!("{owner}/{name}")
+}
+
+/// Returns a task-file path relative to its repository when possible.
+pub fn repository_source_path(
+    repository: &Path,
+    source_path: &Path,
+) -> Result<String, DatabaseError> {
+    let repository = repository.canonicalize()?;
+    let source_path = source_path.canonicalize()?;
+    Ok(source_path
+        .strip_prefix(repository)
+        .unwrap_or(&source_path)
+        .to_string_lossy()
+        .to_string())
+}
+
+/// Returns the ledger identity, falling back to the canonical path without a remote.
+pub fn repository_ledger_id(repository: &Path) -> Result<String, DatabaseError> {
+    let repository = repository.canonicalize()?;
+    let has_origin = run_command("git", &["remote", "get-url", "origin"], &repository, None)
+        .is_ok_and(|output| output.status.success());
+    Ok(if has_origin {
+        repository_id(&repository)
+    } else {
+        repository.to_string_lossy().to_string()
+    })
 }
 
 fn diff_measurement(repository: &Path, base: &str, head: &str) -> Value {
@@ -3142,6 +3170,111 @@ impl From<rusqlite::Error> for ClaimError {
     }
 }
 
+fn migrate_repository_identity(
+    connection: &mut Connection,
+    repository: &Path,
+    repository_id: &str,
+) -> Result<(), DatabaseError> {
+    let legacy_id = repository.canonicalize()?.to_string_lossy().to_string();
+    if legacy_id == repository_id {
+        return Ok(());
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "DELETE FROM tasks AS legacy
+         WHERE repository_id = ?1 AND source = 'local' AND source_path LIKE ?1 || '/%'
+           AND status = 'pending'
+           AND NOT EXISTS (SELECT 1 FROM claims WHERE resource_kind = 'task' AND resource_key = legacy.id)
+           AND NOT EXISTS (SELECT 1 FROM pull_requests WHERE task_id = legacy.id)
+           AND NOT EXISTS (SELECT 1 FROM recovery WHERE task_id = legacy.id)
+           AND EXISTS (
+             SELECT 1 FROM tasks AS current
+             WHERE current.repository_id = ?2 AND current.status = 'pending'
+               AND current.source = legacy.source
+               AND current.source_path = substr(legacy.source_path, length(?1) + 2)
+               AND current.external_id = legacy.external_id
+           )",
+        (&legacy_id, repository_id),
+    )?;
+    transaction.execute(
+        "UPDATE tasks SET source_path = substr(source_path, length(?1) + 2)
+         WHERE repository_id = ?1 AND source = 'local' AND source_path LIKE ?1 || '/%'",
+        [&legacy_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM tasks AS legacy
+         WHERE repository_id = ?1 AND status = 'pending'
+           AND NOT EXISTS (SELECT 1 FROM claims WHERE resource_kind = 'task' AND resource_key = legacy.id)
+           AND NOT EXISTS (SELECT 1 FROM pull_requests WHERE task_id = legacy.id)
+           AND NOT EXISTS (SELECT 1 FROM recovery WHERE task_id = legacy.id)
+           AND EXISTS (
+             SELECT 1 FROM tasks AS current
+             WHERE current.repository_id = ?2 AND current.status = 'pending'
+               AND current.source = legacy.source AND current.source_path = legacy.source_path
+               AND current.external_id = legacy.external_id
+           )",
+        (&legacy_id, repository_id),
+    )?;
+    let conflict: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM tasks legacy
+            JOIN tasks current ON current.repository_id = ?1
+              AND current.source = legacy.source
+              AND current.source_path = legacy.source_path
+              AND current.external_id = legacy.external_id
+            WHERE legacy.repository_id = ?2
+            UNION ALL
+            SELECT 1 FROM pull_requests legacy
+            JOIN pull_requests current ON current.repository_id = ?1 AND current.number = legacy.number
+            WHERE legacy.repository_id = ?2
+            UNION ALL
+            SELECT 1 FROM claims legacy
+            JOIN claims current ON current.repository_id = ?1
+              AND current.resource_kind = legacy.resource_kind
+              AND current.resource_key = legacy.resource_key
+              AND current.state = 'active'
+            WHERE legacy.repository_id = ?2 AND legacy.state = 'active'
+        )",
+        (repository_id, &legacy_id),
+        |row| row.get(0),
+    )?;
+    if conflict {
+        return Err(DatabaseError::IdentityConflict(format!(
+            "legacy repository {legacy_id} conflicts with repository identity {repository_id}"
+        )));
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
+         SELECT ?1, owner, name, cache_path, created_at FROM repositories WHERE id = ?2",
+        (repository_id, &legacy_id),
+    )?;
+    for table in ["runs", "tasks", "claims", "pull_requests", "operations"] {
+        transaction.execute(
+            &format!("UPDATE {table} SET repository_id = ?1 WHERE repository_id = ?2"),
+            (repository_id, &legacy_id),
+        )?;
+    }
+    transaction.execute("DELETE FROM repositories WHERE id = ?1", [&legacy_id])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_ledger_repository_id(
+    connection: &mut Connection,
+    repository: &Path,
+) -> Result<String, DatabaseError> {
+    let repository_id = repository_ledger_id(repository)?;
+    migrate_repository_identity(connection, repository, &repository_id)?;
+    Ok(repository_id)
+}
+
+/// Moves records for this checkout's legacy path identity to its stable identity.
+pub fn ensure_repository_identity(path: &Path, repository: &Path) -> Result<String, DatabaseError> {
+    migrate(path)?;
+    let mut connection = open(path)?;
+    migrate_ledger_repository_id(&mut connection, repository)
+}
+
 pub fn acquire_task(path: &Path, task_id: &str, run_id: &str) -> Result<Claim, ClaimError> {
     let mut connection = open(path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3205,11 +3338,11 @@ pub fn start_task_run(
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))
         .map_err(DatabaseError::from)?;
-    let repository_id = repository.to_string_lossy().to_string();
+    let mut connection = open(path)?;
+    let repository_id = migrate_ledger_repository_id(&mut connection, &repository)?;
     let cache = cache_root.join(repository_cache_key(&repository));
     let run_id = Uuid::new_v4().to_string();
     let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
-    let mut connection = open(path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute(
         "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
@@ -3269,11 +3402,11 @@ pub fn start_task_retry_run(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
-    let repository_id = repository.to_string_lossy().to_string();
+    let mut connection = open(path)?;
+    let repository_id = migrate_ledger_repository_id(&mut connection, &repository)?;
     let run_id = Uuid::new_v4().to_string();
     let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
     let cache = cache_root.join(repository_cache_key(&repository));
-    let connection = open(path)?;
     connection.execute(
         "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
          VALUES (?1, '', ?2, ?3, datetime('now'))",
@@ -3334,10 +3467,11 @@ pub fn start_merge_run(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
-    let repository_id = repository.to_string_lossy().to_string();
+    let mut connection = open(path)?;
+    let repository_id = migrate_ledger_repository_id(&mut connection, &repository)?;
     let run_id = Uuid::new_v4().to_string();
     let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
-    let connection = open(path)?;
+    let connection = connection;
     connection.execute(
         "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
          VALUES (?1, '', ?2, '', datetime('now'))",
@@ -3378,10 +3512,10 @@ pub fn start_continue_run(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
-    let repository_id = repository.to_string_lossy().to_string();
+    let mut connection = open(path)?;
+    let repository_id = migrate_ledger_repository_id(&mut connection, &repository)?;
     let run_id = Uuid::new_v4().to_string();
     let logs_path = logs_root.join(&run_id).to_string_lossy().to_string();
-    let mut connection = open(path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute(
         "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
@@ -4096,7 +4230,8 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
-    let repository_id = repository.to_string_lossy().to_string();
+    let mut connection = open(path)?;
+    let repository_id = migrate_ledger_repository_id(&mut connection, &repository)?;
     let origin_url = run_command("git", &["remote", "get-url", "origin"], &repository, None)
         .ok()
         .filter(|output| output.status.success())
@@ -4175,7 +4310,6 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         &clone,
     )?;
 
-    let mut connection = open(path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute(
         "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
@@ -4550,6 +4684,7 @@ fn restrict_file_permissions(path: &Path) -> io::Result<()> {
 pub enum DatabaseError {
     Io(io::Error),
     Sql(rusqlite::Error),
+    IdentityConflict(String),
 }
 
 impl From<io::Error> for DatabaseError {
@@ -4569,6 +4704,7 @@ impl std::fmt::Display for DatabaseError {
         match self {
             Self::Io(error) => error.fmt(formatter),
             Self::Sql(error) => error.fmt(formatter),
+            Self::IdentityConflict(error) => error.fmt(formatter),
         }
     }
 }

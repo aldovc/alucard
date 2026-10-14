@@ -1,10 +1,12 @@
 use alucard::{
     abandoned_task_claims, acquire_pr, acquire_task, begin_operation, begin_operation_with_payload,
-    defer_operation, finish_operation, heartbeat, migrate, open, pending_operations, prepare_run,
+    defer_operation, ensure_repository_identity, finish_operation, heartbeat, import_github_tasks,
+    import_local_tasks, migrate, open, parse_tasks, pending_operations, prepare_run,
     record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
-    release_abandoned_task_claim, run_command, start_continue_run, start_retry_run,
-    start_task_retry_run, status, task_claim_attempts, transition_task, AbandonedTaskClaim,
-    ClaimError, RunOptions, TaskStatus,
+    release_abandoned_task_claim, repository_id, repository_source_path, run_command,
+    start_continue_run, start_merge_run, start_retry_run, start_task_retry_run, start_task_run,
+    status, task_claim_attempts, task_id, transition_task, AbandonedTaskClaim, ClaimError,
+    GithubTask, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,6 +107,264 @@ fn continue_run_adopts_an_unrecorded_recovery_pull_request() {
 
 fn seed_repository(path: &Path) {
     seed_repository_with_readme(path, "seed\n");
+}
+
+fn set_origin(path: &Path, origin: &str) {
+    assert!(Command::new("git")
+        .args(["remote", "add", "origin", origin])
+        .current_dir(path)
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[test]
+fn repository_identity_shares_leases_across_clones_and_keeps_tasks_distinct() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let first = root.join("first");
+    let second = root.join("second");
+    let other = root.join("other");
+    for repository in [&first, &second, &other] {
+        seed_repository(repository);
+    }
+    set_origin(&first, "https://github.com/example/widgets.git");
+    set_origin(&second, "git@github.com:example/widgets.git");
+    set_origin(&other, "https://github.com/example/other.git");
+    migrate(&path).unwrap();
+    let issues: Vec<GithubTask> = serde_json::from_str(
+        r#"[{"number":42,"title":"Shared","body":"","labels":[]},{"number":43,"title":"Other task","body":"","labels":[]}]"#,
+    )
+    .unwrap();
+    let mut connection = open(&path).unwrap();
+    import_github_tasks(&mut connection, &repository_id(&first), &issues).unwrap();
+    import_github_tasks(&mut connection, &repository_id(&other), &issues[..1]).unwrap();
+    let shared = task_id(&path, &repository_id(&second), "github", "", "42")
+        .unwrap()
+        .unwrap();
+    let distinct = task_id(&path, &repository_id(&second), "github", "", "43")
+        .unwrap()
+        .unwrap();
+    let other_task = task_id(&path, &repository_id(&other), "github", "", "42")
+        .unwrap()
+        .unwrap();
+    let logs = root.join("logs");
+    let cache = root.join("cache");
+    let (first_run, _) = start_task_run(&path, &first, &logs, &cache, None, &shared).unwrap();
+    assert_eq!(first_run.repository_id, repository_id(&second));
+    assert!(matches!(
+        start_task_run(&path, &second, &logs, &cache, None, &shared),
+        Err(ClaimError::ClaimedBy { .. })
+    ));
+    start_task_run(&path, &second, &logs, &cache, None, &distinct).unwrap();
+    start_task_run(&path, &other, &logs, &cache, None, &other_task).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repository_identity_shares_continue_merge_and_relative_local_tasks() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let first = root.join("first");
+    let second = root.join("second");
+    for repository in [&first, &second] {
+        seed_repository(repository);
+    }
+    set_origin(&first, "https://github.com/example/widgets.git");
+    set_origin(&second, "git@github.com:example/widgets.git");
+    migrate(&path).unwrap();
+    let task_contents = "## [ ] 1: Local task\n";
+    let first_tasks = first.join("tasks.md");
+    let second_tasks = second.join("tasks.md");
+    fs::write(&first_tasks, task_contents).unwrap();
+    fs::write(&second_tasks, task_contents).unwrap();
+    let tasks = parse_tasks(task_contents).unwrap().tasks;
+    let first_source_path = repository_source_path(&first, &first_tasks).unwrap();
+    let second_source_path = repository_source_path(&second, &second_tasks).unwrap();
+    assert_eq!(first_source_path, "tasks.md");
+    assert_eq!(first_source_path, second_source_path);
+    let mut connection = open(&path).unwrap();
+    import_local_tasks(
+        &mut connection,
+        &repository_id(&first),
+        Path::new(&first_source_path),
+        &tasks,
+    )
+    .unwrap();
+    let local = task_id(
+        &path,
+        &repository_id(&second),
+        "local",
+        &second_source_path,
+        "1",
+    )
+    .unwrap();
+    assert!(local.is_some());
+    let logs = root.join("logs");
+    let merged = start_merge_run(&path, &first, &logs).unwrap();
+    acquire_pr(&path, &merged.repository_id, 9, &merged.id).unwrap();
+    let competing_merge = start_merge_run(&path, &second, &logs).unwrap();
+    assert!(matches!(
+        acquire_pr(
+            &path,
+            &competing_merge.repository_id,
+            9,
+            &competing_merge.id
+        ),
+        Err(ClaimError::ClaimedBy { .. })
+    ));
+    let continued = start_continue_run(
+        &path, &first, &logs, "image", 10, "branch", "sha", "title", false,
+    )
+    .unwrap();
+    let duplicate = start_continue_run(
+        &path, &second, &logs, "image", 10, "branch", "sha", "title", false,
+    )
+    .unwrap();
+    assert_eq!(continued.task_id, duplicate.task_id);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repository_identity_migrates_legacy_rows_and_reports_live_conflicts() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let repository = root.join("checkout");
+    seed_repository(&repository);
+    set_origin(&repository, "https://github.com/example/widgets.git");
+    migrate(&path).unwrap();
+    let legacy = repository.canonicalize().unwrap().display().to_string();
+    let stable = repository_id(&repository);
+    let connection = open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'checkout', 'now')",
+            [&legacy],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+             VALUES ('legacy-task', ?1, 'github', '42', 'legacy', 'in_flight', '[]', 'now')",
+            [&legacy],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+             VALUES ('legacy-run', ?1, 'run', 'interrupted', 'now', 'now')",
+            [&legacy],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO recovery (id, task_id, original_run_id, branch, reason, created_at)
+             VALUES ('recovery', 'legacy-task', 'legacy-run', 'branch', 'failed', 'now')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        ensure_repository_identity(&path, &repository).unwrap(),
+        stable
+    );
+    let connection = open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT repository_id FROM tasks WHERE id = 'legacy-task'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        stable
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM recovery WHERE task_id = 'legacy-task'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+             VALUES ('conflict', ?1, 'github', '43', 'current', 'pending', '[]', 'now')",
+            [&stable],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'checkout', 'now')",
+            [&legacy],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+             VALUES ('legacy-conflict-task', ?1, 'github', '43', 'legacy', 'claimed', '[]', 'now')",
+            [&legacy],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(ensure_repository_identity(&path, &repository).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repository_identity_discards_pending_legacy_local_task_matching_stable_task() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let repository = root.join("checkout");
+    seed_repository(&repository);
+    set_origin(&repository, "https://github.com/example/widgets.git");
+    migrate(&path).unwrap();
+    let legacy = repository.canonicalize().unwrap().display().to_string();
+    let stable = repository_id(&repository);
+    let connection = open(&path).unwrap();
+    for repository_id in [&legacy, &stable] {
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'checkout', 'now')",
+                [repository_id],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, updated_at)
+             VALUES ('legacy-task', ?1, 'local', ?2, '1', 'legacy', 'pending', '[]', 'now')",
+            (&legacy, format!("{legacy}/tasks.md")),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, updated_at)
+             VALUES ('stable-task', ?1, 'local', 'tasks.md', '1', 'stable', 'pending', '[]', 'now')",
+            [&stable],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        ensure_repository_identity(&path, &repository).unwrap(),
+        stable
+    );
+    let connection = open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE repository_id = ?1 AND source = 'local' AND source_path = 'tasks.md' AND external_id = '1'",
+                [&stable],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn seed_repository_with_readme(path: &Path, readme: &str) {
