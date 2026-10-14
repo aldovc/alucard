@@ -1381,7 +1381,7 @@ fn recovery_operations_replay_only_deferred_failures() {
 }
 
 #[test]
-fn pending_recovery_operations_skip_a_live_publisher() {
+fn pending_recovery_operations_skip_a_live_retry_publisher() {
     let path = database_path();
     migrate(&path).unwrap();
     let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
@@ -1405,15 +1405,22 @@ fn pending_recovery_operations_skip_a_live_publisher() {
     connection
         .execute(
             "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, branch, pid, hostname)
-             VALUES ('run', 'repo', 'run', 'running', 'now', 'now', 'recovery-branch', ?1, ?2)",
-            (i64::from(std::process::id()), hostname),
+             VALUES ('owner', 'repo', 'run', 'running', 'now', 'now', 'owner-branch', 0, ?1)",
+            [&hostname],
         )
         .unwrap();
     connection
         .execute(
             "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
-             VALUES ('claim', 'repo', 'task', 'task', 'run', 'active', 'now', 'now')",
+             VALUES ('claim', 'repo', 'task', 'task', 'owner', 'active', 'now', 'now')",
             [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, branch, pid, hostname, retry_owner_run_id)
+             VALUES ('retry', 'repo', 'run', 'running', 'now', 'now', 'recovery-branch', ?1, ?2, 'owner')",
+            (i64::from(std::process::id()), hostname),
         )
         .unwrap();
     drop(connection);
@@ -1425,7 +1432,7 @@ fn pending_recovery_operations_skip_a_live_publisher() {
 
     open(&path)
         .unwrap()
-        .execute("UPDATE runs SET pid = 0 WHERE id = 'run'", [])
+        .execute("UPDATE runs SET pid = 0 WHERE id = 'retry'", [])
         .unwrap();
     assert_eq!(pending_recovery_operations(&path, "repo").unwrap().len(), 1);
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
