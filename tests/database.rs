@@ -3,9 +3,10 @@ use alucard::{
     defer_operation, ensure_repository_identity, finish_operation, heartbeat, import_github_tasks,
     import_local_tasks, migrate, open, parse_tasks, pending_operations, prepare_run,
     record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
-    release_abandoned_task_claim, repository_id, run_command, start_continue_run, start_merge_run,
-    start_retry_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
-    transition_task, AbandonedTaskClaim, ClaimError, GithubTask, RunOptions, TaskStatus,
+    release_abandoned_task_claim, repository_id, repository_source_path, run_command,
+    start_continue_run, start_merge_run, start_retry_run, start_task_retry_run, start_task_run,
+    status, task_claim_attempts, task_id, transition_task, AbandonedTaskClaim, ClaimError,
+    GithubTask, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -172,16 +173,32 @@ fn repository_identity_shares_continue_merge_and_relative_local_tasks() {
     set_origin(&first, "https://github.com/example/widgets.git");
     set_origin(&second, "git@github.com:example/widgets.git");
     migrate(&path).unwrap();
-    let tasks = parse_tasks("## [ ] 1: Local task\n").unwrap().tasks;
+    let task_contents = "## [ ] 1: Local task\n";
+    let first_tasks = first.join("tasks.md");
+    let second_tasks = second.join("tasks.md");
+    fs::write(&first_tasks, task_contents).unwrap();
+    fs::write(&second_tasks, task_contents).unwrap();
+    let tasks = parse_tasks(task_contents).unwrap().tasks;
+    let first_source_path = repository_source_path(&first, &first_tasks).unwrap();
+    let second_source_path = repository_source_path(&second, &second_tasks).unwrap();
+    assert_eq!(first_source_path, "tasks.md");
+    assert_eq!(first_source_path, second_source_path);
     let mut connection = open(&path).unwrap();
     import_local_tasks(
         &mut connection,
         &repository_id(&first),
-        Path::new("tasks.md"),
+        Path::new(&first_source_path),
         &tasks,
     )
     .unwrap();
-    let local = task_id(&path, &repository_id(&second), "local", "tasks.md", "1").unwrap();
+    let local = task_id(
+        &path,
+        &repository_id(&second),
+        "local",
+        &second_source_path,
+        "1",
+    )
+    .unwrap();
     assert!(local.is_some());
     let logs = root.join("logs");
     let merged = start_merge_run(&path, &first, &logs).unwrap();
