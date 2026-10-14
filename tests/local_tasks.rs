@@ -3354,6 +3354,13 @@ fn startup_reconciliation_keeps_pr_lease_while_feedback_runs() {
     )
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') echo '[]' ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
 
     let run = start_merge_run(&database, &repository, &root.join("logs")).unwrap();
     let claim = acquire_pr(&database, &run.repository_id, 42, &run.id).unwrap();
