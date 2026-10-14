@@ -2865,7 +2865,7 @@ pub fn import_github_tasks(
              VALUES (lower(hex(randomblob(16))), ?1, 'github', '', ?2, ?3, 'pending', ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              ON CONFLICT(repository_id, source, source_path, external_id) DO UPDATE SET
                title = excluded.title,
-               status = CASE WHEN tasks.status IN ('claimed', 'in_flight') THEN tasks.status ELSE excluded.status END,
+               status = CASE WHEN tasks.status IN ('claimed', 'in_flight', 'done') THEN tasks.status ELSE excluded.status END,
                blockers_json = excluded.blockers_json,
                updated_at = excluded.updated_at
              WHERE title IS NOT excluded.title OR status IS NOT excluded.status OR blockers_json IS NOT excluded.blockers_json",

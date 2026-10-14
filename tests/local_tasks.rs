@@ -2320,19 +2320,40 @@ esac
         [42]
     );
 
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "queue",
+            "--github",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let queue: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .map(|issue| &issue["number"])
+            .collect::<Vec<_>>(),
+        [42]
+    );
+
     let connection = open(&database).unwrap();
-    let statuses: Vec<(String, String)> = connection
-        .prepare("SELECT external_id, status FROM tasks ORDER BY external_id")
+    let statuses: Vec<(String, String, Option<i64>)> = connection
+        .prepare("SELECT external_id, status, previous_pr_number FROM tasks ORDER BY external_id")
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(
         statuses,
         [
-            ("42".to_string(), "pending".to_string()),
-            ("43".to_string(), "done".to_string())
+            ("42".to_string(), "pending".to_string(), Some(12)),
+            ("43".to_string(), "done".to_string(), None)
         ]
     );
     drop(connection);
