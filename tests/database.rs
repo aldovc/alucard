@@ -314,6 +314,59 @@ fn repository_identity_migrates_legacy_rows_and_reports_live_conflicts() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn repository_identity_discards_pending_legacy_local_task_matching_stable_task() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let repository = root.join("checkout");
+    seed_repository(&repository);
+    set_origin(&repository, "https://github.com/example/widgets.git");
+    migrate(&path).unwrap();
+    let legacy = repository.canonicalize().unwrap().display().to_string();
+    let stable = repository_id(&repository);
+    let connection = open(&path).unwrap();
+    for repository_id in [&legacy, &stable] {
+        connection
+            .execute(
+                "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'checkout', 'now')",
+                [repository_id],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, updated_at)
+             VALUES ('legacy-task', ?1, 'local', ?2, '1', 'legacy', 'pending', '[]', 'now')",
+            (&legacy, format!("{legacy}/tasks.md")),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, updated_at)
+             VALUES ('stable-task', ?1, 'local', 'tasks.md', '1', 'stable', 'pending', '[]', 'now')",
+            [&stable],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        ensure_repository_identity(&path, &repository).unwrap(),
+        stable
+    );
+    let connection = open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE repository_id = ?1 AND source = 'local' AND source_path = 'tasks.md' AND external_id = '1'",
+                [&stable],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn seed_repository_with_readme(path: &Path, readme: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::create_dir(path).unwrap();

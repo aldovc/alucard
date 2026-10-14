@@ -3181,6 +3181,22 @@ fn migrate_repository_identity(
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute(
+        "DELETE FROM tasks AS legacy
+         WHERE repository_id = ?1 AND source = 'local' AND source_path LIKE ?1 || '/%'
+           AND status = 'pending'
+           AND NOT EXISTS (SELECT 1 FROM claims WHERE resource_kind = 'task' AND resource_key = legacy.id)
+           AND NOT EXISTS (SELECT 1 FROM pull_requests WHERE task_id = legacy.id)
+           AND NOT EXISTS (SELECT 1 FROM recovery WHERE task_id = legacy.id)
+           AND EXISTS (
+             SELECT 1 FROM tasks AS current
+             WHERE current.repository_id = ?2 AND current.status = 'pending'
+               AND current.source = legacy.source
+               AND current.source_path = substr(legacy.source_path, length(?1) + 2)
+               AND current.external_id = legacy.external_id
+           )",
+        (&legacy_id, repository_id),
+    )?;
+    transaction.execute(
         "UPDATE tasks SET source_path = substr(source_path, length(?1) + 2)
          WHERE repository_id = ?1 AND source = 'local' AND source_path LIKE ?1 || '/%'",
         [&legacy_id],
