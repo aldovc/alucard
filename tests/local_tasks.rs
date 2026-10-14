@@ -1818,6 +1818,82 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
 }
 
 #[test]
+fn queue_cli_omits_claimed_local_tasks() {
+    let root = temporary_path("claimed-local-queue");
+    fs::create_dir_all(&root).unwrap();
+    git_repository(&root);
+    let database = root.join("ledger.db");
+    let tasks = root.join("tasks.md");
+    fs::write(
+        &tasks,
+        "## [ ] claimed: Claimed task\n\n## [ ] pending: Pending task\n",
+    )
+    .unwrap();
+    let gh = root.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') printf '%s\\n' '[[]]' ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = env!("CARGO_BIN_EXE_alucard");
+
+    let initial = Command::new(binary)
+        .current_dir(&root)
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "queue",
+            "--tasks",
+            tasks.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(initial.status.success());
+
+    let repository = root.canonicalize().unwrap();
+    let tasks = tasks.canonicalize().unwrap();
+    let claimed_task = task_id(
+        &database,
+        &repository.display().to_string(),
+        "local",
+        &tasks.display().to_string(),
+        "claimed",
+    )
+    .unwrap()
+    .unwrap();
+    start_task_run(
+        &database,
+        &repository,
+        &root.join("logs"),
+        &root.join("cache"),
+        None,
+        &claimed_task,
+    )
+    .unwrap();
+
+    let output = Command::new(binary)
+        .current_dir(&root)
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "queue",
+            "--tasks",
+            tasks.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let queue: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0]["id"], "pending");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn reimport_preserves_claimed_task_status() {
     let database = temporary_path("claimed-reimport").join("ledger.db");
     migrate(&database).unwrap();
@@ -1846,6 +1922,95 @@ fn reimport_preserves_claimed_task_status() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(statuses, ["claimed", "claimed"]);
+    drop(connection);
+    fs::remove_dir_all(database.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn reimport_preserves_in_flight_task_with_active_claim() {
+    let database = temporary_path("in-flight-claim-reimport").join("ledger.db");
+    migrate(&database).unwrap();
+    let mut connection = open(&database).unwrap();
+    let repository = "repo";
+    let path = PathBuf::from("tasks.md");
+    let in_flight = parse_tasks("## [>] task: Local task (PR #12)\n")
+        .unwrap()
+        .tasks;
+
+    import_local_tasks(&mut connection, repository, &path, &in_flight).unwrap();
+    let task_id: String = connection
+        .query_row("SELECT id FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+             VALUES ('run', ?1, 'run', 'running', datetime('now'), datetime('now'))",
+            [repository],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+             VALUES ('claim', ?1, 'task', ?2, 'run', 'active', datetime('now'), datetime('now'))",
+            (repository, &task_id),
+        )
+        .unwrap();
+    let reconciled = parse_tasks("## [ ] task: Local task (previous attempt: PR #12)\n")
+        .unwrap()
+        .tasks;
+
+    import_local_tasks(&mut connection, repository, &path, &reconciled).unwrap();
+
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            [&task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "in_flight");
+    assert_ne!(status, "pending");
+    drop(connection);
+    fs::remove_dir_all(database.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn reimport_updates_closed_and_merged_local_pull_request_tasks() {
+    let database = temporary_path("closed-local-pr-reimport").join("ledger.db");
+    migrate(&database).unwrap();
+    let mut connection = open(&database).unwrap();
+    let repository = "repo";
+    let path = PathBuf::from("tasks.md");
+    let in_flight = parse_tasks(
+        "## [>] closed: Closed attempt (PR #12)\n\n## [>] merged: Merged attempt (PR #13)\n",
+    )
+    .unwrap()
+    .tasks;
+    import_local_tasks(&mut connection, repository, &path, &in_flight).unwrap();
+    let reconciled = parse_tasks(
+        "## [ ] closed: Closed attempt (previous attempt: PR #12)\n\n## [x] merged: Merged attempt (PR #13)\n",
+    )
+    .unwrap()
+    .tasks;
+
+    import_local_tasks(&mut connection, repository, &path, &reconciled).unwrap();
+
+    let states: Vec<(String, String, Option<i64>, Option<i64>)> = connection
+        .prepare(
+            "SELECT external_id, status, pr_number, previous_pr_number FROM tasks ORDER BY external_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        states,
+        [
+            ("closed".to_string(), "pending".to_string(), None, Some(12)),
+            ("merged".to_string(), "done".to_string(), Some(13), None),
+        ]
+    );
     drop(connection);
     fs::remove_dir_all(database.parent().unwrap()).unwrap();
 }

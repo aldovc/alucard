@@ -2828,7 +2828,13 @@ pub fn import_local_tasks(
              VALUES (lower(hex(randomblob(16))), ?1, 'local', ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              ON CONFLICT(repository_id, source, source_path, external_id) DO UPDATE SET
                title = excluded.title,
-               status = CASE WHEN tasks.status IN ('claimed', 'in_flight') THEN tasks.status ELSE excluded.status END,
+               status = CASE WHEN tasks.status = 'claimed'
+                 OR (tasks.status = 'in_flight' AND excluded.status = 'pending' AND excluded.previous_pr_number IS NULL)
+                 OR EXISTS (
+                 SELECT 1 FROM claims
+                 WHERE repository_id = tasks.repository_id AND resource_kind = 'task'
+                   AND resource_key = tasks.id AND state = 'active'
+               ) THEN tasks.status ELSE excluded.status END,
                blockers_json = excluded.blockers_json,
                pr_number = excluded.pr_number, previous_pr_number = excluded.previous_pr_number,
                updated_at = excluded.updated_at

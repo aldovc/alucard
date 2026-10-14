@@ -5335,11 +5335,28 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             Err(error) => return fail(&format!("alucard: {error}")),
         }
     };
-    match serde_json::to_string_pretty(&local_queue_with_open_prs(
-        &parsed.tasks,
-        open_issues.as_deref(),
-        &open_prs,
-    )) {
+    let queue = local_queue_with_open_prs(&parsed.tasks, open_issues.as_deref(), &open_prs)
+        .into_iter()
+        .map(|task| -> Result<Option<_>, String> {
+            let id = task_id(
+                &path,
+                &options.repository.display().to_string(),
+                "local",
+                &task_file.display().to_string(),
+                &task.id,
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or("imported local task is missing")?;
+            Ok(task_is_pending(&path, &id)
+                .map_err(|error| error.to_string())?
+                .then_some(task))
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let queue = match queue {
+        Ok(queue) => queue.into_iter().flatten().collect::<Vec<_>>(),
+        Err(error) => return fail(&format!("alucard: database error: {error}")),
+    };
+    match serde_json::to_string_pretty(&queue) {
         Ok(queue) => {
             println!("{queue}");
             ExitCode::SUCCESS
