@@ -2163,6 +2163,7 @@ fn ensure_recovery_annotations(
 #[derive(serde::Deserialize)]
 struct RecoveryPushPayload {
     checkout: PathBuf,
+    expected_sha: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2218,12 +2219,18 @@ fn replay_recovery_push(
     branch: &str,
     payload: Option<&str>,
 ) -> Result<(), String> {
-    if remote_branch_exists(repository, branch)? {
-        return Ok(());
-    }
     let payload: RecoveryPushPayload =
         serde_json::from_str(payload.ok_or("recovery push has no replay payload")?)
             .map_err(|error| format!("could not parse recovery push payload: {error}"))?;
+    let expected_sha = match payload.expected_sha {
+        Some(expected_sha) => expected_sha,
+        None => git_output(&payload.checkout, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string(),
+    };
+    if remote_branch_sha_matches(repository, branch, &expected_sha)? {
+        return Ok(());
+    }
     let output = execute_command(
         "git",
         &["push", "-u", "origin", branch],
@@ -2243,7 +2250,7 @@ fn replay_recovery_pr(
     branch: &str,
     payload: Option<&str>,
 ) -> Result<(), String> {
-    if find_open_pr(repository, branch)?.is_some() {
+    if find_pr(repository, branch, "all")?.is_some() {
         return Ok(());
     }
     let payload: RecoveryPullRequestPayload =
@@ -2464,6 +2471,37 @@ fn remote_branch_exists(repository: &Path, branch: &str) -> Result<bool, String>
     .map_err(|error| error.to_string())?;
     if output.status.success() || output.status.code() == Some(2) {
         Ok(output.status.success())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn remote_branch_sha_matches(
+    repository: &Path,
+    branch: &str,
+    expected_sha: &str,
+) -> Result<bool, String> {
+    let output = execute_command(
+        "git",
+        &[
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ],
+        repository,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let remote_sha = stdout
+            .split_whitespace()
+            .next()
+            .ok_or("remote branch lookup returned no commit")?;
+        Ok(remote_sha == expected_sha)
+    } else if output.status.code() == Some(2) {
+        Ok(false)
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
@@ -4203,7 +4241,14 @@ fn recover_worker_changes(
         }
     }
     let target = format!("recovery:{}", prepared.branch);
-    let push_payload = serde_json::json!({ "checkout": prepared.clone }).to_string();
+    let expected_sha = git_output(&prepared.clone, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let push_payload = serde_json::json!({
+        "checkout": prepared.clone,
+        "expected_sha": expected_sha,
+    })
+    .to_string();
     let push = begin_operation_with_payload(
         database,
         &prepared.run.repository_id,
@@ -5309,6 +5354,14 @@ fn xml_escape(value: &str) -> String {
 }
 
 fn find_open_pr(repository: &Path, branch: &str) -> Result<Option<(i64, String, String)>, String> {
+    find_pr(repository, branch, "open")
+}
+
+fn find_pr(
+    repository: &Path,
+    branch: &str,
+    state: &str,
+) -> Result<Option<(i64, String, String)>, String> {
     #[derive(serde::Deserialize)]
     struct Pull {
         number: i64,
@@ -5323,7 +5376,7 @@ fn find_open_pr(repository: &Path, branch: &str) -> Result<Option<(i64, String, 
             "pr",
             "list",
             "--state",
-            "open",
+            state,
             "--head",
             branch,
             "--json",
@@ -6666,6 +6719,66 @@ printf '%s' "$FULL_PROMPT""#,
         assert!(local.starts_with("Task: 7\n\n"));
         assert!(local.contains("the harness flips the task to `[x]` when this PR merges."));
         assert!(local.contains("task flips back to `[ ]` at the next queue build"));
+    }
+
+    #[test]
+    fn legacy_recovery_push_payload_replays_when_remote_branch_exists() {
+        let root =
+            std::env::temp_dir().join(format!("alucard-legacy-recovery-{}", uuid::Uuid::new_v4()));
+        let remote = root.join("remote.git");
+        let checkout = root.join("checkout");
+        let database = root.join("alucard.db");
+        fs::create_dir_all(&root).unwrap();
+        let git = |directory: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(directory)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&root, &["init", "--bare", remote.to_str().unwrap()]);
+        git(&root, &["init", checkout.to_str().unwrap()]);
+        git(&checkout, &["config", "user.email", "test@example.com"]);
+        git(&checkout, &["config", "user.name", "Test"]);
+        fs::write(checkout.join("tracked"), "initial\n").unwrap();
+        git(&checkout, &["add", "tracked"]);
+        git(&checkout, &["commit", "-m", "initial"]);
+        git(&checkout, &["branch", "-M", "recovery-branch"]);
+        git(
+            &checkout,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&checkout, &["push", "-u", "origin", "recovery-branch"]);
+
+        let repository_id = ensure_repository_identity(&database, &checkout).unwrap();
+        open(&database)
+            .unwrap()
+            .execute(
+                "INSERT INTO repositories (id, owner, name, cache_path, created_at) VALUES (?1, '', '', '', datetime('now'))",
+                [&repository_id],
+            )
+            .unwrap();
+        let payload = serde_json::json!({ "checkout": checkout }).to_string();
+        begin_operation_with_payload(
+            &database,
+            &repository_id,
+            "recovery:recovery-branch",
+            "push",
+            Some(&payload),
+        )
+        .unwrap();
+
+        replay_recovery_operations(&database, &checkout, &repository_id).unwrap();
+
+        assert!(alucard::pending_operations(&database, &repository_id)
+            .unwrap()
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

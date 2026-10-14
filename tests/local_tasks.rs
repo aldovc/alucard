@@ -149,6 +149,15 @@ fn run(command: &mut Command) {
     assert!(command.status().unwrap().success());
 }
 
+fn head_sha(repository: &Path) -> String {
+    let output = Command::new("git")
+        .args(["-C", repository.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
 fn wait_for_file(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
@@ -792,7 +801,13 @@ esac
         &repository_id,
         target,
         "push",
-        Some(&serde_json::json!({ "checkout": repository }).to_string()),
+        Some(
+            &serde_json::json!({
+                "checkout": repository,
+                "expected_sha": head_sha(&repository),
+            })
+            .to_string(),
+        ),
     )
     .unwrap();
     finish_operation(&database, &push, None).unwrap();
@@ -1048,7 +1063,13 @@ fn startup_leaves_live_recovery_publisher_operations_pending() {
         &repository_id,
         target,
         "push",
-        Some(&serde_json::json!({ "checkout": repository }).to_string()),
+        Some(
+            &serde_json::json!({
+                "checkout": repository,
+                "expected_sha": head_sha(&repository),
+            })
+            .to_string(),
+        ),
     )
     .unwrap();
     let pr = begin_operation_with_payload(
@@ -1172,7 +1193,13 @@ esac
         &repository_id,
         target,
         "push",
-        Some(&serde_json::json!({ "checkout": repository }).to_string()),
+        Some(
+            &serde_json::json!({
+                "checkout": repository,
+                "expected_sha": head_sha(&repository),
+            })
+            .to_string(),
+        ),
     )
     .unwrap();
     finish_operation(&database, &push, None).unwrap();
@@ -1243,6 +1270,7 @@ fn startup_replay_preserves_pending_operations_before_remote_mutations() {
         name: &'static str,
         failure: &'static str,
         operation: &'static str,
+        closed_pr: bool,
     }
 
     for case in [
@@ -1250,31 +1278,43 @@ fn startup_replay_preserves_pending_operations_before_remote_mutations() {
             name: "push",
             failure: "push",
             operation: "push",
+            closed_pr: false,
         },
         Case {
             name: "pr-lookup",
             failure: "pr-list",
             operation: "create_recovery_pr",
+            closed_pr: false,
         },
         Case {
             name: "pr-adoption",
             failure: "",
             operation: "create_recovery_pr",
+            closed_pr: false,
+        },
+        Case {
+            name: "pr-closed-adoption",
+            failure: "",
+            operation: "create_recovery_pr",
+            closed_pr: true,
         },
         Case {
             name: "alucard-label",
             failure: "alucard-edit",
             operation: "alucard-label",
+            closed_pr: false,
         },
         Case {
             name: "needs-human-label",
             failure: "human-edit",
             operation: "needs-human-label",
+            closed_pr: false,
         },
         Case {
             name: "marker",
             failure: "marker",
             operation: "recovery_marker",
+            closed_pr: false,
         },
     ] {
         let root = temporary_path(&format!("replay-recovery-{}", case.name));
@@ -1319,10 +1359,22 @@ fn startup_replay_preserves_pending_operations_before_remote_mutations() {
             run(Command::new("git").args([
                 "-C",
                 repository.to_str().unwrap(),
-                "push",
+                "switch",
                 "-q",
-                "origin",
-                ":recovery-crash",
+                "recovery-crash",
+            ]));
+            fs::write(repository.join("newer.txt"), "newer\n").unwrap();
+            run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+            run(Command::new("git").args([
+                "-C",
+                repository.to_str().unwrap(),
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-qm",
+                "newer recovery work",
             ]));
             let hook = repository.join(".git/hooks/pre-push");
             fs::write(
@@ -1347,7 +1399,9 @@ printf '%s\n' "$*" >> "$ALUCARD_REPLAY_TRACE"
 case "$1 $2" in
   'pr list')
     if [ "$ALUCARD_REPLAY_FAILURE" = pr-list ]; then echo 'PR lookup unavailable' >&2; exit 1; fi
-    if [ -f "$ALUCARD_REPLAY_PR" ]; then echo '[{"number":91,"headRefName":"recovery-crash","headRefOid":"abc"}]'; else echo '[]'; fi ;;
+    if [ "$ALUCARD_REPLAY_CLOSED_PR" = 1 ] && echo "$*" | grep -q -- '--state all'; then
+      echo '[{"number":91,"headRefName":"recovery-crash","headRefOid":"abc"}]'
+    elif [ -f "$ALUCARD_REPLAY_PR" ]; then echo '[{"number":91,"headRefName":"recovery-crash","headRefOid":"abc"}]'; else echo '[]'; fi ;;
   'pr create') : > "$ALUCARD_REPLAY_PR" ;;
   'pr view')
     printf '{"labels":['
@@ -1390,7 +1444,13 @@ esac
             &repository_id,
             target,
             "push",
-            Some(&serde_json::json!({ "checkout": repository }).to_string()),
+            Some(
+                &serde_json::json!({
+                    "checkout": repository,
+                    "expected_sha": head_sha(&repository),
+                })
+                .to_string(),
+            ),
         )
         .unwrap();
         if case.name != "push" {
@@ -1404,10 +1464,13 @@ esac
             Some(r#"{"base":"main","title":"Recovery","body":"Ledger link"}"#),
         )
         .unwrap();
-        if case.name != "pr-lookup" && case.name != "pr-adoption" {
+        if !matches!(
+            case.name,
+            "pr-lookup" | "pr-adoption" | "pr-closed-adoption"
+        ) {
             finish_operation(&database, &pr, None).unwrap();
         }
-        if case.name != "pr-lookup" {
+        if !matches!(case.name, "pr-lookup" | "pr-closed-adoption") {
             fs::write(root.join("pr"), "").unwrap();
         }
         let annotation_target = "recovery-pr:91";
@@ -1463,6 +1526,10 @@ esac
                 .env("ALUCARD_REPLAY_HUMAN", root.join("needs-human"))
                 .env("ALUCARD_REPLAY_MARKER", root.join("marker"))
                 .env("ALUCARD_REPLAY_FAILURE", failure)
+                .env(
+                    "ALUCARD_REPLAY_CLOSED_PR",
+                    if case.closed_pr { "1" } else { "0" },
+                )
                 .env("ALUCARD_CACHE_DIR", root.join("cache"))
                 .args([
                     "--db-path",
@@ -1517,17 +1584,24 @@ esac
         }
         match case.name {
             "push" => {
-                assert!(Command::new("git")
+                let remote_tip = Command::new("git")
                     .args([
                         "ls-remote",
                         "--heads",
                         remote.to_str().unwrap(),
-                        "recovery-crash"
+                        "recovery-crash",
                     ])
                     .output()
-                    .unwrap()
-                    .stdout
-                    .is_empty());
+                    .unwrap();
+                assert!(remote_tip.status.success());
+                assert_ne!(
+                    String::from_utf8(remote_tip.stdout)
+                        .unwrap()
+                        .split_whitespace()
+                        .next(),
+                    Some(head_sha(&repository).as_str())
+                );
+                assert!(repository.join("newer.txt").exists());
                 assert!(fs::read_to_string(root.join("trace"))
                     .map(|trace| !trace.contains("pr create"))
                     .unwrap_or(true));
@@ -1539,9 +1613,11 @@ esac
                 assert!(!root.join("marker").exists());
             }
             "marker" => assert!(!root.join("marker").exists()),
-            "pr-adoption" => assert!(!fs::read_to_string(root.join("trace"))
-                .unwrap()
-                .contains("pr create")),
+            "pr-adoption" | "pr-closed-adoption" => {
+                assert!(!fs::read_to_string(root.join("trace"))
+                    .unwrap()
+                    .contains("pr create"))
+            }
             _ => unreachable!(),
         }
 
@@ -1568,12 +1644,14 @@ esac
         };
         let trace = fs::read_to_string(root.join("trace")).unwrap();
         assert!(invoke("").status.success(), "{}", case.name);
-        assert_eq!(
-            replay_calls(&fs::read_to_string(root.join("trace")).unwrap()),
-            replay_calls(&trace),
-            "{}",
-            case.name
-        );
+        if !case.closed_pr {
+            assert_eq!(
+                replay_calls(&fs::read_to_string(root.join("trace")).unwrap()),
+                replay_calls(&trace),
+                "{}",
+                case.name
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }
