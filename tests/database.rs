@@ -1,12 +1,12 @@
 use alucard::{
     abandoned_task_claims, acquire_pr, acquire_task, begin_operation, begin_operation_with_payload,
     defer_operation, ensure_repository_identity, finish_operation, heartbeat, import_github_tasks,
-    import_local_tasks, migrate, open, parse_tasks, pending_operations, prepare_run,
-    record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
-    release_abandoned_task_claim, repository_id, repository_ledger_id, repository_source_path,
-    run_command, start_continue_run, start_merge_run, start_retry_run, start_task_retry_run,
-    start_task_run, status, task_claim_attempts, task_id, transition_task, AbandonedTaskClaim,
-    ClaimError, GithubTask, RunOptions, TaskStatus,
+    import_local_tasks, lock_recovery_operations, migrate, open, parse_tasks, pending_operations,
+    pending_recovery_operations, prepare_run, record_task_pr, record_task_pr_gate_state,
+    record_task_pr_review, release, release_abandoned_task_claim, repository_id,
+    repository_ledger_id, repository_source_path, run_command, start_continue_run, start_merge_run,
+    start_retry_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
+    transition_task, AbandonedTaskClaim, ClaimError, GithubTask, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1377,6 +1377,88 @@ fn recovery_operations_replay_only_deferred_failures() {
             payload: Some(r#"{"base":"main"}"#.to_string()),
         }]
     );
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn pending_recovery_operations_skip_a_live_publisher() {
+    let path = database_path();
+    migrate(&path).unwrap();
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .unwrap()
+        .trim()
+        .to_string();
+    let connection = open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO repositories (id, owner, name, created_at) VALUES ('repo', 'owner', 'name', 'now')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+             VALUES ('task', 'repo', 'local', 'task', 'task', 'claimed', '[]', 'now')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, branch, pid, hostname)
+             VALUES ('run', 'repo', 'run', 'running', 'now', 'now', 'recovery-branch', ?1, ?2)",
+            (i64::from(std::process::id()), hostname),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+             VALUES ('claim', 'repo', 'task', 'task', 'run', 'active', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    begin_operation(&path, "repo", "recovery:recovery-branch", "push").unwrap();
+
+    assert!(pending_recovery_operations(&path, "repo")
+        .unwrap()
+        .is_empty());
+
+    open(&path)
+        .unwrap()
+        .execute("UPDATE runs SET pid = 0 WHERE id = 'run'", [])
+        .unwrap();
+    assert_eq!(pending_recovery_operations(&path, "repo").unwrap().len(), 1);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn recovery_replay_lock_excludes_concurrent_recoverers() {
+    let path = database_path();
+    migrate(&path).unwrap();
+    let (locked_sender, locked) = std::sync::mpsc::channel();
+    let (release, release_receiver) = std::sync::mpsc::channel();
+    let held_path = path.clone();
+    let holder = thread::spawn(move || {
+        let _lock = lock_recovery_operations(&held_path).unwrap();
+        locked_sender.send(()).unwrap();
+        release_receiver.recv().unwrap();
+    });
+    locked.recv().unwrap();
+
+    let (acquired_sender, acquired) = std::sync::mpsc::channel();
+    let (done, done_receiver) = std::sync::mpsc::channel();
+    let waiting_path = path.clone();
+    let waiter = thread::spawn(move || {
+        let _lock = lock_recovery_operations(&waiting_path).unwrap();
+        acquired_sender.send(()).unwrap();
+        done_receiver.recv().unwrap();
+    });
+    assert!(acquired.recv_timeout(Duration::from_millis(50)).is_err());
+    release.send(()).unwrap();
+    acquired.recv_timeout(Duration::from_secs(1)).unwrap();
+    done.send(()).unwrap();
+    holder.join().unwrap();
+    waiter.join().unwrap();
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
