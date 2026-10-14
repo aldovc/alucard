@@ -26,6 +26,7 @@ fn continue_feedback_stall_contract_matches_the_bash_workflow() {
     let output = Command::new("bash")
         .arg("test/test_continue_feedback_stall.sh")
         .env("ALUCARD", env!("CARGO_BIN_EXE_alucard"))
+        .env("ALUCARD_CI_POLL_INTERVAL", "0")
         .env("CONTINUE_TEST_LEDGER", &ledger)
         .output()
         .unwrap();

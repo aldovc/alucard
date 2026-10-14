@@ -9,6 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ALUCARD_BIN=${ALUCARD:-}
 source "$SCRIPT_DIR/lib.sh"
+export ALUCARD_CI_POLL_INTERVAL=0
 if [ -z "$ALUCARD_BIN" ]; then
   ALUCARD="$SCRIPT_DIR/../alucard"
   # shellcheck disable=SC1090

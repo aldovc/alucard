@@ -393,6 +393,7 @@ esac
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .env("ALUCARD_CI_POLL_INTERVAL", "0")
         .env("ALUCARD_REMOTE", &remote)
         .env("ALUCARD_BRANCH_FILE", &branch_file)
         .env("ALUCARD_REVIEW_ARGS", &review_args)
@@ -526,7 +527,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             comments_json: "{\"comments\":[]}",
             advance_head: false,
             expected_verdict: "APPROVED",
-            expected_state: "review_approved",
+            expected_state: "review_needs_human",
         },
         ReviewCase {
             name: "recovery-untrusted",
@@ -1098,7 +1099,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
         }
         if case.name == "feedback-setup-advance" {
             assert!(!trace.contains("feedback agent stopped without publishing"));
-            assert_eq!(trace.matches("pr checks").count(), 2);
+            assert_eq!(trace.matches("pr checks").count(), 8);
             assert_eq!(
                 fs::read_to_string(root.join("review-attempts"))
                     .unwrap()
