@@ -59,6 +59,13 @@ case "$1 $2" in
       *)           printf '101\n' ;;
     esac ;;
   "pr view")
+    # VIEW_SHA overrides what the PR names; MOVED says a push landed mid-watch.
+    if [ -n "${ALUCARD_TEST_VIEW_SHA:-}" ]; then
+      printf '%s\n' "$ALUCARD_TEST_VIEW_SHA"; exit 0
+    fi
+    if [ -f "$ALUCARD_TEST_MOVED" ]; then
+      printf '%s\n' "$ALUCARD_TEST_HEAD_B"; exit 0
+    fi
     case "$*" in
       *101*) printf '%s\n' "$ALUCARD_TEST_HEAD_A" ;;
       *102*) printf '%s\n' "$ALUCARD_TEST_HEAD_B" ;;
@@ -72,6 +79,11 @@ case "$1 $2" in
       allowed)
         echo "no checks reported on the branch" >&2
         exit 1 ;;
+      pass)
+        exit 0 ;;
+      pass_then_move)
+        : > "$ALUCARD_TEST_MOVED"
+        exit 0 ;;
       late)
         # Checks register only after the first probe, as right after a push.
         if [ ! -f "$ALUCARD_TEST_LATE_SEEN" ]; then
@@ -126,6 +138,7 @@ export ALUCARD_TEST_GH_TRACE="$GH_TRACE"
 export ALUCARD_TEST_HEAD_A="$HEAD_A"
 export ALUCARD_TEST_HEAD_B="$HEAD_B"
 export ALUCARD_TEST_LATE_SEEN="$TEST_DIR/late-seen"
+export ALUCARD_TEST_MOVED="$TEST_DIR/moved"
 
 REPO_ABS="$REPO"
 WT_ROOT="$TEST_DIR/wt"
@@ -221,6 +234,37 @@ assert_eq "checks that appear on the second probe grade the PR green" \
   "green" "$MEASURE_CI_RESULT"
 assert_not_contains "a late registration is not logged as no CI" \
   "no checks configured" "$EV"
+
+# ── Checks path: green for a stale or moved head is not green (#183) ────────
+# ci_gate on PR 101 (feature-a) through gh pr checks; sets EV.
+run_checks_gate() {
+  : > "$GH_TRACE"
+  : > "$EVENTS"
+  rm -f "$ALUCARD_TEST_MOVED"
+  CI_CHECKS_AVAILABLE=""
+  export ALUCARD_TEST_CHECKS_MODE="$1"
+  MEASURE_CI_RESULT=""
+  set +e
+  ci_gate 1 feature-a "$REMOTE" 101 >"$TEST_DIR/out-head" 2>&1
+  set -e
+  EV=$(<"$EVENTS")
+}
+
+echo ""
+echo "── classic PAT: the PR never names the pushed head ──"
+export ALUCARD_TEST_VIEW_SHA="$HEAD_B"
+run_checks_gate pass
+unset ALUCARD_TEST_VIEW_SHA
+assert_eq "passing checks on a stale PR head are unverified" "unverified" "$MEASURE_CI_RESULT"
+assert_eq "and the stale head's checks are never read" "0" \
+  "$(grep -c 'pr checks' "$GH_TRACE" || true)"
+
+echo ""
+echo "── classic PAT: the head moves while checks are watched ──"
+run_checks_gate pass_then_move
+assert_eq "passing checks for a head that moved are unverified" "unverified" "$MEASURE_CI_RESULT"
+assert_not_contains "and are not reported green" "green — ready" "$EV"
+rm -f "$ALUCARD_TEST_MOVED"
 
 # ── Failure still detected via run list ──────────────────────────────────────
 echo ""

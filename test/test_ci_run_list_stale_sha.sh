@@ -65,13 +65,13 @@ case "$1 $2" in
   "pr list")
     printf '479\n' ;;
   "pr view")
-    # PR_LAG: the first view still names the previous head, as right after a push.
-    if [ -n "${ALUCARD_TEST_PR_LAG:-}" ] && [ ! -f "$ALUCARD_TEST_PR_LAG" ]; then
-      : > "$ALUCARD_TEST_PR_LAG"
-      printf '%s\n' "$ALUCARD_TEST_OLD_SHA"
-    else
-      printf '%s\n' "$ALUCARD_TEST_HEAD_SHA"
-    fi ;;
+    # PR_HEADS: the head each successive view names; the last one repeats.
+    read -ra heads <<<"${ALUCARD_TEST_PR_HEADS:-$ALUCARD_TEST_HEAD_SHA}"
+    v=0
+    [ -s "$ALUCARD_TEST_VIEW_COUNT" ] && v=$(<"$ALUCARD_TEST_VIEW_COUNT")
+    printf '%s\n' "$((v + 1))" > "$ALUCARD_TEST_VIEW_COUNT"
+    [ "$v" -lt "${#heads[@]}" ] || v=$((${#heads[@]} - 1))
+    printf '%s\n' "${heads[$v]}" ;;
   "pr checks")
     echo "GraphQL: Resource not accessible by personal access token" >&2
     exit 1 ;;
@@ -167,6 +167,7 @@ export ALUCARD_TEST_SLEEP_TRACE="$SLEEP_TRACE"
 export ALUCARD_TEST_OLD_SHA="$OLD_SHA"
 export ALUCARD_TEST_HEAD_SHA="$HEAD_SHA"
 export ALUCARD_TEST_RUN_COUNT="$TEST_DIR/run-count"
+export ALUCARD_TEST_VIEW_COUNT="$TEST_DIR/view-count"
 
 REPO_ABS="$REPO"
 WT_ROOT="$TEST_DIR/wt"
@@ -194,6 +195,20 @@ reset_traces() {
   : > "$SLEEP_TRACE"
   : > "$EVENTS"
   : > "$ALUCARD_TEST_RUN_COUNT"
+  : > "$ALUCARD_TEST_VIEW_COUNT"
+}
+
+# ci_gate on the run-list path with the PR naming $2 in turn; sets EV.
+run_gate() {
+  reset_traces
+  export ALUCARD_TEST_RUN_MODE="$1" ALUCARD_TEST_PR_HEADS="$2"
+  CI_CHECKS_AVAILABLE=false
+  MEASURE_CI_RESULT=""
+  set +e
+  ci_gate 1 feature "$REMOTE" 479 >"$TEST_DIR/out-gate" 2>&1
+  set -e
+  unset ALUCARD_TEST_PR_HEADS
+  EV=$(<"$EVENTS")
 }
 
 run_poll() {
@@ -315,18 +330,29 @@ assert_not_contains "and does not call the PR green" "green — ready" "$EV"
 # ── ci_gate: waits for the PR to name the pushed head (#183) ────────────────
 echo ""
 echo "── ci_gate: grades the pushed head, not the PR's stale one ──"
-reset_traces
-export ALUCARD_TEST_RUN_MODE=head_success
-export ALUCARD_TEST_PR_LAG="$TEST_DIR/pr-lag"
-rm -f "$ALUCARD_TEST_PR_LAG"
-CI_CHECKS_AVAILABLE=false
-MEASURE_CI_RESULT=""
-set +e
-ci_gate 1 feature "$REMOTE" 479 >"$TEST_DIR/out-lag" 2>&1
-set -e
-unset ALUCARD_TEST_PR_LAG
+run_gate head_success "$OLD_SHA $HEAD_SHA"
 assert_eq "a PR head that lags the push still grades the pushed head" \
   "green" "$MEASURE_CI_RESULT"
+
+# ── ci_gate: a head that never registers is not graded (#183) ──────────────
+echo ""
+echo "── ci_gate: the PR never names the pushed head ──"
+# Older SHAs ran green; the PR keeps naming one of them.
+run_gate stale "$OLD_SHA"
+assert_eq "a stale PR head is unverified, not green" "unverified" "$MEASURE_CI_RESULT"
+assert_contains "the handoff names the mismatch" "never matched origin's feature" "$EV"
+assert_not_contains "no fix agent for an unverified head" "launching fix agent" "$EV"
+
+# ── ci_gate: a push while CI is polled voids the result (#183) ──────────────
+echo ""
+echo "── ci_gate: the head moves while CI is polled ──"
+run_gate head_success "$HEAD_SHA $OLD_SHA"
+assert_eq "a green result for a head that moved is unverified" "unverified" "$MEASURE_CI_RESULT"
+assert_contains "the handoff says the head moved" "moved from $HEAD_SHA" "$EV"
+
+run_gate head_failure "$HEAD_SHA $OLD_SHA"
+assert_eq "a red result for a head that moved is unverified" "unverified" "$MEASURE_CI_RESULT"
+assert_not_contains "and launches no fix agent" "launching fix agent" "$EV"
 
 # ── ci_gate: failing HEAD still launches the fix agent ───────────────────────
 echo ""

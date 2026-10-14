@@ -2679,22 +2679,39 @@ CI_CHECKS_AVAILABLE=""
 CI_REGISTRATION_PROBES=4
 CI_POLL_INTERVAL="${CI_POLL_INTERVAL:-30}"
 
-# The PR's head SHA once it matches the branch tip on origin. Right after a
-# push the PR still names the old head, and grading that head's checks would
-# judge the wrong commit. Falls back to whatever the PR names after the wait.
-# $1=pr_num $2=branch
+# Echoes the PR's head SHA once it matches the branch tip on origin. Right
+# after a push the PR still names the old head, and that head's checks say
+# nothing about the new one. Fails if the two never agree within $3 probes
+# (default CI_REGISTRATION_PROBES), or either lookup keeps failing.
+# $1=pr_num $2=branch $3=probes
 current_pr_head() {
-  local pr_num="$1" branch="$2" tip head="" probe
-  tip=$(remote_branch_sha "$REPO_ABS" "$branch") || tip=""
-  for probe in $(seq "$CI_REGISTRATION_PROBES"); do
+  local pr_num="$1" branch="$2" probes="${3:-$CI_REGISTRATION_PROBES}" tip head probe
+  for probe in $(seq "$probes"); do
+    tip=$(remote_branch_sha "$REPO_ABS" "$branch") || tip=""
     head=$(cd "$REPO_ABS" && \
       gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
-    if [ -z "$tip" ] || [ "$head" = "$tip" ]; then
-      break
+    if [ -n "$tip" ] && [ "$head" = "$tip" ]; then
+      printf '%s\n' "$head"
+      return 0
     fi
-    [ "$probe" -lt "$CI_REGISTRATION_PROBES" ] && sleep "$CI_POLL_INTERVAL"
+    [ "$probe" -lt "$probes" ] && sleep "$CI_POLL_INTERVAL"
   done
-  printf '%s\n' "$head"
+  return 1
+}
+
+# No CI result can be trusted for the PR's head. Like no CI: review goes on,
+# but an approval is flagged for a human rather than read as ready to merge.
+# $1=pr_num $2=reason
+ci_gate_unverified() {
+  local pr_num="$1" reason="$2"
+  log_event "CI gate: PR #$pr_num head not verified — ${reason}; reviewing, then flagging for human."
+  MEASURE_CI_RESULT="unverified"
+  cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+    "${BOT_COMMENT_PREFIX} CI gate: head not verified — not green**
+
+${reason^}. CI results for another commit cannot qualify this PR's head.
+
+Review continues, but an approval will not mark this PR ready to merge. Run the full checks on the head commit before merging." 2>/dev/null || true
 }
 
 # Poll CI via the Actions run list. Echoes 0 (green), 1 (failed), or 2 (no run
@@ -2783,7 +2800,10 @@ ci_gate() {
   local _probe
   for ci_attempt in 1 2 3; do
     # Refresh each attempt so a fix-agent push moves to the new HEAD SHA.
-    pr_head_sha=$(current_pr_head "$pr_num" "$branch")
+    if ! pr_head_sha=$(current_pr_head "$pr_num" "$branch"); then
+      ci_gate_unverified "$pr_num" "the PR's head never matched origin's $branch"
+      return 0
+    fi
     echo "Polling CI (attempt $ci_attempt/3)..."
 
     # Prefer `gh pr checks --watch` when the token can reach statusCheckRollup.
@@ -2832,6 +2852,13 @@ ci_gate() {
         # Any other outcome means the checks surface answered.
         CI_CHECKS_AVAILABLE=true
       fi
+    fi
+
+    # A push while CI was polled leaves a result for a head that is gone.
+    # Neither green nor a reason to launch a fix agent.
+    if [ "$(current_pr_head "$pr_num" "$branch" 1 || true)" != "$pr_head_sha" ]; then
+      ci_gate_unverified "$pr_num" "the head moved from ${pr_head_sha} while CI was polled"
+      return 0
     fi
 
     if [ "$ci_rc" -eq 0 ]; then
@@ -3315,14 +3342,17 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
 "
     fi
 
-    if [ "$review_state" = "APPROVED" ] && [ "${MEASURE_CI_RESULT:-}" = "none" ]; then
+    if [ "$review_state" = "APPROVED" ] && \
+      { [ "${MEASURE_CI_RESULT:-}" = "none" ] || [ "${MEASURE_CI_RESULT:-}" = "unverified" ]; }; then
       # An approval with no CI behind it is a code review, not a merge signal
       # (#107). A parked recovery PR stays parked for the same reason.
-      log_event "Review gate: PR #$pr_num approved, but no CI ran — flagging for human."
+      local _no_ci="no CI ran"
+      [ "$MEASURE_CI_RESULT" = "unverified" ] && _no_ci="CI was not verified for its head"
+      log_event "Review gate: PR #$pr_num approved, but ${_no_ci} — flagging for human."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED — no CI ran, needs human**
+        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED — ${_no_ci}, needs human**
 
-${_reviewed_line}The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.
+${_reviewed_line}The reviewer approved the code, but ${_no_ci} on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.
 
 ${review_comments}${_self_review_note}" 2>/dev/null || true
       add_pr_label "$REPO_ABS" "$pr_num" "needs-human"
