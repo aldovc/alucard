@@ -1344,7 +1344,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                 .unwrap_or(1)
                         ),
                     );
-                    if let Err(error) = record_task_pr(
+                    let pr_claim = match record_task_pr(
                         &database,
                         &selected.ledger_id,
                         &claim.id,
@@ -1353,18 +1353,21 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &branch,
                         &sha,
                     ) {
-                        let _ = transition_task(
-                            &database,
-                            &selected.ledger_id,
-                            &claim.id,
-                            &owner_run_id,
-                            TaskStatus::InFlight,
-                        );
-                        let _ = release(&database, &claim.id, &owner_run_id);
-                        let _ = finish_run(&database, &attempt_run.id, "failed");
-                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
-                        return fail(&format!("alucard: {error}"));
-                    }
+                        Ok(claim) => claim,
+                        Err(error) => {
+                            let _ = transition_task(
+                                &database,
+                                &selected.ledger_id,
+                                &claim.id,
+                                &owner_run_id,
+                                TaskStatus::InFlight,
+                            );
+                            let _ = release(&database, &claim.id, &owner_run_id);
+                            let _ = finish_run(&database, &attempt_run.id, "failed");
+                            print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                            return fail(&format!("alucard: {error}"));
+                        }
+                    };
                     if let Some(local_id) = selected.local_id.as_ref() {
                         let Some(file) = task_file.as_deref() else {
                             unreachable!("local task has a task file");
@@ -1483,6 +1486,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         number,
                         iteration_started.elapsed().as_secs(),
                     );
+                    let _ = release(&database, &pr_claim.id, &owner_run_id);
                     let _ = release(&database, &claim.id, &owner_run_id);
                     let _ = finish_run(&database, &attempt_run.id, "completed");
                     break;
@@ -1728,7 +1732,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             pull.state
         ));
     }
-    let continued = match start_continue_run(
+    let (continued, claim) = match start_continue_run(
         &database,
         &repository,
         &options.logs_root,
@@ -1741,20 +1745,6 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     ) {
         Ok(continued) => continued,
         Err(error) => return fail(&format!("alucard: could not start continue run: {error}")),
-    };
-    let claim = match acquire_pr(
-        &database,
-        &continued.run.repository_id,
-        pr_number,
-        &continued.run.id,
-    ) {
-        Ok(claim) => claim,
-        Err(error) => {
-            let _ = finish_run(&database, &continued.run.id, "failed");
-            return fail(&format!(
-                "alucard: could not lease PR #{pr_number}: {error}"
-            ));
-        }
     };
     let result: Result<(), String> = (|| {
         fs::create_dir_all(continued.run.logs_path.as_deref().unwrap_or_default())
@@ -2100,7 +2090,7 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
                     )
                     .map_err(|error| error.to_string())?;
                 } else {
-                    record_task_pr(
+                    let pr_claim = record_task_pr(
                         database,
                         &claim.task_id,
                         &claim.lease_id,
@@ -2110,6 +2100,8 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
                         &sha,
                     )
                     .map_err(|error| error.to_string())?;
+                    release(database, &pr_claim.id, &claim.run_id)
+                        .map_err(|error| error.to_string())?;
                 }
                 release(database, &claim.lease_id, &claim.run_id)
                     .map_err(|error| error.to_string())?;
