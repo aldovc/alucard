@@ -968,6 +968,276 @@ esac
 }
 
 #[test]
+fn startup_leaves_live_recovery_publisher_operations_pending() {
+    let root = temporary_path("replay-live-recovery-publisher");
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "main",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "branch",
+        "recovery-live",
+    ]));
+
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_REPLAY_GIT_TRACE\"\nexec /usr/bin/git \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\n[ \"$1 $2\" = 'image inspect' ] && echo stamp\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_REPLAY_GH_TRACE\"\n[ \"$1 $2\" = 'pr list' ] && echo '[]'\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let database = root.join("ledger.db");
+    migrate(&database).unwrap();
+    let repository_id = repository_ledger_id(&repository).unwrap();
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "## [ ] recovery: Recovery task\n").unwrap();
+    let (_, claim_id, _) = seed_abandoned_task(
+        &database,
+        &repository,
+        &tasks,
+        "recovery",
+        "recovery-live",
+        None,
+    );
+    open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE runs SET pid = ?1 WHERE id = (SELECT run_id FROM claims WHERE id = ?2)",
+            (i64::from(std::process::id()), &claim_id),
+        )
+        .unwrap();
+    let target = "recovery:recovery-live";
+    let push = begin_operation_with_payload(
+        &database,
+        &repository_id,
+        target,
+        "push",
+        Some(&serde_json::json!({ "checkout": repository }).to_string()),
+    )
+    .unwrap();
+    let pr = begin_operation_with_payload(
+        &database,
+        &repository_id,
+        target,
+        "create_recovery_pr",
+        Some(r#"{"base":"main","title":"Recovery","body":"Ledger link"}"#),
+    )
+    .unwrap();
+
+    let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+        .env("ALUCARD_REPLAY_GIT_TRACE", root.join("git-trace"))
+        .env("ALUCARD_REPLAY_GH_TRACE", root.join("gh-trace"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM operations WHERE id IN (?1, ?2) AND phase = 'pending'",
+                (&push, &pr),
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
+    assert!(!fs::read_to_string(root.join("git-trace"))
+        .unwrap_or_default()
+        .contains("push -u origin recovery-live"));
+    assert!(!fs::read_to_string(root.join("gh-trace"))
+        .unwrap_or_default()
+        .contains("pr create"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn concurrent_startup_replays_one_recovery_pr() {
+    let root = temporary_path("concurrent-replay-recovery-pr");
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "main",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "branch",
+        "recovery-concurrent",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "recovery-concurrent",
+    ]));
+
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\n[ \"$1 $2\" = 'image inspect' ] && echo stamp\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$ALUCARD_REPLAY_TRACE"
+case "$1 $2" in
+  'pr list')
+    if [ -f "$ALUCARD_REPLAY_PR" ]; then echo '[{"number":91,"headRefName":"recovery-concurrent","headRefOid":"abc"}]'; else echo '[]'; fi ;;
+  'pr create')
+    : > "$ALUCARD_REPLAY_CREATE_STARTED"
+    while [ ! -f "$ALUCARD_REPLAY_CREATE_RELEASE" ]; do sleep 0.01; done
+    : > "$ALUCARD_REPLAY_PR" ;;
+  'pr view') echo '{"labels":[],"comments":[]}' ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let database = root.join("ledger.db");
+    migrate(&database).unwrap();
+    let repository_id = repository_ledger_id(&repository).unwrap();
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "## [ ] recovery: Recovery task\n").unwrap();
+    let (task_id, _, _) = seed_abandoned_task(
+        &database,
+        &repository,
+        &tasks,
+        "recovery",
+        "recovery-concurrent",
+        None,
+    );
+    let target = "recovery:recovery-concurrent";
+    let push = begin_operation_with_payload(
+        &database,
+        &repository_id,
+        target,
+        "push",
+        Some(&serde_json::json!({ "checkout": repository }).to_string()),
+    )
+    .unwrap();
+    finish_operation(&database, &push, None).unwrap();
+    begin_operation_with_payload(
+        &database,
+        &repository_id,
+        target,
+        "create_recovery_pr",
+        Some(r#"{"base":"main","title":"Recovery","body":"Ledger link"}"#),
+    )
+    .unwrap();
+
+    let configure = |command: &mut Command| {
+        command
+            .env("ALUCARD_REPLAY_TRACE", root.join("trace"))
+            .env("ALUCARD_REPLAY_PR", root.join("pr"))
+            .env("ALUCARD_REPLAY_CREATE_STARTED", root.join("create-started"))
+            .env("ALUCARD_REPLAY_CREATE_RELEASE", root.join("create-release"));
+    };
+    let mut first = reconciliation_run(&root, &repository, &database, &tasks, &bin);
+    configure(&mut first);
+    let mut first = first.spawn().unwrap();
+    wait_for_file(&root.join("create-started"));
+    let mut second = reconciliation_run(&root, &repository, &database, &tasks, &bin);
+    configure(&mut second);
+    let mut second = second.spawn().unwrap();
+    fs::write(root.join("create-release"), "").unwrap();
+    assert!(first.wait().unwrap().success());
+    second.wait().unwrap();
+
+    let trace = fs::read_to_string(root.join("trace")).unwrap();
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.starts_with("pr create"))
+            .count(),
+        1,
+        "{trace}"
+    );
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM pull_requests WHERE task_id = ?1 AND number = 91",
+                [&task_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM recovery WHERE task_id = ?1",
+                [&task_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn startup_replay_preserves_pending_operations_before_remote_mutations() {
     struct Case {
         name: &'static str,
