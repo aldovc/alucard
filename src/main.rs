@@ -6180,6 +6180,11 @@ printf '%s' "$FULL_PROMPT""#,
         assert!(!cleanup_repair_checkout(&clean_checkout));
         assert!(!clean_checkout.exists());
 
+        let unreadable_checkout = root.join("unreadable-checkout");
+        fs::create_dir(&unreadable_checkout).unwrap();
+        assert!(cleanup_repair_checkout(&unreadable_checkout));
+        assert!(unreadable_checkout.exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 
