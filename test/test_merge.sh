@@ -42,6 +42,12 @@ case "$1 $2" in
   "api user") printf '%s\n' alucard-bot ;;
   "pr view")
     case "$*" in
+      *labels,comments*)
+        if [ -f "$ALUCARD_TEST_STATE/recovery-labelled" ]; then
+          printf '%s\n' '{"labels":[{"name":"alucard"}],"comments":[]}'
+        else
+          printf '%s\n' '{"labels":[],"comments":[]}'
+        fi ;;
       *headRefOid*)
         calls=$(cat "$ALUCARD_TEST_STATE/pr-head-calls" 2>/dev/null || echo 0)
         calls=$((calls + 1))
@@ -57,6 +63,7 @@ case "$1 $2" in
            '{state: "OPEN", headRefName: $b, baseRefName: "main",
              isCrossRepository: false, comments: $c}' ;;
     esac ;;
+  "pr edit") : > "$ALUCARD_TEST_STATE/recovery-labelled" ;;
   "pr comment")
     while [ "$#" -gt 0 ]; do
       [ "$1" = "--body" ] && { printf '%s\n' "$2" >> "$ALUCARD_TEST_STATE/comments"; break; }
@@ -141,6 +148,37 @@ assert_merge_lifecycle() {
   run=$("$ALUCARD" --db-path "$LEDGER" runs show "$run_id")
   assert_contains "the merge run is terminal" "status: $expected_status" "$run"
   assert_contains "the PR lease is released" "claim: pr 9 released" "$run"
+}
+
+seed_pending_recovery_annotation() {
+  "$USES_RUST_BINARY" || return 0
+  "$ALUCARD" --db-path "$LEDGER" db migrate >/dev/null
+  python3 - "$LEDGER" "$(cd -P "$TARGET" && pwd)" <<'PY'
+import sqlite3
+import sys
+
+database, repository_id = sys.argv[1:]
+connection = sqlite3.connect(database)
+connection.execute(
+    "INSERT OR IGNORE INTO repositories (id, owner, name, created_at) VALUES (?, '', 'target', datetime('now'))",
+    (repository_id,),
+)
+connection.execute(
+    "INSERT INTO operations (id, repository_id, target, operation_type, phase, attempt_count, created_at, updated_at) VALUES ('pending-recovery-annotation', ?, 'recovery-pr:7', 'alucard-label', 'pending', 0, datetime('now'), datetime('now'))",
+    (repository_id,),
+)
+connection.commit()
+PY
+}
+
+pending_recovery_annotation_phase() {
+  python3 - "$LEDGER" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+print(connection.execute("SELECT phase FROM operations WHERE id = 'pending-recovery-annotation'").fetchone()[0])
+PY
 }
 
 # The check records the tree it ran on, so a test can tell it saw the rebase.
@@ -257,11 +295,26 @@ assert_contains "and says how to give one" "ALUCARD_CHECK_COMMAND" "$OUT"
 echo ""
 echo "── dry run ──"
 setup_repos stale
-run_merge --check-command 'true' --dry-run
+seed_pending_recovery_annotation
+if "$USES_RUST_BINARY"; then
+  run_merge
+  assert_eq "invalid merge configuration does not replay recovery" "" "$TRACE"
+  assert_eq "invalid merge configuration leaves recovery pending" "pending" "$(pending_recovery_annotation_phase)"
+fi
+
+run_merge --check-command "$PASSING_CHECK" --dry-run
 assert_eq "a passing dry run succeeds" "0" "$RC"
 assert_eq "nothing is pushed" "$PR_SHA" "$REMOTE_HEAD"
 assert_eq "nothing is commented" "" "$POSTED"
 assert_not_contains "nothing is merged" "pr merge" "$TRACE"
+assert_not_contains "nothing is recovered" "pr edit" "$TRACE"
 assert_contains "the evidence is printed instead" "would comment on PR #9" "$OUT"
+assert_eq "the dry-run check sees the rebased tree" "base moved" "$(cat "$STATE/checked")"
+if "$USES_RUST_BINARY"; then
+  assert_eq "dry run leaves recovery pending" "pending" "$(pending_recovery_annotation_phase)"
+  run_merge --check-command 'true'
+  assert_eq "a real merge replays recovery" "done" "$(pending_recovery_annotation_phase)"
+  assert_contains "the pending recovery annotation is replayed" "pr edit 7 --add-label alucard" "$TRACE"
+fi
 
 finish

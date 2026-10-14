@@ -166,9 +166,6 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(path) if git_repository_root(&path).is_some() => path,
         _ => return fail("alucard: target repository is not a git repository"),
     };
-    if let Err(error) = reconcile_startup(&database, &repository) {
-        return fail(&format!("alucard: reconciliation failed: {error}"));
-    }
     let settings = match AgentSettings::from_environment(Some(&options.env_file)) {
         Ok(settings) => settings,
         Err(error) => return fail(&format!("alucard: {error}")),
@@ -182,6 +179,11 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             "alucard: no check command: pass --check-command CMD or set ALUCARD_CHECK_COMMAND",
         );
     };
+    if !options.dry_run {
+        if let Err(error) = reconcile_startup(&database, &repository) {
+            return fail(&format!("alucard: reconciliation failed: {error}"));
+        }
+    }
     let run = match start_merge_run(&database, &repository, &options.logs_root) {
         Ok(run) => run,
         Err(error) => return fail(&format!("alucard: could not start merge run: {error}")),
