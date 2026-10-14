@@ -1,8 +1,9 @@
 use alucard::{
-    begin_operation_with_payload, finish_operation, github_queue, github_ticket_blockers,
-    import_github_tasks, import_local_tasks, local_queue, local_queue_with_open_issues, migrate,
-    open, parse_tasks, resolve_pinned_issue, start_task_retry_run, start_task_run, task_id,
-    write_task_headings, GithubPullRequest, GithubTask, TaskHeadingUpdate, TaskState,
+    begin_operation_with_payload, finish_operation, github_queue, github_task_pull_requests,
+    github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue,
+    local_queue_with_open_issues, migrate, open, parse_tasks, reconcile_github_task_pull_request,
+    resolve_pinned_issue, start_task_retry_run, start_task_run, task_id, write_task_headings,
+    GithubPullRequest, GithubPullRequestState, GithubTask, TaskHeadingUpdate, TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -1927,6 +1928,96 @@ fn reimport_preserves_claimed_task_status() {
 }
 
 #[test]
+fn github_terminal_pull_requests_reconcile_closed_and_merged_states() {
+    let database = temporary_path("github-terminal-pr-reimport").join("ledger.db");
+    migrate(&database).unwrap();
+    let mut connection = open(&database).unwrap();
+    let repository = "repo";
+    let issues = vec![serde_json::from_str::<GithubTask>(
+        r#"{"number":42,"title":"GitHub task","body":"","labels":[]}"#,
+    )
+    .unwrap()];
+
+    import_github_tasks(&mut connection, repository, &issues).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET status = 'in_flight', pr_number = 12 WHERE source = 'github'",
+            [],
+        )
+        .unwrap();
+    let task_id: String = connection
+        .query_row("SELECT id FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+             VALUES ('run', ?1, 'run', 'running', datetime('now'), datetime('now'))",
+            [repository],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+             VALUES ('claim', ?1, 'task', ?2, 'run', 'active', datetime('now'), datetime('now'))",
+            (repository, &task_id),
+        )
+        .unwrap();
+    assert!(github_task_pull_requests(&connection, repository)
+        .unwrap()
+        .is_empty());
+    connection
+        .execute(
+            "UPDATE claims SET state = 'released' WHERE id = 'claim'",
+            [],
+        )
+        .unwrap();
+    let closed = github_task_pull_requests(&connection, repository).unwrap();
+    assert_eq!(closed.len(), 1);
+    reconcile_github_task_pull_request(&connection, &closed[0], GithubPullRequestState::Closed)
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status, pr_number, previous_pr_number FROM tasks",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?
+                )),
+            )
+            .unwrap(),
+        ("pending".to_string(), None, Some(12))
+    );
+
+    connection
+        .execute(
+            "UPDATE tasks SET status = 'in_flight', pr_number = 13, previous_pr_number = NULL",
+            [],
+        )
+        .unwrap();
+    let merged = github_task_pull_requests(&connection, repository).unwrap();
+    reconcile_github_task_pull_request(&connection, &merged[0], GithubPullRequestState::Merged)
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status, pr_number, previous_pr_number FROM tasks",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?
+                )),
+            )
+            .unwrap(),
+        ("done".to_string(), Some(13), None)
+    );
+    drop(connection);
+    fs::remove_dir_all(database.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn reimport_preserves_in_flight_task_with_active_claim() {
     let database = temporary_path("in-flight-claim-reimport").join("ledger.db");
     migrate(&database).unwrap();
@@ -2172,6 +2263,199 @@ fn github_queue_matches_contract_and_orders_high_priority_first() {
             .collect::<Vec<_>>(),
         [9, 10]
     );
+}
+
+#[test]
+fn github_queue_releases_closed_pull_requests_but_not_merged_ones() {
+    let root = temporary_path("github-terminal-queue");
+    fs::create_dir_all(&root).unwrap();
+    let gh = root.join("gh");
+    fs::write(
+        &gh,
+        r##"#!/bin/sh
+case "$1 $2" in
+  "issue list") printf '%s\n' '[{"number":42,"title":"Closed","body":"","labels":[{"name":"ready-for-agent"}]},{"number":43,"title":"Merged","body":"","labels":[{"name":"ready-for-agent"}]}]' ;;
+  "repo view") printf '%s\n' 'owner/repo' ;;
+  "api graphql") printf '%s\n' '[]' ;;
+  "pr view") case "$3" in 12) echo CLOSED ;; 13) echo MERGED ;; esac ;;
+esac
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let database = root.join("ledger.db");
+    migrate(&database).unwrap();
+    let mut connection = open(&database).unwrap();
+    let issues: Vec<GithubTask> = serde_json::from_str(
+        r#"[{"number":42,"title":"Closed","body":"","labels":[{"name":"ready-for-agent"}]},{"number":43,"title":"Merged","body":"","labels":[{"name":"ready-for-agent"}]}]"#,
+    )
+    .unwrap();
+    import_github_tasks(&mut connection, &root.display().to_string(), &issues).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET status = 'in_flight', pr_number = CASE external_id WHEN '42' THEN 12 ELSE 13 END",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "queue",
+            "--github",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let queue: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .map(|issue| &issue["number"])
+            .collect::<Vec<_>>(),
+        [42]
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "queue",
+            "--github",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let queue: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .map(|issue| &issue["number"])
+            .collect::<Vec<_>>(),
+        [42]
+    );
+
+    let connection = open(&database).unwrap();
+    let statuses: Vec<(String, String, Option<i64>)> = connection
+        .prepare("SELECT external_id, status, previous_pr_number FROM tasks ORDER BY external_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        statuses,
+        [
+            ("42".to_string(), "pending".to_string(), Some(12)),
+            ("43".to_string(), "done".to_string(), None)
+        ]
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn github_run_releases_closed_pull_requests_but_not_merged_ones() {
+    let root = temporary_path("github-terminal-run");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&repository).unwrap();
+    git_repository(&repository);
+    let gh_trace = root.join("gh-trace");
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        r##"#!/bin/sh
+printf '%s\n' "$*" >> "$ALUCARD_GH_TRACE"
+case "$1 $2" in
+  "issue list") printf '%s\n' '[{"number":42,"title":"Closed","body":"","labels":[{"name":"ready-for-agent"}]},{"number":43,"title":"Merged","body":"","labels":[{"name":"ready-for-agent"}]}]' ;;
+  "repo view") printf '%s\n' 'owner/repo' ;;
+  "api graphql") printf '%s\n' '[]' ;;
+  "pr list") printf '%s\n' '[]' ;;
+  "pr view") case "$3" in 12) echo CLOSED ;; 13) echo MERGED ;; esac ;;
+esac
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\ncase \"$1 $2\" in 'image inspect') echo stamp ;; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let database = root.join("ledger.db");
+    migrate(&database).unwrap();
+    let mut connection = open(&database).unwrap();
+    let issues: Vec<GithubTask> = serde_json::from_str(
+        r#"[{"number":42,"title":"Closed","body":"","labels":[{"name":"ready-for-agent"}]},{"number":43,"title":"Merged","body":"","labels":[{"name":"ready-for-agent"}]}]"#,
+    )
+    .unwrap();
+    import_github_tasks(&mut connection, &repository.display().to_string(), &issues).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET status = 'in_flight', pr_number = CASE external_id WHEN '42' THEN 12 ELSE 13 END",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_GH_TRACE", &gh_trace)
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "run",
+            "--github",
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            repository.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let trace = fs::read_to_string(&gh_trace).unwrap();
+    assert!(trace.contains("issue edit 42 --add-label in-progress"));
+    assert!(!trace.contains("issue edit 43 --add-label in-progress"));
+    let connection = open(&database).unwrap();
+    let statuses: Vec<(String, String, Option<i64>)> = connection
+        .prepare("SELECT external_id, status, previous_pr_number FROM tasks ORDER BY external_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        statuses,
+        [
+            ("42".to_string(), "pending".to_string(), Some(12)),
+            ("43".to_string(), "done".to_string(), None),
+        ]
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
