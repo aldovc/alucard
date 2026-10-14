@@ -3,10 +3,10 @@ use alucard::{
     defer_operation, ensure_repository_identity, finish_operation, heartbeat, import_github_tasks,
     import_local_tasks, migrate, open, parse_tasks, pending_operations, prepare_run,
     record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
-    release_abandoned_task_claim, repository_id, repository_source_path, run_command,
-    start_continue_run, start_merge_run, start_retry_run, start_task_retry_run, start_task_run,
-    status, task_claim_attempts, task_id, transition_task, AbandonedTaskClaim, ClaimError,
-    GithubTask, RunOptions, TaskStatus,
+    release_abandoned_task_claim, repository_id, repository_ledger_id, repository_source_path,
+    run_command, start_continue_run, start_merge_run, start_retry_run, start_task_retry_run,
+    start_task_run, status, task_claim_attempts, task_id, transition_task, AbandonedTaskClaim,
+    ClaimError, GithubTask, RunOptions, TaskStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -68,7 +68,7 @@ fn continue_run_adopts_an_unrecorded_recovery_pull_request() {
     let logs = directory.join("logs");
     fs::create_dir(&repository).unwrap();
 
-    let continued = start_continue_run(
+    let (continued, _) = start_continue_run(
         &path,
         &repository,
         &logs,
@@ -213,15 +213,15 @@ fn repository_identity_shares_continue_merge_and_relative_local_tasks() {
         ),
         Err(ClaimError::ClaimedBy { .. })
     ));
-    let continued = start_continue_run(
+    let (continued, claim) = start_continue_run(
         &path, &first, &logs, "image", 10, "branch", "sha", "title", false,
     )
     .unwrap();
-    let duplicate = start_continue_run(
-        &path, &second, &logs, "image", 10, "branch", "sha", "title", false,
-    )
-    .unwrap();
-    assert_eq!(continued.task_id, duplicate.task_id);
+    assert!(matches!(
+        start_continue_run(&path, &second, &logs, "image", 10, "branch", "sha", "title", false,),
+        Err(ClaimError::ClaimedBy { .. })
+    ));
+    release(&path, &claim.id, &continued.run.id).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1018,6 +1018,96 @@ fn pr_claims_are_exclusive_and_releases_require_the_owning_lease() {
         Err(ClaimError::LeaseNotActive)
     );
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn task_run_pr_lease_blocks_continue_and_merge_without_overwriting_metadata() {
+    let path = database_path();
+    let directory = path.parent().unwrap();
+    let repository = directory.join("repository");
+    let logs = directory.join("logs");
+    fs::create_dir_all(&repository).unwrap();
+    migrate(&path).unwrap();
+    let repository_id = repository_ledger_id(&repository).unwrap();
+    let connection = open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, 'owner', 'name', 'now')",
+            [&repository_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
+             VALUES ('task', ?1, 'github', 'task', 'task', 'pending', '[]', 'now')",
+            [&repository_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+             VALUES ('run', ?1, 'run', 'running', 'now', 'now')",
+            [&repository_id],
+        )
+        .unwrap();
+    let task_claim = acquire_task(&path, "task", "run").unwrap();
+    let pr_claim = record_task_pr(
+        &path,
+        "task",
+        &task_claim.id,
+        "run",
+        42,
+        "owner-branch",
+        "owner-sha",
+    )
+    .unwrap();
+    assert!(matches!(
+        start_continue_run(
+            &path,
+            &repository,
+            &logs,
+            "image",
+            42,
+            "contender-branch",
+            "contender-sha",
+            "contender title",
+            false,
+        ),
+        Err(ClaimError::ClaimedBy { .. })
+    ));
+    let metadata: (String, String) = open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT branch, head_sha FROM pull_requests WHERE number = 42",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        metadata,
+        ("owner-branch".to_string(), "owner-sha".to_string())
+    );
+
+    let merge = start_merge_run(&path, &repository, &logs).unwrap();
+    assert!(matches!(
+        acquire_pr(&path, &merge.repository_id, 42, &merge.id),
+        Err(ClaimError::ClaimedBy { .. })
+    ));
+    let (unrelated, unrelated_claim) = start_continue_run(
+        &path,
+        &repository,
+        &logs,
+        "image",
+        43,
+        "branch",
+        "sha",
+        "title",
+        false,
+    )
+    .unwrap();
+    release(&path, &unrelated_claim.id, &unrelated.run.id).unwrap();
+    release(&path, &pr_claim.id, "run").unwrap();
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

@@ -3493,7 +3493,7 @@ pub fn start_merge_run(
     })
 }
 
-/// Creates a continue run and adopts a pull request that predates the ledger when needed.
+/// Creates a continue run, leases its pull request, and adopts an unrecorded pull request.
 #[allow(clippy::too_many_arguments)]
 pub fn start_continue_run(
     path: &Path,
@@ -3505,13 +3505,14 @@ pub fn start_continue_run(
     head_sha: &str,
     title: &str,
     recovery: bool,
-) -> Result<ContinueRun, DatabaseError> {
+) -> Result<(ContinueRun, Claim), ClaimError> {
     migrate(path)?;
-    let repository = repository.canonicalize()?;
+    let repository = repository.canonicalize().map_err(DatabaseError::from)?;
     let repository_name = repository
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repository has no name"))
+        .map_err(DatabaseError::from)?;
     let mut connection = open(path)?;
     let repository_id = migrate_ledger_repository_id(&mut connection, &repository)?;
     let run_id = Uuid::new_v4().to_string();
@@ -3529,6 +3530,26 @@ pub fn start_continue_run(
             |row| row.get(0),
         )
         .optional()?;
+    transaction.execute(
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, branch, pid, hostname)
+         VALUES (?1, ?2, 'continue', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
+        params![
+            run_id,
+            repository_id,
+            image,
+            logs_path,
+            branch,
+            std::process::id(),
+            hostname().map_err(DatabaseError::from)?
+        ],
+    )?;
+    let claim = acquire(
+        &transaction,
+        &repository_id,
+        ClaimResource::PullRequest,
+        &number.to_string(),
+        &run_id,
+    )?;
     let task_id = match task_id {
         Some(task_id) => task_id,
         None => {
@@ -3547,24 +3568,22 @@ pub fn start_continue_run(
          ON CONFLICT(repository_id, number) DO UPDATE SET branch = excluded.branch, head_sha = excluded.head_sha, remote_state = 'open'",
         (Uuid::new_v4().to_string(), &task_id, &repository_id, number, branch, head_sha, if recovery { "recovery" } else { "normal" }),
     )?;
-    transaction.execute(
-        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, branch, pid, hostname)
-         VALUES (?1, ?2, 'continue', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
-        params![run_id, repository_id, image, logs_path, branch, std::process::id(), hostname()?],
-    )?;
     transaction.commit()?;
-    Ok(ContinueRun {
-        run: Run {
-            id: run_id,
-            repository_id,
-            command: "continue".to_string(),
-            status: "running".to_string(),
-            base_sha: None,
-            image: Some(image.to_string()),
-            logs_path: Some(logs_path),
+    Ok((
+        ContinueRun {
+            run: Run {
+                id: run_id,
+                repository_id,
+                command: "continue".to_string(),
+                status: "running".to_string(),
+                base_sha: None,
+                image: Some(image.to_string()),
+                logs_path: Some(logs_path),
+            },
+            task_id,
         },
-        task_id,
-    })
+        claim,
+    ))
 }
 
 pub fn heartbeat(path: &Path, lease_id: &str, run_id: &str) -> Result<(), ClaimError> {
@@ -3638,7 +3657,7 @@ pub fn task_is_pending(path: &Path, task_id: &str) -> Result<bool, DatabaseError
         .map_err(Into::into)
 }
 
-/// Records an opened PR and moves the claimed task into flight.
+/// Leases and records an opened PR before moving the claimed task into flight.
 pub fn record_task_pr(
     path: &Path,
     task_id: &str,
@@ -3647,7 +3666,7 @@ pub fn record_task_pr(
     number: i64,
     branch: &str,
     head_sha: &str,
-) -> Result<(), ClaimError> {
+) -> Result<Claim, ClaimError> {
     let mut connection = open(path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let repository_id: String = transaction
@@ -3668,6 +3687,13 @@ pub fn record_task_pr(
     if !active {
         return Err(ClaimError::LeaseNotActive);
     }
+    let claim = acquire(
+        &transaction,
+        &repository_id,
+        ClaimResource::PullRequest,
+        &number.to_string(),
+        run_id,
+    )?;
     transaction.execute(
         "INSERT INTO pull_requests (id, task_id, repository_id, number, branch, head_sha, kind, remote_state, gate_state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'normal', 'open', 'pending')
@@ -3679,7 +3705,7 @@ pub fn record_task_pr(
         (number, task_id),
     )?;
     transaction.commit()?;
-    Ok(())
+    Ok(claim)
 }
 
 /// Records the CI gate result for an opened task pull request.
