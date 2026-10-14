@@ -2876,6 +2876,76 @@ pub fn import_github_tasks(
     Ok(())
 }
 
+/// A GitHub task with an in-flight pull request that may need reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubTaskPullRequest {
+    pub task_id: String,
+    pub pull_request_number: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubPullRequestState {
+    Closed,
+    Merged,
+}
+
+/// Lists unclaimed GitHub tasks whose recorded pull requests need checking.
+pub fn github_task_pull_requests(
+    connection: &Connection,
+    repository: &str,
+) -> Result<Vec<GithubTaskPullRequest>, DatabaseError> {
+    connection
+        .prepare(
+            "SELECT tasks.id, tasks.pr_number
+             FROM tasks
+             WHERE repository_id = ?1 AND source = 'github' AND status = 'in_flight'
+               AND pr_number IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims
+                 WHERE repository_id = tasks.repository_id AND resource_kind = 'task'
+                   AND resource_key = tasks.id AND state = 'active'
+               )",
+        )?
+        .query_map([repository], |row| {
+            Ok(GithubTaskPullRequest {
+                task_id: row.get(0)?,
+                pull_request_number: row.get(1)?,
+            })
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(Into::into)
+}
+
+/// Updates an unclaimed GitHub task after GitHub confirms its PR is terminal.
+pub fn reconcile_github_task_pull_request(
+    connection: &Connection,
+    task: &GithubTaskPullRequest,
+    state: GithubPullRequestState,
+) -> Result<(), DatabaseError> {
+    let (status, pr_number, previous_pr_number) = match state {
+        GithubPullRequestState::Closed => ("pending", None, Some(task.pull_request_number)),
+        GithubPullRequestState::Merged => ("done", Some(task.pull_request_number), None),
+    };
+    connection.execute(
+        "UPDATE tasks SET status = ?1, pr_number = ?2, previous_pr_number = ?3,
+             updated_at = datetime('now')
+         WHERE id = ?4 AND source = 'github' AND status = 'in_flight' AND pr_number = ?5
+           AND NOT EXISTS (
+             SELECT 1 FROM claims
+             WHERE repository_id = tasks.repository_id AND resource_kind = 'task'
+               AND resource_key = tasks.id AND state = 'active'
+           )",
+        (
+            status,
+            pr_number,
+            previous_pr_number,
+            &task.task_id,
+            task.pull_request_number,
+        ),
+    )?;
+    Ok(())
+}
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_run_owners.sql")),

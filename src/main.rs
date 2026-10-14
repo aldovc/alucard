@@ -3,19 +3,20 @@
 use alucard::{
     abandoned_pull_request_claims, abandoned_task_claims, acquire_pr, archive_prompt,
     begin_operation, begin_operation_with_payload, build_image, compose_role_prompt, database_path,
-    defer_operation, find_run, finish_operation, finish_run, github_queue, github_ticket_blockers,
-    import_github_tasks, import_local_tasks, iteration_usage_comment_for_dirs,
-    local_queue_with_open_issues, local_queue_with_open_prs, log_event,
-    mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
-    pending_operations, prepare_run, recent_runs, record_recovery_failure, record_recovery_pr,
-    record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
-    release_abandoned_pull_request_claim, release_abandoned_task_claim, run_claims,
-    run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
-    start_continue_run, start_merge_run, start_task_retry_run, start_task_run, status,
-    task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
-    usage_report_for_dirs, warn_if_stale_image, write_iteration_measurement, write_run_measurement,
-    write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentResult,
-    AgentRole, AgentSettings, GithubPullRequest, GithubTask, IterationMeasurement, Provider,
+    defer_operation, find_run, finish_operation, finish_run, github_queue,
+    github_task_pull_requests, github_ticket_blockers, import_github_tasks, import_local_tasks,
+    iteration_usage_comment_for_dirs, local_queue_with_open_issues, local_queue_with_open_prs,
+    log_event, mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
+    pending_operations, prepare_run, recent_runs, reconcile_github_task_pull_request,
+    record_recovery_failure, record_recovery_pr, record_task_pr, record_task_pr_gate_state,
+    record_task_pr_review, release, release_abandoned_pull_request_claim,
+    release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
+    run_reconciliation_reason, run_recovery, start_continue_run, start_merge_run,
+    start_task_retry_run, start_task_run, status, task_claim_attempts, task_id, task_is_pending,
+    toolchain_preflight, transition_task, usage_report_for_dirs, warn_if_stale_image,
+    write_iteration_measurement, write_run_measurement, write_stage_measurement,
+    write_task_headings, AgentExit, AgentInvocation, AgentResult, AgentRole, AgentSettings,
+    GithubPullRequest, GithubPullRequestState, GithubTask, IterationMeasurement, Provider,
     RecoveryPullRequest, RunOptions, StageMeasurement, TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
@@ -4835,7 +4836,7 @@ fn select_run_task(
             parent_context: parsed.parent_context,
         }));
     }
-    let (issues, pinned_is_pr) = if let Some(number) = options.issue {
+    let (fetched_issues, pinned_is_pr) = if let Some(number) = options.issue {
         let (issue, is_pr) = fetch_pinned_issue(&options.repository, number)?;
         (vec![issue], is_pr)
     } else {
@@ -4843,24 +4844,26 @@ fn select_run_task(
     };
     let open_issues = fetch_open_issue_numbers_required(&options.repository)?;
     let prs = fetch_open_prs(&options.repository)?;
-    let issues = if options.issue.is_some() {
-        vec![alucard::resolve_pinned_issue(
-            issues.into_iter().next().unwrap(),
-            pinned_is_pr,
-            &open_issues,
-            &prs,
-        )?]
-    } else {
-        github_queue(issues, &open_issues, &prs)
-    };
     migrate(database).map_err(|error| error.to_string())?;
     let mut connection = open(database).map_err(|error| error.to_string())?;
     import_github_tasks(
         &mut connection,
         &options.repository.display().to_string(),
-        &issues,
+        &fetched_issues,
     )
     .map_err(|error| error.to_string())?;
+    drop(connection);
+    reconcile_github_tasks(database, &options.repository)?;
+    let issues = if options.issue.is_some() {
+        vec![alucard::resolve_pinned_issue(
+            fetched_issues.into_iter().next().unwrap(),
+            pinned_is_pr,
+            &open_issues,
+            &prs,
+        )?]
+    } else {
+        github_queue(fetched_issues, &open_issues, &prs)
+    };
     let issue = issues.into_iter().find(|issue| {
         task_id(
             database,
@@ -4909,39 +4912,67 @@ fn reconcile_local_tasks(
         .filter(|task| task.state == TaskState::InFlight && task.pr_number.is_some())
     {
         let number = task.pr_number.expect("filtered above");
-        let output = match gh_output(
-            repository,
-            &[
-                "pr",
-                "view",
-                &number.to_string(),
-                "--json",
-                "state",
-                "--jq",
-                ".state",
-            ],
-            "could not inspect pull request",
-        ) {
-            Ok(output) => output,
+        let state = match pull_request_state(repository, number) {
+            Ok(state) => state,
             Err(_) => return Ok(()),
         };
-        match String::from_utf8_lossy(&output).trim() {
-            "MERGED" => updates.push(TaskHeadingUpdate {
+        match state {
+            Some(GithubPullRequestState::Merged) => updates.push(TaskHeadingUpdate {
                 id: task.id.clone(),
                 state: TaskState::Done,
                 pr_number: Some(number),
                 previous_pr_number: None,
             }),
-            "CLOSED" => updates.push(TaskHeadingUpdate {
+            Some(GithubPullRequestState::Closed) => updates.push(TaskHeadingUpdate {
                 id: task.id.clone(),
                 state: TaskState::Pending,
                 pr_number: None,
                 previous_pr_number: Some(number),
             }),
-            _ => {}
+            None => {}
         }
     }
     write_task_headings(file, contents, &updates)
+}
+
+fn pull_request_state(
+    repository: &Path,
+    number: i64,
+) -> Result<Option<GithubPullRequestState>, String> {
+    let output = gh_output(
+        repository,
+        &[
+            "pr",
+            "view",
+            &number.to_string(),
+            "--json",
+            "state",
+            "--jq",
+            ".state",
+        ],
+        "could not inspect pull request",
+    )?;
+    Ok(match String::from_utf8_lossy(&output).trim() {
+        "MERGED" => Some(GithubPullRequestState::Merged),
+        "CLOSED" => Some(GithubPullRequestState::Closed),
+        _ => None,
+    })
+}
+
+fn reconcile_github_tasks(database: &Path, repository: &Path) -> Result<(), String> {
+    let repository_id = repository.display().to_string();
+    let connection = open(database).map_err(|error| error.to_string())?;
+    let tasks = github_task_pull_requests(&connection, &repository_id)
+        .map_err(|error| error.to_string())?;
+    for task in tasks {
+        let state = match pull_request_state(repository, task.pull_request_number) {
+            Ok(Some(state)) => state,
+            Ok(None) | Err(_) => continue,
+        };
+        reconcile_github_task_pull_request(&connection, &task, state)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn worker_prompt(
@@ -5385,12 +5416,11 @@ fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> Exi
         Ok(prs) => prs,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
-    let imported_tasks = issues.clone();
-    let queue = github_queue(issues, &open_issues, &open_prs);
     let path = match database_path(db_path) {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
+    let imported_tasks = issues.clone();
     if let Err(error) = migrate(&path).and_then(|_| {
         let mut connection = open(&path)?;
         import_github_tasks(
@@ -5401,6 +5431,30 @@ fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> Exi
     }) {
         return fail(&format!("alucard: database error: {error}"));
     }
+    if let Err(error) = reconcile_github_tasks(&path, &options.repository) {
+        return fail(&format!("alucard: database error: {error}"));
+    }
+    let queue = github_queue(issues, &open_issues, &open_prs)
+        .into_iter()
+        .map(|issue| -> Result<Option<_>, String> {
+            let id = task_id(
+                &path,
+                &options.repository.display().to_string(),
+                "github",
+                "",
+                &issue.number.to_string(),
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or("imported GitHub issue is missing")?;
+            Ok(task_is_pending(&path, &id)
+                .map_err(|error| error.to_string())?
+                .then_some(issue))
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let queue = match queue {
+        Ok(queue) => queue.into_iter().flatten().collect::<Vec<_>>(),
+        Err(error) => return fail(&format!("alucard: database error: {error}")),
+    };
     match serde_json::to_string_pretty(&queue) {
         Ok(queue) => {
             println!("{queue}");
