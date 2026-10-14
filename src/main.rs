@@ -1980,6 +1980,7 @@ enum ReconciliationAction {
 }
 
 fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
+    let _lock = lock_recovery_operations(database).map_err(|error| error.to_string())?;
     let repository_id =
         ensure_repository_identity(database, repository).map_err(|error| error.to_string())?;
     replay_recovery_operations(database, repository, &repository_id)?;
@@ -2176,7 +2177,6 @@ fn replay_recovery_operations(
     repository: &Path,
     repository_id: &str,
 ) -> Result<(), String> {
-    let _lock = lock_recovery_operations(database).map_err(|error| error.to_string())?;
     let mut operations =
         pending_recovery_operations(database, repository_id).map_err(|error| error.to_string())?;
     operations.sort_by_key(|operation| match operation.operation_type.as_str() {
