@@ -2845,6 +2845,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
         "no-remote-trace",
         "remote-branch",
         "unpublished-work",
+        "stashed-work",
         "missing-checkout",
     ] {
         let root = temporary_path(&format!("reconciliation-{scenario}"));
@@ -2863,7 +2864,11 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
         fs::write(&tasks, task_contents).unwrap();
         if matches!(
             scenario,
-            "no-remote-trace" | "remote-branch" | "unpublished-work" | "missing-checkout"
+            "no-remote-trace"
+                | "remote-branch"
+                | "unpublished-work"
+                | "stashed-work"
+                | "missing-checkout"
         ) {
             let remote = root.join("remote.git");
             run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
@@ -2969,6 +2974,14 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                 "first-branch",
                 None,
             ),
+            "stashed-work" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "first-branch",
+                None,
+            ),
             "missing-checkout" => seed_abandoned_task(
                 &database,
                 &repository,
@@ -2979,7 +2992,10 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
             ),
             _ => unreachable!(),
         };
-        if matches!(scenario, "no-remote-trace" | "unpublished-work") {
+        if matches!(
+            scenario,
+            "no-remote-trace" | "unpublished-work" | "stashed-work"
+        ) {
             let logs: String = open(&database)
                 .unwrap()
                 .query_row(
@@ -2997,6 +3013,16 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
             ]));
             if scenario == "unpublished-work" {
                 fs::write(checkout.join("unfinished"), "dirty\n").unwrap();
+            } else if scenario == "stashed-work" {
+                fs::write(checkout.join("README.md"), "stashed\n").unwrap();
+                run(Command::new("git").args([
+                    "-C",
+                    checkout.to_str().unwrap(),
+                    "stash",
+                    "push",
+                    "-qm",
+                    "unfinished",
+                ]));
             }
         }
         if scenario == "recovery-pr" {
@@ -3261,7 +3287,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                     "needs reconciliation: branch first-branch exists without an open pull request"
                 ));
             }
-            "unpublished-work" | "missing-checkout" => {
+            "unpublished-work" | "stashed-work" | "missing-checkout" => {
                 assert!(output.status.success(), "{output:?}");
                 assert_eq!(
                     connection
@@ -3289,7 +3315,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                     .unwrap();
                 assert!(runs.status.success(), "{runs:?}");
                 assert!(String::from_utf8_lossy(&runs.stdout).contains(
-                    if scenario == "unpublished-work" {
+                    if matches!(scenario, "unpublished-work" | "stashed-work") {
                         "has unpublished work"
                     } else {
                         "checkout is unavailable"
