@@ -2626,7 +2626,7 @@ run_feedback_once() {
 $(compose_role_prompt alucard-feedback-prompt.md)
 </instructions>
 <pr_num>${pr_num}</pr_num>
-<branch>${branch}</branch>
+<branch>$(printf '%s' "$branch" | xml_escape)</branch>
 <toolchain_status>
 $(printf '%s' "${TOOLCHAIN_STATUS:-Unknown — no preflight result available.}" | xml_escape)
 </toolchain_status>
