@@ -1,10 +1,11 @@
 use alucard::{
-    begin_operation_with_payload, finish_operation, github_queue, github_task_pull_requests,
-    github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue,
-    local_queue_with_open_issues, migrate, open, parse_tasks, reconcile_github_task_pull_request,
-    repository_ledger_id, repository_source_path, resolve_pinned_issue, start_task_retry_run,
-    start_task_run, task_id, write_task_headings, GithubPullRequest, GithubPullRequestState,
-    GithubTask, TaskHeadingUpdate, TaskState,
+    acquire_pr, begin_operation_with_payload, finish_operation, github_queue,
+    github_task_pull_requests, github_ticket_blockers, import_github_tasks, import_local_tasks,
+    local_queue, local_queue_with_open_issues, migrate, open, parse_tasks,
+    reconcile_github_task_pull_request, repository_ledger_id, repository_source_path,
+    resolve_pinned_issue, start_merge_run, start_task_retry_run, start_task_run, task_id,
+    write_task_headings, GithubPullRequest, GithubPullRequestState, GithubTask, TaskHeadingUpdate,
+    TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -3334,6 +3335,185 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
         drop(connection);
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn startup_reconciliation_keeps_pr_lease_while_retry_feedback_runs() {
+    let root = temporary_path("reconciliation-pr-workload");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    let tasks = root.join("tasks.md");
+    let database = root.join("ledger.db");
+    fs::create_dir_all(&bin).unwrap();
+    git_repository(&repository);
+    fs::write(&tasks, "## [ ] 1: Retry feedback\n").unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'ps --format') [ -z \"${ALUCARD_DOCKER_FAIL:-}\" ] || exit 1; [ -z \"${ALUCARD_ACTIVE_RUN:-}\" ] || echo \"alucard-feedback-$ALUCARD_ACTIVE_RUN-1\" ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate'|'pr list') echo '[]' ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (_, task_claim, retry) =
+        seed_abandoned_task(&database, &repository, &tasks, "1", "owner", Some("retry"));
+    let owner_run_id: String = open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT run_id FROM claims WHERE id = ?1",
+            [&task_claim],
+            |row| row.get(0),
+        )
+        .unwrap();
+    open(&database)
+        .unwrap()
+        .execute("DELETE FROM claims WHERE id = ?1", [&task_claim])
+        .unwrap();
+    let claim = acquire_pr(
+        &database,
+        &repository_ledger_id(&repository).unwrap(),
+        42,
+        &owner_run_id,
+    )
+    .unwrap();
+    let retry_run_id = retry.unwrap();
+
+    let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+        .env("ALUCARD_ACTIVE_RUN", &retry_run_id)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&claim.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "active"
+    );
+    drop(connection);
+
+    let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+        .env("ALUCARD_DOCKER_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&claim.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "active"
+    );
+
+    let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&claim.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "released"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn startup_reconciliation_keeps_pr_lease_while_merge_check_runs() {
+    let root = temporary_path("reconciliation-merge-check");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    let tasks = root.join("tasks.md");
+    let database = root.join("ledger.db");
+    fs::create_dir_all(&bin).unwrap();
+    git_repository(&repository);
+    fs::write(&tasks, "## [ ] 1: Merge check\n").unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'ps --format') ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate'|'pr list') echo '[]' ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run = start_merge_run(&database, &repository, &root.join("logs")).unwrap();
+    let claim = acquire_pr(&database, &run.repository_id, 42, &run.id).unwrap();
+    open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE runs SET pid = ?1 WHERE id = ?2",
+            (i64::MAX, &run.id),
+        )
+        .unwrap();
+    let checkout = Path::new(run.logs_path.as_deref().unwrap()).join("repository");
+    fs::create_dir_all(&checkout).unwrap();
+    let mut check = Command::new("sh")
+        .args(["-c", "exec sleep 60"])
+        .current_dir(&checkout)
+        .spawn()
+        .unwrap();
+
+    let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&claim.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "active"
+    );
+
+    check.kill().unwrap();
+    check.wait().unwrap();
+    let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&claim.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "released"
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

@@ -3075,6 +3075,8 @@ pub struct AbandonedTaskClaim {
 pub struct AbandonedPullRequestClaim {
     pub lease_id: String,
     pub run_id: String,
+    pub command: String,
+    pub logs_path: Option<String>,
 }
 
 /// A run that may still be working on a task claimed by an earlier run.
@@ -3987,7 +3989,7 @@ pub fn abandoned_pull_request_claims(
     let connection = open(path)?;
     let hostname = hostname()?;
     let mut statement = connection.prepare(
-        "SELECT claims.id, claims.run_id
+        "SELECT claims.id, claims.run_id, runs.command, runs.logs_path
          FROM claims
          JOIN runs ON runs.id = claims.run_id
          WHERE claims.state = 'active' AND claims.resource_kind = 'pr'
@@ -3999,6 +4001,8 @@ pub fn abandoned_pull_request_claims(
             Ok(AbandonedPullRequestClaim {
                 lease_id: row.get(0)?,
                 run_id: row.get(1)?,
+                command: row.get(2)?,
+                logs_path: row.get(3)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?
@@ -4021,6 +4025,14 @@ pub fn task_claim_attempts(
     path: &Path,
     claim: &AbandonedTaskClaim,
 ) -> Result<Vec<TaskClaimAttempt>, DatabaseError> {
+    run_retry_attempts(path, &claim.run_id)
+}
+
+/// Lists a run and retries linked to it.
+pub fn run_retry_attempts(
+    path: &Path,
+    run_id: &str,
+) -> Result<Vec<TaskClaimAttempt>, DatabaseError> {
     let connection = open(path)?;
     let mut statement = connection.prepare(
         "SELECT id, branch, logs_path FROM runs
@@ -4028,7 +4040,7 @@ pub fn task_claim_attempts(
          ORDER BY id != ?1, started_at, rowid",
     )?;
     let attempts = statement
-        .query_map([&claim.run_id], |row| {
+        .query_map([run_id], |row| {
             Ok(TaskClaimAttempt {
                 run_id: row.get(0)?,
                 branch: row.get(1)?,
