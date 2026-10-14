@@ -2838,11 +2838,14 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
 fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
     for scenario in [
         "active-retry",
+        "active-wrapup",
         "open-pr",
         "recovery-pr",
         "lookup-failure",
         "no-remote-trace",
         "remote-branch",
+        "unpublished-work",
+        "missing-checkout",
     ] {
         let root = temporary_path(&format!("reconciliation-{scenario}"));
         let repository = root.join("repository");
@@ -2858,7 +2861,10 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
             "## [ ] first: First task\n\nBody\n"
         };
         fs::write(&tasks, task_contents).unwrap();
-        if matches!(scenario, "no-remote-trace" | "remote-branch") {
+        if matches!(
+            scenario,
+            "no-remote-trace" | "remote-branch" | "unpublished-work" | "missing-checkout"
+        ) {
             let remote = root.join("remote.git");
             run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
             run(Command::new("git").args([
@@ -2886,7 +2892,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
         let docker = bin.join("docker");
         fs::write(
             &docker,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'ps --format') [ -z \"${ALUCARD_ACTIVE_RUN:-}\" ] || echo \"alucard-worker-$ALUCARD_ACTIVE_RUN-1\" ;;\nesac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'ps --format')\n    [ -z \"${ALUCARD_ACTIVE_RUN:-}\" ] || {\n      if [ \"${ALUCARD_ACTIVE_ROLE:-worker}\" = wrapup ]; then echo \"alucard-wrapup-1-$ALUCARD_ACTIVE_RUN\"; else echo \"alucard-worker-$ALUCARD_ACTIVE_RUN-1\"; fi\n    } ;;\nesac\n",
         )
         .unwrap();
         fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2906,6 +2912,14 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                 "first",
                 "owner-branch",
                 Some("retry-branch"),
+            ),
+            "active-wrapup" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "owner-branch",
+                None,
             ),
             "open-pr" => seed_abandoned_task(
                 &database,
@@ -2947,8 +2961,44 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                 "first-branch",
                 None,
             ),
+            "unpublished-work" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "first-branch",
+                None,
+            ),
+            "missing-checkout" => seed_abandoned_task(
+                &database,
+                &repository,
+                &tasks,
+                "first",
+                "first-branch",
+                None,
+            ),
             _ => unreachable!(),
         };
+        if matches!(scenario, "no-remote-trace" | "unpublished-work") {
+            let logs: String = open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT logs_path FROM runs WHERE id = (SELECT run_id FROM claims WHERE id = ?1)",
+                    [&first_claim],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let checkout = Path::new(&logs).join("repository");
+            run(Command::new("git").args([
+                "clone",
+                "-q",
+                repository.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ]));
+            if scenario == "unpublished-work" {
+                fs::write(checkout.join("unfinished"), "dirty\n").unwrap();
+            }
+        }
         if scenario == "recovery-pr" {
             let operation = begin_operation_with_payload(
                 &database,
@@ -2995,16 +3045,31 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                 .unwrap();
         }
 
+        let active_run = if scenario == "active-retry" {
+            retry.clone().unwrap_or_default()
+        } else if scenario == "active-wrapup" {
+            open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT run_id FROM claims WHERE id = ?1",
+                    [&first_claim],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        } else {
+            String::new()
+        };
         let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
             .env("ALUCARD_DOCKER_TRACE", &docker_trace)
             .env("ALUCARD_GH_CALLS", &gh_calls)
             .env("ALUCARD_SCENARIO", scenario)
+            .env("ALUCARD_ACTIVE_RUN", &active_run)
             .env(
-                "ALUCARD_ACTIVE_RUN",
-                if scenario == "active-retry" {
-                    retry.as_deref().unwrap_or("")
+                "ALUCARD_ACTIVE_ROLE",
+                if scenario == "active-wrapup" {
+                    "wrapup"
                 } else {
-                    ""
+                    "worker"
                 },
             )
             .output()
@@ -3012,7 +3077,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
 
         let connection = open(&database).unwrap();
         match scenario {
-            "active-retry" => {
+            "active-retry" | "active-wrapup" => {
                 assert!(output.status.success(), "{output:?}");
                 assert_eq!(
                     connection
@@ -3195,6 +3260,48 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                 assert!(String::from_utf8_lossy(&runs.stdout).contains(
                     "needs reconciliation: branch first-branch exists without an open pull request"
                 ));
+            }
+            "unpublished-work" | "missing-checkout" => {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?1",
+                            [&first_task],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "human"
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT state FROM claims WHERE id = ?1",
+                            [&first_claim],
+                            |row| row.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "active"
+                );
+                let runs = Command::new(env!("CARGO_BIN_EXE_alucard"))
+                    .args(["--db-path", database.to_str().unwrap(), "runs"])
+                    .output()
+                    .unwrap();
+                assert!(runs.status.success(), "{runs:?}");
+                assert!(String::from_utf8_lossy(&runs.stdout).contains(
+                    if scenario == "unpublished-work" {
+                        "has unpublished work"
+                    } else {
+                        "checkout is unavailable"
+                    }
+                ));
+                let second = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+                    .env("ALUCARD_DOCKER_TRACE", &docker_trace)
+                    .env("ALUCARD_GH_CALLS", &gh_calls)
+                    .env("ALUCARD_SCENARIO", scenario)
+                    .output()
+                    .unwrap();
+                assert!(second.status.success(), "{second:?}");
             }
             _ => unreachable!(),
         }

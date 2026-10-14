@@ -2050,6 +2050,11 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
                 claim,
                 reason: "branch identity is unavailable".to_string(),
             });
+        } else if let Some(reason) = attempts
+            .iter()
+            .find_map(abandoned_attempt_requires_recovery)
+        {
+            actions.push(ReconciliationAction::Human { claim, reason });
         } else {
             actions.push(ReconciliationAction::Release(claim));
         }
@@ -2355,7 +2360,44 @@ fn docker_run_is_active_output(
     }
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(|name| name.starts_with(&format!("alucard-worker-{run_id}-"))))
+        .any(|name| docker_container_belongs_to_run(name, run_id)))
+}
+
+fn docker_container_belongs_to_run(name: &str, run_id: &str) -> bool {
+    ["worker", "review", "feedback", "fix"]
+        .iter()
+        .any(|role| name.starts_with(&format!("alucard-{role}-{run_id}-")))
+        || (name.starts_with("alucard-wrapup-") && name.ends_with(&format!("-{run_id}")))
+}
+
+fn abandoned_attempt_requires_recovery(attempt: &alucard::TaskClaimAttempt) -> Option<String> {
+    let Some(logs_path) = attempt.logs_path.as_ref() else {
+        return Some(format!(
+            "attempt {} has no recorded checkout",
+            attempt.run_id
+        ));
+    };
+    let checkout = PathBuf::from(logs_path).join("repository");
+    if !checkout.is_dir() {
+        return Some(format!(
+            "attempt {} checkout is unavailable at {}",
+            attempt.run_id,
+            checkout.display()
+        ));
+    }
+    match checkout_requires_preservation(&checkout) {
+        Ok(true) => Some(format!(
+            "attempt {} has unpublished work at {}",
+            attempt.run_id,
+            checkout.display()
+        )),
+        Ok(false) => None,
+        Err(error) => Some(format!(
+            "could not inspect attempt {} checkout at {}: {error}",
+            attempt.run_id,
+            checkout.display()
+        )),
+    }
 }
 
 fn reconcile_remote_pr(
@@ -3986,10 +4028,23 @@ fn cleanup_repair_checkout(checkout: &Path) -> bool {
     if !checkout.is_dir() {
         return false;
     }
+    let preserved = checkout_requires_preservation(checkout).unwrap_or(true);
+    if !preserved {
+        let _ = fs::remove_dir_all(checkout);
+    } else {
+        eprintln!(
+            "CI gate: unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
+            checkout.display()
+        );
+    }
+    preserved
+}
+
+fn checkout_requires_preservation(checkout: &Path) -> Result<bool, String> {
     let dirty = git_output(
         checkout,
         &["status", "--porcelain", "--untracked-files=all"],
-    );
+    )?;
     let unpublished = git_output(
         checkout,
         &[
@@ -4000,21 +4055,9 @@ fn cleanup_repair_checkout(checkout: &Path) -> bool {
             "--not",
             "--remotes=origin",
         ],
-    );
-    let stashes = git_output(checkout, &["stash", "list"]);
-    let clean = dirty.is_ok_and(|value| value.is_empty())
-        && unpublished.is_ok_and(|value| value.trim() == "0")
-        && stashes.is_ok_and(|value| value.is_empty());
-    if clean {
-        let _ = fs::remove_dir_all(checkout);
-        false
-    } else {
-        eprintln!(
-            "CI gate: unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
-            checkout.display()
-        );
-        true
-    }
+    )?;
+    let stashes = git_output(checkout, &["stash", "list"])?;
+    Ok(!(dirty.is_empty() && unpublished.trim() == "0" && stashes.is_empty()))
 }
 
 #[allow(clippy::too_many_arguments)]
