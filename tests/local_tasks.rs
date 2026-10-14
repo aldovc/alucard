@@ -2,8 +2,9 @@ use alucard::{
     begin_operation_with_payload, finish_operation, github_queue, github_task_pull_requests,
     github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue,
     local_queue_with_open_issues, migrate, open, parse_tasks, reconcile_github_task_pull_request,
-    resolve_pinned_issue, start_task_retry_run, start_task_run, task_id, write_task_headings,
-    GithubPullRequest, GithubPullRequestState, GithubTask, TaskHeadingUpdate, TaskState,
+    repository_ledger_id, repository_source_path, resolve_pinned_issue, start_task_retry_run,
+    start_task_run, task_id, write_task_headings, GithubPullRequest, GithubPullRequestState,
+    GithubTask, TaskHeadingUpdate, TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -186,23 +187,18 @@ fn seed_abandoned_task(
 ) -> (String, String, Option<String>) {
     migrate(database).unwrap();
     let parsed = parse_tasks(&fs::read_to_string(tasks).unwrap()).unwrap();
-    let repository_id = repository.display().to_string();
+    let repository_id = repository_ledger_id(repository).unwrap();
+    let source_path = repository_source_path(repository, tasks).unwrap();
     import_local_tasks(
         &mut open(database).unwrap(),
         &repository_id,
-        tasks,
+        Path::new(&source_path),
         &parsed.tasks,
     )
     .unwrap();
-    let task_id = task_id(
-        database,
-        &repository_id,
-        "local",
-        &tasks.display().to_string(),
-        external_id,
-    )
-    .unwrap()
-    .unwrap();
+    let task_id = task_id(database, &repository_id, "local", &source_path, external_id)
+        .unwrap()
+        .unwrap();
     let logs = repository.parent().unwrap().join("logs");
     let cache = repository.parent().unwrap().join("cache");
     let (owner, claim) =
@@ -770,11 +766,7 @@ esac
 
     let database = root.join("ledger.db");
     migrate(&database).unwrap();
-    let repository_id = repository
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let repository_id = repository_ledger_id(&repository).unwrap();
     let tasks = root.join("tasks.md");
     fs::write(&tasks, "## [ ] recovery: Recovery task\n").unwrap();
     let (task_id, claim_id, _) = seed_abandoned_task(
@@ -1110,11 +1102,7 @@ esac
 
         let database = root.join("ledger.db");
         migrate(&database).unwrap();
-        let repository_id = repository
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let repository_id = repository_ledger_id(&repository).unwrap();
         let tasks = root.join("tasks.md");
         fs::write(&tasks, "## [ ] recovery: Recovery task\n").unwrap();
         seed_abandoned_task(
@@ -1857,9 +1845,9 @@ fn queue_cli_omits_claimed_local_tasks() {
     let tasks = tasks.canonicalize().unwrap();
     let claimed_task = task_id(
         &database,
-        &repository.display().to_string(),
+        &repository_ledger_id(&repository).unwrap(),
         "local",
-        &tasks.display().to_string(),
+        &repository_source_path(&repository, &tasks).unwrap(),
         "claimed",
     )
     .unwrap()

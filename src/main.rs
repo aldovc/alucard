@@ -3,14 +3,15 @@
 use alucard::{
     abandoned_pull_request_claims, abandoned_task_claims, acquire_pr, archive_prompt,
     begin_operation, begin_operation_with_payload, build_image, compose_role_prompt, database_path,
-    defer_operation, find_run, finish_operation, finish_run, github_queue,
-    github_task_pull_requests, github_ticket_blockers, import_github_tasks, import_local_tasks,
-    iteration_usage_comment_for_dirs, local_queue_with_open_issues, local_queue_with_open_prs,
-    log_event, mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
-    pending_operations, prepare_run, recent_runs, reconcile_github_task_pull_request,
-    record_recovery_failure, record_recovery_pr, record_task_pr, record_task_pr_gate_state,
-    record_task_pr_review, release, release_abandoned_pull_request_claim,
-    release_abandoned_task_claim, run_claims, run_command as execute_command, run_pull_requests,
+    defer_operation, ensure_repository_identity, find_run, finish_operation, finish_run,
+    github_queue, github_task_pull_requests, github_ticket_blockers, import_github_tasks,
+    import_local_tasks, iteration_usage_comment_for_dirs, local_queue_with_open_issues,
+    local_queue_with_open_prs, log_event, mark_claim_needs_reconciliation, migrate, open,
+    operation_exists, parse_tasks, pending_operations, prepare_run, recent_runs,
+    reconcile_github_task_pull_request, record_recovery_failure, record_recovery_pr,
+    record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
+    release_abandoned_pull_request_claim, release_abandoned_task_claim, repository_ledger_id,
+    repository_source_path, run_claims, run_command as execute_command, run_pull_requests,
     run_reconciliation_reason, run_recovery, start_continue_run, start_merge_run,
     start_task_retry_run, start_task_run, status, task_claim_attempts, task_id, task_is_pending,
     toolchain_preflight, transition_task, usage_report_for_dirs, warn_if_stale_image,
@@ -1988,12 +1989,8 @@ enum ReconciliationAction {
 }
 
 fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
-    migrate(database).map_err(|error| error.to_string())?;
-    let repository_id = repository
-        .canonicalize()
-        .map_err(|error| error.to_string())?
-        .to_string_lossy()
-        .to_string();
+    let repository_id =
+        ensure_repository_identity(database, repository).map_err(|error| error.to_string())?;
     replay_recovery_operations(database, repository, &repository_id)?;
     for claim in abandoned_pull_request_claims(database, &repository_id)
         .map_err(|error| error.to_string())?
@@ -4793,40 +4790,33 @@ fn select_run_task(
             fetch_open_issue_numbers(&options.repository).as_deref(),
             &open_prs,
         );
-        migrate(database).map_err(|error| error.to_string())?;
+        ensure_repository_identity(database, &options.repository)
+            .map_err(|error| error.to_string())?;
         let mut connection = open(database).map_err(|error| error.to_string())?;
+        let repository_id =
+            repository_ledger_id(&options.repository).map_err(|error| error.to_string())?;
+        let source_path =
+            repository_source_path(&options.repository, file).map_err(|error| error.to_string())?;
         import_local_tasks(
             &mut connection,
-            &options.repository.display().to_string(),
-            file,
+            &repository_id,
+            Path::new(&source_path),
             &parsed.tasks,
         )
         .map_err(|error| error.to_string())?;
         let task = tasks.into_iter().find(|task| {
-            task_id(
-                database,
-                &options.repository.display().to_string(),
-                "local",
-                &file.display().to_string(),
-                &task.id,
-            )
-            .and_then(|id| id.map(|id| task_is_pending(database, &id)).transpose())
-            .ok()
-            .flatten()
-            .unwrap_or(false)
+            task_id(database, &repository_id, "local", &source_path, &task.id)
+                .and_then(|id| id.map(|id| task_is_pending(database, &id)).transpose())
+                .ok()
+                .flatten()
+                .unwrap_or(false)
         });
         let Some(task) = task else {
             return Ok(None);
         };
-        let id = task_id(
-            database,
-            &options.repository.display().to_string(),
-            "local",
-            &file.display().to_string(),
-            &task.id,
-        )
-        .map_err(|error| error.to_string())?
-        .ok_or("imported local task is missing")?;
+        let id = task_id(database, &repository_id, "local", &source_path, &task.id)
+            .map_err(|error| error.to_string())?
+            .ok_or("imported local task is missing")?;
         return Ok(Some(SelectedRunTask {
             ledger_id: id,
             issue: None,
@@ -4844,14 +4834,12 @@ fn select_run_task(
     };
     let open_issues = fetch_open_issue_numbers_required(&options.repository)?;
     let prs = fetch_open_prs(&options.repository)?;
-    migrate(database).map_err(|error| error.to_string())?;
+    ensure_repository_identity(database, &options.repository).map_err(|error| error.to_string())?;
     let mut connection = open(database).map_err(|error| error.to_string())?;
-    import_github_tasks(
-        &mut connection,
-        &options.repository.display().to_string(),
-        &fetched_issues,
-    )
-    .map_err(|error| error.to_string())?;
+    let repository_id =
+        repository_ledger_id(&options.repository).map_err(|error| error.to_string())?;
+    import_github_tasks(&mut connection, &repository_id, &fetched_issues)
+        .map_err(|error| error.to_string())?;
     drop(connection);
     reconcile_github_tasks(database, &options.repository)?;
     let issues = if options.issue.is_some() {
@@ -4867,7 +4855,7 @@ fn select_run_task(
     let issue = issues.into_iter().find(|issue| {
         task_id(
             database,
-            &options.repository.display().to_string(),
+            &repository_id,
             "github",
             "",
             &issue.number.to_string(),
@@ -4882,7 +4870,7 @@ fn select_run_task(
     };
     let id = task_id(
         database,
-        &options.repository.display().to_string(),
+        &repository_id,
         "github",
         "",
         &issue.number.to_string(),
@@ -4960,7 +4948,7 @@ fn pull_request_state(
 }
 
 fn reconcile_github_tasks(database: &Path, repository: &Path) -> Result<(), String> {
-    let repository_id = repository.display().to_string();
+    let repository_id = repository_ledger_id(repository).map_err(|error| error.to_string())?;
     let connection = open(database).map_err(|error| error.to_string())?;
     let tasks = github_task_pull_requests(&connection, &repository_id)
         .map_err(|error| error.to_string())?;
@@ -5341,12 +5329,14 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
-    if let Err(error) = migrate(&path).and_then(|_| {
+    if let Err(error) = ensure_repository_identity(&path, &options.repository).and_then(|_| {
         let mut connection = open(&path)?;
+        let repository_id = repository_ledger_id(&options.repository)?;
+        let source_path = repository_source_path(&options.repository, &task_file)?;
         import_local_tasks(
             &mut connection,
-            &options.repository.display().to_string(),
-            &task_file,
+            &repository_id,
+            Path::new(&source_path),
             &parsed.tasks,
         )
     }) {
@@ -5369,15 +5359,13 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     let queue = local_queue_with_open_prs(&parsed.tasks, open_issues.as_deref(), &open_prs)
         .into_iter()
         .map(|task| -> Result<Option<_>, String> {
-            let id = task_id(
-                &path,
-                &options.repository.display().to_string(),
-                "local",
-                &task_file.display().to_string(),
-                &task.id,
-            )
-            .map_err(|error| error.to_string())?
-            .ok_or("imported local task is missing")?;
+            let repository_id =
+                repository_ledger_id(&options.repository).map_err(|error| error.to_string())?;
+            let source_path = repository_source_path(&options.repository, &task_file)
+                .map_err(|error| error.to_string())?;
+            let id = task_id(&path, &repository_id, "local", &source_path, &task.id)
+                .map_err(|error| error.to_string())?
+                .ok_or("imported local task is missing")?;
             Ok(task_is_pending(&path, &id)
                 .map_err(|error| error.to_string())?
                 .then_some(task))
@@ -5421,11 +5409,11 @@ fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> Exi
         Err(error) => return fail(&format!("alucard: {error}")),
     };
     let imported_tasks = issues.clone();
-    if let Err(error) = migrate(&path).and_then(|_| {
+    if let Err(error) = ensure_repository_identity(&path, &options.repository).and_then(|_| {
         let mut connection = open(&path)?;
         import_github_tasks(
             &mut connection,
-            &options.repository.display().to_string(),
+            &repository_ledger_id(&options.repository)?,
             &imported_tasks,
         )
     }) {
@@ -5439,7 +5427,7 @@ fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> Exi
         .map(|issue| -> Result<Option<_>, String> {
             let id = task_id(
                 &path,
-                &options.repository.display().to_string(),
+                &repository_ledger_id(&options.repository).map_err(|error| error.to_string())?,
                 "github",
                 "",
                 &issue.number.to_string(),
