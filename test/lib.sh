@@ -42,3 +42,7 @@ finish() {
   echo "── $PASS passed, $FAIL failed ──"
   [ "$FAIL" -eq 0 ]
 }
+
+# The CI gate waits between probes for GitHub to register a push. Tests that
+# count those waits stub sleep; the rest should not spend real time on them.
+export CI_POLL_INTERVAL=0

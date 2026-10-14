@@ -72,6 +72,14 @@ case "$1 $2" in
       allowed)
         echo "no checks reported on the branch" >&2
         exit 1 ;;
+      late)
+        # Checks register only after the first probe, as right after a push.
+        if [ ! -f "$ALUCARD_TEST_LATE_SEEN" ]; then
+          : > "$ALUCARD_TEST_LATE_SEEN"
+          echo "no checks reported on the branch" >&2
+          exit 1
+        fi
+        exit 0 ;;
       fail)
         echo "some checks were not successful" >&2
         exit 1 ;;
@@ -117,6 +125,7 @@ export PATH="$MOCK_BIN:$PATH"
 export ALUCARD_TEST_GH_TRACE="$GH_TRACE"
 export ALUCARD_TEST_HEAD_A="$HEAD_A"
 export ALUCARD_TEST_HEAD_B="$HEAD_B"
+export ALUCARD_TEST_LATE_SEEN="$TEST_DIR/late-seen"
 
 REPO_ABS="$REPO"
 WT_ROOT="$TEST_DIR/wt"
@@ -185,7 +194,8 @@ echo "── classic PAT: pr checks still used ──"
 run_two_gates allowed success
 
 checks_calls=$(grep -c 'pr checks' <<<"$GH" || true)
-assert_eq "pr checks is used on every gate when available" "2" "$checks_calls"
+assert_eq "pr checks probes the registration window on every gate" \
+  "$((2 * CI_REGISTRATION_PROBES))" "$checks_calls"
 assert_eq "availability is remembered as true" "true" "$CI_CHECKS_AVAILABLE"
 assert_not_contains "no degradation log when the API works" \
   "checks API unavailable" "$EV"
@@ -193,6 +203,24 @@ assert_contains "no checks is logged as such" \
   "no checks configured" "$EV"
 assert_not_contains "and is not reported green" "green — ready" "$EV"
 assert_eq "MEASURE_CI_RESULT records that no CI ran" "none" "$MEASURE_CI_RESULT"
+
+# ── Checks that register late are waited for (#183) ──────────────────────────
+echo ""
+echo "── classic PAT: checks registered after the push are used ──"
+: > "$GH_TRACE"
+: > "$EVENTS"
+rm -f "$ALUCARD_TEST_LATE_SEEN"
+CI_CHECKS_AVAILABLE=""
+export ALUCARD_TEST_CHECKS_MODE=late
+MEASURE_CI_RESULT=""
+set +e
+ci_gate 1 feature-a "$REMOTE" 101 >"$TEST_DIR/out-late" 2>&1
+set -e
+EV=$(<"$EVENTS")
+assert_eq "checks that appear on the second probe grade the PR green" \
+  "green" "$MEASURE_CI_RESULT"
+assert_not_contains "a late registration is not logged as no CI" \
+  "no checks configured" "$EV"
 
 # ── Failure still detected via run list ──────────────────────────────────────
 echo ""
