@@ -306,6 +306,17 @@ set -eu
 printf '%s\n' "$*" >> "$ALUCARD_GH_TRACE"
 branch=$(cat "$ALUCARD_BRANCH_FILE" 2>/dev/null || true)
 sha() { git --git-dir="$ALUCARD_REMOTE" rev-parse "refs/heads/$branch"; }
+advance_head() {
+  advance=$(mktemp -d "$ALUCARD_ADVANCE_ROOT/ci-head.XXXXXX")
+  git clone -q "$ALUCARD_REMOTE" "$advance"
+  git -C "$advance" checkout -q "$branch"
+  git -C "$advance" config user.email test@example.com
+  git -C "$advance" config user.name Test
+  printf 'CI head advance %s\n' "$(sha)" > "$advance/ci-head-advance.txt"
+  git -C "$advance" add ci-head-advance.txt
+  git -C "$advance" commit -qm advance
+  git -C "$advance" push -q origin "HEAD:$branch"
+}
 case "$1 $2" in
   'api user') printf '%s\n' alucard-bot ;;
   'pr ready') : ;;
@@ -315,6 +326,11 @@ case "$1 $2" in
   'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
   'pr checks')
     case "$ALUCARD_CASE" in recovery-unpark|recovery-old-head|recovery-untrusted|recovery-formal-approved) exit 0 ;; esac
+    case "$ALUCARD_CASE" in
+      ci-stale-checks-green) advance_head; exit 0 ;;
+      ci-stale-checks-failed) advance_head; echo "checks failed" >&2; exit 1 ;;
+      ci-stale-runs-green|ci-stale-runs-failed) echo "Resource not accessible" >&2; exit 1 ;;
+    esac
     if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
       feedback_attempts=$(wc -l < "$ALUCARD_FEEDBACK_ATTEMPTS")
       repair_attempts=$(wc -l < "$ALUCARD_CI_FIX_ATTEMPTS")
@@ -333,7 +349,7 @@ case "$1 $2" in
   'pr view')
     case "$*" in
       *headRefOid*)
-        if [ "$ALUCARD_CASE" = recovery-old-head ]; then
+        if [ "$ALUCARD_CASE" = registration-unverified ]; then
           printf '%s\n' 0000000000000000000000000000000000000000
         else
           sha
@@ -356,6 +372,16 @@ case "$1 $2" in
       *reviews*) printf '%s\n' "$ALUCARD_FORMAL_VERDICT" ;;
     esac ;;
   'api --paginate') echo '[[]]' ;;
+  'run list')
+    case "$ALUCARD_CASE" in
+      ci-stale-runs-green)
+        head=$(sha); advance_head
+        printf '[{"headSha":"%s","status":"completed","conclusion":"success"}]\n' "$head" ;;
+      ci-stale-runs-failed)
+        head=$(sha); advance_head
+        printf '[{"headSha":"%s","status":"completed","conclusion":"failure"}]\n' "$head" ;;
+      *) echo '[[]]' ;;
+    esac ;;
 esac
 "#,
     )
@@ -393,6 +419,7 @@ esac
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .env("ALUCARD_CI_POLL_INTERVAL", "0")
         .env("ALUCARD_REMOTE", &remote)
         .env("ALUCARD_BRANCH_FILE", &branch_file)
         .env("ALUCARD_REVIEW_ARGS", &review_args)
@@ -447,6 +474,7 @@ esac
             },
         )
         .env("ALUCARD_ADVANCE_CHECKOUT", root.join("advance"))
+        .env("ALUCARD_ADVANCE_ROOT", &root)
         .args([
             "--db-path",
             database.to_str().unwrap(),
@@ -524,9 +552,74 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             formal_verdict: "",
             reviewer_outcomes: "verdict",
             comments_json: "{\"comments\":[]}",
-            advance_head: false,
+            advance_head: true,
             expected_verdict: "APPROVED",
             expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "registration-unverified",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "ci-stale-checks-green",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "ci-stale-checks-failed",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "ci-stale-runs-green",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "ci-stale-runs-failed",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
         },
         ReviewCase {
             name: "recovery-untrusted",
@@ -1017,6 +1110,37 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
         if case.name == "recovery-old-head" {
             assert!(!trace.contains("pr ready 77"), "{trace}");
             assert!(!trace.contains("labels/needs-human"), "{trace}");
+            assert!(!trace.contains("pr edit 77 --title"), "{trace}");
+        }
+        if matches!(
+            case.name,
+            "registration-unverified"
+                | "ci-stale-checks-green"
+                | "ci-stale-checks-failed"
+                | "ci-stale-runs-green"
+                | "ci-stale-runs-failed"
+        ) {
+            assert!(trace.contains("current-head CI is unverified"), "{trace}");
+            assert!(
+                trace.contains("APPROVED — CI status is unverified, needs human"),
+                "{trace}"
+            );
+            assert!(fs::read_to_string(root.join("ci-fix-attempts"))
+                .unwrap()
+                .is_empty());
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let measurement = fs::read_to_string(log_dir.join("measurements.jsonl")).unwrap();
+            let iteration: serde_json::Value = measurement
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .find(|record: &serde_json::Value| record["record"] == "iteration")
+                .unwrap();
+            assert_eq!(iteration["ci_result"], "unverified");
         }
         if case.name == "recovery-untrusted" {
             assert!(!trace.contains("pr ready 77"), "{trace}");
@@ -1098,7 +1222,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
         }
         if case.name == "feedback-setup-advance" {
             assert!(!trace.contains("feedback agent stopped without publishing"));
-            assert_eq!(trace.matches("pr checks").count(), 2);
+            assert_eq!(trace.matches("pr checks").count(), 8);
             assert_eq!(
                 fs::read_to_string(root.join("review-attempts"))
                     .unwrap()
@@ -1157,7 +1281,16 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             "review_blocked" => assert!(trace.contains("pr edit 77 --add-label needs-human")),
             "review_needs_human" => {
                 assert!(trace.contains("pr edit 77 --add-label needs-human"));
-                assert!(trace.contains("APPROVED — no CI ran, needs human"));
+                if !matches!(
+                    case.name,
+                    "registration-unverified"
+                        | "ci-stale-checks-green"
+                        | "ci-stale-checks-failed"
+                        | "ci-stale-runs-green"
+                        | "ci-stale-runs-failed"
+                ) {
+                    assert!(trace.contains("APPROVED — no CI ran, needs human"));
+                }
             }
             "review_missing" => {
                 assert!(trace.contains(match case.name {
