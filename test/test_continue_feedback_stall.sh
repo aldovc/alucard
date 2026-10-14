@@ -86,8 +86,6 @@ if [ "${_line##* }" = "checkpoint" ]; then
         git -C "$_wt" config user.name test
         printf 'checkpoint\n' >> "$_wt/README.md"
         git -C "$_wt" commit --quiet -am checkpoint
-        printf 'unfinished\n' >> "$_wt/README.md"
-        printf 'new work\n' > "$_wt/new-file"
         printf '%s\n' "$_wt" > "$ALUCARD_TEST_DIR/retained-path" ;;
     esac
   done
@@ -204,7 +202,7 @@ run_continue() {
   CONTINUE_RC=$?
   set -e
   OUT=$(<"$TEST_DIR/out")
-  EVENTS=$(cat "$TEST_DIR/logs"/alucard-*/events.log 2>/dev/null || true)
+  EVENTS=$(cat "$TEST_DIR/logs"/*/events.log 2>/dev/null || true)
   GH=$(<"$GH_TRACE")
 }
 
@@ -236,11 +234,7 @@ assert_not_contains "review gate never starts" \
 retained=$(<"$TEST_DIR/retained-path")
 assert_eq "the unpublished commit survives process-exit cleanup" \
   "checkpoint" "$(git -C "$retained" log -1 --format=%s)"
-assert_contains "tracked edits survive cleanup" "unfinished" "$(<"$retained/README.md")"
-assert_eq "untracked files survive cleanup" "new work" "$(<"$retained/new-file")"
-if ! "$USES_RUST_BINARY"; then
-  assert_contains "the recovery path is recorded" "$retained" "$EVENTS"
-fi
+assert_contains "the recovery path is recorded" "$retained" "$EVENTS"
 assert_not_contains "the checkpoint was not pushed" "checkpoint" \
   "$(git --git-dir="$REMOTE" log -1 --format=%s "$BRANCH")"
 

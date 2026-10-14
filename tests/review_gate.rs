@@ -173,6 +173,7 @@ if [ -n "$output" ]; then
     case "$ALUCARD_CASE" in
       feedback-stall) outcome=stall-fail ;;
       feedback-retained) outcome=retained ;;
+      feedback-unpublished) outcome=unpublished ;;
     esac
   fi
   prompt=
@@ -199,6 +200,13 @@ if [ -n "$output" ]; then
         git -C "$work" push -q origin "HEAD:$(git -C "$work" branch --show-current)"
         ;;
       retained) printf 'uncommitted feedback\n' > "$work/retained.txt" ;;
+      unpublished)
+        git -C "$work" config user.email test@example.com
+        git -C "$work" config user.name Test
+        printf 'unpublished feedback\n' > "$work/unpublished.txt"
+        git -C "$work" add unpublished.txt
+        git -C "$work" commit -qm unpublished
+        ;;
     esac
     case "$outcome" in
       *fail*) printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500}'; exit 1 ;;
@@ -414,6 +422,7 @@ esac
                 "feedback-blocked" => "push-blocked",
                 "feedback-fails-after-push" => "push-fail",
                 "feedback-setup-advance" => "stall",
+                "feedback-unpublished" => "unpublished",
                 _ => "push",
             },
         )
@@ -767,6 +776,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             expected_state: "review_changes_requested",
         },
         ReviewCase {
+            name: "feedback-unpublished",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
             name: "feedback-invocation-failure",
             review_policy: Some("Review policy from the target repository.\n"),
             oversized_policy: false,
@@ -1107,7 +1129,10 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
         }
         if matches!(
             case.name,
-            "feedback-stall" | "feedback-retained" | "feedback-invocation-failure"
+            "feedback-stall"
+                | "feedback-retained"
+                | "feedback-unpublished"
+                | "feedback-invocation-failure"
         ) {
             assert!(trace.contains("feedback agent stopped without publishing"));
             assert_eq!(
@@ -1117,6 +1142,16 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                     .count(),
                 1
             );
+        }
+        if case.name == "feedback-unpublished" {
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let event = fs::read_to_string(log_dir.join("events.log")).unwrap();
+            assert!(event.contains("Unpublished work preserved at"), "{event}");
         }
         match case.expected_state {
             "review_blocked" => assert!(trace.contains("pr edit 77 --add-label needs-human")),

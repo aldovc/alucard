@@ -3079,13 +3079,16 @@ fn run_feedback_once(
     let after = remote_branch_sha(&prepared.clone, branch);
     let advanced = before.zip(after).map(|(before, after)| before != after);
     let blocked = fs::read_to_string(output.join(".alucard-blocked")).unwrap_or_default();
-    let retained = git_output(
-        &checkout,
-        &["status", "--porcelain", "--untracked-files=all"],
-    )
-    .map(|value| !value.trim().is_empty())
-    .unwrap_or(true);
-    if !retained {
+    let retained = cleanup_repair_checkout(&checkout);
+    if retained {
+        log_event(
+            &prepared.directory,
+            &format!(
+                "Unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
+                checkout.display()
+            ),
+        );
+    } else {
         let _ = fs::remove_dir_all(&root);
     }
     Ok((
@@ -3846,9 +3849,9 @@ fn git_output(repository: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn cleanup_repair_checkout(checkout: &Path) {
+fn cleanup_repair_checkout(checkout: &Path) -> bool {
     if !checkout.is_dir() {
-        return;
+        return false;
     }
     let dirty = git_output(
         checkout,
@@ -3871,11 +3874,13 @@ fn cleanup_repair_checkout(checkout: &Path) {
         && stashes.is_ok_and(|value| value.is_empty());
     if clean {
         let _ = fs::remove_dir_all(checkout);
+        false
     } else {
         eprintln!(
             "CI gate: unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
             checkout.display()
         );
+        true
     }
 }
 
@@ -6160,6 +6165,20 @@ printf '%s' "$FULL_PROMPT""#,
         git(&checkout, &["commit", "-m", "unpublished"]);
         cleanup_repair_checkout(&checkout);
         assert!(checkout.is_dir());
+
+        let clean_checkout = root.join("clean-checkout");
+        git(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                clean_checkout.to_str().unwrap(),
+            ],
+        );
+        assert!(!cleanup_repair_checkout(&clean_checkout));
+        assert!(!clean_checkout.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
