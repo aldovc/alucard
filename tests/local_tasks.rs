@@ -2361,6 +2361,104 @@ esac
 }
 
 #[test]
+fn github_run_releases_closed_pull_requests_but_not_merged_ones() {
+    let root = temporary_path("github-terminal-run");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&repository).unwrap();
+    git_repository(&repository);
+    let gh_trace = root.join("gh-trace");
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        r##"#!/bin/sh
+printf '%s\n' "$*" >> "$ALUCARD_GH_TRACE"
+case "$1 $2" in
+  "issue list") printf '%s\n' '[{"number":42,"title":"Closed","body":"","labels":[{"name":"ready-for-agent"}]},{"number":43,"title":"Merged","body":"","labels":[{"name":"ready-for-agent"}]}]' ;;
+  "repo view") printf '%s\n' 'owner/repo' ;;
+  "api graphql") printf '%s\n' '[]' ;;
+  "pr list") printf '%s\n' '[]' ;;
+  "pr view") case "$3" in 12) echo CLOSED ;; 13) echo MERGED ;; esac ;;
+esac
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\ncase \"$1 $2\" in 'image inspect') echo stamp ;; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let database = root.join("ledger.db");
+    migrate(&database).unwrap();
+    let mut connection = open(&database).unwrap();
+    let issues: Vec<GithubTask> = serde_json::from_str(
+        r#"[{"number":42,"title":"Closed","body":"","labels":[{"name":"ready-for-agent"}]},{"number":43,"title":"Merged","body":"","labels":[{"name":"ready-for-agent"}]}]"#,
+    )
+    .unwrap();
+    import_github_tasks(&mut connection, &repository.display().to_string(), &issues).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET status = 'in_flight', pr_number = CASE external_id WHEN '42' THEN 12 ELSE 13 END",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_GH_TRACE", &gh_trace)
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "run",
+            "--github",
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            repository.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let trace = fs::read_to_string(&gh_trace).unwrap();
+    assert!(trace.contains("issue edit 42 --add-label in-progress"));
+    assert!(!trace.contains("issue edit 43 --add-label in-progress"));
+    let connection = open(&database).unwrap();
+    let statuses: Vec<(String, String, Option<i64>)> = connection
+        .prepare("SELECT external_id, status, previous_pr_number FROM tasks ORDER BY external_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        statuses,
+        [
+            ("42".to_string(), "pending".to_string(), Some(12)),
+            ("43".to_string(), "done".to_string(), None),
+        ]
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn github_queue_cli_reports_gh_failures_and_rejects_pins() {
     let root = temporary_path("github-queue");
     fs::create_dir_all(&root).unwrap();
