@@ -2392,6 +2392,7 @@ enum CiResult {
     Green,
     Failed,
     Missing,
+    Unverified,
 }
 
 const CI_REGISTRATION_PROBES: usize = 4;
@@ -2411,6 +2412,7 @@ impl CiResult {
             Self::Green => "green",
             Self::Failed => "failed",
             Self::Missing => "none",
+            Self::Unverified => "unverified",
         }
     }
 
@@ -2419,6 +2421,7 @@ impl CiResult {
             Self::Green => "ci_green",
             Self::Failed => "ci_failed",
             Self::Missing => "ci_missing",
+            Self::Unverified => "ci_unverified",
         }
     }
 }
@@ -2463,9 +2466,10 @@ impl CiGate<'_> {
         for attempt in 1..=3 {
             let Some(head) = wait_for_current_pr_head(&prepared.clone, pr_number, branch)? else {
                 eprintln!(
-                    "CI gate: PR #{pr_number} did not register the current origin head; not green."
+                    "CI gate: PR #{pr_number} did not register the current origin head; CI status is unverified."
                 );
-                return Ok(CiResult::Missing);
+                post_unverified_ci_comment(&prepared.clone, pr_number);
+                return Ok(CiResult::Unverified);
             };
             match probe_ci(&prepared.clone, pr_number, branch, &head, checks_available)? {
                 CiResult::Green => {
@@ -2494,16 +2498,18 @@ impl CiGate<'_> {
                     );
                     return Ok(CiResult::Missing);
                 }
-                CiResult::Failed if attempt == 3 => {
-                    eprintln!("CI gate: PR #{pr_number} still failing after 3 check attempts.");
-                    return Ok(CiResult::Failed);
-                }
                 CiResult::Failed => {}
+                CiResult::Unverified => unreachable!("CI probes do not return unverified results"),
             }
 
             if !pr_head_matches_origin(&prepared.clone, pr_number, branch, &head)? {
                 eprintln!("CI gate: PR #{pr_number} head changed while CI was checked; retrying.");
                 continue;
+            }
+
+            if attempt == 3 {
+                eprintln!("CI gate: PR #{pr_number} still failing after 3 check attempts.");
+                return Ok(CiResult::Failed);
             }
 
             let failure_log = failed_run_log(&prepared.clone, branch, &head).unwrap_or_default();
@@ -2587,7 +2593,11 @@ impl CiGate<'_> {
             }
             repair?;
         }
-        Ok(CiResult::Failed)
+        eprintln!(
+            "CI gate: PR #{pr_number} head kept changing while CI was checked; CI status is unverified."
+        );
+        post_unverified_ci_comment(&prepared.clone, pr_number);
+        Ok(CiResult::Unverified)
     }
 }
 
@@ -3317,6 +3327,10 @@ fn review_gate(
                                 "APPROVED — no CI ran, needs human",
                                 "The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.\n\n",
                             )),
+                            Some(CiResult::Unverified) => Some((
+                                "APPROVED — CI status is unverified, needs human",
+                                "The reviewer approved the code, but Alucard could not verify CI for the current head because the PR and origin heads did not converge. It is not ready to merge. Verify the repository's full checks on the head commit before merging.\n\n",
+                            )),
                             Some(CiResult::Failed) => Some((
                                 "APPROVED — CI is failing, needs human",
                                 "The reviewer approved the code, but CI is failing on the current head, so it is not ready to merge. Fix the failing checks before merging.\n\n",
@@ -3929,6 +3943,25 @@ fn ci_fix_prompt(
 
 fn no_ci_comment() -> &'static str {
     "**🤖 Alucard CI gate: no CI ran — not green**\n\nNo CI checks reported for this PR's head commit. Workflows may be missing or disabled, or the token cannot see their runs. The agents ran only the checks the container can run, so nothing has run this repository's full suite.\n\nReview continues, but an approval will not mark this PR ready to merge. Run the full checks before merging."
+}
+
+fn unverified_ci_comment() -> &'static str {
+    "**🤖 Alucard CI gate: current-head CI is unverified — not green**\n\nAlucard could not verify that this PR named origin's current head while checking CI. Review continues, but an approval will not mark this PR ready to merge. Verify the repository's full checks on the head commit before merging."
+}
+
+fn post_unverified_ci_comment(repository: &Path, pr_number: i64) {
+    let _ = execute_command(
+        "gh",
+        &[
+            "pr",
+            "comment",
+            &pr_number.to_string(),
+            "--body",
+            unverified_ci_comment(),
+        ],
+        repository,
+        Some(Duration::from_secs(2700)),
+    );
 }
 
 fn gh_text(repository: &Path, args: &[&str]) -> Result<String, String> {
