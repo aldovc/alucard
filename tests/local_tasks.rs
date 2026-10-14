@@ -1,10 +1,11 @@
 use alucard::{
-    begin_operation_with_payload, finish_operation, github_queue, github_task_pull_requests,
-    github_ticket_blockers, import_github_tasks, import_local_tasks, local_queue,
-    local_queue_with_open_issues, migrate, open, parse_tasks, reconcile_github_task_pull_request,
-    repository_ledger_id, repository_source_path, resolve_pinned_issue, start_task_retry_run,
-    start_task_run, task_id, write_task_headings, GithubPullRequest, GithubPullRequestState,
-    GithubTask, TaskHeadingUpdate, TaskState,
+    acquire_pr, begin_operation_with_payload, finish_operation, github_queue,
+    github_task_pull_requests, github_ticket_blockers, import_github_tasks, import_local_tasks,
+    local_queue, local_queue_with_open_issues, migrate, open, parse_tasks,
+    reconcile_github_task_pull_request, repository_ledger_id, repository_source_path,
+    resolve_pinned_issue, start_merge_run, start_task_retry_run, start_task_run, task_id,
+    write_task_headings, GithubPullRequest, GithubPullRequestState, GithubTask, TaskHeadingUpdate,
+    TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -3334,6 +3335,84 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
         drop(connection);
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn startup_reconciliation_keeps_pr_lease_while_feedback_runs() {
+    let root = temporary_path("reconciliation-pr-workload");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    let tasks = root.join("tasks.md");
+    let database = root.join("ledger.db");
+    fs::create_dir_all(&bin).unwrap();
+    git_repository(&repository);
+    fs::write(&tasks, "").unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'ps --format') [ -z \"${ALUCARD_DOCKER_FAIL:-}\" ] || exit 1; [ -z \"${ALUCARD_ACTIVE_RUN:-}\" ] || echo \"alucard-feedback-$ALUCARD_ACTIVE_RUN-1\" ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run = start_merge_run(&database, &repository, &root.join("logs")).unwrap();
+    let claim = acquire_pr(&database, &run.repository_id, 42, &run.id).unwrap();
+    open(&database)
+        .unwrap()
+        .execute("UPDATE runs SET pid = 999999 WHERE id = ?1", [&run.id])
+        .unwrap();
+
+    let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+        .env("ALUCARD_ACTIVE_RUN", &run.id)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&claim.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "active"
+    );
+    drop(connection);
+
+    let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+        .env("ALUCARD_DOCKER_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&claim.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "active"
+    );
+
+    let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM claims WHERE id = ?1",
+                [&claim.id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "released"
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

@@ -1985,6 +1985,9 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
     for claim in abandoned_pull_request_claims(database, &repository_id)
         .map_err(|error| error.to_string())?
     {
+        if owned_workload_is_active(&claim.run_id, &claim.command, claim.logs_path.as_deref())? {
+            continue;
+        }
         release_abandoned_pull_request_claim(database, &claim)
             .map_err(|error| error.to_string())?;
     }
@@ -2327,6 +2330,20 @@ fn abandoned_branch(attempt: &alucard::TaskClaimAttempt) -> Option<String> {
         .filter(|branch| !branch.is_empty())
 }
 
+fn owned_workload_is_active(
+    run_id: &str,
+    command: &str,
+    logs_path: Option<&str>,
+) -> Result<bool, String> {
+    if docker_run_is_active(run_id)? {
+        return Ok(true);
+    }
+    if command == "merge" {
+        return merge_check_is_active(logs_path);
+    }
+    Ok(false)
+}
+
 fn docker_run_is_active(run_id: &str) -> Result<bool, String> {
     let output = execute_command(
         "docker",
@@ -2336,6 +2353,33 @@ fn docker_run_is_active(run_id: &str) -> Result<bool, String> {
     )
     .map_err(|error| error.to_string())?;
     docker_run_is_active_output(run_id, &output)
+}
+
+fn merge_check_is_active(logs_path: Option<&str>) -> Result<bool, String> {
+    let Some(logs_path) = logs_path else {
+        return Ok(false);
+    };
+    let checkout = Path::new(logs_path).join("repository");
+    let Ok(checkout) = checkout.canonicalize() else {
+        return Ok(false);
+    };
+    for process in fs::read_dir("/proc").map_err(|error| error.to_string())? {
+        let process = process.map_err(|error| error.to_string())?;
+        if process
+            .file_name()
+            .to_str()
+            .is_none_or(|name| name.parse::<u32>().is_err())
+        {
+            continue;
+        }
+        let Ok(cwd) = fs::read_link(process.path().join("cwd")) else {
+            continue;
+        };
+        if cwd.starts_with(&checkout) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn docker_run_is_active_output(
@@ -6689,6 +6733,23 @@ printf '%s' "$prompt""#,
     fn failed_docker_inspection_is_not_treated_as_no_worker() {
         let output = Command::new("sh").args(["-c", "exit 1"]).output().unwrap();
         assert!(docker_run_is_active_output("run", &output).is_err());
+    }
+
+    #[test]
+    fn merge_check_workload_remains_active_after_its_owner_exits() {
+        let root =
+            std::env::temp_dir().join(format!("alucard-merge-check-{}", uuid::Uuid::new_v4()));
+        let checkout = root.join("repository");
+        fs::create_dir_all(&checkout).unwrap();
+        let mut check = Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .current_dir(&checkout)
+            .spawn()
+            .unwrap();
+        assert!(merge_check_is_active(root.to_str()).unwrap());
+        check.kill().unwrap();
+        check.wait().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
