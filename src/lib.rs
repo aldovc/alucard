@@ -3890,6 +3890,7 @@ pub fn lock_recovery_operations(path: &Path) -> Result<RecoveryOperationLock, Da
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(lock_path)?;
     file.lock_exclusive()?;
     Ok(RecoveryOperationLock { _file: file })
