@@ -3060,6 +3060,11 @@ pub struct PendingOperation {
     pub payload: Option<String>,
 }
 
+/// Holds exclusive ownership while recovery operations are replayed.
+pub struct RecoveryOperationLock {
+    _file: File,
+}
+
 /// An active task claim whose owning process is no longer alive on this host.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AbandonedTaskClaim {
@@ -3876,6 +3881,75 @@ pub fn pending_operations(
         .collect::<Result<Vec<_>, _>>()
         .map_err(DatabaseError::from)?;
     Ok(operations)
+}
+
+/// Acquires the repository-wide lock used while reconciling startup recovery work.
+pub fn lock_recovery_operations(path: &Path) -> Result<RecoveryOperationLock, DatabaseError> {
+    let lock_path = path.with_extension("recovery.lock");
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    file.lock_exclusive()?;
+    Ok(RecoveryOperationLock { _file: file })
+}
+
+/// Lists pending operations whose publisher is not still running on this host.
+pub fn pending_recovery_operations(
+    path: &Path,
+    repository_id: &str,
+) -> Result<Vec<PendingOperation>, DatabaseError> {
+    let hostname = hostname()?;
+    let mut pending = Vec::new();
+    for operation in pending_operations(path, repository_id)? {
+        let publisher = recovery_operation_publisher(path, repository_id, &operation)?;
+        if !matches!(publisher, Some((owner_hostname, pid)) if owner_hostname == hostname && process_is_alive(pid))
+        {
+            pending.push(operation);
+        }
+    }
+    Ok(pending)
+}
+
+fn recovery_operation_publisher(
+    path: &Path,
+    repository_id: &str,
+    operation: &PendingOperation,
+) -> Result<Option<(String, i64)>, DatabaseError> {
+    let connection = open(path)?;
+    let publisher = if let Some(branch) = operation.target.strip_prefix("recovery:") {
+        connection
+            .query_row(
+                "SELECT attempts.hostname, attempts.pid
+                 FROM claims
+                 JOIN runs owner ON owner.id = claims.run_id
+                 JOIN runs attempts ON attempts.id = owner.id OR attempts.retry_owner_run_id = owner.id
+                 WHERE claims.repository_id = ?1 AND claims.resource_kind = 'task'
+                   AND claims.state = 'active' AND attempts.branch = ?2
+                 ORDER BY attempts.id = owner.id DESC, attempts.started_at DESC LIMIT 1",
+                (repository_id, branch),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+    } else if let Some(number) = operation.target.strip_prefix("recovery-pr:") {
+        connection
+            .query_row(
+                "SELECT owner.hostname, owner.pid
+                 FROM recovery
+                 JOIN claims ON claims.run_id = recovery.original_run_id
+                 JOIN runs owner ON owner.id = recovery.original_run_id
+                 WHERE recovery.pull_request_number = ?1 AND claims.repository_id = ?2
+                   AND claims.resource_kind = 'task' AND claims.state = 'active'",
+                (number, repository_id),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+    } else {
+        None
+    };
+    Ok(publisher)
 }
 
 /// Reports whether a recovery operation was journaled, including completed intents.
