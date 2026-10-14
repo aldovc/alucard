@@ -4025,6 +4025,14 @@ pub fn task_claim_attempts(
     path: &Path,
     claim: &AbandonedTaskClaim,
 ) -> Result<Vec<TaskClaimAttempt>, DatabaseError> {
+    run_retry_attempts(path, &claim.run_id)
+}
+
+/// Lists a run and retries linked to it.
+pub fn run_retry_attempts(
+    path: &Path,
+    run_id: &str,
+) -> Result<Vec<TaskClaimAttempt>, DatabaseError> {
     let connection = open(path)?;
     let mut statement = connection.prepare(
         "SELECT id, branch, logs_path FROM runs
@@ -4032,7 +4040,7 @@ pub fn task_claim_attempts(
          ORDER BY id != ?1, started_at, rowid",
     )?;
     let attempts = statement
-        .query_map([&claim.run_id], |row| {
+        .query_map([run_id], |row| {
             Ok(TaskClaimAttempt {
                 run_id: row.get(0)?,
                 branch: row.get(1)?,

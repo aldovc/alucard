@@ -12,13 +12,14 @@ use alucard::{
     record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
     release_abandoned_pull_request_claim, release_abandoned_task_claim, repository_ledger_id,
     repository_source_path, run_claims, run_command as execute_command, run_pull_requests,
-    run_reconciliation_reason, run_recovery, start_continue_run, start_merge_run,
-    start_task_retry_run, start_task_run, status, task_claim_attempts, task_id, task_is_pending,
-    toolchain_preflight, transition_task, usage_report_for_dirs, warn_if_stale_image,
-    write_iteration_measurement, write_run_measurement, write_stage_measurement,
-    write_task_headings, AgentExit, AgentInvocation, AgentResult, AgentRole, AgentSettings,
-    GithubPullRequest, GithubPullRequestState, GithubTask, IterationMeasurement, Provider,
-    RecoveryPullRequest, RunOptions, StageMeasurement, TaskHeadingUpdate, TaskState, TaskStatus,
+    run_reconciliation_reason, run_recovery, run_retry_attempts, start_continue_run,
+    start_merge_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
+    task_is_pending, toolchain_preflight, transition_task, usage_report_for_dirs,
+    warn_if_stale_image, write_iteration_measurement, write_run_measurement,
+    write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentResult,
+    AgentRole, AgentSettings, GithubPullRequest, GithubPullRequestState, GithubTask,
+    IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, StageMeasurement,
+    TaskHeadingUpdate, TaskState, TaskStatus,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -1985,7 +1986,9 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
     for claim in abandoned_pull_request_claims(database, &repository_id)
         .map_err(|error| error.to_string())?
     {
-        if owned_workload_is_active(&claim.run_id, &claim.command, claim.logs_path.as_deref())? {
+        let attempts =
+            run_retry_attempts(database, &claim.run_id).map_err(|error| error.to_string())?;
+        if owned_workload_is_active(&attempts, &claim.command, claim.logs_path.as_deref())? {
             continue;
         }
         release_abandoned_pull_request_claim(database, &claim)
@@ -2331,12 +2334,14 @@ fn abandoned_branch(attempt: &alucard::TaskClaimAttempt) -> Option<String> {
 }
 
 fn owned_workload_is_active(
-    run_id: &str,
+    attempts: &[alucard::TaskClaimAttempt],
     command: &str,
     logs_path: Option<&str>,
 ) -> Result<bool, String> {
-    if docker_run_is_active(run_id)? {
-        return Ok(true);
+    for attempt in attempts {
+        if docker_run_is_active(&attempt.run_id)? {
+            return Ok(true);
+        }
     }
     if command == "merge" {
         return merge_check_is_active(logs_path);

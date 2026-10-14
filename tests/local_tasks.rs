@@ -3,9 +3,8 @@ use alucard::{
     github_task_pull_requests, github_ticket_blockers, import_github_tasks, import_local_tasks,
     local_queue, local_queue_with_open_issues, migrate, open, parse_tasks,
     reconcile_github_task_pull_request, repository_ledger_id, repository_source_path,
-    resolve_pinned_issue, start_merge_run, start_task_retry_run, start_task_run, task_id,
-    write_task_headings, GithubPullRequest, GithubPullRequestState, GithubTask, TaskHeadingUpdate,
-    TaskState,
+    resolve_pinned_issue, start_task_retry_run, start_task_run, task_id, write_task_headings,
+    GithubPullRequest, GithubPullRequestState, GithubTask, TaskHeadingUpdate, TaskState,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -3338,7 +3337,7 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
 }
 
 #[test]
-fn startup_reconciliation_keeps_pr_lease_while_feedback_runs() {
+fn startup_reconciliation_keeps_pr_lease_while_retry_feedback_runs() {
     let root = temporary_path("reconciliation-pr-workload");
     let repository = root.join("repository");
     let bin = root.join("bin");
@@ -3346,7 +3345,7 @@ fn startup_reconciliation_keeps_pr_lease_while_feedback_runs() {
     let database = root.join("ledger.db");
     fs::create_dir_all(&bin).unwrap();
     git_repository(&repository);
-    fs::write(&tasks, "").unwrap();
+    fs::write(&tasks, "## [ ] 1: Retry feedback\n").unwrap();
     let docker = bin.join("docker");
     fs::write(
         &docker,
@@ -3357,20 +3356,36 @@ fn startup_reconciliation_keeps_pr_lease_while_feedback_runs() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') echo '[]' ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate'|'pr list') echo '[]' ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let run = start_merge_run(&database, &repository, &root.join("logs")).unwrap();
-    let claim = acquire_pr(&database, &run.repository_id, 42, &run.id).unwrap();
+    let (_, task_claim, retry) =
+        seed_abandoned_task(&database, &repository, &tasks, "1", "owner", Some("retry"));
+    let owner_run_id: String = open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT run_id FROM claims WHERE id = ?1",
+            [&task_claim],
+            |row| row.get(0),
+        )
+        .unwrap();
     open(&database)
         .unwrap()
-        .execute("UPDATE runs SET pid = 999999 WHERE id = ?1", [&run.id])
+        .execute("DELETE FROM claims WHERE id = ?1", [&task_claim])
         .unwrap();
+    let claim = acquire_pr(
+        &database,
+        &repository_ledger_id(&repository).unwrap(),
+        42,
+        &owner_run_id,
+    )
+    .unwrap();
+    let retry_run_id = retry.unwrap();
 
     let output = reconciliation_run(&root, &repository, &database, &tasks, &bin)
-        .env("ALUCARD_ACTIVE_RUN", &run.id)
+        .env("ALUCARD_ACTIVE_RUN", &retry_run_id)
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
