@@ -1851,6 +1851,47 @@ fn reimport_preserves_claimed_task_status() {
 }
 
 #[test]
+fn reimport_updates_closed_and_merged_local_pull_request_tasks() {
+    let database = temporary_path("closed-local-pr-reimport").join("ledger.db");
+    migrate(&database).unwrap();
+    let mut connection = open(&database).unwrap();
+    let repository = "repo";
+    let path = PathBuf::from("tasks.md");
+    let in_flight = parse_tasks(
+        "## [>] closed: Closed attempt (PR #12)\n\n## [>] merged: Merged attempt (PR #13)\n",
+    )
+    .unwrap()
+    .tasks;
+    import_local_tasks(&mut connection, repository, &path, &in_flight).unwrap();
+    let reconciled = parse_tasks(
+        "## [ ] closed: Closed attempt (previous attempt: PR #12)\n\n## [x] merged: Merged attempt (PR #13)\n",
+    )
+    .unwrap()
+    .tasks;
+
+    import_local_tasks(&mut connection, repository, &path, &reconciled).unwrap();
+
+    let states: Vec<(String, String, Option<i64>, Option<i64>)> = connection
+        .prepare(
+            "SELECT external_id, status, pr_number, previous_pr_number FROM tasks ORDER BY external_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        states,
+        [
+            ("closed".to_string(), "pending".to_string(), None, Some(12)),
+            ("merged".to_string(), "done".to_string(), Some(13), None),
+        ]
+    );
+    drop(connection);
+    fs::remove_dir_all(database.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn queue_resolves_explicit_environment_and_detected_task_sources() {
     let root = temporary_path("task-source");
     let task_directory = root.join(".alucard");
