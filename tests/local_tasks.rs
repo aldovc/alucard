@@ -1818,6 +1818,82 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
 }
 
 #[test]
+fn queue_cli_omits_claimed_local_tasks() {
+    let root = temporary_path("claimed-local-queue");
+    fs::create_dir_all(&root).unwrap();
+    git_repository(&root);
+    let database = root.join("ledger.db");
+    let tasks = root.join("tasks.md");
+    fs::write(
+        &tasks,
+        "## [ ] claimed: Claimed task\n\n## [ ] pending: Pending task\n",
+    )
+    .unwrap();
+    let gh = root.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') printf '%s\\n' '[[]]' ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = env!("CARGO_BIN_EXE_alucard");
+
+    let initial = Command::new(binary)
+        .current_dir(&root)
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "queue",
+            "--tasks",
+            tasks.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(initial.status.success());
+
+    let repository = root.canonicalize().unwrap();
+    let tasks = tasks.canonicalize().unwrap();
+    let claimed_task = task_id(
+        &database,
+        &repository.display().to_string(),
+        "local",
+        &tasks.display().to_string(),
+        "claimed",
+    )
+    .unwrap()
+    .unwrap();
+    start_task_run(
+        &database,
+        &repository,
+        &root.join("logs"),
+        &root.join("cache"),
+        None,
+        &claimed_task,
+    )
+    .unwrap();
+
+    let output = Command::new(binary)
+        .current_dir(&root)
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "queue",
+            "--tasks",
+            tasks.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let queue: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0]["id"], "pending");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn reimport_preserves_claimed_task_status() {
     let database = temporary_path("claimed-reimport").join("ledger.db");
     migrate(&database).unwrap();
