@@ -574,6 +574,7 @@ mod agent_tests {
 
     #[test]
     fn build_cleanup_matches_bash_contract() {
+        let _path_lock = PATH_LOCK.lock().unwrap();
         let old = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let new = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
