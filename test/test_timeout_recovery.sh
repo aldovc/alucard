@@ -198,17 +198,34 @@ assert_line_after "Branch clone happens after its tracking branch is created" \
   "git -C $REPO_ABS branch --force feature/test origin/feature/test" \
   "git clone --local --no-tags --single-branch --branch feature/test $REPO_ABS $branch_dest" "$trace"
 
-: > "$TRACE_FILE"
-base_dest="$TEST_DIR/base-clone"
-make_agent_clone "main" "$base_dest" "$branch_origin" base
-trace=$(cat "$TRACE_FILE")
-assert_contains "Base clone fetches directly into the remote-tracking ref" \
-  "git -C $REPO_ABS fetch origin +refs/heads/main:refs/remotes/origin/main" "$trace"
-assert_not_contains "Base clone skips a local branch force-update" \
-  "git -C $REPO_ABS branch --force" "$trace"
-assert_line_after "Base clone happens after its refspec fetch" \
-  "git -C $REPO_ABS fetch origin +refs/heads/main:refs/remotes/origin/main" \
-  "git clone --local --no-tags --single-branch --branch main $REPO_ABS $base_dest" "$trace"
+# Real git: the cached clone has main checked out and `next` only on origin,
+# which is the shape `run --base next` meets.
+(
+  PATH="${PATH#"$MOCK_BIN:"}"
+  g() { git -c user.name=t -c user.email=t@t "$@"; }
+  base_origin="$TEST_DIR/base-origin.git"
+  g init -q --bare -b main "$base_origin"
+  g clone -q "$base_origin" "$TEST_DIR/seed" 2>/dev/null
+  g -C "$TEST_DIR/seed" commit -q --allow-empty -m one
+  g -C "$TEST_DIR/seed" push -q origin HEAD:main
+  REPO_ABS="$TEST_DIR/base-cache"
+  g clone -q "$base_origin" "$REPO_ABS"
+  g -C "$TEST_DIR/seed" commit -q --allow-empty -m two
+  g -C "$TEST_DIR/seed" push -q origin HEAD:next
+  next_sha=$(g -C "$TEST_DIR/seed" rev-parse HEAD)
+  for b in main next; do
+    make_agent_clone "$b" "$TEST_DIR/base-clone-$b" "$branch_origin" base >/dev/null 2>&1 \
+      || fail "Base clone of $b failed"
+  done
+  assert_eq "Base clone tracks a base that is not checked out" \
+    "$next_sha" "$(git -C "$TEST_DIR/base-clone-next" rev-parse origin/next)"
+  assert_eq "Base clone fetches only its base" \
+    "+refs/heads/next:refs/remotes/origin/next" \
+    "$(git -C "$TEST_DIR/base-clone-next" config --get-all remote.origin.fetch)"
+  assert_eq "Base clone leaves the cached clone's branches alone" \
+    "main" "$(git -C "$REPO_ABS" for-each-ref --format='%(refname:short)' refs/heads)"
+  [ "$FAIL" -eq 0 ]
+) || fail "Base clone checks (counted inside the subshell above)"
 
 findings_file="$TEST_DIR/findings"
 empty_actual="$TEST_DIR/human-empty-actual"

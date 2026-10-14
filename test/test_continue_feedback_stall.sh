@@ -231,4 +231,19 @@ assert_contains "gates ran — review gate started" \
 assert_not_contains "a push is not treated as a stall" \
   "stopping before gates" "$EVENTS"
 
+# ── Scenario 3: a later approval supersedes the change request ───────────────
+echo ""
+echo "── continue: findings already approved ──"
+# The reviewer is the only agent; with stale findings, feedback would run
+# first, push nothing, and stop before the gates.
+COMMENTS_JSON=$(jq -n --arg cr "$CR_BODY" \
+  --arg ok '**🤖 Alucard review cycle 2/3: APPROVED**' \
+  '{comments:[{body:$cr,createdAt:"2026-01-01T00:00:00Z",author:{login:"bot"}},
+              {body:$ok,createdAt:"2026-01-02T00:00:00Z",author:{login:"bot"}}]}')
+printf '1 %s\n' "$MAX_TURNS_RESULT" > "$TEST_DIR/script"
+run_continue
+
+assert_eq "only the reviewer ran" "1" "$(grep -c '^agent launch$' "$TRACE" || true)"
+assert_contains "the review gate started without feedback" "Review gate" "$OUT"
+
 finish

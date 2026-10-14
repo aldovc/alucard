@@ -89,6 +89,13 @@ cat > "$MOCK_BIN/docker" <<'MOCK'
 set -euo pipefail
 case "$1" in
   run)
+    # Record the worker clone's gh-merge-base: gh pr create targets it.
+    for arg in "$@"; do
+      case "$arg" in
+        *:/work:rw) git -C "${arg%:/work:rw}" config --get-regexp 'gh-merge-base' \
+          > "${ALUCARD_TEST_MERGE_BASE_FILE:-/dev/null}" || true ;;
+      esac
+    done
     printf '%s\n' "${ALUCARD_TEST_DOCKER_RUN_OUTPUT:-{}}"
     exit "${ALUCARD_TEST_DOCKER_RUN_EXIT:-0}"
     ;;
@@ -219,13 +226,17 @@ assert_eq "empty queue records the run end last" \
 export ALUCARD_TEST_DOCKER_RUN_EXIT=7
 export ALUCARD_TEST_DOCKER_RUN_OUTPUT='{"error":"billing_error"}'
 export ALUCARD_WORKER_PROVIDER="claude"
+export ALUCARD_TEST_MERGE_BASE_FILE="$TEST_DIR/merge-base"
 set +e
 (command_run) >/dev/null 2>&1
 billing_rc=$?
 set -e
-unset ALUCARD_TEST_DOCKER_RUN_EXIT ALUCARD_TEST_DOCKER_RUN_OUTPUT ALUCARD_WORKER_PROVIDER
+unset ALUCARD_TEST_DOCKER_RUN_EXIT ALUCARD_TEST_DOCKER_RUN_OUTPUT ALUCARD_WORKER_PROVIDER \
+  ALUCARD_TEST_MERGE_BASE_FILE
 
 assert_eq "billing error aborts the run with rc=2" "2" "$billing_rc"
+assert_matches "the worker branch targets --base for gh pr create (#147)" \
+  '^branch\.[^ ]+\.gh-merge-base main$' "$(cat "$TEST_DIR/merge-base")"
 mapfile -t billing_events < <(cut -f2- "$BILLING_LOG_DIR/events.log" | grep -E \
   '^(Iteration 1/1 start|Agent iter-1 end:|Iteration 1/1 end:|Run end: provider returned billing_error)')
 assert_eq "billing abort emits four iteration/run transitions" "4" "${#billing_events[@]}"

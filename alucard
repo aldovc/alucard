@@ -2549,6 +2549,14 @@ make_agent_clone_locked() {
   local branch="$1" dest="$2" mode="$3"
   if [ "$mode" = "base" ]; then
     git -C "$REPO_ABS" fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+    # clone --branch sees only REPO_ABS's local branches, and a --base other
+    # than the checked-out one exists here only as that remote-tracking ref.
+    # A --local clone shares every object, so clone HEAD and track $branch;
+    # the caller resets to it.
+    git clone --local --no-tags --single-branch "$REPO_ABS" "$dest"
+    git -C "$dest" config remote.origin.fetch "+refs/heads/$branch:refs/remotes/origin/$branch"
+    git -C "$dest" update-ref "refs/remotes/origin/$branch" "$(git -C "$REPO_ABS" rev-parse "origin/$branch")"
+    return
   else
     git -C "$REPO_ABS" fetch origin "$branch"
     git -C "$REPO_ABS" branch --force "$branch" "origin/$branch"
@@ -2618,7 +2626,7 @@ run_feedback_once() {
 $(compose_role_prompt alucard-feedback-prompt.md)
 </instructions>
 <pr_num>${pr_num}</pr_num>
-<branch>${branch}</branch>
+<branch>$(printf '%s' "$branch" | xml_escape)</branch>
 <toolchain_status>
 $(printf '%s' "${TOOLCHAIN_STATUS:-Unknown — no preflight result available.}" | xml_escape)
 </toolchain_status>
@@ -4192,6 +4200,9 @@ command_run() {
     # Minted after dispatch so a pinned issue or local task is in the name.
     BRANCH=$(mint_branch "$i")
     git -C "$WT_HOST" checkout -b "$BRANCH"
+    # The worker's `gh pr create` passes no --base, so without this a --base
+    # run opens its PR against the default branch. gh reads this config.
+    git -C "$WT_HOST" config "branch.$BRANCH.gh-merge-base" "$BASE_BRANCH"
     if [ "$TASK_SOURCE" = "file" ]; then
       echo "Dispatching task ${DISPATCHED_TASK_ID}: $(echo "$issues" | jq -r '.[0].title')"
     elif [ -n "${PIN_ISSUE:-}" ]; then
@@ -4231,6 +4242,7 @@ command_run() {
         git -C "$WT_HOST" reset --hard "$(git -C "$REPO_ABS" rev-parse "origin/$BASE_BRANCH")"
         _base_sha="$(git -C "$WT_HOST" rev-parse HEAD)"
         git -C "$WT_HOST" checkout -b "$BRANCH"
+        git -C "$WT_HOST" config "branch.$BRANCH.gh-merge-base" "$BASE_BRANCH"
         log_file="$LOG_DIR/iter-${i}-attempt-${_attempt}.jsonl"
       fi
 
@@ -4662,13 +4674,13 @@ command_continue() {
   _comments_json=$(cd "$REPO_ABS" && \
     gh pr view "$pr_num" --json comments 2>/dev/null || echo '{"comments":[]}')
 
+  # Only a CHANGES_REQUESTED that no later approval superseded: after a base
+  # merge, a stale one sends feedback after fixed findings, which then stalls.
+  local _latest_verdict='.comments | map(select(.body | startswith($prefix) and test("review cycle [0-9]+/[0-9]+: (CHANGES_REQUESTED|APPROVED)"))) | last | select(.body | contains("CHANGES_REQUESTED"))'
   last_bot_cr_body=$(echo "$_comments_json" | jq -r --arg prefix "$BOT_COMMENT_PREFIX" \
-    '.comments | map(select(.body | startswith($prefix) and contains("CHANGES_REQUESTED"))) | last | .body // empty' \
-    2>/dev/null || true)
-  bot_cr_time=$(echo "$_comments_json" | jq -r \
-    --arg prefix "$BOT_COMMENT_PREFIX" \
-    '.comments | map(select(.body | startswith($prefix) and contains("CHANGES_REQUESTED"))) | last | .createdAt // empty' \
-    2>/dev/null || true)
+    "$_latest_verdict | .body // empty" 2>/dev/null || true)
+  bot_cr_time=$(echo "$_comments_json" | jq -r --arg prefix "$BOT_COMMENT_PREFIX" \
+    "$_latest_verdict | .createdAt // empty" 2>/dev/null || true)
 
   if [ -n "${last_bot_cr_body:-}" ]; then
     human_after=""
