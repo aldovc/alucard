@@ -174,6 +174,13 @@ fn postgres_toolchain_status(status: String, configured: bool) -> String {
     )).unwrap_or(status)
 }
 
+fn postgres_agent_environment(postgres: Option<&RunPostgres>) -> (Option<&str>, Option<&str>) {
+    (
+        postgres.map(|value| value.network.as_str()),
+        postgres.map(|_| POSTGRES_URL),
+    )
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (db_path, commands) = match parse_db_path(&args) {
@@ -1510,6 +1517,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             let log = prepared
                 .directory
                 .join(format!("iter-{iteration}-attempt-{attempt}.jsonl"));
+            let (network, database_url) = postgres_agent_environment(postgres.as_ref());
             let result = AgentInvocation {
                 role: AgentRole::Worker,
                 name: &name,
@@ -1518,9 +1526,9 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 worktree: &prepared.clone,
                 prompt: &prompt,
                 timeout_minutes: options.timeout_minutes,
-                network: postgres.as_ref().map(|value| value.network.as_str()),
+                network,
                 playwright_cache: playwright_cache.as_deref(),
-                database_url: postgres.as_ref().map(|_| POSTGRES_URL),
+                database_url,
                 github_repo: github_repo.as_deref(),
                 worktree_read_only: false,
                 output_dir: None,
@@ -1606,14 +1614,15 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             Err(error) => eprintln!("alucard: {error}"),
                         }
                     }
+                    let (network, database_url) = postgres_agent_environment(postgres.as_ref());
                     let ci_result = match (CiGate {
                         tools: &tools,
                         settings: &settings,
                         options: &options,
                         playwright_cache: playwright_cache.as_deref(),
                         github_repo: github_repo.as_deref(),
-                        network: postgres.as_ref().map(|value| value.network.as_str()),
-                        database_url: postgres.as_ref().map(|_| POSTGRES_URL),
+                        network,
+                        database_url,
                     })
                     .run(
                         &prepared,
@@ -2072,14 +2081,15 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             }
         }
         let mut checks_available = true;
+        let (network, database_url) = postgres_agent_environment(postgres.as_ref());
         let ci_result = match (CiGate {
             tools: &tools,
             settings: &settings,
             options: &options,
             playwright_cache: None,
             github_repo: github_repo_slug(&repository).as_deref(),
-            network: postgres.as_ref().map(|value| value.network.as_str()),
-            database_url: postgres.as_ref().map(|_| POSTGRES_URL),
+            network,
+            database_url,
         })
         .run(
             &prepared,
@@ -3629,6 +3639,7 @@ fn run_feedback_once(
         .join(format!("iter-{iteration}-feedback-{cycle}.jsonl"));
     let name = format!("alucard-feedback-{}-{cycle}", prepared.run.id);
     let cycle_text = format!("{iteration}-feedback-{cycle}");
+    let (network, database_url) = postgres_agent_environment(postgres);
     let result = AgentInvocation {
         role: AgentRole::Feedback,
         name: &name,
@@ -3637,9 +3648,9 @@ fn run_feedback_once(
         worktree: &checkout,
         prompt: &prompt,
         timeout_minutes: options.timeout_minutes,
-        network: postgres.map(|value| value.network.as_str()),
+        network,
         playwright_cache: None,
-        database_url: postgres.map(|_| POSTGRES_URL),
+        database_url,
         github_repo: github_repo_slug(&options.queue.repository).as_deref(),
         worktree_read_only: false,
         output_dir: Some(&output),
@@ -3808,6 +3819,7 @@ fn review_gate(
                     "iter-{iteration}-review-{cycle}-attempt-{attempt}.jsonl"
                 ));
                 let name = format!("alucard-review-{}-{cycle}-{attempt}", prepared.run.id);
+                let (network, database_url) = postgres_agent_environment(postgres);
                 let agent = AgentInvocation {
                     role: AgentRole::Reviewer,
                     name: &name,
@@ -3816,9 +3828,9 @@ fn review_gate(
                     worktree: &checkout,
                     prompt: &prompt,
                     timeout_minutes: options.timeout_minutes,
-                    network: postgres.map(|value| value.network.as_str()),
+                    network,
                     playwright_cache: None,
-                    database_url: postgres.map(|_| POSTGRES_URL),
+                    database_url,
                     github_repo: github_repo_slug(&options.queue.repository).as_deref(),
                     worktree_read_only: true,
                     output_dir: Some(&output_dir),
@@ -4060,14 +4072,15 @@ fn review_gate(
                                     None,
                                 );
                             }
+                            let (network, database_url) = postgres_agent_environment(postgres);
                             ci_result = (CiGate {
                                 tools,
                                 settings,
                                 options,
                                 playwright_cache: None,
                                 github_repo: github_repo_slug(&options.queue.repository).as_deref(),
-                                network: postgres.map(|value| value.network.as_str()),
-                                database_url: postgres.map(|_| POSTGRES_URL),
+                                network,
+                                database_url,
                             })
                             .run(
                                 prepared,
@@ -7348,6 +7361,7 @@ printf '\n</failure_log>'"#,
 
     #[test]
     fn recovery_label_replay_retries_after_a_failed_rest_request() {
+        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let root = std::env::temp_dir().join(format!(
             "alucard-recovery-label-replay-{}",
             uuid::Uuid::new_v4()
@@ -7386,6 +7400,7 @@ printf '\n</failure_log>'"#,
         let mut path_entries = vec![bin.clone()];
         path_entries.extend(std::env::split_paths(&path));
         std::env::set_var("PATH", std::env::join_paths(path_entries).unwrap());
+        let _path = PathGuard(path);
         assert!(replay_recovery_operations(&database, &checkout, repository_id).is_err());
         assert_eq!(
             alucard::pending_operations(&database, repository_id)
@@ -7401,7 +7416,6 @@ printf '\n</failure_log>'"#,
         assert!(alucard::pending_operations(&database, repository_id)
             .unwrap()
             .is_empty());
-        std::env::set_var("PATH", path);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7708,6 +7722,55 @@ printf '%s' "$prompt""#,
         assert!(postgres_toolchain_status("ready".to_string(), true).contains(
             "Postgres runs beside this container, fresh for each iteration, at DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres."
         ));
+    }
+
+    #[test]
+    fn postgres_agent_environment_reaches_every_active_agent_role() {
+        let root =
+            std::env::temp_dir().join(format!("alucard-postgres-agents-{}", uuid::Uuid::new_v4()));
+        let env_file = root.join("alucard.env");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&env_file, "ALUCARD_PROVIDER=claude\n").unwrap();
+        let settings = AgentSettings::from_environment(Some(&env_file)).unwrap();
+        let postgres = RunPostgres {
+            network: "alucard-run".to_string(),
+            container: "unused".to_string(),
+            image: "postgres:16".to_string(),
+        };
+
+        for role in [
+            AgentRole::Worker,
+            AgentRole::CiFix,
+            AgentRole::Reviewer,
+            AgentRole::Feedback,
+        ] {
+            let (network, database_url) = postgres_agent_environment(Some(&postgres));
+            let args = AgentInvocation {
+                role,
+                name: "alucard-test",
+                image: "alucard:test",
+                env_file: &env_file,
+                worktree: &root,
+                prompt: "prompt",
+                timeout_minutes: 1,
+                network,
+                playwright_cache: None,
+                database_url,
+                github_repo: None,
+                worktree_read_only: false,
+                output_dir: None,
+                extra_env: &[],
+            }
+            .docker_args(&settings)
+            .unwrap();
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["--network", "alucard-run"]));
+            assert!(args
+                .iter()
+                .any(|arg| arg == &format!("DATABASE_URL={POSTGRES_URL}")));
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
