@@ -159,6 +159,13 @@ fn legacy_run_shorthand_and_directory_command_dispatch_to_run() {
             missing_env.to_str().unwrap(),
         ],
         vec![target, "--env-file", missing_env.to_str().unwrap()],
+        vec![
+            target,
+            "-n",
+            "1",
+            "--env-file",
+            missing_env.to_str().unwrap(),
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
             .args(&arguments)
