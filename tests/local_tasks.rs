@@ -547,11 +547,6 @@ esac
         .env("ALUCARD_TRACE", &trace)
         .env("ALUCARD_GH_TRACE", root.join("gh-trace"))
         .env("ALUCARD_SCENARIO", scenario)
-        .env("ALUCARD_DOCKER_BILLING_READY", root.join("billing-ready"))
-        .env(
-            "ALUCARD_DOCKER_BILLING_RELEASE",
-            root.join("billing-release"),
-        )
         .env("ALUCARD_FOREIGN_HEAD", foreign_head)
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
         .env("ALUCARD_TRANSPORT_RETRY_ATTEMPTS", retries.to_string())
