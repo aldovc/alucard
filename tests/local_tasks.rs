@@ -5148,6 +5148,117 @@ fn sigterm_cleans_up_postgres_for_an_interrupted_run() {
 }
 
 #[test]
+fn sigterm_during_run_preflight_stops_before_starting_an_agent() {
+    let root = temporary_path("sigterm-run-preflight");
+    let repository = root.join("repository");
+    let origin = root.join("origin.git");
+    let bin = root.join("bin");
+    let trace = root.join("docker-trace");
+    let started = root.join("preflight-started");
+    let release = root.join("preflight-release");
+    fs::create_dir_all(&bin).unwrap();
+    git_repository(&repository);
+    fs::create_dir_all(repository.join(".alucard")).unwrap();
+    fs::write(repository.join(".alucard/postgres"), "postgres:16\n").unwrap();
+    fs::write(repository.join("package-lock.json"), "{}\n").unwrap();
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "add",
+        ".alucard/postgres",
+        "package-lock.json",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "preflight",
+    ]));
+    run(Command::new("git").args(["init", "-q", "--bare", origin.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        origin.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-qu",
+        "origin",
+        "main",
+    ]));
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$*\" in\n  *'--name alucard-preflight-'*) : > \"$ALUCARD_PREFLIGHT_STARTED\"; while [ ! -f \"$ALUCARD_PREFLIGHT_RELEASE\" ]; do sleep 0.01; done ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in 'pr list') echo '[]' ;; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "## [ ] one: Interrupt me\n").unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+    command
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_DOCKER_TRACE", &trace)
+        .env("ALUCARD_PREFLIGHT_STARTED", &started)
+        .env("ALUCARD_PREFLIGHT_RELEASE", &release)
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "run",
+            "--tasks",
+            tasks.to_str().unwrap(),
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            repository.to_str().unwrap(),
+        ]);
+    let mut process = command.spawn().unwrap();
+    wait_for_file(&started);
+    unsafe { libc::kill(process.id() as i32, libc::SIGTERM) };
+    fs::write(&release, "").unwrap();
+    assert_eq!(process.wait().unwrap().code(), Some(143));
+    let trace = fs::read_to_string(trace).unwrap();
+    assert!(trace.contains("rm -f -v alucard-postgres-"), "{trace}");
+    assert!(trace.contains("network rm alucard-"), "{trace}");
+    for agent in ["worker", "feedback", "ci", "review"] {
+        assert!(
+            !trace.contains(&format!("--name alucard-{agent}-")),
+            "{trace}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn sigterm_during_continue_review_stops_following_stages_and_cleans_postgres() {
     let root = temporary_path("sigterm-continue-review");
     let repository = root.join("repository");

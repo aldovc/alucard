@@ -1574,6 +1574,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         });
         let playwright_cache = preflight.playwright_cache;
         let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+        if interrupted() {
+            print!("{}", usage_report_for_dirs(&usage_log_dirs));
+            return ExitCode::SUCCESS;
+        }
         let prompt = match worker_prompt(
             &tools,
             &selected,
@@ -2143,6 +2147,9 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         });
         let playwright_cache = preflight.playwright_cache;
         let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
         let findings = continue_feedback_findings(&pull.comments, login.trim());
         if !findings.is_empty() {
             let (feedback, blocked, advanced, retained) = run_feedback_once(
