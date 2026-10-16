@@ -3819,9 +3819,16 @@ fn run_feedback_once(
         ],
         &prepared.clone,
         Some(Duration::from_secs(120)),
-    )
-    .map_err(|error| error.to_string())?;
+    );
+    let cloned = match cloned {
+        Ok(cloned) => cloned,
+        Err(error) => {
+            cleanup_feedback_root(&root, &checkout);
+            return Err(error.to_string());
+        }
+    };
     if !cloned.status.success() {
+        cleanup_feedback_root(&root, &checkout);
         return Err(String::from_utf8_lossy(&cloned.stderr).trim().to_string());
     }
     let policy = read_review_policy(&checkout)?;
@@ -3861,10 +3868,7 @@ fn run_feedback_once(
         classification: AgentExit::Failed,
     });
     if interrupted() {
-        let retained = cleanup_repair_checkout(&checkout);
-        if !retained {
-            let _ = fs::remove_dir_all(&root);
-        }
+        cleanup_feedback_root(&root, &checkout);
         return Err("interrupted".to_string());
     }
     let after = remote_branch_sha(&prepared.clone, branch);
@@ -3888,6 +3892,12 @@ fn run_feedback_once(
         advanced,
         retained,
     ))
+}
+
+fn cleanup_feedback_root(root: &Path, checkout: &Path) {
+    if !cleanup_repair_checkout(checkout) {
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 const DEFAULT_REVIEW_POLICY_MAX_BYTES: usize = 16_384;

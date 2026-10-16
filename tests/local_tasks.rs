@@ -5386,3 +5386,133 @@ fn sigterm_during_continue_postgres_startup_stops_before_starting_an_agent() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn sigterm_during_feedback_clone_removes_the_temporary_checkout_and_postgres() {
+    let root = temporary_path("sigterm-feedback-clone");
+    let repository = root.join("repository");
+    let origin = root.join("origin.git");
+    let bin = root.join("bin");
+    let trace = root.join("docker-trace");
+    let clone_started = root.join("feedback-clone-started");
+    let feedback_checkout = root.join("feedback-checkout");
+    fs::create_dir_all(&bin).unwrap();
+    git_repository(&repository);
+    fs::create_dir_all(repository.join(".alucard")).unwrap();
+    fs::write(repository.join(".alucard/postgres"), "postgres:16\n").unwrap();
+    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "postgres",
+    ]));
+    let base_sha = head_sha(&repository);
+    run(Command::new("git").args(["init", "-q", "--bare", origin.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        origin.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-qu",
+        "origin",
+        "main",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "switch",
+        "-qc",
+        "feature",
+    ]));
+    fs::write(repository.join("feature.txt"), "feature\n").unwrap();
+    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "feature",
+    ]));
+    let head_sha = head_sha(&repository);
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-qu",
+        "origin",
+        "feature",
+    ]));
+    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "switch", "-q", "main"]));
+    let pull = root.join("pull.json");
+    fs::write(&pull, format!(r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{head_sha}","baseRefOid":"{base_sha}","title":"Test PR","comments":[{{"body":"**🤖 Alucard review cycle 1/2: CHANGES_REQUESTED**\\n\\nfix this","createdAt":"2026-01-01T00:00:00Z","author":{{"login":"alucard"}}}}]}}"#)).unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let git = bin.join("git");
+    fs::write(&git, "#!/bin/sh\nif [ \"$1\" = clone ] && [ \"$2\" != --local ]; then\n  for argument do checkout=\"$argument\"; done\n  printf '%s' \"$checkout\" > \"$ALUCARD_FEEDBACK_CHECKOUT\"\n  : > \"$ALUCARD_FEEDBACK_CLONE_STARTED\"\n  while :; do sleep 1; done\nfi\nexec /usr/bin/git \"$@\"\n").unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\ncase \"$*\" in\n  *'api user'*) echo alucard ;;\n  *'state,headRefName,headRefOid,baseRefOid,title,comments'*) cat \"$ALUCARD_PULL\" ;;\n  *'--json comments'*) echo '{\"comments\":[]}' ;;\n  *'headRefOid'*) echo \"$ALUCARD_HEAD\" ;;\nesac\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+    command
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_DOCKER_TRACE", &trace)
+        .env("ALUCARD_FEEDBACK_CLONE_STARTED", &clone_started)
+        .env("ALUCARD_FEEDBACK_CHECKOUT", &feedback_checkout)
+        .env("ALUCARD_PULL", &pull)
+        .env("ALUCARD_HEAD", &head_sha)
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "continue",
+            "91",
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            repository.to_str().unwrap(),
+        ]);
+    let mut process = command.spawn().unwrap();
+    wait_for_file(&clone_started);
+    unsafe { libc::kill(process.id() as i32, libc::SIGTERM) };
+    assert_eq!(process.wait().unwrap().code(), Some(143));
+    let checkout = PathBuf::from(fs::read_to_string(&feedback_checkout).unwrap());
+    assert!(!checkout.parent().unwrap().exists());
+    let trace = fs::read_to_string(trace).unwrap();
+    assert!(trace.contains("rm -f -v alucard-postgres-"), "{trace}");
+    assert!(trace.contains("network rm alucard-"), "{trace}");
+    fs::remove_dir_all(root).unwrap();
+}
