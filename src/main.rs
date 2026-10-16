@@ -21,6 +21,7 @@ use alucard::{
     IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, StageMeasurement,
     TaskHeadingUpdate, TaskState, TaskStatus,
 };
+use fs2::FileExt;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -165,9 +166,9 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
-    let repository = match options.repository.canonicalize() {
-        Ok(path) if git_repository_root(&path).is_some() => path,
-        _ => return fail("alucard: target repository is not a git repository"),
+    let repository = match resolve_repository_target(&options.repository) {
+        Ok(path) => path,
+        Err(error) => return fail(&format!("alucard: {error}")),
     };
     let settings = match AgentSettings::from_environment(Some(&options.env_file)) {
         Ok(settings) => settings,
@@ -918,8 +919,10 @@ fn github_ref(path: &std::path::Path) -> Option<String> {
     [owner, name]
         .iter()
         .all(|part| {
-            part.bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+            !matches!(*part, "." | "..")
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
         })
         .then(|| format!("{owner}/{name}"))
 }
@@ -933,6 +936,64 @@ fn cache_path(repository: &str) -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".cache/alucard")))
         .unwrap_or_default()
         .join(repository)
+}
+
+fn resolve_repository_target(target: &Path) -> Result<PathBuf, String> {
+    if target.is_dir() {
+        let path = target
+            .canonicalize()
+            .map_err(|error| format!("could not resolve target repository: {error}"))?;
+        return git_repository_root(&path)
+            .map(|_| path)
+            .ok_or_else(|| format!("target path is not inside a git repo: {}", target.display()));
+    }
+    let repository = github_ref(target)
+        .ok_or_else(|| format!("target repo does not exist: {}", target.display()))?;
+    let cache = cache_path(&repository);
+    let parent = cache
+        .parent()
+        .ok_or_else(|| "could not create repository cache".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create repository cache: {error}"))?;
+    let lock = fs::File::create(cache.with_extension("lock"))
+        .map_err(|error| format!("could not lock repository cache: {error}"))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("could not lock repository cache: {error}"))?;
+    let result = if cache.exists() {
+        Command::new("git")
+            .args([
+                "-C",
+                cache.to_str().unwrap_or_default(),
+                "fetch",
+                "--quiet",
+                "origin",
+            ])
+            .output()
+    } else {
+        let clone_url = if target.to_string_lossy().starts_with("git@github.com:") {
+            format!("git@github.com:{repository}.git")
+        } else {
+            format!("https://github.com/{repository}.git")
+        };
+        Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                &clone_url,
+                cache.to_str().unwrap_or_default(),
+            ])
+            .output()
+    }
+    .map_err(|error| format!("could not update target repository: {error}"))?;
+    if !result.status.success() {
+        return Err(format!(
+            "could not update target repository: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        ));
+    }
+    cache
+        .canonicalize()
+        .map_err(|error| format!("could not resolve target repository: {error}"))
 }
 
 fn doctor_tasks(path: &std::path::Path, ok: &mut bool) {
@@ -1125,11 +1186,15 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     let Some(tools) = tool_dir() else {
         return fail("alucard: could not locate tool files");
     };
-    let options = match RunCommandOptions::parse(args, &tools) {
+    let mut options = match RunCommandOptions::parse(args, &tools) {
         Ok(options) => options,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
     let database = match database_path(db_path) {
+        Ok(path) => path,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    options.queue.repository = match resolve_repository_target(&options.queue.repository) {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
@@ -1695,9 +1760,9 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
-    let repository = match options.queue.repository.canonicalize() {
-        Ok(path) if git_repository_root(&path).is_some() => path,
-        _ => return fail("alucard: target repository is not a git repository"),
+    let repository = match resolve_repository_target(&options.queue.repository) {
+        Ok(path) => path,
+        Err(error) => return fail(&format!("alucard: {error}")),
     };
     let login = match gh_text(&repository, &["api", "user", "--jq", ".login"]) {
         Ok(login) if !login.trim().is_empty() => login,
@@ -5981,10 +6046,6 @@ impl QueueOptions {
             }
             .to_string());
         }
-        options.repository = options
-            .repository
-            .canonicalize()
-            .unwrap_or(options.repository);
         Ok(options)
     }
 
@@ -6178,6 +6239,21 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn github_targets_accept_the_cli_forms() {
+        for target in [
+            "owner/repository",
+            "https://github.com/owner/repository.git",
+            "git@github.com:owner/repository.git",
+        ] {
+            assert_eq!(
+                github_ref(Path::new(target)).as_deref(),
+                Some("owner/repository")
+            );
+        }
+        assert!(github_ref(Path::new("example.invalid/owner/repository")).is_none());
     }
 
     #[test]
