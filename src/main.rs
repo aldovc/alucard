@@ -6046,10 +6046,6 @@ impl QueueOptions {
             }
             .to_string());
         }
-        options.repository = options
-            .repository
-            .canonicalize()
-            .unwrap_or(options.repository);
         Ok(options)
     }
 

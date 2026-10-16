@@ -31,6 +31,7 @@ fn git(directory: &Path, args: &[&str]) {
 
 fn run_target(root: &Path, cache: &Path, database: &Path, target: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .current_dir(root)
         .args([
             "--db-path",
             database.to_str().unwrap(),
@@ -193,6 +194,14 @@ fn target_resolution_cli_matches_bash_and_reuses_the_cache() {
         "alucard: target path is not inside a git repo: {}",
         non_git.display()
     )));
+    let output = run_target(
+        &root,
+        &root.join("cache-errors"),
+        &root.join("errors.db"),
+        "./not-a-repository",
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("alucard: target path is not inside a git repo: ./not-a-repository",));
     let file_target = root.join("not-a-repository-file");
     fs::write(&file_target, "not a repository\n").unwrap();
     let output = run_target(
