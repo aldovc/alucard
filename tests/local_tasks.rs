@@ -3248,6 +3248,109 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
 }
 
 #[test]
+fn run_loads_env_file_for_host_commands_and_rejects_missing_credentials_early() {
+    let root = temporary_path("run-env-file-credentials");
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-u",
+        "origin",
+        "main",
+    ]));
+    let gh_trace = root.join("gh-trace");
+    let docker_trace = root.join("docker-trace");
+    fs::write(
+        bin.join("gh"),
+        format!(
+            "#!/bin/sh\n[ -n \"$GITHUB_TOKEN\" ] && echo present >> {}\nprintf '[]\\n'\n",
+            gh_trace.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        bin.join("docker"),
+        format!("#!/bin/sh\necho called >> {}\n", docker_trace.display()),
+    )
+    .unwrap();
+    for command in ["gh", "docker"] {
+        fs::set_permissions(bin.join(command), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "## [ ] task: Task\n").unwrap();
+    let environment = root.join("alucard.env");
+    fs::write(
+        &environment,
+        "GITHUB_TOKEN=from-file\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=key\n",
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let invoke = |env_file: &Path, database: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .env("PATH", &path)
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN")
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .args([
+                "--db-path",
+                database.to_str().unwrap(),
+                "run",
+                "--iterations",
+                "1",
+                "--tasks",
+                tasks.to_str().unwrap(),
+                "--env-file",
+                env_file.to_str().unwrap(),
+                "--logs-root",
+                root.join("logs").to_str().unwrap(),
+                "--no-build",
+                repository.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let output = invoke(&environment, &root.join("with-token.db"));
+    assert!(output.status.success(), "{output:?}");
+    assert!(!format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .contains("from-file"));
+    assert!(!fs::read_to_string(&gh_trace).unwrap().is_empty());
+
+    fs::remove_file(&gh_trace).unwrap();
+    fs::remove_file(&docker_trace).unwrap();
+    fs::write(&environment, "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=key\n").unwrap();
+    let database = root.join("missing-token.db");
+    let output = invoke(&environment, &database);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
+        "GITHUB_TOKEN is empty in {}",
+        environment.display()
+    )));
+    assert!(!gh_trace.exists());
+    assert!(!docker_trace.exists());
+    assert!(!database.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn run_uses_the_current_origin_base_without_changing_the_checkout() {
     let root = temporary_path("run-origin-base");
     let repository = root.join("repository");
