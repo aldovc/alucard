@@ -10,6 +10,7 @@ use alucard::{
     TaskState,
 };
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -422,7 +423,7 @@ fn startup_reconciliation_creates_missing_ledger_directories() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn run_transport_case(root: &Path, scenario: &str, retries: usize) -> std::process::Output {
+fn transport_command(root: &Path, scenario: &str, retries: usize) -> Command {
     let repository = root.join("repository");
     let remote = root.join("remote.git");
     let bin = root.join("bin");
@@ -496,7 +497,12 @@ case "$1 $2" in
     for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; esac; done
     printf '%s|%s\n' "$(git -C "$worktree" branch --show-current)" "$worktree" >> "$ALUCARD_TRACE"
     case "$ALUCARD_SCENARIO" in
-      billing) printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"error":"billing_error"}' ;;
+      billing|billing-hold)
+        if [ "$ALUCARD_SCENARIO" = billing-hold ]; then
+          : > "$ALUCARD_DOCKER_BILLING_READY"
+          while [ ! -f "$ALUCARD_DOCKER_BILLING_RELEASE" ]; do sleep 0.01; done
+        fi
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"error":"billing_error","modelUsage":{"test":{"inputTokens":1,"outputTokens":1}}}' ;;
       *) printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"API Error: Connection closed"}' ;;
     esac
     [ "$ALUCARD_SCENARIO" = foreign ] && exit 0
@@ -537,7 +543,8 @@ esac
         "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
     )
     .unwrap();
-    Command::new(env!("CARGO_BIN_EXE_alucard"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+    command
         .env(
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -545,6 +552,11 @@ esac
         .env("ALUCARD_TRACE", &trace)
         .env("ALUCARD_GH_TRACE", root.join("gh-trace"))
         .env("ALUCARD_SCENARIO", scenario)
+        .env("ALUCARD_DOCKER_BILLING_READY", root.join("billing-ready"))
+        .env(
+            "ALUCARD_DOCKER_BILLING_RELEASE",
+            root.join("billing-release"),
+        )
         .env("ALUCARD_FOREIGN_HEAD", foreign_head)
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
         .env("ALUCARD_TRANSPORT_RETRY_ATTEMPTS", retries.to_string())
@@ -562,9 +574,12 @@ esac
             root.join("logs").to_str().unwrap(),
             "--no-build",
             repository.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap()
+        ]);
+    command
+}
+
+fn run_transport_case(root: &Path, scenario: &str, retries: usize) -> std::process::Output {
+    transport_command(root, scenario, retries).output().unwrap()
 }
 
 #[test]
@@ -5044,6 +5059,110 @@ fn test_transport_recovery() {
         .unwrap_or_default()
         .contains("pr create"));
     fs::remove_dir_all(clean_root).unwrap();
+}
+
+#[test]
+fn billing_usage_is_emitted_before_task_cleanup() {
+    let root = temporary_path("transport-billing-order");
+    let database = root.join("ledger.db");
+    let mut child = transport_command(&root, "billing-hold", 0)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&root.join("billing-ready"));
+
+    let connection = open(&database).unwrap();
+    connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    fs::write(root.join("billing-release"), "").unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let mut stdout = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert_ne!(stdout.read_line(&mut line).unwrap(), 0, "{child:?}");
+        if line.contains("=== Alucard Token Usage:") {
+            break;
+        }
+    }
+    assert_eq!(
+        connection
+            .query_row("SELECT state FROM claims", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "active"
+    );
+    connection.execute_batch("COMMIT").unwrap();
+    drop(connection);
+
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(2), "{status:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row("SELECT state FROM claims", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "released"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retry_allocation_failure_finishes_prior_attempt_and_releases_claim_once() {
+    let root = temporary_path("transport-retry-allocation-failure");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("ledger.db");
+    migrate(&database).unwrap();
+    let connection = open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE retry_cleanup_audit (action TEXT NOT NULL);
+             CREATE TRIGGER reject_retry_run BEFORE INSERT ON runs
+             WHEN NEW.retry_owner_run_id IS NOT NULL
+             BEGIN SELECT RAISE(FAIL, 'retry allocation failed'); END;
+             CREATE TRIGGER record_failed_run AFTER UPDATE OF status ON runs
+             WHEN NEW.status = 'failed'
+             BEGIN INSERT INTO retry_cleanup_audit VALUES ('finish'); END;
+             CREATE TRIGGER record_claim_release AFTER UPDATE OF state ON claims
+             WHEN OLD.state = 'active' AND NEW.state = 'released'
+             BEGIN INSERT INTO retry_cleanup_audit VALUES ('release'); END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = transport_command(&root, "transport", 1).output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM retry_cleanup_audit WHERE action = 'finish'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM retry_cleanup_audit WHERE action = 'release'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT state FROM claims", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "released"
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
