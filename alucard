@@ -4958,7 +4958,13 @@ command_merge() {
   LOG_DIR=$(claim_unique_dir "$LOG_ROOT/alucard-merge-${pr_num}-$(date +%Y%m%d-%H%M%S)")
 
   local wt
-  wt=$(claim_unique_dir "${REPO_ABS}/.alucard-worktrees/merge-${pr_num}-$$")
+  if [ -n "${ALUCARD_MERGE_WORKTREE:-}" ]; then
+    wt="$ALUCARD_MERGE_WORKTREE"
+    mkdir -p "$(dirname "$wt")"
+    mkdir "$wt" || die "could not create merge checkout"
+  else
+    wt=$(claim_unique_dir "${REPO_ABS}/.alucard-worktrees/merge-${pr_num}-$$")
+  fi
   # shellcheck disable=SC2064
   trap "rm -rf '$wt'" EXIT
 

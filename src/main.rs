@@ -456,6 +456,12 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         .arg(script)
         .args(args)
         .env("ALUCARD_LOG_ROOT", &options.logs_root);
+    if let Some(logs_path) = &run.logs_path {
+        command.env(
+            "ALUCARD_MERGE_WORKTREE",
+            Path::new(logs_path).join("repository"),
+        );
+    }
     if std::env::var_os("HOME").is_none() {
         command.env("HOME", &options.logs_root);
     }

@@ -186,7 +186,7 @@ PY
 }
 
 # The check records the tree it ran on, so a test can tell it saw the rebase.
-PASSING_CHECK='cat a.txt > "$ALUCARD_TEST_STATE/checked"; echo "== 12 passed =="'
+PASSING_CHECK='pwd > "$ALUCARD_TEST_STATE/check-cwd"; cat a.txt > "$ALUCARD_TEST_STATE/checked"; echo "== 12 passed =="'
 
 echo "── stale but clean approved PR ──"
 setup_repos stale
@@ -210,6 +210,11 @@ assert_eq "the stale PR head is polled until it advances" "2" \
   "$(cat "$STATE/pr-head-calls")"
 assert_contains "and deletes the branch" "git/refs/heads/$BRANCH" "$TRACE"
 assert_merge_lifecycle completed
+if "$USES_RUST_BINARY"; then
+  merge_run_id=$("$ALUCARD" --db-path "$LEDGER" runs | awk -F '\t' '$3 == "merge" { print $1; exit }')
+  merge_logs=$("$ALUCARD" --db-path "$LEDGER" runs show "$merge_run_id" | awk -F ': ' '$1 == "logs" { print $2 }')
+  assert_eq "the check uses the ledger checkout" "$merge_logs/repository" "$(cat "$STATE/check-cwd")"
+fi
 
 if "$USES_RUST_BINARY"; then
   echo ""
