@@ -2228,20 +2228,156 @@ fn replay_recovery_push(
             .trim()
             .to_string(),
     };
-    if remote_branch_sha_matches(repository, branch, &expected_sha)? {
+    let remote_sha = match recovery_remote_branch_sha(repository, branch) {
+        Ok(remote_sha) => remote_sha,
+        Err(error) => {
+            ensure_recovery_commit_ref(&payload.checkout, branch, &expected_sha)?;
+            return Err(format!(
+                "recovery push deferred: expected commit {expected_sha} could not read remote branch {branch}: {error}"
+            ));
+        }
+    };
+    if remote_sha.as_deref() == Some(&expected_sha) {
         return Ok(());
+    }
+    ensure_recovery_commit_ref(&payload.checkout, branch, &expected_sha)?;
+    if let Some(remote_sha) = remote_sha {
+        fetch_remote_branch(&payload.checkout, branch).map_err(|error| {
+            format!(
+                "recovery push deferred: expected commit {expected_sha} could not fetch remote branch {branch}: {error}"
+            )
+        })?;
+        if commit_is_ancestor(&payload.checkout, &expected_sha, "FETCH_HEAD").map_err(|error| {
+            format!(
+                "recovery push deferred: expected commit {expected_sha} could not compare remote branch {branch}: {error}"
+            )
+        })? {
+            return Ok(());
+        }
+        if !commit_is_ancestor(&payload.checkout, &remote_sha, &expected_sha).map_err(|error| {
+            format!(
+                "recovery push deferred: expected commit {expected_sha} could not compare remote branch {branch}: {error}"
+            )
+        })? {
+            return Err(format!(
+                "recovery push deferred: expected commit {expected_sha} diverges from remote commit {remote_sha}"
+            ));
+        }
     }
     let output = execute_command(
         "git",
-        &["push", "-u", "origin", branch],
+        &[
+            "push",
+            "origin",
+            &format!("{expected_sha}:refs/heads/{branch}"),
+        ],
         &payload.checkout,
         None,
+    )
+    .map_err(|error| format!("recovery push deferred: expected commit {expected_sha}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "recovery push deferred: expected commit {expected_sha}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let remote_sha = recovery_remote_branch_sha(repository, branch).map_err(|error| {
+        format!(
+            "recovery push deferred: expected commit {expected_sha} could not read remote branch {branch}: {error}"
+        )
+    })?;
+    if remote_sha.as_deref() == Some(&expected_sha) {
+        return Ok(());
+    }
+    if let Some(remote_sha) = remote_sha {
+        fetch_remote_branch(&payload.checkout, branch).map_err(|error| {
+            format!(
+                "recovery push deferred: expected commit {expected_sha} could not fetch remote branch {branch}: {error}"
+            )
+        })?;
+        if commit_is_ancestor(&payload.checkout, &expected_sha, "FETCH_HEAD").map_err(|error| {
+            format!(
+                "recovery push deferred: expected commit {expected_sha} could not compare remote branch {branch}: {error}"
+            )
+        })? {
+            return Ok(());
+        }
+        return Err(format!(
+            "recovery push deferred: expected commit {expected_sha} is not on remote commit {remote_sha}"
+        ));
+    }
+    Err(format!(
+        "recovery push deferred: expected commit {expected_sha} is absent from remote branch {branch}"
+    ))
+}
+
+fn ensure_recovery_commit_ref(
+    checkout: &Path,
+    branch: &str,
+    expected_sha: &str,
+) -> Result<(), String> {
+    let exists = execute_command(
+        "git",
+        &["cat-file", "-e", &format!("{expected_sha}^{{commit}}")],
+        checkout,
+        None,
+    )
+    .map_err(|error| format!("recovery push deferred: expected commit {expected_sha}: {error}"))?;
+    if !exists.status.success() {
+        return Err(format!(
+            "recovery push deferred: expected commit {expected_sha} is missing locally"
+        ));
+    }
+    let reference = format!("refs/alucard/recovery/{branch}");
+    let update = execute_command(
+        "git",
+        &["update-ref", &reference, expected_sha],
+        checkout,
+        None,
+    )
+    .map_err(|error| format!("recovery push deferred: expected commit {expected_sha}: {error}"))?;
+    if update.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "recovery push deferred: expected commit {expected_sha}: {}",
+            String::from_utf8_lossy(&update.stderr).trim()
+        ))
+    }
+}
+
+fn fetch_remote_branch(checkout: &Path, branch: &str) -> Result<(), String> {
+    let output = execute_command(
+        "git",
+        &[
+            "fetch",
+            "--quiet",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ],
+        checkout,
+        Some(Duration::from_secs(120)),
     )
     .map_err(|error| error.to_string())?;
     if output.status.success() {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn commit_is_ancestor(checkout: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let output = execute_command(
+        "git",
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        checkout,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
     }
 }
 
@@ -2476,11 +2612,7 @@ fn remote_branch_exists(repository: &Path, branch: &str) -> Result<bool, String>
     }
 }
 
-fn remote_branch_sha_matches(
-    repository: &Path,
-    branch: &str,
-    expected_sha: &str,
-) -> Result<bool, String> {
+fn recovery_remote_branch_sha(repository: &Path, branch: &str) -> Result<Option<String>, String> {
     let output = execute_command(
         "git",
         &[
@@ -2499,9 +2631,9 @@ fn remote_branch_sha_matches(
             .split_whitespace()
             .next()
             .ok_or("remote branch lookup returned no commit")?;
-        Ok(remote_sha == expected_sha)
+        Ok(Some(remote_sha.to_string()))
     } else if output.status.code() == Some(2) {
-        Ok(false)
+        Ok(None)
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
@@ -6775,6 +6907,99 @@ printf '%s' "$FULL_PROMPT""#,
 
         replay_recovery_operations(&database, &checkout, &repository_id).unwrap();
 
+        assert!(alucard::pending_operations(&database, &repository_id)
+            .unwrap()
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_push_replay_publishes_the_recorded_commit_after_branch_moves() {
+        let root = std::env::temp_dir().join(format!(
+            "alucard-recovery-push-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let remote = root.join("remote.git");
+        let checkout = root.join("checkout");
+        let database = root.join("alucard.db");
+        fs::create_dir_all(&root).unwrap();
+        let git = |directory: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(directory)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&root, &["init", "--bare", remote.to_str().unwrap()]);
+        git(&root, &["init", checkout.to_str().unwrap()]);
+        git(&checkout, &["config", "user.email", "test@example.com"]);
+        git(&checkout, &["config", "user.name", "Test"]);
+        fs::write(checkout.join("tracked"), "initial\n").unwrap();
+        git(&checkout, &["add", "tracked"]);
+        git(&checkout, &["commit", "-m", "initial"]);
+        git(&checkout, &["branch", "-M", "recovery-branch"]);
+        git(
+            &checkout,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&checkout, &["push", "-u", "origin", "recovery-branch"]);
+        fs::write(checkout.join("tracked"), "recovery\n").unwrap();
+        git(&checkout, &["commit", "-am", "recovery"]);
+        let expected_sha = git_output(&checkout, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        git(&checkout, &["branch", "retained-recovery", &expected_sha]);
+        git(&checkout, &["reset", "--hard", "HEAD~"]);
+
+        let repository_id = ensure_repository_identity(&database, &checkout).unwrap();
+        open(&database)
+            .unwrap()
+            .execute(
+                "INSERT INTO repositories (id, owner, name, cache_path, created_at) VALUES (?1, '', '', '', datetime('now'))",
+                [&repository_id],
+            )
+            .unwrap();
+        let payload = serde_json::json!({
+            "checkout": checkout,
+            "expected_sha": expected_sha,
+        })
+        .to_string();
+        begin_operation_with_payload(
+            &database,
+            &repository_id,
+            "recovery:recovery-branch",
+            "push",
+            Some(&payload),
+        )
+        .unwrap();
+
+        replay_recovery_operations(&database, &checkout, &repository_id).unwrap();
+
+        assert_eq!(
+            git_output(
+                &checkout,
+                &["ls-remote", "origin", "refs/heads/recovery-branch"],
+            )
+            .unwrap()
+            .split_whitespace()
+            .next(),
+            Some(expected_sha.as_str())
+        );
+        assert_eq!(
+            git_output(
+                &checkout,
+                &["rev-parse", "refs/alucard/recovery/recovery-branch"],
+            )
+            .unwrap()
+            .trim(),
+            expected_sha
+        );
         assert!(alucard::pending_operations(&database, &repository_id)
             .unwrap()
             .is_empty());
