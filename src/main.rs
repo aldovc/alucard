@@ -1351,9 +1351,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         return fail(&format!("alucard: reconciliation failed: {error}"));
     }
     let cache = cache_root();
-    let playwright_cache = fs::create_dir_all(cache.join("playwright-browsers"))
-        .ok()
-        .map(|()| cache.join("playwright-browsers"));
+    let playwright_cache_path = cache.join("playwright-browsers");
     let github_repo = github_repo_slug(&options.queue.repository);
     let mut checks_available = true;
     if !options.no_build {
@@ -1459,17 +1457,20 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     return fail(&format!("alucard: {error}"));
                 }
             };
-        let toolchain_status = postgres_toolchain_status(
-            toolchain_preflight(
-                &options.queue.repository,
-                &options.base,
-                &options.image,
-                &options.env_file,
-                options.timeout_minutes,
-            )
-            .unwrap_or_else(|error| format!("Preflight unavailable: {error}")),
-            postgres.is_some(),
-        );
+        let preflight = toolchain_preflight(
+            &options.queue.repository,
+            &options.base,
+            &options.image,
+            &options.env_file,
+            options.timeout_minutes,
+            &playwright_cache_path,
+        )
+        .unwrap_or_else(|error| alucard::ToolchainPreflight {
+            status: format!("Preflight unavailable: {error}"),
+            playwright_cache: None,
+        });
+        let playwright_cache = preflight.playwright_cache;
+        let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
         let prompt = match worker_prompt(
             &tools,
             &selected,
@@ -1676,6 +1677,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             previous_sha: &mut previous_stage_sha,
                         },
                         postgres.as_ref(),
+                        playwright_cache.as_deref(),
                     ) {
                         Ok(outcome) => outcome,
                         Err(error) => {
@@ -2005,17 +2007,21 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             parent_context: String::new(),
         };
         let postgres = RunPostgres::setup(&repository, &options.base, &continued.run.id)?;
-        let toolchain_status = postgres_toolchain_status(
-            toolchain_preflight(
-                &repository,
-                &options.base,
-                &options.image,
-                &options.env_file,
-                options.timeout_minutes,
-            )
-            .unwrap_or_else(|error| format!("Preflight unavailable: {error}")),
-            postgres.is_some(),
-        );
+        let playwright_cache_path = cache_root().join("playwright-browsers");
+        let preflight = toolchain_preflight(
+            &repository,
+            &options.base,
+            &options.image,
+            &options.env_file,
+            options.timeout_minutes,
+            &playwright_cache_path,
+        )
+        .unwrap_or_else(|error| alucard::ToolchainPreflight {
+            status: format!("Preflight unavailable: {error}"),
+            playwright_cache: None,
+        });
+        let playwright_cache = preflight.playwright_cache;
+        let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
         let findings = continue_feedback_findings(&pull.comments, login.trim());
         if !findings.is_empty() {
             let (feedback, blocked, advanced, retained) = run_feedback_once(
@@ -2030,6 +2036,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 1,
                 &toolchain_status,
                 postgres.as_ref(),
+                playwright_cache.as_deref(),
             )?;
             if advanced == Some(false) && (feedback.status.unwrap_or(1) != 0 || retained) {
                 let comment = format!("**🤖 Alucard continue: feedback agent stopped without publishing — needs human** (rc={})\n\nThe feedback agent pushed nothing, so this branch is still at the commit the previous review already read. Alucard stopped rather than re-run CI and review against it.", feedback.status.unwrap_or(1));
@@ -2086,7 +2093,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             tools: &tools,
             settings: &settings,
             options: &options,
-            playwright_cache: None,
+            playwright_cache: playwright_cache.as_deref(),
             github_repo: github_repo_slug(&repository).as_deref(),
             network,
             database_url,
@@ -2140,6 +2147,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 previous_sha: &mut previous_stage_sha,
             },
             postgres.as_ref(),
+            playwright_cache.as_deref(),
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -3601,6 +3609,7 @@ fn run_feedback_once(
     iteration: usize,
     toolchain_status: &str,
     postgres: Option<&RunPostgres>,
+    playwright_cache: Option<&Path>,
 ) -> Result<(AgentResult, Option<String>, Option<bool>, bool), String> {
     let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
     let before = remote_branch_sha(&prepared.clone, branch);
@@ -3649,7 +3658,7 @@ fn run_feedback_once(
         prompt: &prompt,
         timeout_minutes: options.timeout_minutes,
         network,
-        playwright_cache: None,
+        playwright_cache,
         database_url,
         github_repo: github_repo_slug(&options.queue.repository).as_deref(),
         worktree_read_only: false,
@@ -3769,6 +3778,7 @@ fn review_gate(
     toolchain_status: &str,
     stage_progress: &mut StageProgress<'_>,
     postgres: Option<&RunPostgres>,
+    playwright_cache: Option<&Path>,
 ) -> Result<ReviewOutcome, String> {
     println!("Review gate: PR #{pr_number} on {branch}.");
     let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
@@ -3829,7 +3839,7 @@ fn review_gate(
                     prompt: &prompt,
                     timeout_minutes: options.timeout_minutes,
                     network,
-                    playwright_cache: None,
+                    playwright_cache,
                     database_url,
                     github_repo: github_repo_slug(&options.queue.repository).as_deref(),
                     worktree_read_only: true,
@@ -4018,6 +4028,7 @@ fn review_gate(
                                 iteration,
                                 toolchain_status,
                                 postgres,
+                                playwright_cache,
                             )?;
                             if let Some(head_sha) = remote_branch_sha(&prepared.clone, branch) {
                                 write_stage_measurement(
@@ -4077,7 +4088,7 @@ fn review_gate(
                                 tools,
                                 settings,
                                 options,
-                                playwright_cache: None,
+                                playwright_cache,
                                 github_repo: github_repo_slug(&options.queue.repository).as_deref(),
                                 network,
                                 database_url,
