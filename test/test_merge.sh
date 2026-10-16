@@ -156,11 +156,12 @@ assert_merge_lifecycle() {
 seed_pending_recovery_annotation() {
   "$USES_RUST_BINARY" || return 0
   "$ALUCARD" --db-path "$LEDGER" db migrate >/dev/null
-  python3 - "$LEDGER" "$(cd -P "$TARGET" && pwd)" <<'PY'
+  python3 - "$LEDGER" "$(git -C "$TARGET" remote get-url origin)" <<'PY'
 import sqlite3
 import sys
 
 database, repository_id = sys.argv[1:]
+repository_id = "/".join(repository_id.rstrip("/").removesuffix(".git").rsplit("/", 2)[-2:]).lower()
 connection = sqlite3.connect(database)
 connection.execute(
     "INSERT OR IGNORE INTO repositories (id, owner, name, created_at) VALUES (?, '', 'target', datetime('now'))",

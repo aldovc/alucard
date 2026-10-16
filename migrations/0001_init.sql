@@ -16,7 +16,12 @@ CREATE TABLE runs (
     ended_at TEXT,
     base_sha TEXT,
     image TEXT,
-    logs_path TEXT
+    logs_path TEXT,
+    pid INTEGER,
+    hostname TEXT,
+    reconciliation_reason TEXT,
+    branch TEXT,
+    retry_owner_run_id TEXT REFERENCES runs(id)
 );
 
 CREATE TABLE tasks (
@@ -60,6 +65,7 @@ CREATE TABLE pull_requests (
     remote_state TEXT NOT NULL,
     gate_state TEXT NOT NULL,
     reviewer_approved_sha TEXT,
+    review_verdict TEXT,
     UNIQUE (repository_id, number)
 );
 
@@ -72,7 +78,9 @@ CREATE TABLE recovery (
     reason TEXT NOT NULL,
     marker_posted_at TEXT,
     unparked_at TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    checkout_path TEXT,
+    failure_reason TEXT
 );
 
 CREATE TABLE operations (
@@ -84,5 +92,19 @@ CREATE TABLE operations (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    payload TEXT
+);
+
+CREATE UNIQUE INDEX recovery_per_run ON recovery (original_run_id);
+CREATE UNIQUE INDEX operation_target_type ON operations (repository_id, target, operation_type);
+
+CREATE TABLE measurement_summaries (
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    iteration INTEGER NOT NULL,
+    measurements_path TEXT NOT NULL,
+    total_invocations INTEGER NOT NULL,
+    costed_invocations INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, iteration)
 );

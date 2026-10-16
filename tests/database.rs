@@ -2,8 +2,8 @@ mod test_support;
 
 use alucard::{
     abandoned_task_claims, acquire_pr, acquire_task, begin_operation, begin_operation_with_payload,
-    defer_operation, ensure_repository_identity, finish_operation, heartbeat, import_github_tasks,
-    import_local_tasks, lock_recovery_operations, migrate, open, parse_tasks, pending_operations,
+    defer_operation, finish_operation, heartbeat, import_github_tasks, import_local_tasks,
+    lock_recovery_operations, migrate, open, parse_tasks, pending_operations,
     pending_recovery_operations, prepare_run, record_task_pr, record_task_pr_gate_state,
     record_task_pr_review, release, release_abandoned_task_claim, repository_id,
     repository_ledger_id, repository_source_path, run_command, start_continue_run, start_merge_run,
@@ -227,238 +227,6 @@ fn repository_identity_shares_continue_merge_and_relative_local_tasks() {
         Err(ClaimError::ClaimedBy { .. })
     ));
     release(&path, &claim.id, &continued.run.id).unwrap();
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn repository_identity_migrates_legacy_rows_and_reports_live_conflicts() {
-    let path = database_path();
-    let root = path.parent().unwrap();
-    let repository = root.join("checkout");
-    seed_repository(&repository);
-    set_origin(&repository, "https://github.com/example/widgets.git");
-    migrate(&path).unwrap();
-    let legacy = "Example/Widgets";
-    let stable = repository_id(&repository);
-    let connection = open(&path).unwrap();
-    connection
-        .execute(
-            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'checkout', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
-             VALUES ('legacy-task', ?1, 'github', '42', 'legacy', 'in_flight', '[]', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
-             VALUES ('legacy-run', ?1, 'run', 'interrupted', 'now', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO recovery (id, task_id, original_run_id, branch, reason, created_at)
-             VALUES ('recovery', 'legacy-task', 'legacy-run', 'branch', 'failed', 'now')",
-            [],
-        )
-        .unwrap();
-    drop(connection);
-    assert_eq!(
-        ensure_repository_identity(&path, &repository).unwrap(),
-        stable
-    );
-    let connection = open(&path).unwrap();
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT repository_id FROM tasks WHERE id = 'legacy-task'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-        stable
-    );
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT COUNT(*) FROM recovery WHERE task_id = 'legacy-task'",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-        1
-    );
-    connection
-        .execute(
-            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
-             VALUES ('conflict', ?1, 'github', '43', 'current', 'pending', '[]', 'now')",
-            [&stable],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'checkout', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO tasks (id, repository_id, source, external_id, title, status, blockers_json, updated_at)
-             VALUES ('legacy-conflict-task', ?1, 'github', '43', 'legacy', 'claimed', '[]', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    drop(connection);
-    assert!(ensure_repository_identity(&path, &repository).is_err());
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn repository_identity_migrates_live_legacy_lease_from_equivalent_clone() {
-    let path = database_path();
-    let root = path.parent().unwrap();
-    let first = root.join("first");
-    let second = root.join("second");
-    for repository in [&first, &second] {
-        seed_repository(repository);
-    }
-    set_origin(&first, "https://github.com/example/widgets.git");
-    set_origin(&second, "git@github.com:example/widgets.git");
-    migrate(&path).unwrap();
-    let legacy = first.canonicalize().unwrap().display().to_string();
-    let connection = open(&path).unwrap();
-    connection
-        .execute(
-            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'first', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
-             VALUES ('legacy-run', ?1, 'merge', 'running', 'now', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
-             VALUES ('legacy-claim', ?1, 'pr', '42', 'legacy-run', 'active', 'now', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    drop(connection);
-
-    let stable = ensure_repository_identity(&path, &second).unwrap();
-    let competing = start_merge_run(&path, &second, &root.join("logs")).unwrap();
-    assert!(matches!(
-        acquire_pr(&path, &stable, 42, &competing.id),
-        Err(ClaimError::ClaimedBy { .. })
-    ));
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn repository_identity_migrates_live_legacy_git_suffix_lease() {
-    let path = database_path();
-    let root = path.parent().unwrap();
-    let first = root.join("first");
-    let second = root.join("second");
-    for repository in [&first, &second] {
-        seed_repository(repository);
-    }
-    set_origin(&first, "https://github.com/example/widgets.git/");
-    set_origin(&second, "git@github.com:example/widgets.git");
-    migrate(&path).unwrap();
-    let legacy = "example/widgets.git";
-    let connection = open(&path).unwrap();
-    connection
-        .execute(
-            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'first', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
-             VALUES ('legacy-run', ?1, 'merge', 'running', 'now', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
-             VALUES ('legacy-claim', ?1, 'pr', '42', 'legacy-run', 'active', 'now', 'now')",
-            [&legacy],
-        )
-        .unwrap();
-    drop(connection);
-
-    let stable = ensure_repository_identity(&path, &second).unwrap();
-    let competing = start_merge_run(&path, &second, &root.join("logs")).unwrap();
-    assert!(matches!(
-        acquire_pr(&path, &stable, 42, &competing.id),
-        Err(ClaimError::ClaimedBy { .. })
-    ));
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn repository_identity_discards_pending_legacy_local_task_matching_stable_task() {
-    let path = database_path();
-    let root = path.parent().unwrap();
-    let repository = root.join("checkout");
-    seed_repository(&repository);
-    set_origin(&repository, "https://github.com/example/widgets.git");
-    migrate(&path).unwrap();
-    let legacy = repository.canonicalize().unwrap().display().to_string();
-    let stable = repository_id(&repository);
-    let connection = open(&path).unwrap();
-    for repository_id in [&legacy, &stable] {
-        connection
-            .execute(
-                "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'checkout', 'now')",
-                [repository_id],
-            )
-            .unwrap();
-    }
-    connection
-        .execute(
-            "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, updated_at)
-             VALUES ('legacy-task', ?1, 'local', ?2, '1', 'legacy', 'pending', '[]', 'now')",
-            (&legacy, format!("{legacy}/tasks.md")),
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO tasks (id, repository_id, source, source_path, external_id, title, status, blockers_json, updated_at)
-             VALUES ('stable-task', ?1, 'local', 'tasks.md', '1', 'stable', 'pending', '[]', 'now')",
-            [&stable],
-        )
-        .unwrap();
-    drop(connection);
-
-    assert_eq!(
-        ensure_repository_identity(&path, &repository).unwrap(),
-        stable
-    );
-    let connection = open(&path).unwrap();
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT COUNT(*) FROM tasks WHERE repository_id = ?1 AND source = 'local' AND source_path = 'tasks.md' AND external_id = '1'",
-                [&stable],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-        1
-    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1570,7 +1338,7 @@ fn recovery_replay_lock_excludes_concurrent_recoverers() {
 #[test]
 fn migration_is_idempotent_and_enforces_the_ledger_constraints() {
     let path = database_path();
-    assert_eq!(status(&path).unwrap().pending_migrations, 9);
+    assert_eq!(status(&path).unwrap().pending_migrations, 1);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
     assert_eq!(migrate(&path).unwrap().pending_migrations, 0);
 
@@ -1654,7 +1422,7 @@ fn status_reports_pending_migrations_until_the_database_is_migrated() {
     assert!(!status.status.success());
     assert!(String::from_utf8(status.stdout)
         .unwrap()
-        .contains("pending migrations: 9"));
+        .contains("pending migrations: 1"));
 
     let migrate = Command::new(binary)
         .args(["--db-path", path.to_str().unwrap(), "db", "migrate"])
@@ -1788,7 +1556,7 @@ fn status_preserves_existing_database_parent_permissions() {
     fs::create_dir(parent).unwrap();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(status(&path).unwrap().pending_migrations, 9);
+    assert_eq!(status(&path).unwrap().pending_migrations, 1);
     assert_eq!(
         fs::metadata(parent).unwrap().permissions().mode() & 0o777,
         0o755
