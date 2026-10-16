@@ -3348,7 +3348,7 @@ impl CiGate<'_> {
             })();
             if agent_invoked {
                 if interrupted() {
-                    let _ = fs::remove_dir_all(&checkout);
+                    cleanup_repair_checkout(&checkout);
                     return Err("interrupted".to_string());
                 }
                 cleanup_repair_checkout(&checkout);
@@ -3869,24 +3869,13 @@ fn run_feedback_once(
         classification: AgentExit::Failed,
     });
     if interrupted() {
-        cleanup_feedback_root(&root);
+        cleanup_feedback_checkout(&prepared.directory, &root, &checkout);
         return Err("interrupted".to_string());
     }
     let after = remote_branch_sha(&prepared.clone, branch);
     let advanced = before.zip(after).map(|(before, after)| before != after);
     let blocked = fs::read_to_string(output.join(".alucard-blocked")).unwrap_or_default();
-    let retained = cleanup_repair_checkout(&checkout);
-    if retained {
-        log_event(
-            &prepared.directory,
-            &format!(
-                "Unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
-                checkout.display()
-            ),
-        );
-    } else {
-        let _ = fs::remove_dir_all(&root);
-    }
+    let retained = cleanup_feedback_checkout(&prepared.directory, &root, &checkout);
     Ok((
         result,
         (!blocked.trim().is_empty()).then_some(blocked),
@@ -3897,6 +3886,22 @@ fn run_feedback_once(
 
 fn cleanup_feedback_root(root: &Path) {
     let _ = fs::remove_dir_all(root);
+}
+
+fn cleanup_feedback_checkout(directory: &Path, root: &Path, checkout: &Path) -> bool {
+    let retained = cleanup_repair_checkout(checkout);
+    if retained {
+        log_event(
+            directory,
+            &format!(
+                "Unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
+                checkout.display()
+            ),
+        );
+    } else {
+        cleanup_feedback_root(root);
+    }
+    retained
 }
 
 const DEFAULT_REVIEW_POLICY_MAX_BYTES: usize = 16_384;
@@ -4801,7 +4806,7 @@ fn cleanup_repair_checkout(checkout: &Path) -> bool {
         let _ = fs::remove_dir_all(checkout);
     } else {
         eprintln!(
-            "CI gate: unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
+            "CI gate: Unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
             checkout.display()
         );
     }
@@ -4809,22 +4814,28 @@ fn cleanup_repair_checkout(checkout: &Path) -> bool {
 }
 
 fn checkout_requires_preservation(checkout: &Path) -> Result<bool, String> {
-    let dirty = git_output(
-        checkout,
-        &["status", "--porcelain", "--untracked-files=all"],
-    )?;
-    let unpublished = git_output(
-        checkout,
-        &[
-            "rev-list",
-            "--count",
-            "HEAD",
-            "--branches",
-            "--not",
-            "--remotes=origin",
-        ],
-    )?;
-    let stashes = git_output(checkout, &["stash", "list"])?;
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(checkout)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    };
+    let dirty = git(&["status", "--porcelain", "--untracked-files=all"])?;
+    let unpublished = git(&[
+        "rev-list",
+        "--count",
+        "HEAD",
+        "--branches",
+        "--not",
+        "--remotes=origin",
+    ])?;
+    let stashes = git(&["stash", "list"])?;
     Ok(!(dirty.is_empty() && unpublished.trim() == "0" && stashes.is_empty()))
 }
 

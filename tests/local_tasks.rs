@@ -5388,7 +5388,16 @@ fn sigterm_during_continue_postgres_startup_stops_before_starting_an_agent() {
 }
 
 #[test]
-fn sigterm_during_feedback_agent_removes_the_temporary_checkout_and_postgres() {
+fn sigterm_during_feedback_agent_removes_a_clean_temporary_checkout_and_postgres() {
+    assert_sigterm_during_feedback_agent(false);
+}
+
+#[test]
+fn sigterm_during_feedback_agent_preserves_a_dirty_temporary_checkout() {
+    assert_sigterm_during_feedback_agent(true);
+}
+
+fn assert_sigterm_during_feedback_agent(dirty_checkout: bool) {
     let root = temporary_path("sigterm-feedback-agent");
     let repository = root.join("repository");
     let origin = root.join("origin.git");
@@ -5465,7 +5474,7 @@ fn sigterm_during_feedback_agent_removes_the_temporary_checkout_and_postgres() {
     let docker = bin.join("docker");
     fs::write(
         &docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$*\" in\n  *'--name alucard-feedback-'*) : > \"$ALUCARD_FEEDBACK_AGENT_STARTED\"; while :; do sleep 1; done ;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$*\" in\n  *'--name alucard-feedback-'*) if [ \"$ALUCARD_FEEDBACK_DIRTY\" = 1 ]; then echo wip > \"$(cat \"$ALUCARD_FEEDBACK_CHECKOUT\")/wip.txt\"; fi; : > \"$ALUCARD_FEEDBACK_AGENT_STARTED\"; while :; do sleep 1; done ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
@@ -5490,6 +5499,10 @@ fn sigterm_during_feedback_agent_removes_the_temporary_checkout_and_postgres() {
         .env("ALUCARD_DOCKER_TRACE", &trace)
         .env("ALUCARD_FEEDBACK_AGENT_STARTED", &agent_started)
         .env("ALUCARD_FEEDBACK_CHECKOUT", &feedback_checkout)
+        .env(
+            "ALUCARD_FEEDBACK_DIRTY",
+            if dirty_checkout { "1" } else { "0" },
+        )
         .env("ALUCARD_PULL", &pull)
         .env("ALUCARD_HEAD", &head_sha)
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
@@ -5510,7 +5523,12 @@ fn sigterm_during_feedback_agent_removes_the_temporary_checkout_and_postgres() {
     unsafe { libc::kill(process.id() as i32, libc::SIGTERM) };
     assert_eq!(process.wait().unwrap().code(), Some(143));
     let checkout = PathBuf::from(fs::read_to_string(&feedback_checkout).unwrap());
-    assert!(!checkout.parent().unwrap().exists());
+    if dirty_checkout {
+        assert!(checkout.is_dir());
+        assert!(checkout.join("wip.txt").exists());
+    } else {
+        assert!(!checkout.parent().unwrap().exists());
+    }
     let trace = fs::read_to_string(trace).unwrap();
     assert!(trace.contains("rm -f -v alucard-postgres-"), "{trace}");
     assert!(trace.contains("network rm alucard-"), "{trace}");
