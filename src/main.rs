@@ -271,9 +271,7 @@ impl MergeOptions {
             env_file: nonempty_environment("ALUCARD_ENV_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| tools.join("alucard.env")),
-            logs_root: nonempty_environment("ALUCARD_LOGS_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".alucard-logs")),
+            logs_root: default_logs_root()?,
             check_command: None,
             timeout_minutes: 60,
             dry_run: false,
@@ -369,9 +367,7 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(run) => run,
         Err(error) => return fail(&format!("alucard: could not start merge run: {error}")),
     };
-    if options.logs_root.starts_with("/tmp") {
-        eprintln!("warning: logs under /tmp will not survive a reboot");
-    }
+    warn_if_volatile_log_root(&options.logs_root);
     let claim = match acquire_pr(&database, &run.repository_id, options.pr_number, &run.id) {
         Ok(claim) => claim,
         Err(error) => {
@@ -770,6 +766,29 @@ const REQUIRED_TOOL_FILES: &str = include_str!("../required-tool-files.txt");
 
 fn nonempty_environment(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn default_logs_root() -> Result<PathBuf, String> {
+    nonempty_environment("ALUCARD_LOG_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| {
+            nonempty_environment("XDG_STATE_HOME")
+                .map(|root| PathBuf::from(root).join("alucard/logs"))
+        })
+        .or_else(|| {
+            nonempty_environment("HOME")
+                .map(|root| PathBuf::from(root).join(".local/state/alucard/logs"))
+        })
+        .ok_or_else(|| "log root is not set; use --logs-root or ALUCARD_LOG_ROOT".to_string())
+}
+
+fn warn_if_volatile_log_root(logs_root: &Path) {
+    if logs_root.starts_with("/tmp") || logs_root.starts_with("/private/tmp") {
+        eprintln!(
+            "Warning: --logs-root {} is under /tmp — these run logs will not survive a reboot.",
+            logs_root.display()
+        );
+    }
 }
 
 fn required_settings(env_file: &Path) -> Result<AgentSettings, String> {
@@ -1262,17 +1281,7 @@ impl RunCommandOptions {
             .and_then(|value| value.into_string().ok())
             .unwrap_or_else(|| "ghcr.io/aldovc/alucard:latest".to_string());
         let mut no_build = false;
-        let mut logs_root = nonempty_environment("ALUCARD_LOG_ROOT")
-            .map(PathBuf::from)
-            .or_else(|| {
-                nonempty_environment("XDG_STATE_HOME")
-                    .map(|root| PathBuf::from(root).join("alucard/logs"))
-            })
-            .or_else(|| {
-                nonempty_environment("HOME")
-                    .map(|root| PathBuf::from(root).join(".local/state/alucard/logs"))
-            })
-            .ok_or("log root is not set; use --logs-root or ALUCARD_LOG_ROOT")?;
+        let mut logs_root = default_logs_root()?;
         let mut env_file = nonempty_environment("ALUCARD_ENV_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| tools.join("alucard.env"));
@@ -1398,6 +1407,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(file) => file,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
+    warn_if_volatile_log_root(&options.logs_root);
     let mut iteration = 1;
     while iteration <= options.iterations {
         let selected = match select_run_task(&options.queue, task_file.as_deref(), &database) {
@@ -2018,6 +2028,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(continued) => continued,
         Err(error) => return fail(&format!("alucard: could not start continue run: {error}")),
     };
+    warn_if_volatile_log_root(&options.logs_root);
     let iteration_started = Instant::now();
     let result: Result<ReviewOutcome, String> = (|| {
         fs::create_dir_all(continued.run.logs_path.as_deref().unwrap_or_default())
