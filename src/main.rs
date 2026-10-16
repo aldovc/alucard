@@ -7902,12 +7902,15 @@ printf '%s' "$prompt""#,
                 vec!["9", "--help"],
                 "usage: alucard merge <PR_NUM> [TARGET_REPO] [--check-command CMD] [--dry-run]",
             ),
-            (vec!["9", "--issue", "7"], "--issue is only valid with alucard run"),
+            (
+                vec!["9", "--issue", "7"],
+                "--issue is only valid with alucard run",
+            ),
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
             assert_eq!(
-                MergeOptions::parse(&args, Path::new("tools")).unwrap_err(),
-                message
+                MergeOptions::parse(&args, Path::new("tools")).err(),
+                Some(message.to_string())
             );
         }
     }
