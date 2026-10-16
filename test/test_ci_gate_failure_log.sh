@@ -17,7 +17,6 @@ REPO="$TEST_DIR/repo"
 mkdir -p "$MOCK_BIN"
 
 PR_NUM=77
-HEAD_SHA="deadbeefcafef00d"
 RUN_ID=123456789
 FAILURE_TEXT="FAILED test_thing.py::test_widget — AssertionError: expected 1 got 2"
 
@@ -35,6 +34,7 @@ git -C "$REPO" checkout -qb feature-branch
 printf 'change\n' >> "$REPO/README.md"
 git -C "$REPO" commit -qam 'feature work'
 git -C "$REPO" push -qu origin feature-branch
+HEAD_SHA=$(git -C "$REPO" rev-parse feature-branch)
 # make_agent_clone force-updates this branch from origin; git refuses that
 # on the branch currently checked out, so leave REPO_ABS on main.
 git -C "$REPO" checkout -q main

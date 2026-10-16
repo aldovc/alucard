@@ -51,6 +51,7 @@ esac
 for _a in "$@"; do
   case "$_a" in
     *:/work-output:rw)
+      : > "$ALUCARD_TEST_STATE/reviewed"
       if [ -n "${ALUCARD_TEST_VERDICT:-}" ]; then
         printf '%s\n' "$ALUCARD_TEST_VERDICT" > "${_a%%:*}/.alucard-review"
         printf 'one finding\n' > "${_a%%:*}/.alucard-review-body"
@@ -112,7 +113,14 @@ case "$1 $2" in
               | jq -r "${*: -1}" ;;
           *)                   [ -n "${ALUCARD_TEST_FORMAL_STATE:-}" ] && printf 'formal review body\n' || printf '\n' ;;
         esac ;;
-      *headRefOid*)        printf '%s\n' "$ALUCARD_TEST_PR_HEAD" ;;
+      # The CI gate sees the reviewed head; PR_HEAD takes over once the
+      # reviewer has run, so a push during review moves only the later head.
+      *headRefOid*)
+        if [ -f "$ALUCARD_TEST_STATE/reviewed" ]; then
+          printf '%s\n' "$ALUCARD_TEST_PR_HEAD"
+        else
+          printf '%s\n' "$ALUCARD_TEST_REVIEWED_SHA"
+        fi ;;
       *)                   printf '{}\n' ;;
     esac ;;
   "api --silent")
@@ -151,7 +159,7 @@ reset_pr() {
 }
 
 run_continue() {
-  rm -rf "$TEST_DIR/logs" "$STATE/patch.json"
+  rm -rf "$TEST_DIR/logs" "$STATE/patch.json" "$STATE/reviewed"
   : > "$GH_TRACE"
   set +e
   PATH="$MOCK_BIN:$PATH" \
@@ -170,6 +178,7 @@ run_continue() {
   ALUCARD_TEST_LOGIN="$LOGIN" \
   ALUCARD_TEST_PR_AUTHOR="$PR_AUTHOR" \
   ALUCARD_TEST_PR_HEAD="$PR_HEAD" \
+  ALUCARD_TEST_REVIEWED_SHA="$REVIEWED_SHA" \
   ALUCARD_TEST_CHECKS="$CHECKS" \
   ALUCARD_TRANSPORT_RETRY_ATTEMPTS=0 \
     "$ALUCARD" continue 77 "$TARGET" --no-build --max-review-cycles 1 \
