@@ -1,3 +1,5 @@
+mod test_support;
+
 use std::process::Command;
 
 #[test]

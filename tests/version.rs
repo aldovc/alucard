@@ -1,3 +1,5 @@
+mod test_support;
+
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;

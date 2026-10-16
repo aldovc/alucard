@@ -1,3 +1,5 @@
+mod test_support;
+
 use alucard::{
     archive_prompt, extract_agent_usage, iteration_usage_comment, iteration_usage_comment_for_dirs,
     log_event, usage_report, usage_report_for_dirs, write_iteration_measurement,

@@ -1,3 +1,5 @@
+mod test_support;
+
 use alucard::{
     acquire_pr, begin_operation_with_payload, finish_operation, github_queue,
     github_task_pull_requests, github_ticket_blockers, import_github_tasks, import_local_tasks,
@@ -3983,7 +3985,6 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
         command
             .env("PATH", &path)
-            .env("ALUCARD_CI_POLL_INTERVAL", "0")
             .env("ALUCARD_DOCKER_TRACE", &docker_trace)
             .env("ALUCARD_GH_TRACE", &gh_trace)
             .env("ALUCARD_RETURN_PR", &return_pr)
