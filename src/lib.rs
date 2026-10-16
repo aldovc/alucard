@@ -460,7 +460,7 @@ pub fn toolchain_preflight(
             }
             let script = if cache_available {
                 format!(
-                    "marker=\"$PLAYWRIGHT_BROWSERS_PATH/.alucard-seeded\"\nif [ \"$(cat \"$marker\" 2>/dev/null || true)\" != \"$BAKED_STAMP\" ]; then\n  if (set -o pipefail; (cd \"$BAKED_BROWSERS\" && tar cf - .) | (cd \"$PLAYWRIGHT_BROWSERS_PATH\" && tar xf -)); then printf '%s' \"$BAKED_STAMP\" > \"$marker\"; else echo 'alucard: could not seed the browser cache from the image' >&2; fi\nfi\n{}\nrc=$?\nif [ $rc -eq 0 ] && [ -f node_modules/playwright-core/browsers.json ]; then repo_rev=$(jq -r '.browsers[] | select(.name==\"chromium\") | .revision' node_modules/playwright-core/browsers.json 2>/dev/null); repo_ver=$(jq -r '.version // empty' node_modules/playwright-core/package.json 2>/dev/null); for dir in \"$BAKED_BROWSERS\"/chromium-*; do [ -d \"$dir\" ] || continue; baked_rev=${{dir##*/chromium-}}; break; done; if [ -n \"${{repo_rev:-}}\" ] && [ -n \"${{baked_rev:-}}\" ] && [ \"$repo_rev\" != \"$baked_rev\" ]; then echo \"alucard-playwright-pin: playwright ${{repo_ver:-unknown}} wants chromium $repo_rev; the image bakes chromium $baked_rev\"; fi; fi\nif [ $rc -eq 0 ]; then if [ -x node_modules/.bin/playwright ]; then timeout \"$PW_INSTALL_TIMEOUT\" node_modules/.bin/playwright install chromium || echo 'alucard: playwright install failed — this repo will download its browser in-run' >&2; elif [ -f node_modules/playwright-core/cli.js ]; then timeout \"$PW_INSTALL_TIMEOUT\" node node_modules/playwright-core/cli.js install chromium || echo 'alucard: playwright install failed — this repo will download its browser in-run' >&2; fi; fi\nexit $rc",
+                    "marker=\"$PLAYWRIGHT_BROWSERS_PATH/.alucard-seeded\"\nif [ \"$(cat \"$marker\" 2>/dev/null || true)\" != \"$BAKED_STAMP\" ]; then\n  rm -f \"$marker\"\n  if (set -o pipefail; (cd \"$BAKED_BROWSERS\" && tar cf - .) | (cd \"$PLAYWRIGHT_BROWSERS_PATH\" && tar xf -)); then printf '%s' \"$BAKED_STAMP\" > \"$marker\"; else echo 'alucard: could not seed the browser cache from the image' >&2; fi\nfi\n{}\nrc=$?\nif [ $rc -eq 0 ] && [ -f node_modules/playwright-core/browsers.json ]; then repo_rev=$(jq -r '.browsers[] | select(.name==\"chromium\") | .revision' node_modules/playwright-core/browsers.json 2>/dev/null); repo_ver=$(jq -r '.version // empty' node_modules/playwright-core/package.json 2>/dev/null); for dir in \"$BAKED_BROWSERS\"/chromium-*; do [ -d \"$dir\" ] || continue; baked_rev=${{dir##*/chromium-}}; break; done; if [ -n \"${{repo_rev:-}}\" ] && [ -n \"${{baked_rev:-}}\" ] && [ \"$repo_rev\" != \"$baked_rev\" ]; then echo \"alucard-playwright-pin: playwright ${{repo_ver:-unknown}} wants chromium $repo_rev; the image bakes chromium $baked_rev\"; fi; fi\nif [ $rc -eq 0 ]; then if [ -x node_modules/.bin/playwright ]; then timeout \"$PW_INSTALL_TIMEOUT\" node_modules/.bin/playwright install chromium || echo 'alucard: playwright install failed — this repo will download its browser in-run' >&2; elif [ -f node_modules/playwright-core/cli.js ]; then timeout \"$PW_INSTALL_TIMEOUT\" node node_modules/playwright-core/cli.js install chromium || echo 'alucard: playwright install failed — this repo will download its browser in-run' >&2; fi; fi\nexit $rc",
                     install.command
                 )
             } else {
@@ -795,7 +795,7 @@ mod agent_tests {
         fs::write(
             bin.join("docker"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; *:/opt/alucard-browsers:rw) browsers=${{argument%:/opt/alucard-browsers:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  if [ \"${{ALUCARD_SEED_CACHE:-}}\" = 1 ]; then mkdir -p \"$browsers\"; printf unknown > \"$browsers/.alucard-seeded\"; fi\n  exit 23\nfi\n",
+                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; *:/opt/alucard-browsers:rw) browsers=${{argument%:/opt/alucard-browsers:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  if [ \"${{ALUCARD_SEED_CACHE:-}}\" = 1 ]; then mkdir -p \"$browsers\"; printf unknown > \"$browsers/.alucard-seeded\"; fi\n  if [ \"${{ALUCARD_RESEED_FAIL:-}}\" = 1 ]; then case \"$*\" in *'rm -f \"$marker\"'*) rm -f \"$browsers/.alucard-seeded\" ;; esac; fi\n  exit 23\nfi\n",
                 trace.display(),
                 non_default_ran.display()
             ),
@@ -869,6 +869,22 @@ mod agent_tests {
         .unwrap();
         env::remove_var("ALUCARD_SEED_CACHE");
         assert_eq!(seeded.playwright_cache, Some(dir.join("seeded-browsers")));
+        let stale_cache = dir.join("stale-browsers");
+        fs::create_dir_all(&stale_cache).unwrap();
+        fs::write(stale_cache.join(".alucard-seeded"), "old-image").unwrap();
+        env::set_var("ALUCARD_RESEED_FAIL", "1");
+        let reseed_failed = super::toolchain_preflight(
+            &repository,
+            "preflight-base",
+            "alucard:test",
+            &env_file,
+            7,
+            &stale_cache,
+        )
+        .unwrap();
+        env::remove_var("ALUCARD_RESEED_FAIL");
+        assert!(reseed_failed.playwright_cache.is_none());
+        assert!(!stale_cache.join(".alucard-seeded").exists());
         env::set_var("PATH", path);
         assert!(non_default_ran.exists());
         fs::remove_dir_all(dir).unwrap();

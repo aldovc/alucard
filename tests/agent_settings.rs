@@ -101,25 +101,26 @@ fn role_settings_and_docker_arguments_match_bash_contract() {
 }
 
 #[test]
-fn role_mounts_and_extra_environment_match_bash_contract() {
+fn run_and_continue_roles_mount_only_validated_playwright_caches() {
     let agent_settings = settings("ALUCARD_PROVIDER=claude\n");
     let output = Path::new("/tmp/output");
+    let cache = Path::new("/tmp/browsers");
     for role in [
         AgentRole::Worker,
         AgentRole::CiFix,
         AgentRole::Reviewer,
         AgentRole::Feedback,
-        AgentRole::Wrapup,
     ] {
-        let invocation = AgentInvocation {
+        let invocation_args = AgentInvocation {
             worktree_read_only: true,
             output_dir: Some(output),
             extra_env: &[("ALUCARD_ITER", "7-review-2")],
             network: Some("alucard-test"),
+            playwright_cache: Some(cache),
             database_url: Some("postgresql://postgres:postgres@postgres:5432/postgres"),
             ..invocation(role)
         };
-        let args = invocation.docker_args(&agent_settings).unwrap();
+        let args = invocation_args.docker_args(&agent_settings).unwrap();
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--network", "alucard-test"]));
@@ -129,6 +130,18 @@ fn role_mounts_and_extra_environment_match_bash_contract() {
         assert!(args.iter().any(|arg| arg == "/tmp/worktree:/work:ro"));
         assert!(args.iter().any(|arg| arg == "/tmp/output:/work-output:rw"));
         assert!(args.iter().any(|arg| arg == "ALUCARD_ITER=7-review-2"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "/tmp/browsers:/opt/alucard-browsers:rw"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "PLAYWRIGHT_BROWSERS_PATH=/opt/alucard-browsers"));
+        assert!(args.iter().any(|arg| arg == "PLAYWRIGHT_SKIP_BROWSER_GC=1"));
+
+        let unseeded = invocation(role).docker_args(&agent_settings).unwrap();
+        assert!(!unseeded
+            .iter()
+            .any(|arg| arg.contains("/opt/alucard-browsers")));
     }
 }
 
