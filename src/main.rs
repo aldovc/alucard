@@ -389,17 +389,21 @@ impl MergeOptions {
             }
         }
         let mut run = RunCommandOptions::parse(&rest, tools)?;
-        run.timeout_minutes = match rest
-            .windows(2)
-            .find(|values| matches!(values[0].as_str(), "-t" | "--timeout-minutes"))
+        if run.queue.help {
+            return Err(
+                "usage: alucard merge <PR_NUM> [TARGET_REPO] [--check-command CMD] [--dry-run]"
+                    .to_string(),
+            );
+        }
+        if run.queue.issue.is_some() {
+            return Err("--issue is only valid with alucard run".to_string());
+        }
+        if !rest
+            .iter()
+            .any(|value| matches!(value.as_str(), "-t" | "--timeout-minutes"))
         {
-            Some(values) => values[1]
-                .parse()
-                .ok()
-                .filter(|minutes: &u64| *minutes > 0)
-                .ok_or("timeout must be greater than zero")?,
-            None => 60,
-        };
+            run.timeout_minutes = 60;
+        }
         Ok(Self {
             pr_number,
             queue: run.queue,
@@ -484,16 +488,7 @@ struct MergePullRequest {
     base: String,
     #[serde(rename = "isCrossRepository")]
     cross_repository: bool,
-    comments: Vec<MergeComment>,
-}
-#[derive(serde::Deserialize)]
-struct MergeComment {
-    author: MergeAuthor,
-    body: String,
-}
-#[derive(serde::Deserialize)]
-struct MergeAuthor {
-    login: String,
+    comments: Vec<ContinueComment>,
 }
 
 fn merge_pr(
@@ -558,7 +553,7 @@ fn merge_pr(
     result
 }
 
-fn harness_approved_sha(comments: &[MergeComment], login: &str) -> Option<String> {
+fn harness_approved_sha(comments: &[ContinueComment], login: &str) -> Option<String> {
     let comment = comments.iter().rev().find(|comment| {
         comment.author.login == login && comment.body.starts_with("**🤖 Alucard review cycle ")
     })?;
@@ -7888,6 +7883,33 @@ printf '%s' "$prompt""#,
         check.kill().unwrap();
         check.wait().unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn merge_options_keep_the_last_timeout_flag() {
+        let args = ["9", "-t", "5", "--timeout-minutes", "7"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let options = MergeOptions::parse(&args, Path::new("tools")).unwrap();
+        assert_eq!(options.timeout_minutes, 7);
+    }
+
+    #[test]
+    fn merge_options_reject_run_only_parser_states() {
+        for (args, message) in [
+            (
+                vec!["9", "--help"],
+                "usage: alucard merge <PR_NUM> [TARGET_REPO] [--check-command CMD] [--dry-run]",
+            ),
+            (vec!["9", "--issue", "7"], "--issue is only valid with alucard run"),
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                MergeOptions::parse(&args, Path::new("tools")).unwrap_err(),
+                message
+            );
+        }
     }
 
     #[test]
