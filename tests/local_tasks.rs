@@ -3272,6 +3272,224 @@ fn continue_passes_selected_human_comments_to_feedback() {
 }
 
 #[test]
+fn continue_records_the_selected_measurement_base_source() {
+    for (name, prior_base, pull_head, expected_base, expected_source) in [
+        (
+            "prior-run",
+            Some("oldest-prior-base"),
+            None,
+            Some("oldest-prior-base"),
+            "prior-run",
+        ),
+        ("merge-base", None, None, None, "merge-base"),
+        (
+            "current-base",
+            None,
+            Some("missing-pr-head"),
+            None,
+            "current-base",
+        ),
+    ] {
+        let root = temporary_path(&format!("continue-measurement-base-{name}"));
+        let repository = root.join("repository");
+        let remote = root.join("remote.git");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        git_repository(&repository);
+        run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().unwrap(),
+        ]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "push",
+            "-q",
+            "origin",
+            "main",
+        ]));
+        let base_sha = head_sha(&repository);
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "switch",
+            "-q",
+            "-c",
+            "feature",
+        ]));
+        fs::write(repository.join("feature.txt"), "feature\n").unwrap();
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "feature",
+        ]));
+        let feature_sha = head_sha(&repository);
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "push",
+            "-q",
+            "origin",
+            "feature",
+        ]));
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "switch", "-q", "main"]));
+
+        let database = root.join("ledger.db");
+        let logs = root.join("logs");
+        let expected_base = expected_base.unwrap_or(&base_sha);
+        if let Some(prior_base) = prior_base {
+            migrate(&database).unwrap();
+            let repository_id = repository_ledger_id(&repository).unwrap();
+            let prior_logs = logs.join("older-run");
+            fs::create_dir_all(&prior_logs).unwrap();
+            fs::write(
+                prior_logs.join("measurements.jsonl"),
+                format!(
+                    r#"{{"record":"stage","repo_id":"{repository_id}","pr":"91","base_sha":"{prior_base}","baseline_source":"pinned"}}"#
+                ),
+            )
+            .unwrap();
+            let newer_logs = logs.join("newer-run");
+            fs::create_dir_all(&newer_logs).unwrap();
+            fs::write(
+                newer_logs.join("measurements.jsonl"),
+                format!(
+                    r#"{{"record":"stage","repo_id":"{repository_id}","pr":"91","base_sha":"newer-prior-base","baseline_source":"pinned"}}"#
+                ),
+            )
+            .unwrap();
+            let connection = open(&database).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO repositories (id, owner, name, cache_path, created_at) VALUES (?1, '', 'repository', '', datetime('now'))",
+                    [&repository_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, logs_path, pid, hostname) VALUES ('newer-run', ?1, 'run', 'completed', '2001-01-01', '2001-01-01', ?2, 1, 'test')",
+                    rusqlite::params![repository_id, newer_logs.to_string_lossy()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, logs_path, pid, hostname) VALUES ('older-run', ?1, 'run', 'completed', '2000-01-01', '2000-01-01', ?2, 1, 'test')",
+                    rusqlite::params![repository_id, prior_logs.to_string_lossy()],
+                )
+                .unwrap();
+        }
+
+        let pr = root.join("pull-request.json");
+        let pr_head = pull_head.unwrap_or(&feature_sha);
+        fs::write(
+            &pr,
+            format!(
+                r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{pr_head}","baseRefOid":"{base_sha}","title":"Test PR","comments":[]}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            bin.join("docker"),
+            "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'run '*) printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"reviewed\"}' ;;\n  'rm -f') ;;\nesac\n",
+        )
+        .unwrap();
+        fs::write(
+            bin.join("gh"),
+            "#!/bin/sh\ncase \"$1 $2\" in\n  'api user') echo alucard ;;\n  'pr checks') exit 1 ;;\n  'pr view') case \"$*\" in *'--jq .headRefOid'*) echo \"$ALUCARD_CONTINUE_HEAD\" ;; *reviews*) ;; *) cat \"$ALUCARD_CONTINUE_PR\" ;; esac ;;\n  'pr comment'|'pr edit') ;;\nesac\n",
+        )
+        .unwrap();
+        for command in ["docker", "gh"] {
+            fs::set_permissions(bin.join(command), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let environment = root.join("agent.env");
+        fs::write(
+            &environment,
+            "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+        )
+        .unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .env("ALUCARD_CONTINUE_PR", &pr)
+            .env("ALUCARD_CONTINUE_HEAD", pr_head)
+            .args([
+                "--db-path",
+                database.to_str().unwrap(),
+                "continue",
+                "91",
+                "--env-file",
+                environment.to_str().unwrap(),
+                "--logs-root",
+                logs.to_str().unwrap(),
+                "--no-build",
+                repository.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{name}: {output:?}");
+
+        let connection = open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT base_sha FROM runs WHERE command = 'continue'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            expected_base,
+            "{name}"
+        );
+        let measurements_path = connection
+            .query_row(
+                "SELECT measurements_path FROM measurement_summaries WHERE iteration = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let measurements = fs::read_to_string(measurements_path).unwrap();
+        let selected_records = measurements
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|record: &serde_json::Value| {
+                record["record"] == "stage" || record["record"] == "iteration"
+            })
+            .collect::<Vec<serde_json::Value>>();
+        assert!(
+            selected_records
+                .iter()
+                .any(|record| record["record"] == "iteration"),
+            "{name}"
+        );
+        for record in selected_records {
+            assert_eq!(record["base_sha"], expected_base, "{name}: {record}");
+            assert_eq!(
+                record["baseline_source"], expected_source,
+                "{name}: {record}"
+            );
+        }
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     let root = temporary_path("run-local");
     let repository = root.join("repository");
