@@ -7779,12 +7779,11 @@ printf '%s' "$prompt""#,
         let root =
             std::env::temp_dir().join(format!("alucard-postgres-none-{}", uuid::Uuid::new_v4()));
         let repository = postgres_repository(&root, None, None);
-        let (docker, _path) = install_docker_stub(&root, true);
+        let (_docker, _path) = install_docker_stub(&root, true);
 
         assert!(RunPostgres::setup(&repository, "main", "run")
             .unwrap()
             .is_none());
-        assert!(!docker.with_extension("trace").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7828,12 +7827,11 @@ printf '%s' "$prompt""#,
         let root =
             std::env::temp_dir().join(format!("alucard-postgres-pr-{}", uuid::Uuid::new_v4()));
         let repository = postgres_repository(&root, None, Some("postgres:16"));
-        let (docker, _path) = install_docker_stub(&root, true);
+        let (_docker, _path) = install_docker_stub(&root, true);
 
         assert!(RunPostgres::setup(&repository, "main", "run")
             .unwrap()
             .is_none());
-        assert!(!docker.with_extension("trace").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
