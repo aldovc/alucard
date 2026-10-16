@@ -463,17 +463,7 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         &check_command,
         run.logs_path.as_deref().unwrap_or_default(),
     );
-    let _ = release(&database, &claim.id, &run.id);
-    let _ = finish_run(
-        &database,
-        &run.id,
-        if result.is_ok() {
-            "completed"
-        } else {
-            "failed"
-        },
-    );
-    match result {
+    match finish_claimed_run(&database, &run.id, &claim.id, result) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(&format!("alucard: {error}")),
     }
@@ -491,6 +481,7 @@ struct MergePullRequest {
     comments: Vec<ContinueComment>,
 }
 
+#[rustfmt::skip]
 fn merge_pr(
     repository: &Path,
     options: &MergeOptions,
@@ -498,54 +489,21 @@ fn merge_pr(
     logs_path: &str,
 ) -> Result<(), String> {
     let number = options.pr_number.to_string();
-    let metadata: MergePullRequest = serde_json::from_slice(&gh_output(
-        repository,
-        &[
-            "pr",
-            "view",
-            &number,
-            "--json",
-            "state,headRefName,baseRefName,isCrossRepository,comments",
-        ],
-        "could not read pull request",
-    )?)
+    let metadata: MergePullRequest = serde_json::from_slice(&gh_output(repository, &["pr", "view", &number, "--json", "state,headRefName,baseRefName,isCrossRepository,comments"], "could not read pull request")?)
     .map_err(|error| format!("could not parse pull request: {error}"))?;
     if metadata.state != "OPEN" {
-        return Err(format!(
-            "PR #{} is not open (state: {})",
-            options.pr_number, metadata.state
-        ));
+        return Err(format!("PR #{} is not open (state: {})", options.pr_number, metadata.state));
     }
     if metadata.cross_repository {
-        return Err(format!(
-            "PR #{} comes from a fork; merge only rebases branches on origin",
-            options.pr_number
-        ));
+        return Err(format!("PR #{} comes from a fork; merge only rebases branches on origin", options.pr_number));
     }
     let login = gh_text(repository, &["api", "user", "--jq", ".login"])
         .map_err(|_| "could not read the GitHub login the harness posts as".to_string())?;
-    let approved = harness_approved_sha(&metadata.comments, login.trim()).ok_or_else(|| {
-        format!(
-            "PR #{} has no harness approval to merge: run: alucard continue {}",
-            options.pr_number, options.pr_number
-        )
-    })?;
+    let approved = harness_approved_sha(&metadata.comments, login.trim()).ok_or_else(|| format!("PR #{} has no harness approval to merge: run: alucard continue {}", options.pr_number, options.pr_number))?;
     fs::create_dir_all(logs_path).map_err(|error| error.to_string())?;
     let checkout = PathBuf::from(logs_path).join("repository");
     let origin = git_output(repository, &["remote", "get-url", "origin"])?;
-    if !command_succeeds(
-        "git",
-        &[
-            "clone",
-            "--quiet",
-            "--branch",
-            &metadata.branch,
-            origin.trim(),
-            checkout.to_str().ok_or("invalid checkout path")?,
-        ],
-        repository,
-        Some(Duration::from_secs(120)),
-    )? {
+    if !command_succeeds("git", &["clone", "--quiet", "--branch", &metadata.branch, origin.trim(), checkout.to_str().ok_or("invalid checkout path")?], repository, Some(Duration::from_secs(120)))? {
         return Err("could not fetch PR branch".to_string());
     }
     let result = merge_checkout(&checkout, &metadata, &approved, options, check_command);
@@ -569,6 +527,7 @@ fn harness_approved_sha(comments: &[ContinueComment], login: &str) -> Option<Str
     (sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| sha.to_string())
 }
 
+#[rustfmt::skip]
 fn merge_checkout(
     checkout: &Path,
     metadata: &MergePullRequest,
@@ -576,63 +535,24 @@ fn merge_checkout(
     options: &MergeOptions,
     check_command: &str,
 ) -> Result<(), String> {
-    let head = git_output(checkout, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
+    let head = git_output(checkout, &["rev-parse", "HEAD"])?.trim().to_string();
     if head != approved {
-        return Err(format!(
-            "PR #{} head {} is not the commit the harness approved ({}). Run: alucard continue {}",
-            options.pr_number,
-            &head[..12],
-            &approved[..12],
-            options.pr_number
-        ));
+        return Err(format!("PR #{} head {} is not the commit the harness approved ({}). Run: alucard continue {}", options.pr_number, &head[..12], &approved[..12], options.pr_number));
     }
-    if !command_succeeds(
-        "git",
-        &[
-            "fetch",
-            "--quiet",
-            "origin",
-            &format!(
-                "+refs/heads/{}:refs/remotes/origin/{}",
-                metadata.base, metadata.base
-            ),
-        ],
-        checkout,
-        Some(Duration::from_secs(120)),
-    )? {
+    if !command_succeeds("git", &["fetch", "--quiet", "origin", &format!("+refs/heads/{}:refs/remotes/origin/{}", metadata.base, metadata.base)], checkout, Some(Duration::from_secs(120)))? {
         return Err(format!("could not fetch {}", metadata.base));
     }
-    let base = git_output(
-        checkout,
-        &["rev-parse", &format!("origin/{}", metadata.base)],
-    )?
-    .trim()
-    .to_string();
-    let ancestor = command_succeeds(
-        "git",
-        &["merge-base", "--is-ancestor", &base, "HEAD"],
-        checkout,
-        None,
-    )?;
+    let base = git_output(checkout, &["rev-parse", &format!("origin/{}", metadata.base)])?.trim().to_string();
+    let ancestor = command_succeeds("git", &["merge-base", "--is-ancestor", &base, "HEAD"], checkout, None)?;
     let (new_head, rebased) = if ancestor {
         (head.clone(), false)
     } else {
-        if !command_succeeds(
-            "git",
-            &["rebase", &base],
-            checkout,
-            Some(Duration::from_secs(120)),
-        )? {
+        if !command_succeeds("git", &["rebase", &base], checkout, Some(Duration::from_secs(120)))? {
             let conflicts = git_output(checkout, &["diff", "--name-only", "--diff-filter=U"])
                 .unwrap_or_default();
             let _ = execute_command("git", &["rebase", "--abort"], checkout, None);
             if conflicts.trim().is_empty() {
-                return Err(format!(
-                    "rebase of PR #{} failed without a conflict; nothing pushed or merged",
-                    options.pr_number
-                ));
+                return Err(format!("rebase of PR #{} failed without a conflict; nothing pushed or merged", options.pr_number));
             }
             let body = format!(
                 "**🤖 Alucard merge: rebase conflict — needs human**\n\nRebasing `{head}` onto {} (`{base}`) conflicts in:\n\n{}\nNothing was pushed or merged.",
@@ -643,72 +563,30 @@ fn merge_checkout(
             if !options.dry_run {
                 let _ = add_pr_label(checkout, options.pr_number, "needs-human");
             }
-            return Err(format!(
-                "rebase of PR #{} failed; nothing pushed or merged",
-                options.pr_number
-            ));
+            return Err(format!("rebase of PR #{} failed; nothing pushed or merged", options.pr_number));
         }
-        (
-            git_output(checkout, &["rev-parse", "HEAD"])?
-                .trim()
-                .to_string(),
-            true,
-        )
+        (git_output(checkout, &["rev-parse", "HEAD"])?.trim().to_string(), true)
     };
     let check_log_path = checkout.parent().unwrap().join("check.log");
-    let check = run_merge_check(
-        checkout,
-        check_command,
-        options.timeout_minutes,
-        &check_log_path,
-    )?;
+    let check = run_merge_check(checkout, check_command, options.timeout_minutes, &check_log_path)?;
     let check_log = fs::read_to_string(&check_log_path).unwrap_or_default();
     let evidence = format!("**🤖 Alucard merge: checks {}**\n\nRan `{}` on `{}`: exit {}.\n\n<details><summary>Last lines of output</summary>\n\n```\n{}\n```\n\n</details>", if check.success() { "passed" } else { "failed — not merged" }, check_command, new_head, check.code().unwrap_or(1), check_log.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
     if !check.success() {
         merge_post(checkout, options.pr_number, &evidence, options.dry_run);
-        return Err(format!(
-            "checks failed; see {}/check.log",
-            checkout.parent().unwrap().display()
-        ));
+        return Err(format!("checks failed; see {}/check.log", checkout.parent().unwrap().display()));
     }
     if options.dry_run {
         merge_post(checkout, options.pr_number, &evidence, true);
-        println!(
-            "Dry run: checks passed on {}; not pushing or merging.",
-            &new_head[..12]
-        );
+        println!("Dry run: checks passed on {}; not pushing or merging.", &new_head[..12]);
         return Ok(());
     }
     if rebased {
         let lease = format!("--force-with-lease=refs/heads/{}:{}", metadata.branch, head);
-        if !command_succeeds(
-            "git",
-            &[
-                "push",
-                "--quiet",
-                &lease,
-                "origin",
-                &format!("HEAD:refs/heads/{}", metadata.branch),
-            ],
-            checkout,
-            Some(Duration::from_secs(120)),
-        )? {
+        if !command_succeeds("git", &["push", "--quiet", &lease, "origin", &format!("HEAD:refs/heads/{}", metadata.branch)], checkout, Some(Duration::from_secs(120)))? {
             return Err("push of rebased PR was rejected: the branch moved since it was checked. Nothing merged.".to_string());
         }
         for _ in 0..30 {
-            let pr_head = gh_text(
-                checkout,
-                &[
-                    "pr",
-                    "view",
-                    &options.pr_number.to_string(),
-                    "--json",
-                    "headRefOid",
-                    "--jq",
-                    ".headRefOid",
-                ],
-            )
-            .unwrap_or_default();
+            let pr_head = gh_text(checkout, &["pr", "view", &options.pr_number.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"]).unwrap_or_default();
             if pr_head.trim() == new_head {
                 break;
             }
@@ -716,39 +594,10 @@ fn merge_checkout(
         }
     }
     merge_post(checkout, options.pr_number, &evidence, false);
-    if !command_succeeds(
-        "gh",
-        &[
-            "pr",
-            "merge",
-            &options.pr_number.to_string(),
-            "--squash",
-            "--match-head-commit",
-            &new_head,
-        ],
-        checkout,
-        Some(Duration::from_secs(120)),
-    )? {
-        return Err(format!(
-            "merging PR #{} failed after checks passed",
-            options.pr_number
-        ));
+    if !command_succeeds("gh", &["pr", "merge", &options.pr_number.to_string(), "--squash", "--match-head-commit", &new_head], checkout, Some(Duration::from_secs(120)))? {
+        return Err(format!("merging PR #{} failed after checks passed", options.pr_number));
     }
-    let _ = execute_command(
-        "gh",
-        &[
-            "api",
-            "--silent",
-            "-X",
-            "DELETE",
-            &format!(
-                "repos/{{owner}}/{{repo}}/git/refs/heads/{}",
-                metadata.branch
-            ),
-        ],
-        checkout,
-        None,
-    );
+    let _ = execute_command("gh", &["api", "--silent", "-X", "DELETE", &format!("repos/{{owner}}/{{repo}}/git/refs/heads/{}", metadata.branch)], checkout, None);
     println!("PR #{} merged.", options.pr_number);
     Ok(())
 }
@@ -789,6 +638,25 @@ fn merge_post(repository: &Path, number: i64, body: &str, dry_run: bool) {
             None,
         );
     }
+}
+
+fn finish_claimed_run<T>(
+    database: &Path,
+    run_id: &str,
+    claim_id: &str,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    let _ = release(database, claim_id, run_id);
+    let _ = finish_run(
+        database,
+        run_id,
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    result
 }
 
 fn build_command(args: &[String]) -> ExitCode {
@@ -2271,17 +2139,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         pr_number,
         iteration_started.elapsed().as_secs(),
     );
-    let _ = release(&database, &claim.id, &continued.run.id);
-    let _ = finish_run(
-        &database,
-        &continued.run.id,
-        if result.is_ok() {
-            "completed"
-        } else {
-            "failed"
-        },
-    );
-    match result {
+    match finish_claimed_run(&database, &continued.run.id, &claim.id, result) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(&format!("alucard: {error}")),
     }
