@@ -3118,17 +3118,27 @@ fn run_reports_worker_usage_when_pr_lookup_fails_after_invocation() {
 fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     let root = temporary_path("run-local");
     let repository = root.join("repository");
+    let remote = root.join("remote.git");
     let bin = root.join("bin");
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir(&repository).unwrap();
     git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
     run(Command::new("git").args([
         "-C",
         repository.to_str().unwrap(),
         "remote",
         "add",
         "origin",
-        "git@github.com:example/repo.git",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-u",
+        "origin",
+        "main",
     ]));
     let tasks = root.join("tasks.md");
     fs::write(
@@ -3138,14 +3148,12 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     .unwrap();
     let prompts = root.join("prompts");
     fs::create_dir(&prompts).unwrap();
-    let docker_args = root.join("docker-args");
-    fs::create_dir(&docker_args).unwrap();
     let selection = root.join("selection");
     fs::create_dir(&selection).unwrap();
     let docker = bin.join("docker");
     fs::write(
         &docker,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'run '*)\n    printf '%s\\n' \"$@\" > \"$ALUCARD_DOCKER_ARGS/$$\"\n    cat > \"$ALUCARD_PROMPTS/$$\" ;;\n  'rm -f') ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') echo stamp ;;\n  'run '*) cat > \"$ALUCARD_PROMPTS/$$\" ;;\n  'rm -f') ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3169,7 +3177,6 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
         command
             .env("PATH", &path)
             .env("ALUCARD_PROMPTS", &prompts)
-            .env("ALUCARD_DOCKER_ARGS", &docker_args)
             .env("ALUCARD_SELECTION", &selection)
             .env("ALUCARD_CACHE_DIR", root.join("cache"))
             .args([
@@ -3203,13 +3210,6 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     assert_eq!(prompts.len(), 2);
     assert!(prompts.iter().any(|prompt| prompt.contains("First task")));
     assert!(prompts.iter().any(|prompt| prompt.contains("Second task")));
-    let docker_arguments = fs::read_dir(docker_args)
-        .unwrap()
-        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
-        .collect::<Vec<_>>();
-    assert!(docker_arguments
-        .iter()
-        .all(|arguments| arguments.contains("GH_REPO=example/repo")));
     for entry in fs::read_dir(root.join("logs")).unwrap() {
         let clone = entry.unwrap().path().join("repository");
         let origin = Command::new("git")
@@ -3219,7 +3219,7 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&origin.stdout).trim(),
-            "https://github.com/example/repo.git"
+            remote.to_str().unwrap()
         );
     }
     let connection = open(&database).unwrap();
