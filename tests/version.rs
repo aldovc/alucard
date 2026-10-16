@@ -109,6 +109,33 @@ fn top_level_help_matches_bash() {
 }
 
 #[test]
+fn cli_error_messages_match_bash() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    for (arguments, stderr) in [
+        (
+            vec!["run", root, "-n", "x"],
+            "alucard: iterations must be a positive integer\n",
+        ),
+        (
+            vec!["continue"],
+            "alucard: usage: alucard continue <PR_NUM> [options] — PR_NUM must be a positive integer\n",
+        ),
+        (
+            vec!["merge"],
+            "alucard: usage: alucard merge <PR_NUM> [options] — PR_NUM must be a positive integer\n",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .args(arguments)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), stderr);
+    }
+}
+
+#[test]
 fn legacy_run_shorthand_and_directory_command_dispatch_to_run() {
     let root = env!("CARGO_MANIFEST_DIR");
     let directory = std::env::temp_dir().join(format!(

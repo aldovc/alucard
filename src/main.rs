@@ -262,9 +262,7 @@ impl MergeOptions {
             .first()
             .and_then(|value| value.parse().ok())
             .filter(|n: &i64| *n > 0)
-            .ok_or(
-                "usage: alucard merge <PR_NUM> [TARGET_REPO] — PR_NUM must be a positive integer",
-            )?;
+            .ok_or("usage: alucard merge <PR_NUM> [options] — PR_NUM must be a positive integer")?;
         let mut options = Self {
             pr_number,
             repository: nonempty_environment("ALUCARD_TARGET_REPO")
@@ -1284,9 +1282,11 @@ impl RunCommandOptions {
             match value.as_str() {
                 "-n" | "--iterations" => {
                     iterations_from_flag = true;
-                    iterations = values
-                        .next()
-                        .ok_or("--iterations requires a number")?
+                    let value = values.next().ok_or("--iterations requires a number")?;
+                    if !is_uint(value) {
+                        return Err("iterations must be a positive integer".to_string());
+                    }
+                    iterations = value
                         .parse()
                         .ok()
                         .filter(|value: &usize| *value > 0)
@@ -1940,11 +1940,9 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         .first()
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|number| *number > 0)
-        .ok_or(
-            "usage: alucard continue <PR_NUM> [TARGET_REPO] — PR_NUM must be a positive integer",
-        );
+        .ok_or("usage: alucard continue <PR_NUM> [options] — PR_NUM must be a positive integer");
     let Ok(pr_number) = pr_number else {
-        return fail(pr_number.unwrap_err());
+        return fail(&format!("alucard: {}", pr_number.unwrap_err()));
     };
     let mut options = match RunCommandOptions::parse(&args[1..], &tools) {
         Ok(options)
