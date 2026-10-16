@@ -88,6 +88,97 @@ fn version_matches_bash() {
 }
 
 #[test]
+fn top_level_help_matches_bash() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    for arguments in [Vec::<&str>::new(), vec!["help"], vec!["-h"], vec!["--help"]] {
+        let bash = Command::new("bash")
+            .arg("alucard")
+            .args(&arguments)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let rust = Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .args(&arguments)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(bash.status.success());
+        assert!(rust.status.success());
+        assert_eq!(bash.stdout, rust.stdout);
+    }
+}
+
+#[test]
+fn cli_error_messages_match_bash() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    for (arguments, stderr) in [
+        (
+            vec!["run", root, "-n", "x"],
+            "alucard: iterations must be a positive integer\n",
+        ),
+        (
+            vec!["continue"],
+            "alucard: usage: alucard continue <PR_NUM> [options] — PR_NUM must be a positive integer\n",
+        ),
+        (
+            vec!["merge"],
+            "alucard: usage: alucard merge <PR_NUM> [options] — PR_NUM must be a positive integer\n",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .args(arguments)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), stderr);
+    }
+}
+
+#[test]
+fn legacy_run_shorthand_and_directory_command_dispatch_to_run() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let directory = std::env::temp_dir().join(format!(
+        "alucard-cli-dispatch-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let missing_env = directory.join("missing.env");
+    let target = directory.to_str().unwrap();
+
+    for arguments in [
+        vec!["1", target, "--env-file", missing_env.to_str().unwrap()],
+        vec![
+            "1",
+            "2",
+            target,
+            "--env-file",
+            missing_env.to_str().unwrap(),
+        ],
+        vec![target, "--env-file", missing_env.to_str().unwrap()],
+        vec![
+            target,
+            "-n",
+            "1",
+            "--env-file",
+            missing_env.to_str().unwrap(),
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .args(&arguments)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("missing env file"));
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn doctor_matches_bash_before_ledger_checks() {
     let root = env!("CARGO_MANIFEST_DIR");
     let unique = SystemTime::now()
