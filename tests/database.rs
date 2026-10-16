@@ -655,6 +655,7 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
     let path = database_path();
     let root = path.parent().unwrap();
     let repository = root.join("source");
+    let remote = root.join("remote.git");
     seed_repository(&repository);
     assert!(Command::new("git")
         .args(["branch", "release"])
@@ -663,14 +664,14 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
         .unwrap()
         .success());
     assert!(Command::new("git")
-        .args([
-            "-C",
-            repository.to_str().unwrap(),
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:example/source.git",
-        ])
+        .args(["init", "--bare", "-q", remote.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    set_origin(&repository, remote.to_str().unwrap());
+    assert!(Command::new("git")
+        .args(["push", "-u", "origin", "HEAD", "release"])
+        .current_dir(&repository)
         .status()
         .unwrap()
         .success());
@@ -740,7 +741,7 @@ fn prepared_runs_have_isolated_clones_branches_and_directories() {
         )
         .unwrap()
         .trim(),
-        "https://github.com/example/source.git"
+        remote.to_str().unwrap()
     );
     assert_eq!(
         open(&path)
