@@ -122,7 +122,7 @@ run_merge() {
   if "$USES_RUST_BINARY"; then
     command+=(--db-path "$LEDGER")
   fi
-  command+=(merge 9 "$TARGET" --env-file "$TEST_DIR/alucard.env" \
+  command+=(merge 9 "$TARGET" --env-file "${MERGE_ENV_FILE:-$TEST_DIR/alucard.env}" \
     --logs-root "$TEST_DIR/logs" "$@")
   if [ -n "${MERGE_TIMEOUT:-}" ]; then
     command=(timeout --kill-after 1s "$MERGE_TIMEOUT" "${command[@]}")
@@ -306,6 +306,15 @@ setup_repos current
 run_merge
 assert_eq "merge refuses without a check command" "1" "$RC"
 assert_contains "and says how to give one" "ALUCARD_CHECK_COMMAND" "$OUT"
+
+if "$USES_RUST_BINARY"; then
+  echo ""
+  echo "── explicit merge env file ──"
+  setup_repos current
+  printf 'ALUCARD_CHECK_COMMAND=true\n' > "$TEST_DIR/merge.env"
+  MERGE_ENV_FILE="$TEST_DIR/merge.env" run_merge
+  assert_eq "merge loads its explicit env file" "0" "$RC"
+fi
 
 echo ""
 echo "── dry run ──"

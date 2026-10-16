@@ -358,6 +358,7 @@ struct MergeOptions {
     pr_number: i64,
     queue: QueueOptions,
     logs_root: PathBuf,
+    env_file: PathBuf,
     check_command: Option<String>,
     timeout_minutes: u64,
     dry_run: bool,
@@ -408,6 +409,7 @@ impl MergeOptions {
             pr_number,
             queue: run.queue,
             logs_root: run.logs_root,
+            env_file: run.env_file,
             check_command,
             timeout_minutes: run.timeout_minutes,
             dry_run,
@@ -419,7 +421,7 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     let (options, database, repository, check_command) = match (|| -> Result<_, String> {
         let tools = tool_dir().ok_or_else(|| "could not locate tool files".to_string())?;
         let options = MergeOptions::parse(args, &tools)?;
-        let settings = optional_settings(&options.queue.env_file)?;
+        let settings = optional_settings(&options.env_file)?;
         settings.apply_to_process();
         let database = database_path(db_path).map_err(|error| error.to_string())?;
         let repository = resolve_repository_target(&options.queue.repository)?;
