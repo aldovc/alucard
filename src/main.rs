@@ -6370,8 +6370,11 @@ impl QueueOptions {
                 }
                 "--no-build" => {}
                 "--tasks" => {
-                    options.tasks =
-                        Some(PathBuf::from(args.next().ok_or("--tasks requires a path")?));
+                    options.tasks = Some(PathBuf::from(
+                        args.next()
+                            .filter(|value| !value.is_empty())
+                            .ok_or("--tasks requires a path")?,
+                    ));
                     options.tasks_from_flag = true;
                 }
                 "--github" => options.github = true,
@@ -6385,12 +6388,16 @@ impl QueueOptions {
                     options.issue = Some(number);
                 }
                 "--env-file" => {
-                    options.env_file =
-                        PathBuf::from(args.next().ok_or("--env-file requires a path")?)
+                    options.env_file = PathBuf::from(
+                        args.next()
+                            .filter(|value| !value.is_empty())
+                            .ok_or("--env-file requires a path")?,
+                    )
                 }
                 "-C" | "--repo" => {
                     options.repository = PathBuf::from(
                         args.next()
+                            .filter(|value| !value.is_empty())
                             .ok_or_else(|| format!("{arg} requires a path"))?,
                     );
                     options.repository_set = true;

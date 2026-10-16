@@ -2943,6 +2943,10 @@ esac
         ("--base", "--base requires a branch name"),
         ("--image", "--image requires an image name"),
         ("--logs-root", "--logs-root requires a path"),
+        ("--tasks", "--tasks requires a path"),
+        ("--env-file", "--env-file requires a path"),
+        ("-C", "-C requires a path"),
+        ("--repo", "--repo requires a path"),
     ] {
         let output = Command::new(binary)
             .env("PATH", &root)
