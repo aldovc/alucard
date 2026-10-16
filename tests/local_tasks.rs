@@ -189,6 +189,90 @@ fn git_repository(root: &Path) {
     ]));
 }
 
+#[test]
+fn merge_cli_uses_the_shared_log_root_sources() {
+    let root = temporary_path("merge-log-root");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    git_repository(&repository);
+    let gh = bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for (name, flag_root, environment_root, state_home) in [
+        ("flag", Some(root.join("flag-logs")), None, None),
+        (
+            "environment",
+            None,
+            Some(root.join("environment-logs")),
+            None,
+        ),
+        ("default", None, None, Some(root.join("state"))),
+        ("relative", Some(PathBuf::from("logs")), None, None),
+    ] {
+        let database = root.join(format!("{name}.db"));
+        let expected_root = flag_root
+            .as_ref()
+            .or(environment_root.as_ref())
+            .cloned()
+            .unwrap_or_else(|| state_home.as_ref().unwrap().join("alucard/logs"));
+        let expected_warning_root = expected_root
+            .is_absolute()
+            .then(|| expected_root.clone())
+            .unwrap_or_else(|| repository.join(&expected_root));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+        command
+            .current_dir(&repository)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env_remove("ALUCARD_LOG_ROOT")
+            .env("ALUCARD_LOGS_ROOT", root.join("obsolete-logs"))
+            .env_remove("XDG_STATE_HOME")
+            .args([
+                "--db-path",
+                database.to_str().unwrap(),
+                "merge",
+                "9",
+                repository.to_str().unwrap(),
+                "--check-command",
+                "true",
+                "--dry-run",
+            ]);
+        if let Some(logs_root) = &flag_root {
+            command.args(["--logs-root", logs_root.to_str().unwrap()]);
+        }
+        if let Some(logs_root) = &environment_root {
+            command.env("ALUCARD_LOG_ROOT", logs_root);
+        }
+        if let Some(state_home) = &state_home {
+            command.env("XDG_STATE_HOME", state_home);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "Warning: --logs-root {} is under /tmp — these run logs will not survive a reboot.",
+            expected_warning_root.display()
+        )));
+        let connection = open(&database).unwrap();
+        let logs_path: String = connection
+            .query_row(
+                "SELECT logs_path FROM runs WHERE command = 'merge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Path::new(&logs_path).parent(),
+            Some(expected_root.as_path())
+        );
+        assert!(!repository.join(".alucard-logs").exists());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn seed_abandoned_task(
     database: &Path,
     repository: &Path,

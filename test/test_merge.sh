@@ -127,6 +127,9 @@ run_merge() {
   if [ -n "${MERGE_TIMEOUT:-}" ]; then
     command=(timeout --kill-after 1s "$MERGE_TIMEOUT" "${command[@]}")
   fi
+  if [ "${NO_LOG_FALLBACK:-}" = true ]; then
+    command=(env -u HOME -u XDG_STATE_HOME -u ALUCARD_LOG_ROOT "${command[@]}")
+  fi
   set +e
   PATH="$MOCK_BIN:$PATH" \
   ALUCARD_TEST_STATE="$STATE" ALUCARD_TEST_REMOTE="$REMOTE" \
@@ -206,6 +209,17 @@ assert_eq "the stale PR head is polled until it advances" "2" \
   "$(cat "$STATE/pr-head-calls")"
 assert_contains "and deletes the branch" "git/refs/heads/$BRANCH" "$TRACE"
 assert_merge_lifecycle completed
+
+if "$USES_RUST_BINARY"; then
+  echo ""
+  echo "── explicit logs root without fallback environment ──"
+  setup_repos current
+  NO_LOG_FALLBACK=true run_merge --check-command 'true'
+  unset NO_LOG_FALLBACK
+  assert_eq "merge succeeds without a log-root fallback" "0" "$RC"
+  assert_contains "the merge log is persisted below the flag root" "$TEST_DIR/logs/" \
+    "$("$ALUCARD" --db-path "$LEDGER" runs | awk -F '\t' '$3 == "merge" { print $4; exit }')"
+fi
 
 echo ""
 echo "── approved head already contains the base ──"
