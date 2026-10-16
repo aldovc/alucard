@@ -3347,10 +3347,11 @@ impl CiGate<'_> {
                 Ok(())
             })();
             if agent_invoked {
-                cleanup_repair_checkout(&checkout);
                 if interrupted() {
+                    let _ = fs::remove_dir_all(&checkout);
                     return Err("interrupted".to_string());
                 }
+                cleanup_repair_checkout(&checkout);
                 if let Some(head_sha) = remote_branch_sha(&prepared.clone, branch) {
                     write_stage_measurement(
                         &prepared.directory,
@@ -3868,7 +3869,7 @@ fn run_feedback_once(
         classification: AgentExit::Failed,
     });
     if interrupted() {
-        cleanup_feedback_root(&root, &checkout);
+        cleanup_feedback_root(&root);
         return Err("interrupted".to_string());
     }
     let after = remote_branch_sha(&prepared.clone, branch);
@@ -3894,10 +3895,8 @@ fn run_feedback_once(
     ))
 }
 
-fn cleanup_feedback_root(root: &Path, checkout: &Path) {
-    if !cleanup_repair_checkout(checkout) {
-        let _ = fs::remove_dir_all(root);
-    }
+fn cleanup_feedback_root(root: &Path) {
+    let _ = fs::remove_dir_all(root);
 }
 
 const DEFAULT_REVIEW_POLICY_MAX_BYTES: usize = 16_384;

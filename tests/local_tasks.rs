@@ -5388,13 +5388,13 @@ fn sigterm_during_continue_postgres_startup_stops_before_starting_an_agent() {
 }
 
 #[test]
-fn sigterm_during_feedback_clone_removes_the_temporary_checkout_and_postgres() {
-    let root = temporary_path("sigterm-feedback-clone");
+fn sigterm_during_feedback_agent_removes_the_temporary_checkout_and_postgres() {
+    let root = temporary_path("sigterm-feedback-agent");
     let repository = root.join("repository");
     let origin = root.join("origin.git");
     let bin = root.join("bin");
     let trace = root.join("docker-trace");
-    let clone_started = root.join("feedback-clone-started");
+    let agent_started = root.join("feedback-agent-started");
     let feedback_checkout = root.join("feedback-checkout");
     fs::create_dir_all(&bin).unwrap();
     git_repository(&repository);
@@ -5465,12 +5465,12 @@ fn sigterm_during_feedback_clone_removes_the_temporary_checkout_and_postgres() {
     let docker = bin.join("docker");
     fs::write(
         &docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$*\" in\n  *'--name alucard-feedback-'*) : > \"$ALUCARD_FEEDBACK_AGENT_STARTED\"; while :; do sleep 1; done ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
     let git = bin.join("git");
-    fs::write(&git, "#!/bin/sh\nif [ \"$1\" = clone ] && [ \"$2\" != --local ]; then\n  for argument do checkout=\"$argument\"; done\n  mkdir -p \"$checkout/.git\"\n  printf '%s' \"$checkout\" > \"$ALUCARD_FEEDBACK_CHECKOUT\"\n  : > \"$ALUCARD_FEEDBACK_CLONE_STARTED\"\n  while :; do sleep 1; done\nfi\nexec /usr/bin/git \"$@\"\n").unwrap();
+    fs::write(&git, "#!/bin/sh\n/usr/bin/git \"$@\"\nstatus=$?\nif [ \"$1\" = clone ] && [ \"$2\" != --local ] && [ \"$status\" -eq 0 ]; then\n  for argument do checkout=\"$argument\"; done\n  printf '%s' \"$checkout\" > \"$ALUCARD_FEEDBACK_CHECKOUT\"\nfi\nexit \"$status\"\n").unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
     let gh = bin.join("gh");
     fs::write(&gh, "#!/bin/sh\ncase \"$*\" in\n  *'api user'*) echo alucard ;;\n  *'state,headRefName,headRefOid,baseRefOid,title,comments'*) cat \"$ALUCARD_PULL\" ;;\n  *'--json comments'*) echo '{\"comments\":[]}' ;;\n  *'headRefOid'*) echo \"$ALUCARD_HEAD\" ;;\nesac\n").unwrap();
@@ -5488,7 +5488,7 @@ fn sigterm_during_feedback_clone_removes_the_temporary_checkout_and_postgres() {
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("ALUCARD_DOCKER_TRACE", &trace)
-        .env("ALUCARD_FEEDBACK_CLONE_STARTED", &clone_started)
+        .env("ALUCARD_FEEDBACK_AGENT_STARTED", &agent_started)
         .env("ALUCARD_FEEDBACK_CHECKOUT", &feedback_checkout)
         .env("ALUCARD_PULL", &pull)
         .env("ALUCARD_HEAD", &head_sha)
@@ -5506,7 +5506,7 @@ fn sigterm_during_feedback_clone_removes_the_temporary_checkout_and_postgres() {
             repository.to_str().unwrap(),
         ]);
     let mut process = command.spawn().unwrap();
-    wait_for_file(&clone_started);
+    wait_for_file(&agent_started);
     unsafe { libc::kill(process.id() as i32, libc::SIGTERM) };
     assert_eq!(process.wait().unwrap().code(), Some(143));
     let checkout = PathBuf::from(fs::read_to_string(&feedback_checkout).unwrap());
