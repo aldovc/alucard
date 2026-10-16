@@ -17,8 +17,8 @@ use alucard::{
     start_merge_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
     task_is_pending, toolchain_preflight, transition_task, usage_report_for_dirs,
     warn_if_stale_image, write_iteration_measurement, write_run_measurement,
-    write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentResult,
-    AgentRole, AgentSettings, GithubPullRequest, GithubPullRequestState, GithubTask,
+    write_stage_measurement, write_task_headings, ActiveCommand, AgentExit, AgentInvocation,
+    AgentResult, AgentRole, AgentSettings, GithubPullRequest, GithubPullRequestState, GithubTask,
     IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, StageMeasurement,
     TaskHeadingUpdate, TaskState, TaskStatus,
 };
@@ -26,6 +26,7 @@ use fs2::FileExt;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
 
@@ -37,6 +38,51 @@ const RECOVERY_MARKER_PREFIX: &str = "**🤖 Alucard recovery PR parked**";
 const RECOVERY_TITLE_PREFIX: &str = "wip: alucard recovery";
 const BLOCKED_FINDINGS_MARKER: &str = "**🤖 Alucard blocked findings**";
 const POSTGRES_URL: &str = "postgresql://postgres:postgres@postgres:5432/postgres";
+
+static INTERRUPTED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn record_interrupt(signal: libc::c_int) {
+    if INTERRUPTED_SIGNAL
+        .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        alucard::interrupt_active_command();
+    }
+}
+
+fn install_interrupt_handlers() -> Result<(), String> {
+    let action = libc::sigaction {
+        sa_sigaction: record_interrupt as usize,
+        sa_mask: unsafe { std::mem::zeroed() },
+        sa_flags: 0,
+        sa_restorer: None,
+    };
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+fn interruptible(command: impl FnOnce() -> ExitCode) -> ExitCode {
+    INTERRUPTED_SIGNAL.store(0, Ordering::SeqCst);
+    alucard::reset_command_interrupt();
+    if let Err(error) = install_interrupt_handlers() {
+        return fail(&format!(
+            "alucard: could not install interrupt handlers: {error}"
+        ));
+    }
+    let exit = command();
+    match INTERRUPTED_SIGNAL.load(Ordering::SeqCst) {
+        0 => exit,
+        signal => ExitCode::from((128 + signal) as u8),
+    }
+}
+
+fn interrupted() -> bool {
+    INTERRUPTED_SIGNAL.load(Ordering::SeqCst) != 0
+}
 
 struct RunPostgres {
     network: String,
@@ -65,20 +111,23 @@ impl RunPostgres {
         let Some(image) = image else {
             return Ok(None);
         };
-        let network = format!("alucard-{run_id}");
-        let created = Command::new("docker")
-            .args(["network", "create", &network])
-            .stdout(Stdio::null())
-            .status()
-            .map_err(|error| format!("cannot create Docker network {network}: {error}"))?;
-        if !created.success() {
-            return Err(format!("cannot create Docker network {network}"));
-        }
         let postgres = Self {
             container: format!("alucard-postgres-{run_id}"),
-            network,
+            network: format!("alucard-{run_id}"),
             image,
         };
+        let created = postgres
+            .docker_status(
+                Command::new("docker")
+                    .args(["network", "create", &postgres.network])
+                    .stdout(Stdio::null()),
+            )
+            .map_err(|error| {
+                format!("cannot create Docker network {}: {error}", postgres.network)
+            })?;
+        if !created.success() {
+            return Err(format!("cannot create Docker network {}", postgres.network));
+        }
         postgres.start_with_attempts(attempts, sleep)?;
         Ok(Some(postgres))
     }
@@ -88,54 +137,90 @@ impl RunPostgres {
         attempts: usize,
         mut sleep: impl FnMut(Duration),
     ) -> Result<(), String> {
-        self.remove_container();
-        let started = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--rm",
-                "--name",
-                &self.container,
-                "--network",
-                &self.network,
-                "--network-alias",
-                "postgres",
-                "--memory",
-                "1g",
-                "--security-opt",
-                "no-new-privileges",
-                "-e",
-                "POSTGRES_PASSWORD=postgres",
-                &self.image,
-            ])
-            .stdout(Stdio::null())
-            .status()
+        self.remove_container_interruptibly()?;
+        let started = self
+            .docker_status(
+                Command::new("docker")
+                    .args([
+                        "run",
+                        "-d",
+                        "--rm",
+                        "--name",
+                        &self.container,
+                        "--network",
+                        &self.network,
+                        "--network-alias",
+                        "postgres",
+                        "--memory",
+                        "1g",
+                        "--security-opt",
+                        "no-new-privileges",
+                        "-e",
+                        "POSTGRES_PASSWORD=postgres",
+                        &self.image,
+                    ])
+                    .stdout(Stdio::null()),
+            )
             .map_err(|error| format!("cannot start Postgres from {}: {error}", self.image))?;
         if !started.success() {
             return Err(format!("cannot start Postgres from {}", self.image));
         }
         for _ in 0..attempts {
-            if Command::new("docker")
-                .args([
-                    "exec",
-                    &self.container,
-                    "pg_isready",
-                    "-q",
-                    "-h",
-                    "127.0.0.1",
-                    "-U",
-                    "postgres",
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+            if self
+                .docker_status(
+                    Command::new("docker")
+                        .args([
+                            "exec",
+                            &self.container,
+                            "pg_isready",
+                            "-q",
+                            "-h",
+                            "127.0.0.1",
+                            "-U",
+                            "postgres",
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null()),
+                )
                 .is_ok_and(|status| status.success())
             {
                 return Ok(());
             }
-            sleep(Duration::from_secs(1));
+            if interrupted() {
+                return Err("interrupted".to_string());
+            }
+            for _ in 0..100 {
+                sleep(Duration::from_millis(10));
+                if interrupted() {
+                    return Err("interrupted".to_string());
+                }
+            }
         }
         Err(format!("Postgres from {} not ready after 60s", self.image))
+    }
+
+    fn docker_status(&self, command: &mut Command) -> Result<ExitStatus, String> {
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let active_command = ActiveCommand::register(child.id());
+        let status = child.wait().map_err(|error| error.to_string());
+        drop(active_command);
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
+        status
+    }
+
+    fn remove_container_interruptibly(&self) -> Result<(), String> {
+        self.docker_status(
+            Command::new("docker")
+                .args(["rm", "-f", "-v", &self.container])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .map(|_| ())
     }
 
     fn remove_container(&self) {
@@ -220,15 +305,15 @@ fn main() -> ExitCode {
         },
         Some("doctor") => doctor_command(&commands[1..], db_path),
         Some("queue") => queue_command(&commands[1..], db_path),
-        Some("run") => run_command(&commands[1..], db_path),
-        Some("continue") => continue_command(&commands[1..], db_path),
+        Some("run") => interruptible(|| run_command(&commands[1..], db_path)),
+        Some("continue") => interruptible(|| continue_command(&commands[1..], db_path)),
         Some("merge") => merge_command(&commands[1..], db_path),
         Some("build") => build_command(&commands[1..]),
         Some("runs") => match database_path(db_path) {
             Ok(path) => runs_command(&commands[1..], &path),
             Err(error) => fail(&format!("alucard: {error}")),
         },
-        Some(cmd) if Path::new(cmd).is_dir() => run_command(&commands, db_path),
+        Some(cmd) if Path::new(cmd).is_dir() => interruptible(|| run_command(&commands, db_path)),
         Some(cmd) => fail(&format!("alucard: unknown command: {cmd}")),
         None => unreachable!("empty commands return before dispatch"),
     }
@@ -1529,6 +1614,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         });
         let playwright_cache = preflight.playwright_cache;
         let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+        if interrupted() {
+            print!("{}", usage_report_for_dirs(&usage_log_dirs));
+            return ExitCode::SUCCESS;
+        }
         let prompt = match worker_prompt(
             &tools,
             &selected,
@@ -1594,6 +1683,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 extra_env: &[],
             }
             .invoke(&settings, &log);
+            if interrupted() {
+                print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                return ExitCode::SUCCESS;
+            }
             let classification = result
                 .as_ref()
                 .map(|result| result.classification)
@@ -1716,6 +1809,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             None
                         }
                     };
+                    if interrupted() {
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                        return ExitCode::SUCCESS;
+                    }
                     let review = match review_gate(
                         &database,
                         &tools,
@@ -1747,6 +1844,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             }
                         }
                     };
+                    if interrupted() {
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                        return ExitCode::SUCCESS;
+                    }
                     write_iteration_measurement(IterationMeasurement {
                         database: &database,
                         run_id: &attempt_run.id,
@@ -1848,7 +1949,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         usage_log_dirs.push(prepared.directory.clone());
                         continue;
                     }
-                    let recovery_pr = match recover_worker_changes(
+                    let recovery = recover_worker_changes(
                         &database,
                         &tools,
                         &options,
@@ -1861,7 +1962,12 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         classification,
                         result.as_ref().ok().and_then(|value| value.status),
                         &log,
-                    ) {
+                    );
+                    if interrupted() {
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                        return ExitCode::SUCCESS;
+                    }
+                    let recovery_pr = match recovery {
                         Ok(Some(number)) => {
                             post_iteration_usage(
                                 &options.queue.repository,
@@ -2081,6 +2187,9 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         });
         let playwright_cache = preflight.playwright_cache;
         let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
         let findings = continue_feedback_findings(&pull.comments, login.trim());
         if !findings.is_empty() {
             let (feedback, blocked, advanced, retained) = run_feedback_once(
@@ -2097,6 +2206,9 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 postgres.as_ref(),
                 playwright_cache.as_deref(),
             )?;
+            if interrupted() {
+                return Err("interrupted".to_string());
+            }
             if advanced == Some(false) && (feedback.status.unwrap_or(1) != 0 || retained) {
                 let comment = format!("**🤖 Alucard continue: feedback agent stopped without publishing — needs human** (rc={})\n\nThe feedback agent pushed nothing, so this branch is still at the commit the previous review already read. Alucard stopped rather than re-run CI and review against it.", feedback.status.unwrap_or(1));
                 let _ = gh_output(
@@ -2187,6 +2299,9 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 None
             }
         };
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
         let review = match review_gate(
             &database,
             &tools,
@@ -2218,8 +2333,14 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 }
             }
         };
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
         Ok(review)
     })();
+    if interrupted() {
+        return ExitCode::SUCCESS;
+    }
     let outcome = result.as_ref().copied().unwrap_or(ReviewOutcome {
         ci_result: None,
         verdict: None,
@@ -3113,6 +3234,9 @@ impl CiGate<'_> {
         let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
         let remote = remote.trim();
         for attempt in 1..=3 {
+            if interrupted() {
+                return Err("interrupted".to_string());
+            }
             let Some(head) = wait_for_current_pr_head(&prepared.clone, pr_number, branch)? else {
                 eprintln!(
                     "CI gate: PR #{pr_number} did not register the current origin head; CI status is unverified."
@@ -3149,6 +3273,10 @@ impl CiGate<'_> {
                 }
                 CiResult::Failed => {}
                 CiResult::Unverified => unreachable!("CI probes do not return unverified results"),
+            }
+
+            if interrupted() {
+                return Err("interrupted".to_string());
             }
 
             if !pr_head_matches_origin(&prepared.clone, pr_number, branch, &head)? {
@@ -3219,6 +3347,10 @@ impl CiGate<'_> {
                 Ok(())
             })();
             if agent_invoked {
+                if interrupted() {
+                    cleanup_repair_checkout(&checkout);
+                    return Err("interrupted".to_string());
+                }
                 cleanup_repair_checkout(&checkout);
                 if let Some(head_sha) = remote_branch_sha(&prepared.clone, branch) {
                     write_stage_measurement(
@@ -3688,9 +3820,16 @@ fn run_feedback_once(
         ],
         &prepared.clone,
         Some(Duration::from_secs(120)),
-    )
-    .map_err(|error| error.to_string())?;
+    );
+    let cloned = match cloned {
+        Ok(cloned) => cloned,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&root);
+            return Err(error.to_string());
+        }
+    };
     if !cloned.status.success() {
+        let _ = fs::remove_dir_all(&root);
         return Err(String::from_utf8_lossy(&cloned.stderr).trim().to_string());
     }
     let policy = read_review_policy(&checkout)?;
@@ -3729,27 +3868,40 @@ fn run_feedback_once(
         status: None,
         classification: AgentExit::Failed,
     });
+    if interrupted() {
+        cleanup_feedback_checkout(&prepared.directory, &root, &checkout);
+        return Err("interrupted".to_string());
+    }
     let after = remote_branch_sha(&prepared.clone, branch);
     let advanced = before.zip(after).map(|(before, after)| before != after);
     let blocked = fs::read_to_string(output.join(".alucard-blocked")).unwrap_or_default();
-    let retained = cleanup_repair_checkout(&checkout);
-    if retained {
-        log_event(
-            &prepared.directory,
-            &format!(
-                "Unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
-                checkout.display()
-            ),
-        );
-    } else {
-        let _ = fs::remove_dir_all(&root);
-    }
+    let retained = cleanup_feedback_checkout(&prepared.directory, &root, &checkout);
     Ok((
         result,
         (!blocked.trim().is_empty()).then_some(blocked),
         advanced,
         retained,
     ))
+}
+
+fn cleanup_feedback_root(root: &Path) {
+    let _ = fs::remove_dir_all(root);
+}
+
+fn cleanup_feedback_checkout(directory: &Path, root: &Path, checkout: &Path) -> bool {
+    let retained = cleanup_repair_checkout(checkout);
+    if retained {
+        log_event(
+            directory,
+            &format!(
+                "Unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
+                checkout.display()
+            ),
+        );
+    } else {
+        cleanup_feedback_root(root);
+    }
+    retained
 }
 
 const DEFAULT_REVIEW_POLICY_MAX_BYTES: usize = 16_384;
@@ -3906,6 +4058,9 @@ fn review_gate(
                     extra_env: &[],
                 }
                 .invoke(settings, &log)?;
+                if interrupted() {
+                    return Err("interrupted".to_string());
+                }
                 let current_head = gh_text(
                     &prepared.clone,
                     &[
@@ -4651,7 +4806,7 @@ fn cleanup_repair_checkout(checkout: &Path) -> bool {
         let _ = fs::remove_dir_all(checkout);
     } else {
         eprintln!(
-            "CI gate: unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
+            "CI gate: Unpublished work preserved at {} — inspect this checkout and run required local checks before pushing.",
             checkout.display()
         );
     }
@@ -4659,22 +4814,28 @@ fn cleanup_repair_checkout(checkout: &Path) -> bool {
 }
 
 fn checkout_requires_preservation(checkout: &Path) -> Result<bool, String> {
-    let dirty = git_output(
-        checkout,
-        &["status", "--porcelain", "--untracked-files=all"],
-    )?;
-    let unpublished = git_output(
-        checkout,
-        &[
-            "rev-list",
-            "--count",
-            "HEAD",
-            "--branches",
-            "--not",
-            "--remotes=origin",
-        ],
-    )?;
-    let stashes = git_output(checkout, &["stash", "list"])?;
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(checkout)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    };
+    let dirty = git(&["status", "--porcelain", "--untracked-files=all"])?;
+    let unpublished = git(&[
+        "rev-list",
+        "--count",
+        "HEAD",
+        "--branches",
+        "--not",
+        "--remotes=origin",
+    ])?;
+    let stashes = git(&["stash", "list"])?;
     Ok(!(dirty.is_empty() && unpublished.trim() == "0" && stashes.is_empty()))
 }
 
@@ -4750,6 +4911,9 @@ fn recover_worker_changes(
     } else {
         None
     };
+    if interrupted() {
+        return Err("interrupted".to_string());
+    }
     let dirty = execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
         .map_err(|error| error.to_string())?;
     let dirty = !dirty.stdout.is_empty();

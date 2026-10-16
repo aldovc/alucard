@@ -11,9 +11,52 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// The command currently running on behalf of the orchestrator.
+pub static ACTIVE_COMMAND_PID: AtomicI32 = AtomicI32::new(0);
+static COMMAND_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Stops the command that is currently running on behalf of the orchestrator.
+pub fn interrupt_active_command() {
+    COMMAND_INTERRUPTED.store(true, Ordering::SeqCst);
+    let pid = ACTIVE_COMMAND_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+
+/// Clears the interrupt state before a command begins.
+pub fn reset_command_interrupt() {
+    COMMAND_INTERRUPTED.store(false, Ordering::SeqCst);
+}
+
+/// Reports whether a command was interrupted.
+pub fn command_interrupted() -> bool {
+    COMMAND_INTERRUPTED.load(Ordering::SeqCst)
+}
+
+fn active_command_status(command: &mut Command) -> io::Result<std::process::ExitStatus> {
+    let mut child = command.spawn()?;
+    let active_command = ActiveCommand::register(child.id());
+    let status = child.wait();
+    drop(active_command);
+    status
+}
+
+fn active_command_output(command: &mut Command) -> io::Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn()?;
+    let active_command = ActiveCommand::register(child.id());
+    let output = child.wait_with_output();
+    drop(active_command);
+    output
+}
 
 /// The provider selected for an agent role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,18 +445,28 @@ pub fn toolchain_preflight(
     timeout_minutes: u64,
     playwright_cache: &Path,
 ) -> Result<ToolchainPreflight, String> {
+    if command_interrupted() {
+        return Err("interrupted".to_string());
+    }
     let clone = env::temp_dir().join(format!("alucard-preflight-{}", Uuid::new_v4()));
-    let cloned = Command::new("git")
-        .args(["clone", "--local", "--no-tags"])
-        .arg(repository)
-        .arg(&clone)
-        .status()
-        .is_ok_and(|status| status.success())
-        && Command::new("git")
-            .args(["reset", "--hard", &format!("origin/{base_branch}")])
-            .current_dir(&clone)
-            .status()
-            .is_ok_and(|status| status.success());
+    let cloned = active_command_status(
+        Command::new("git")
+            .args(["clone", "--local", "--no-tags"])
+            .arg(repository)
+            .arg(&clone),
+    )
+    .is_ok_and(|status| status.success())
+        && !command_interrupted()
+        && active_command_status(
+            Command::new("git")
+                .args(["reset", "--hard", &format!("origin/{base_branch}")])
+                .current_dir(&clone),
+        )
+        .is_ok_and(|status| status.success());
+    if command_interrupted() {
+        let _ = fs::remove_dir_all(clone);
+        return Err("interrupted".to_string());
+    }
     if !cloned {
         let _ = fs::remove_dir_all(clone);
         return Ok(ToolchainPreflight {
@@ -435,13 +488,16 @@ pub fn toolchain_preflight(
         }
 
         let name = format!("alucard-preflight-{}", std::process::id());
-        let baked_stamp = Command::new("docker")
-            .args(["image", "inspect", "-f", "{{.Id}}", image])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            .filter(|stamp| !stamp.is_empty());
+        let baked_stamp = active_command_output(
+            Command::new("docker").args(["image", "inspect", "-f", "{{.Id}}", image]),
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|stamp| !stamp.is_empty());
+        if command_interrupted() {
+            return Err("interrupted".to_string());
+        }
         let cache_available = baked_stamp.is_some() && fs::create_dir_all(playwright_cache).is_ok();
         let baked_stamp = baked_stamp.unwrap_or_default();
         let mut results = Vec::new();
@@ -482,9 +538,13 @@ pub fn toolchain_preflight(
                 install.command.to_string()
             };
             docker_args.extend([image.into(), "bash".into(), "-lc".into(), script]);
-            let output = timeout_docker_command(timeout_minutes, &docker_args).output();
+            let output =
+                active_command_output(&mut timeout_docker_command(timeout_minutes, &docker_args));
             cleanup_docker_container(&name);
             let output = output.map_err(|error| format!("cannot start docker: {error}"))?;
+            if command_interrupted() {
+                return Err("interrupted".to_string());
+            }
             let stdout = String::from_utf8_lossy(&output.stdout);
             if let Some(message) = playwright_pin_mismatch_message(&stdout, cache_available) {
                 eprintln!("{message}");
@@ -2487,6 +2547,7 @@ impl AgentInvocation<'_> {
         let mut child = command
             .spawn()
             .map_err(|error| format!("cannot start docker: {error}"))?;
+        let active_command = ActiveCommand::register(child.id());
         let status = (|| {
             if provider == Provider::Codex {
                 child
@@ -2500,6 +2561,7 @@ impl AgentInvocation<'_> {
                 .wait()
                 .map_err(|error| format!("cannot wait for docker: {error}"))
         })();
+        drop(active_command);
         cleanup_docker_container(self.name);
         let status = status?;
         let log = fs::read_to_string(log_file).unwrap_or_default();
@@ -2508,6 +2570,27 @@ impl AgentInvocation<'_> {
             status: status.code(),
             classification,
         })
+    }
+}
+
+pub struct ActiveCommand(i32);
+
+impl ActiveCommand {
+    pub fn register(pid: u32) -> Self {
+        let pid = pid as i32;
+        ACTIVE_COMMAND_PID.store(pid, Ordering::SeqCst);
+        if COMMAND_INTERRUPTED.load(Ordering::SeqCst) {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+        Self(pid)
+    }
+}
+
+impl Drop for ActiveCommand {
+    fn drop(&mut self) {
+        let _ = ACTIVE_COMMAND_PID.compare_exchange(self.0, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
@@ -4543,6 +4626,7 @@ pub fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
+    let active_command = ActiveCommand::register(child.id());
     let stdout = drain(child.stdout.take().expect("stdout is piped"));
     let stderr = drain(child.stderr.take().expect("stderr is piped"));
     let status = match timeout {
@@ -4565,6 +4649,7 @@ pub fn run_command(
             }
         }
     };
+    drop(active_command);
     Ok(Output {
         status,
         stdout: join_output(stdout)?,
