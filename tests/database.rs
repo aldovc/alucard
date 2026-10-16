@@ -130,7 +130,7 @@ fn repository_identity_shares_leases_across_clones_and_keeps_tasks_distinct() {
     for repository in [&first, &second, &other] {
         seed_repository(repository);
     }
-    set_origin(&first, "https://github.com/example/widgets.git");
+    set_origin(&first, "https://github.com/example/widgets.git/");
     set_origin(&second, "git@github.com:Example/Widgets.git");
     set_origin(&other, "https://github.com/example/other.git");
     migrate(&path).unwrap();
@@ -317,7 +317,7 @@ fn repository_identity_migrates_legacy_rows_and_reports_live_conflicts() {
 }
 
 #[test]
-fn repository_identity_migrates_live_legacy_lease_from_equivalent_clone() {
+fn repository_identity_migrates_live_legacy_git_suffix_lease() {
     let path = database_path();
     let root = path.parent().unwrap();
     let first = root.join("first");
@@ -325,10 +325,10 @@ fn repository_identity_migrates_live_legacy_lease_from_equivalent_clone() {
     for repository in [&first, &second] {
         seed_repository(repository);
     }
-    set_origin(&first, "https://github.com/example/widgets.git");
+    set_origin(&first, "https://github.com/example/widgets.git/");
     set_origin(&second, "git@github.com:example/widgets.git");
     migrate(&path).unwrap();
-    let legacy = first.canonicalize().unwrap().display().to_string();
+    let legacy = "example/widgets.git";
     let connection = open(&path).unwrap();
     connection
         .execute(
