@@ -4736,10 +4736,8 @@ fn recover_worker_changes(
     status: Option<i32>,
     worker_log: &Path,
 ) -> Result<Option<i64>, String> {
-    if classification == alucard::AgentExit::Clean
-        || (classification == alucard::AgentExit::Transport && status == Some(0))
-    {
-        return release_pending(
+    let release = || {
+        release_pending(
             database,
             task,
             lease_id,
@@ -4747,7 +4745,12 @@ fn recover_worker_changes(
             &prepared.run.repository_id,
             &options.queue.repository,
         )
-        .map(|()| None);
+        .map(|()| None)
+    };
+    if classification == alucard::AgentExit::Clean
+        || (classification == alucard::AgentExit::Transport && status == Some(0))
+    {
+        return release();
     }
     let base = prepared.run.base_sha.as_deref().unwrap_or("HEAD");
     let commits = execute_command(
@@ -4761,22 +4764,12 @@ fn recover_worker_changes(
         .trim()
         .parse()
         .unwrap_or(0);
-    let dirty = execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
-        .map_err(|error| error.to_string())?;
-    let dirty = !dirty.stdout.is_empty();
+    let dirty = recovery_checkout_dirty(prepared)?;
     if !dirty && commit_count == 0 {
         if classification == alucard::AgentExit::Transport {
             return Ok(None);
         }
-        return release_pending(
-            database,
-            task,
-            lease_id,
-            run_id,
-            &prepared.run.repository_id,
-            &options.queue.repository,
-        )
-        .map(|()| None);
+        return release();
     }
     let handoff = if wrapup_applies(classification) && wrapup_enabled(settings) {
         run_wrapup_agent(
@@ -4796,9 +4789,7 @@ fn recover_worker_changes(
     if interrupted() {
         return Err("interrupted".to_string());
     }
-    let dirty = execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
-        .map_err(|error| error.to_string())?;
-    let dirty = !dirty.stdout.is_empty();
+    let dirty = recovery_checkout_dirty(prepared)?;
     if dirty {
         let add = execute_command("git", &["add", "-A"], &prepared.clone, None)
             .map_err(|error| error.to_string())?;
@@ -4900,15 +4891,7 @@ fn recover_worker_changes(
     }
     finish_operation(database, &push, None).map_err(|error| error.to_string())?;
     if classification == alucard::AgentExit::Transport && commit_count == 0 {
-        return release_pending(
-            database,
-            task,
-            lease_id,
-            run_id,
-            &prepared.run.repository_id,
-            &options.queue.repository,
-        )
-        .map(|()| None);
+        return release();
     }
     if let Some((number, branch, sha)) = find_open_pr(&options.queue.repository, &prepared.branch)?
     {
@@ -4986,6 +4969,15 @@ fn recover_worker_changes(
     .map(Some)
 }
 
+fn recovery_checkout_dirty(prepared: &alucard::PreparedRun) -> Result<bool, String> {
+    Ok(
+        !execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
+            .map_err(|error| error.to_string())?
+            .stdout
+            .is_empty(),
+    )
+}
+
 fn release_pending(
     database: &Path,
     task: &SelectedRunTask,
@@ -5003,14 +4995,11 @@ fn release_pending(
     )
     .map_err(|error| error.to_string())?;
     if let Some(issue) = &task.issue {
-        let operation = begin_operation(
+        let _ = journal_recovery_gh(
             database,
             repository_id,
             &format!("issue:{}", issue.number),
             "release_pending_label_removal",
-        )
-        .map_err(|error| error.to_string())?;
-        let result = gh_output(
             repository,
             &[
                 "issue",
@@ -5020,12 +5009,25 @@ fn release_pending(
                 "in-progress",
             ],
             "could not remove GitHub issue label",
-        );
-        let error = result.err();
-        finish_operation(database, &operation, error.as_deref())
-            .map_err(|error| error.to_string())?;
+        )?;
     }
     Ok(())
+}
+
+fn journal_recovery_gh(
+    database: &Path,
+    repository_id: &str,
+    target: &str,
+    operation_type: &str,
+    repository: &Path,
+    args: &[&str],
+    context: &str,
+) -> Result<Option<String>, String> {
+    let operation = begin_operation(database, repository_id, target, operation_type)
+        .map_err(|error| error.to_string())?;
+    let error = gh_output(repository, args, context).err();
+    finish_operation(database, &operation, error.as_deref()).map_err(|error| error.to_string())?;
+    Ok(error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5105,14 +5107,11 @@ fn record_recovery(
     }
     if let Some(issue) = &task.issue {
         let comment = recovery_ticket_comment(number, classification, status, commits);
-        let comment_operation = begin_operation(
+        let _ = journal_recovery_gh(
             database,
             &prepared.run.repository_id,
             &format!("issue:{}", issue.number),
             "recovery_issue_comment",
-        )
-        .map_err(|error| error.to_string())?;
-        let comment_result = gh_output(
             &prepared.clone,
             &[
                 "issue",
@@ -5122,18 +5121,12 @@ fn record_recovery(
                 &comment,
             ],
             "could not comment on recovery issue",
-        );
-        let comment_error = comment_result.err();
-        finish_operation(database, &comment_operation, comment_error.as_deref())
-            .map_err(|error| error.to_string())?;
-        let label_operation = begin_operation(
+        )?;
+        let _ = journal_recovery_gh(
             database,
             &prepared.run.repository_id,
             &format!("issue:{}", issue.number),
             "recovery_label_removal",
-        )
-        .map_err(|error| error.to_string())?;
-        let label_result = gh_output(
             &prepared.clone,
             &[
                 "issue",
@@ -5143,10 +5136,7 @@ fn record_recovery(
                 "in-progress",
             ],
             "could not remove GitHub issue label",
-        );
-        let label_error = label_result.err();
-        finish_operation(database, &label_operation, label_error.as_deref())
-            .map_err(|error| error.to_string())?;
+        )?;
     }
     Ok(number)
 }
