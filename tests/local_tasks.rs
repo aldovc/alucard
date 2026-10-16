@@ -2975,6 +2975,7 @@ esac
         ("--iterations", "--iterations requires a number"),
         ("-t", "-t requires a number"),
         ("--timeout-minutes", "--timeout-minutes requires a number"),
+        ("--issue", "--issue requires a number"),
         (
             "--max-review-cycles",
             "--max-review-cycles requires a number",

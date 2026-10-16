@@ -6379,7 +6379,10 @@ impl QueueOptions {
                 }
                 "--github" => options.github = true,
                 "--issue" => {
-                    let value = args.next().ok_or("--issue requires a number")?;
+                    let value = args
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--issue requires a number")?;
                     let number = value
                         .parse::<i64>()
                         .ok()
