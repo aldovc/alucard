@@ -3305,6 +3305,8 @@ fn run_loads_env_file_for_host_commands_and_rejects_missing_credentials_early() 
             .env("PATH", &path)
             .env_remove("GITHUB_TOKEN")
             .env_remove("GH_TOKEN")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY")
             .env("ALUCARD_CACHE_DIR", root.join("cache"))
             .args([
                 "--db-path",
