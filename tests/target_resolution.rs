@@ -239,5 +239,17 @@ fn target_resolution_cli_matches_bash_and_reuses_the_cache() {
         assert!(!cache.exists());
     }
 
+    let local_shorthand = root.join("owner/repository");
+    fs::create_dir_all(local_shorthand.parent().unwrap()).unwrap();
+    git(&root, &["init", local_shorthand.to_str().unwrap()]);
+    let local_precedence_cache = root.join("cache-local-precedence");
+    assert_resolved(run_target(
+        &root,
+        &local_precedence_cache,
+        &root.join("local-precedence.db"),
+        "owner/repository",
+    ));
+    assert!(!local_precedence_cache.exists());
+
     fs::remove_dir_all(root).unwrap();
 }
