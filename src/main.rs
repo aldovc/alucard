@@ -188,9 +188,11 @@ impl RunPostgres {
             if interrupted() {
                 return Err("interrupted".to_string());
             }
-            sleep(Duration::from_secs(1));
-            if interrupted() {
-                return Err("interrupted".to_string());
+            for _ in 0..100 {
+                sleep(Duration::from_millis(10));
+                if interrupted() {
+                    return Err("interrupted".to_string());
+                }
             }
         }
         Err(format!("Postgres from {} not ready after 60s", self.image))
