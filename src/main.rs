@@ -1537,18 +1537,22 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         let mut attempt_run = run;
         let mut attempt = 1;
         let iteration_started = Instant::now();
+        let abandon_attempt = |run_id: &str, usage_log_dirs: &[PathBuf]| {
+            print!("{}", usage_report_for_dirs(usage_log_dirs));
+            release_without_pr(
+                &database,
+                &selected,
+                &claim.id,
+                &owner_run_id,
+                &options.queue.repository,
+            );
+            let _ = finish_run(&database, run_id, "failed");
+        };
         let mut prepared =
             match prepare_attempt(&database, &options, &cache, &selected, &attempt_run) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    release_without_pr(
-                        &database,
-                        &selected,
-                        &claim.id,
-                        &owner_run_id,
-                        &options.queue.repository,
-                    );
-                    let _ = finish_run(&database, &attempt_run.id, "failed");
+                    abandon_attempt(&attempt_run.id, &[]);
                     return fail(&format!("alucard: {error}"));
                 }
             };
@@ -1580,14 +1584,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         let commits = match recent_base_commits(&prepared.clone, &options.base) {
             Ok(commits) => commits,
             Err(error) => {
-                release_without_pr(
-                    &database,
-                    &selected,
-                    &claim.id,
-                    &owner_run_id,
-                    &options.queue.repository,
-                );
-                let _ = finish_run(&database, &attempt_run.id, "failed");
+                abandon_attempt(&attempt_run.id, &[]);
                 return fail(&format!("alucard: {error}"));
             }
         };
@@ -1599,14 +1596,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         ) {
             Ok(environment) => environment,
             Err(error) => {
-                release_without_pr(
-                    &database,
-                    &selected,
-                    &claim.id,
-                    &owner_run_id,
-                    &options.queue.repository,
-                );
-                let _ = finish_run(&database, &attempt_run.id, "failed");
+                abandon_attempt(&attempt_run.id, &[]);
                 return fail(&format!("alucard: {error}"));
             }
         };
@@ -1623,14 +1613,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         ) {
             Ok(prompt) => prompt,
             Err(error) => {
-                release_without_pr(
-                    &database,
-                    &selected,
-                    &claim.id,
-                    &owner_run_id,
-                    &options.queue.repository,
-                );
-                let _ = finish_run(&database, &attempt_run.id, "failed");
+                abandon_attempt(&attempt_run.id, &[]);
                 return fail(&format!("alucard: {error}"));
             }
         };
@@ -1882,15 +1865,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 }
                 Ok(None) => {
                     if classification == alucard::AgentExit::Billing {
-                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
-                        release_without_pr(
-                            &database,
-                            &selected,
-                            &claim.id,
-                            &owner_run_id,
-                            &options.queue.repository,
-                        );
-                        let _ = finish_run(&database, &attempt_run.id, "failed");
+                        abandon_attempt(&attempt_run.id, &usage_log_dirs);
                         eprintln!(
                             "alucard: provider returned billing_error (credit balance too low)"
                         );
@@ -1899,9 +1874,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     if classification == alucard::AgentExit::Transport
                         && attempt < options.transport_attempts
                     {
-                        let _ = finish_run(&database, &attempt_run.id, "failed");
                         attempt += 1;
-                        attempt_run = match start_task_retry_run(
+                        let retry_run = match start_task_retry_run(
                             &database,
                             &options.queue.repository,
                             &options.logs_root,
@@ -1911,17 +1885,12 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         ) {
                             Ok(run) => run,
                             Err(error) => {
-                                release_without_pr(
-                                    &database,
-                                    &selected,
-                                    &claim.id,
-                                    &owner_run_id,
-                                    &options.queue.repository,
-                                );
-                                print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                                abandon_attempt(&attempt_run.id, &usage_log_dirs);
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
+                        let _ = finish_run(&database, &attempt_run.id, "failed");
+                        attempt_run = retry_run;
                         prepared = match prepare_attempt(
                             &database,
                             &options,
@@ -1931,15 +1900,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         ) {
                             Ok(prepared) => prepared,
                             Err(error) => {
-                                release_without_pr(
-                                    &database,
-                                    &selected,
-                                    &claim.id,
-                                    &owner_run_id,
-                                    &options.queue.repository,
-                                );
-                                let _ = finish_run(&database, &attempt_run.id, "failed");
-                                print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                                abandon_attempt(&attempt_run.id, &usage_log_dirs);
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
@@ -2042,15 +2003,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     break;
                 }
                 Err(error) => {
-                    release_without_pr(
-                        &database,
-                        &selected,
-                        &claim.id,
-                        &owner_run_id,
-                        &options.queue.repository,
-                    );
-                    let _ = finish_run(&database, &attempt_run.id, "failed");
-                    print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                    abandon_attempt(&attempt_run.id, &usage_log_dirs);
                     return fail(&format!("alucard: {error}"));
                 }
             }

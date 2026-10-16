@@ -422,7 +422,7 @@ fn startup_reconciliation_creates_missing_ledger_directories() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn run_transport_case(root: &Path, scenario: &str, retries: usize) -> std::process::Output {
+fn transport_command(root: &Path, scenario: &str, retries: usize) -> Command {
     let repository = root.join("repository");
     let remote = root.join("remote.git");
     let bin = root.join("bin");
@@ -496,7 +496,8 @@ case "$1 $2" in
     for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; esac; done
     printf '%s|%s\n' "$(git -C "$worktree" branch --show-current)" "$worktree" >> "$ALUCARD_TRACE"
     case "$ALUCARD_SCENARIO" in
-      billing) printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"error":"billing_error"}' ;;
+      billing)
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"error":"billing_error","modelUsage":{"test":{"inputTokens":1,"outputTokens":1}}}' ;;
       *) printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"API Error: Connection closed"}' ;;
     esac
     [ "$ALUCARD_SCENARIO" = foreign ] && exit 0
@@ -537,7 +538,8 @@ esac
         "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
     )
     .unwrap();
-    Command::new(env!("CARGO_BIN_EXE_alucard"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+    command
         .env(
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -562,9 +564,12 @@ esac
             root.join("logs").to_str().unwrap(),
             "--no-build",
             repository.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap()
+        ]);
+    command
+}
+
+fn run_transport_case(root: &Path, scenario: &str, retries: usize) -> std::process::Output {
+    transport_command(root, scenario, retries).output().unwrap()
 }
 
 #[test]
@@ -5044,6 +5049,43 @@ fn test_transport_recovery() {
         .unwrap_or_default()
         .contains("pr create"));
     fs::remove_dir_all(clean_root).unwrap();
+}
+
+#[test]
+fn retry_allocation_failure_releases_claim_and_returns_task_to_pending() {
+    let root = temporary_path("transport-retry-allocation-failure");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("ledger.db");
+    migrate(&database).unwrap();
+    let connection = open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_retry_run BEFORE INSERT ON runs
+             WHEN NEW.retry_owner_run_id IS NOT NULL
+             BEGIN SELECT RAISE(FAIL, 'retry allocation failed'); END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = transport_command(&root, "transport", 1).output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT state FROM claims", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "released"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT status FROM tasks", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "pending"
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
