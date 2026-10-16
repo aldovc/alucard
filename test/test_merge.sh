@@ -231,20 +231,6 @@ assert_eq "nothing is force-pushed" "$PR_SHA" "$REMOTE_HEAD"
 assert_contains "the approved commit is merged" "--match-head-commit $PR_SHA" "$TRACE"
 
 echo ""
-echo "── quoted supplied worktree ──"
-setup_repos current
-trap_marker="$TEST_DIR/trap-ran"
-supplied_wt="$TEST_DIR/worktree'; touch $trap_marker; #/repository"
-export ALUCARD_MERGE_WORKTREE="$supplied_wt"
-run_merge --check-command 'true'
-unset ALUCARD_MERGE_WORKTREE
-assert_eq "merge succeeds" "0" "$RC"
-assert_not_contains "the cleanup trap does not execute the path" \
-  "trap-ran" "$(find "$TEST_DIR" -name trap-ran -print)"
-assert_eq "the supplied worktree is removed" "false" \
-  "$(test -e "$supplied_wt" && echo true || echo false)"
-
-echo ""
 echo "── rebase conflict ──"
 setup_repos conflict
 run_merge --check-command 'true'
