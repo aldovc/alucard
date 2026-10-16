@@ -248,7 +248,7 @@ fn reconciliation_run(
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
     )
     .unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
@@ -288,7 +288,7 @@ fn startup_reconciliation_creates_missing_ledger_directories() {
     fs::write(&tasks, "# Tasks\n").unwrap();
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
     )
     .unwrap();
     let docker = bin.join("docker");
@@ -450,7 +450,7 @@ esac
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
     )
     .unwrap();
     Command::new(env!("CARGO_BIN_EXE_alucard"))
@@ -571,7 +571,7 @@ esac
         let environment = root.join("agent.env");
         fs::write(
             &environment,
-            "ALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+            "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
         )
         .unwrap();
         let database = root.join("ledger.db");
@@ -886,7 +886,7 @@ esac
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
     )
     .unwrap();
     let invoke = |fail_marker: bool| {
@@ -1575,7 +1575,7 @@ esac
         let environment = root.join("agent.env");
         fs::write(
             &environment,
-            "ALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+            "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
         )
         .unwrap();
         let invoke = |failure: &str| {
@@ -1826,7 +1826,7 @@ esac
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nANTHROPIC_API_KEY=test\n",
     )
     .unwrap();
     let database = root.join("ledger.db");
@@ -2796,7 +2796,7 @@ esac
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
     )
     .unwrap();
     let database = root.join("ledger.db");
@@ -2983,7 +2983,7 @@ fn run_leaves_in_flight_task_unchanged_when_pr_lookup_fails() {
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
     )
     .unwrap();
 
@@ -3167,7 +3167,7 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
     )
     .unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
@@ -3434,7 +3434,7 @@ fn run_uses_the_current_origin_base_without_changing_the_checkout() {
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
     )
     .unwrap();
     let database = root.join("ledger.db");
@@ -4268,7 +4268,7 @@ fn pinned_run_removes_the_label_without_a_pr_and_skips_a_second_dispatch() {
     let environment = root.join("agent.env");
     fs::write(
         &environment,
-        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
     )
     .unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
