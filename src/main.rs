@@ -525,8 +525,8 @@ fn merge_pr(
     fs::create_dir_all(logs_path).map_err(|error| error.to_string())?;
     let checkout = PathBuf::from(logs_path).join("repository");
     let origin = git_output(repository, &["remote", "get-url", "origin"])?;
-    if !command_succeeds(
-        "git",
+    git_output(
+        repository,
         &[
             "clone",
             "--quiet",
@@ -535,11 +535,8 @@ fn merge_pr(
             origin.trim(),
             checkout.to_str().ok_or("invalid checkout path")?,
         ],
-        repository,
-        Some(Duration::from_secs(120)),
-    )? {
-        return Err("could not fetch PR branch".to_string());
-    }
+    )
+    .map_err(|_| "could not fetch PR branch".to_string())?;
     let result = merge_checkout(&checkout, &metadata, &approved, options, check_command);
     let _ = fs::remove_dir_all(&checkout);
     result
@@ -580,43 +577,23 @@ fn merge_checkout(
             options.pr_number
         ));
     }
-    if !command_succeeds(
-        "git",
-        &[
-            "fetch",
-            "--quiet",
-            "origin",
-            &format!(
-                "+refs/heads/{}:refs/remotes/origin/{}",
-                metadata.base, metadata.base
-            ),
-        ],
-        checkout,
-        Some(Duration::from_secs(120)),
-    )? {
-        return Err(format!("could not fetch {}", metadata.base));
-    }
+    let base_ref = format!(
+        "+refs/heads/{}:refs/remotes/origin/{}",
+        metadata.base, metadata.base
+    );
+    git_output(checkout, &["fetch", "--quiet", "origin", &base_ref])
+        .map_err(|_| format!("could not fetch {}", metadata.base))?;
     let base = git_output(
         checkout,
         &["rev-parse", &format!("origin/{}", metadata.base)],
     )?
     .trim()
     .to_string();
-    let ancestor = command_succeeds(
-        "git",
-        &["merge-base", "--is-ancestor", &base, "HEAD"],
-        checkout,
-        None,
-    )?;
+    let ancestor = commit_is_ancestor(checkout, &base, "HEAD")?;
     let (new_head, rebased) = if ancestor {
         (head.clone(), false)
     } else {
-        if !command_succeeds(
-            "git",
-            &["rebase", &base],
-            checkout,
-            Some(Duration::from_secs(120)),
-        )? {
+        if git_output(checkout, &["rebase", &base]).is_err() {
             let conflicts = git_output(checkout, &["diff", "--name-only", "--diff-filter=U"])
                 .unwrap_or_default();
             let _ = execute_command("git", &["rebase", "--abort"], checkout, None);
@@ -690,20 +667,9 @@ fn merge_checkout(
     }
     if rebased {
         let lease = format!("--force-with-lease=refs/heads/{}:{}", metadata.branch, head);
-        if !command_succeeds(
-            "git",
-            &[
-                "push",
-                "--quiet",
-                &lease,
-                "origin",
-                &format!("HEAD:refs/heads/{}", metadata.branch),
-            ],
-            checkout,
-            Some(Duration::from_secs(120)),
-        )? {
-            return Err("push of rebased PR was rejected: the branch moved since it was checked. Nothing merged.".to_string());
-        }
+        let branch_ref = format!("HEAD:refs/heads/{}", metadata.branch);
+        git_output(checkout, &["push", "--quiet", &lease, "origin", &branch_ref])
+            .map_err(|_| "push of rebased PR was rejected: the branch moved since it was checked. Nothing merged.".to_string())?;
         for _ in 0..30 {
             let pr_head = gh_text(
                 checkout,
@@ -725,7 +691,7 @@ fn merge_checkout(
         }
     }
     merge_post(checkout, options.pr_number, &evidence, false);
-    if !command_succeeds(
+    let merged = execute_command(
         "gh",
         &[
             "pr",
@@ -737,7 +703,9 @@ fn merge_checkout(
         ],
         checkout,
         Some(Duration::from_secs(120)),
-    )? {
+    )
+    .map_err(|error| error.to_string())?;
+    if !merged.status.success() {
         return Err(format!(
             "merging PR #{} failed after checks passed",
             options.pr_number
@@ -4628,17 +4596,6 @@ fn gh_text(repository: &Path, args: &[&str]) -> Result<String, String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
-}
-
-fn command_succeeds(
-    program: &str,
-    args: &[&str],
-    directory: &Path,
-    timeout: Option<Duration>,
-) -> Result<bool, String> {
-    execute_command(program, args, directory, timeout)
-        .map(|output| output.status.success())
-        .map_err(|error| error.to_string())
 }
 
 fn add_pr_label(

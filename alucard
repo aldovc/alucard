@@ -4911,9 +4911,6 @@ command_merge() {
       --dry-run)
         MERGE_DRY_RUN=true
         shift ;;
-      -h|--help)
-        die "usage: alucard merge <PR_NUM> [TARGET_REPO] [--check-command CMD] [--dry-run]"
-        ;;
       *)
         rest+=("$arg")
         shift ;;
