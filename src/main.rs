@@ -4565,6 +4565,48 @@ fn ci_fix_prompt(
     ))
 }
 
+fn wrapup_prompt(
+    tools: &Path,
+    task: &SelectedRunTask,
+    base_branch: &str,
+    base_sha: &str,
+    classification: alucard::AgentExit,
+    status: Option<i32>,
+    last_words: &str,
+) -> Result<String, String> {
+    let instructions = fs::read_to_string(tools.join("alucard-wrapup-prompt.md"))
+        .map_err(|error| error.to_string())?
+        .trim_end_matches('\n')
+        .to_string();
+    let ticket = match (&task.issue, &task.local_id) {
+        (Some(issue), _) => format!("issue #{}", issue.number),
+        (None, Some(id)) => format!("task {id}"),
+        (None, None) => "unknown — the worker did not claim a ticket".to_string(),
+    };
+    let mut prompt = format!(
+        "<instructions>\n{instructions}\n</instructions>\n<ticket>{}</ticket>\n<stop_reason>The worker {} (rc={}) before opening a PR.</stop_reason>\n<base_branch>{}</base_branch>\n<base_sha>{}</base_sha>\n<worker_last_words>\n{}\n</worker_last_words>",
+        xml_escape(&ticket),
+        recovery_stop_description(classification),
+        status.unwrap_or(1),
+        xml_escape(base_branch),
+        xml_escape(base_sha),
+        xml_escape(last_words),
+    );
+    if task.issue.is_none() {
+        let local = WorkerLocalTaskPrompt {
+            id: task.local_id.as_deref(),
+            title: &task.local_title,
+            body: &task.local_body,
+        };
+        prompt.push_str(&format!(
+            "\n<task>{}</task>\n<parent_context>{}</parent_context>",
+            xml_escape(&serde_json::to_string(&local).expect("local task is serializable")),
+            xml_escape(&task.parent_context),
+        ));
+    }
+    Ok(prompt)
+}
+
 fn no_ci_comment() -> &'static str {
     "**🤖 Alucard CI gate: no CI ran — not green**\n\nNo CI checks reported for this PR's head commit. Workflows may be missing or disabled, or the token cannot see their runs. The agents ran only the checks the container can run, so nothing has run this repository's full suite.\n\nReview continues, but an approval will not mark this PR ready to merge. Run the full checks before merging."
 }
@@ -4679,6 +4721,15 @@ fn git_output(repository: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+fn checkout_dirty(prepared: &alucard::PreparedRun) -> Result<bool, String> {
+    Ok(
+        !execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
+            .map_err(|error| error.to_string())?
+            .stdout
+            .is_empty(),
+    )
+}
+
 fn cleanup_repair_checkout(checkout: &Path) -> bool {
     if !checkout.is_dir() {
         return false;
@@ -4764,14 +4815,14 @@ fn recover_worker_changes(
         .trim()
         .parse()
         .unwrap_or(0);
-    let dirty = recovery_checkout_dirty(prepared)?;
+    let dirty = checkout_dirty(prepared)?;
     if !dirty && commit_count == 0 {
         if classification == alucard::AgentExit::Transport {
             return Ok(None);
         }
         return release();
     }
-    let handoff = if wrapup_applies(classification) && wrapup_enabled(settings) {
+    let handoff = if wrapup_enabled(settings, classification) {
         run_wrapup_agent(
             tools,
             options,
@@ -4789,7 +4840,7 @@ fn recover_worker_changes(
     if interrupted() {
         return Err("interrupted".to_string());
     }
-    let dirty = recovery_checkout_dirty(prepared)?;
+    let dirty = checkout_dirty(prepared)?;
     if dirty {
         let add = execute_command("git", &["add", "-A"], &prepared.clone, None)
             .map_err(|error| error.to_string())?;
@@ -4969,15 +5020,6 @@ fn recover_worker_changes(
     .map(Some)
 }
 
-fn recovery_checkout_dirty(prepared: &alucard::PreparedRun) -> Result<bool, String> {
-    Ok(
-        !execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
-            .map_err(|error| error.to_string())?
-            .stdout
-            .is_empty(),
-    )
-}
-
 fn release_pending(
     database: &Path,
     task: &SelectedRunTask,
@@ -4995,7 +5037,7 @@ fn release_pending(
     )
     .map_err(|error| error.to_string())?;
     if let Some(issue) = &task.issue {
-        let _ = journal_recovery_gh(
+        let _ = journal_gh_operation(
             database,
             repository_id,
             &format!("issue:{}", issue.number),
@@ -5012,22 +5054,6 @@ fn release_pending(
         )?;
     }
     Ok(())
-}
-
-fn journal_recovery_gh(
-    database: &Path,
-    repository_id: &str,
-    target: &str,
-    operation_type: &str,
-    repository: &Path,
-    args: &[&str],
-    context: &str,
-) -> Result<Option<String>, String> {
-    let operation = begin_operation(database, repository_id, target, operation_type)
-        .map_err(|error| error.to_string())?;
-    let error = gh_output(repository, args, context).err();
-    finish_operation(database, &operation, error.as_deref()).map_err(|error| error.to_string())?;
-    Ok(error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5107,7 +5133,7 @@ fn record_recovery(
     }
     if let Some(issue) = &task.issue {
         let comment = recovery_ticket_comment(number, classification, status, commits);
-        let _ = journal_recovery_gh(
+        let _ = journal_gh_operation(
             database,
             &prepared.run.repository_id,
             &format!("issue:{}", issue.number),
@@ -5122,7 +5148,7 @@ fn record_recovery(
             ],
             "could not comment on recovery issue",
         )?;
-        let _ = journal_recovery_gh(
+        let _ = journal_gh_operation(
             database,
             &prepared.run.repository_id,
             &format!("issue:{}", issue.number),
@@ -5146,9 +5172,12 @@ fn recovery_title(
     classification: alucard::AgentExit,
     status: Option<i32>,
 ) -> String {
+    let class = match classification {
+        alucard::AgentExit::NoWorktree => "no_worktree".to_string(),
+        _ => format!("{classification:?}").to_lowercase(),
+    };
     format!(
-        "wip: alucard recovery — iter {iteration} (worker stopped: {}, rc={})",
-        recovery_class(classification),
+        "wip: alucard recovery — iter {iteration} (worker stopped: {class}, rc={})",
         status.unwrap_or(1)
     )
 }
@@ -5182,29 +5211,12 @@ fn recovery_stop_description(classification: alucard::AgentExit) -> &'static str
     }
 }
 
-fn recovery_class(classification: alucard::AgentExit) -> &'static str {
-    match classification {
-        alucard::AgentExit::Clean => "clean",
-        alucard::AgentExit::Timeout => "timeout",
-        alucard::AgentExit::Exhausted => "exhausted",
-        alucard::AgentExit::Wedged => "wedged",
-        alucard::AgentExit::Transport => "transport",
-        alucard::AgentExit::Billing => "billing",
-        alucard::AgentExit::NoWorktree => "no_worktree",
-        alucard::AgentExit::Failed => "failed",
-    }
-}
-
-fn wrapup_applies(classification: alucard::AgentExit) -> bool {
+fn wrapup_enabled(settings: &AgentSettings, classification: alucard::AgentExit) -> bool {
+    let turns = settings.turns(AgentRole::Wrapup);
     matches!(
         classification,
         alucard::AgentExit::Exhausted | alucard::AgentExit::Failed
-    )
-}
-
-fn wrapup_enabled(settings: &AgentSettings) -> bool {
-    let turns = settings.turns(AgentRole::Wrapup);
-    !turns.is_empty()
+    ) && !turns.is_empty()
         && turns.bytes().all(|byte| byte.is_ascii_digit())
         && turns.parse::<u64>().is_ok_and(|turns| turns > 0)
 }
@@ -5265,99 +5277,6 @@ fn run_wrapup_agent(
         .filter(|handoff| !handoff.is_empty());
     let _ = fs::remove_dir_all(output_dir);
     handoff
-}
-
-fn worker_last_words(log: &Path, provider: Option<Provider>) -> String {
-    let Ok(log) = fs::read_to_string(log) else {
-        return "No narration was captured from the worker.".to_string();
-    };
-    let mut words = Vec::new();
-    for line in log.lines() {
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        match provider {
-            Some(Provider::Codex)
-                if record["type"] == "item.completed"
-                    && record["item"]["type"] == "agent_message" =>
-            {
-                if let Some(text) = record["item"]["text"].as_str() {
-                    words.push(text.to_string());
-                }
-            }
-            Some(Provider::Claude) if record["type"] == "assistant" => {
-                if let Some(content) = record["message"]["content"].as_array() {
-                    words.extend(content.iter().filter_map(|item| {
-                        (item["type"] == "text")
-                            .then(|| item["text"].as_str())
-                            .flatten()
-                            .map(str::to_string)
-                    }));
-                }
-            }
-            _ => {}
-        }
-    }
-    let words = words.join("\n");
-    if words.is_empty() {
-        return "No narration was captured from the worker.".to_string();
-    }
-    if words.chars().count() > 4000 {
-        return format!(
-            "…{}",
-            words
-                .chars()
-                .rev()
-                .take(4000)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
-        );
-    }
-    words
-}
-
-fn wrapup_prompt(
-    tools: &Path,
-    task: &SelectedRunTask,
-    base_branch: &str,
-    base_sha: &str,
-    classification: alucard::AgentExit,
-    status: Option<i32>,
-    last_words: &str,
-) -> Result<String, String> {
-    let instructions = fs::read_to_string(tools.join("alucard-wrapup-prompt.md"))
-        .map_err(|error| error.to_string())?
-        .trim_end_matches('\n')
-        .to_string();
-    let ticket = match (&task.issue, &task.local_id) {
-        (Some(issue), _) => format!("issue #{}", issue.number),
-        (None, Some(id)) => format!("task {id}"),
-        (None, None) => "unknown — the worker did not claim a ticket".to_string(),
-    };
-    let mut prompt = format!(
-        "<instructions>\n{instructions}\n</instructions>\n<ticket>{}</ticket>\n<stop_reason>The worker {} (rc={}) before opening a PR.</stop_reason>\n<base_branch>{}</base_branch>\n<base_sha>{}</base_sha>\n<worker_last_words>\n{}\n</worker_last_words>",
-        xml_escape(&ticket),
-        recovery_stop_description(classification),
-        status.unwrap_or(1),
-        xml_escape(base_branch),
-        xml_escape(base_sha),
-        xml_escape(last_words),
-    );
-    if task.issue.is_none() {
-        let local = WorkerLocalTaskPrompt {
-            id: task.local_id.as_deref(),
-            title: &task.local_title,
-            body: &task.local_body,
-        };
-        prompt.push_str(&format!(
-            "\n<task>{}</task>\n<parent_context>{}</parent_context>",
-            xml_escape(&serde_json::to_string(&local).expect("local task is serializable")),
-            xml_escape(&task.parent_context),
-        ));
-    }
-    Ok(prompt)
 }
 
 fn recovery_body(
@@ -6173,6 +6092,73 @@ fn gh_output(repository: &Path, args: &[&str], context: &str) -> Result<Vec<u8>,
             format!("{context}: {error}")
         })
     }
+}
+
+fn journal_gh_operation(
+    database: &Path,
+    repository_id: &str,
+    target: &str,
+    operation_type: &str,
+    repository: &Path,
+    args: &[&str],
+    context: &str,
+) -> Result<Option<String>, String> {
+    let operation = begin_operation(database, repository_id, target, operation_type)
+        .map_err(|error| error.to_string())?;
+    let error = gh_output(repository, args, context).err();
+    finish_operation(database, &operation, error.as_deref()).map_err(|error| error.to_string())?;
+    Ok(error)
+}
+
+fn worker_last_words(log: &Path, provider: Option<Provider>) -> String {
+    let Ok(log) = fs::read_to_string(log) else {
+        return "No narration was captured from the worker.".to_string();
+    };
+    let mut words = Vec::new();
+    for line in log.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match provider {
+            Some(Provider::Codex)
+                if record["type"] == "item.completed"
+                    && record["item"]["type"] == "agent_message" =>
+            {
+                if let Some(text) = record["item"]["text"].as_str() {
+                    words.push(text.to_string());
+                }
+            }
+            Some(Provider::Claude) if record["type"] == "assistant" => {
+                if let Some(content) = record["message"]["content"].as_array() {
+                    words.extend(content.iter().filter_map(|item| {
+                        (item["type"] == "text")
+                            .then(|| item["text"].as_str())
+                            .flatten()
+                            .map(str::to_string)
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    let words = words.join("\n");
+    if words.is_empty() {
+        return "No narration was captured from the worker.".to_string();
+    }
+    if words.chars().count() > 4000 {
+        return format!(
+            "…{}",
+            words
+                .chars()
+                .rev()
+                .take(4000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
+    }
+    words
 }
 
 fn post_iteration_usage(
