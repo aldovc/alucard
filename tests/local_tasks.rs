@@ -274,6 +274,68 @@ fn reconciliation_run(
     command
 }
 
+#[test]
+fn startup_reconciliation_creates_missing_ledger_directories() {
+    let root = temporary_path("first-run-state-directory");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    let tasks = root.join("tasks.md");
+    let environment = root.join("agent.env");
+    fs::create_dir_all(&bin).unwrap();
+    git_repository(&repository);
+    fs::write(&tasks, "# Tasks\n").unwrap();
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let docker = bin.join("docker");
+    fs::write(&docker, "#!/bin/sh\necho stamp\n").unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\nprintf '[[]]\\n'\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for (name, database) in [
+        ("default", root.join("state/alucard/alucard.db")),
+        ("override", root.join("custom/state/ledger.db")),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+        command
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("ALUCARD_CACHE_DIR", root.join(format!("cache-{name}")))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .arg("run")
+            .arg("--iterations")
+            .arg("1")
+            .arg("--tasks")
+            .arg(&tasks)
+            .arg("--env-file")
+            .arg(&environment)
+            .arg("--logs-root")
+            .arg(root.join(format!("logs-{name}")))
+            .arg("--no-build");
+        if name == "override" {
+            command.arg("--db-path").arg(&database);
+        }
+        let output = command.arg(&repository).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(database.exists());
+        assert_eq!(
+            fs::metadata(database.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn run_transport_case(root: &Path, scenario: &str, retries: usize) -> std::process::Output {
     let repository = root.join("repository");
     let remote = root.join("remote.git");

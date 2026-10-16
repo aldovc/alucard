@@ -3883,8 +3883,9 @@ pub fn pending_operations(
     Ok(operations)
 }
 
-/// Acquires the repository-wide lock used while reconciling startup recovery work.
+/// Acquires the per-ledger lock held across startup recovery replay network calls.
 pub fn lock_recovery_operations(path: &Path) -> Result<RecoveryOperationLock, DatabaseError> {
+    prepare_directory(path)?;
     let lock_path = path.with_extension("recovery.lock");
     let file = File::options()
         .read(true)
