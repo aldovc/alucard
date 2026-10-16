@@ -129,7 +129,7 @@ fn repository_identity_shares_leases_across_clones_and_keeps_tasks_distinct() {
         seed_repository(repository);
     }
     set_origin(&first, "https://github.com/example/widgets.git");
-    set_origin(&second, "git@github.com:example/widgets.git");
+    set_origin(&second, "git@github.com:Example/Widgets.git");
     set_origin(&other, "https://github.com/example/other.git");
     migrate(&path).unwrap();
     let issues: Vec<GithubTask> = serde_json::from_str(
@@ -233,7 +233,7 @@ fn repository_identity_migrates_legacy_rows_and_reports_live_conflicts() {
     seed_repository(&repository);
     set_origin(&repository, "https://github.com/example/widgets.git");
     migrate(&path).unwrap();
-    let legacy = repository.canonicalize().unwrap().display().to_string();
+    let legacy = "Example/Widgets";
     let stable = repository_id(&repository);
     let connection = open(&path).unwrap();
     connection
@@ -311,6 +311,51 @@ fn repository_identity_migrates_legacy_rows_and_reports_live_conflicts() {
         .unwrap();
     drop(connection);
     assert!(ensure_repository_identity(&path, &repository).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repository_identity_migrates_live_legacy_lease_from_equivalent_clone() {
+    let path = database_path();
+    let root = path.parent().unwrap();
+    let first = root.join("first");
+    let second = root.join("second");
+    for repository in [&first, &second] {
+        seed_repository(repository);
+    }
+    set_origin(&first, "https://github.com/example/widgets.git");
+    set_origin(&second, "git@github.com:example/widgets.git");
+    migrate(&path).unwrap();
+    let legacy = first.canonicalize().unwrap().display().to_string();
+    let connection = open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO repositories (id, owner, name, created_at) VALUES (?1, '', 'first', 'now')",
+            [&legacy],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at)
+             VALUES ('legacy-run', ?1, 'merge', 'running', 'now', 'now')",
+            [&legacy],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO claims (id, repository_id, resource_kind, resource_key, run_id, state, acquired_at, heartbeat_at)
+             VALUES ('legacy-claim', ?1, 'pr', '42', 'legacy-run', 'active', 'now', 'now')",
+            [&legacy],
+        )
+        .unwrap();
+    drop(connection);
+
+    let stable = ensure_repository_identity(&path, &second).unwrap();
+    let competing = start_merge_run(&path, &second, &root.join("logs")).unwrap();
+    assert!(matches!(
+        acquire_pr(&path, &stable, 42, &competing.id),
+        Err(ClaimError::ClaimedBy { .. })
+    ));
     fs::remove_dir_all(root).unwrap();
 }
 
