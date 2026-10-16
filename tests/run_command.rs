@@ -3,13 +3,16 @@ use alucard::{
     ACTIVE_COMMAND_PID,
 };
 use std::fs;
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static ACTIVE_COMMAND_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(unix)]
 #[test]
 fn run_command_interrupts_the_child_while_waiting() {
+    let _lock = ACTIVE_COMMAND_TEST_LOCK.lock().unwrap();
     reset_command_interrupt();
     let directory = std::env::temp_dir().join(format!(
         "alucard-command-{}",
@@ -45,6 +48,7 @@ fn run_command_interrupts_the_child_while_waiting() {
 #[cfg(unix)]
 #[test]
 fn registration_terminates_a_child_when_already_interrupted() {
+    let _lock = ACTIVE_COMMAND_TEST_LOCK.lock().unwrap();
     reset_command_interrupt();
     let mut child = std::process::Command::new("sleep")
         .arg("60")
