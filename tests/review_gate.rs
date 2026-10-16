@@ -1,3 +1,5 @@
+mod test_support;
+
 use alucard::open;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -419,7 +421,6 @@ esac
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
-        .env("ALUCARD_CI_POLL_INTERVAL", "0")
         .env("ALUCARD_REMOTE", &remote)
         .env("ALUCARD_BRANCH_FILE", &branch_file)
         .env("ALUCARD_REVIEW_ARGS", &review_args)

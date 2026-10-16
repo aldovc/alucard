@@ -1,3 +1,5 @@
+mod test_support;
+
 use alucard::{
     acquire_pr, begin_operation_with_payload, finish_operation, github_queue,
     github_task_pull_requests, github_ticket_blockers, import_github_tasks, import_local_tasks,

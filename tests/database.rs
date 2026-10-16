@@ -1,3 +1,5 @@
+mod test_support;
+
 use alucard::{
     abandoned_task_claims, acquire_pr, acquire_task, begin_operation, begin_operation_with_payload,
     defer_operation, ensure_repository_identity, finish_operation, heartbeat, import_github_tasks,

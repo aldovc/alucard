@@ -1,3 +1,5 @@
+mod test_support;
+
 use alucard::{
     build_inputs_hash, classify_agent_output, compose_role_prompt, detect_dependency_installs,
     toolchain_status, AgentExit, AgentInvocation, AgentRole, AgentSettings, DependencyInstall,
