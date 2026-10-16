@@ -172,7 +172,7 @@ fn repository_identity_shares_continue_merge_and_relative_local_tasks() {
     for repository in [&first, &second] {
         seed_repository(repository);
     }
-    set_origin(&first, "https://github.com/example/widgets.git");
+    set_origin(&first, "https://github.com/example/widgets.git/");
     set_origin(&second, "git@github.com:example/widgets.git");
     migrate(&path).unwrap();
     let task_contents = "## [ ] 1: Local task\n";
