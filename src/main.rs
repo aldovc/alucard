@@ -937,7 +937,7 @@ fn cache_path(repository: &str) -> PathBuf {
 }
 
 fn resolve_repository_target(target: &Path) -> Result<PathBuf, String> {
-    if target.exists() {
+    if target.is_dir() {
         let path = target
             .canonicalize()
             .map_err(|error| format!("could not resolve target repository: {error}"))?;

@@ -193,6 +193,18 @@ fn target_resolution_cli_matches_bash_and_reuses_the_cache() {
         "alucard: target path is not inside a git repo: {}",
         non_git.display()
     )));
+    let file_target = root.join("not-a-repository-file");
+    fs::write(&file_target, "not a repository\n").unwrap();
+    let output = run_target(
+        &root,
+        &root.join("cache-errors"),
+        &root.join("errors.db"),
+        file_target.to_str().unwrap(),
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
+        "alucard: target repo does not exist: {}",
+        file_target.display()
+    )));
     let output = run_target(
         &root,
         &root.join("cache-errors"),
