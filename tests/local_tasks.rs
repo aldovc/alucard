@@ -292,6 +292,9 @@ fn startup_reconciliation_creates_missing_ledger_directories() {
     let docker = bin.join("docker");
     fs::write(&docker, "#!/bin/sh\necho stamp\n").unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\nprintf '[[]]\\n'\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
 
     for (name, database) in [
         ("default", root.join("state/alucard/alucard.db")),
