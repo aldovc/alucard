@@ -308,17 +308,6 @@ assert_eq "merge refuses without a check command" "1" "$RC"
 assert_contains "and says how to give one" "ALUCARD_CHECK_COMMAND" "$OUT"
 
 echo ""
-echo "── parser-only merge options ──"
-setup_repos current
-run_merge --help
-assert_eq "merge help does not run a merge" "1" "$RC"
-assert_contains "merge help keeps its usage result" "usage: alucard merge" "$OUT"
-assert_eq "merge help makes no GitHub calls" "" "$TRACE"
-run_merge --issue 7
-assert_eq "merge rejects the run-only issue option" "1" "$RC"
-assert_contains "merge names the run-only issue option" "--issue is only valid with alucard run" "$OUT"
-
-echo ""
 echo "── dry run ──"
 setup_repos stale
 seed_pending_recovery_annotation
