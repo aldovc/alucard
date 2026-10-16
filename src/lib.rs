@@ -4621,6 +4621,7 @@ pub fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
+    let active_command = ActiveCommand::register(child.id());
     let stdout = drain(child.stdout.take().expect("stdout is piped"));
     let stderr = drain(child.stderr.take().expect("stderr is piped"));
     let status = match timeout {
@@ -4643,6 +4644,7 @@ pub fn run_command(
             }
         }
     };
+    drop(active_command);
     Ok(Output {
         status,
         stdout: join_output(stdout)?,
