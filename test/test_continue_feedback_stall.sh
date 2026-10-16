@@ -137,8 +137,9 @@ case "$1 $2" in
         git -C "$ALUCARD_TEST_TARGET" fetch --quiet origin "$ALUCARD_TEST_BRANCH" 2>/dev/null || true
         _head=$(git -C "$ALUCARD_TEST_TARGET" rev-parse "origin/$ALUCARD_TEST_BRANCH" 2>/dev/null \
           || printf 'deadbeef')
-        jq -c --arg branch "$ALUCARD_TEST_BRANCH" --arg head "$_head" \
-          '. + {state:"OPEN",headRefName:$branch,headRefOid:$head,title:"test pull request"}' \
+        _base=$(git -C "$ALUCARD_TEST_TARGET" rev-parse origin/main 2>/dev/null || printf 'baseoid')
+        jq -c --arg branch "$ALUCARD_TEST_BRANCH" --arg head "$_head" --arg base "$_base" \
+          '. + {state:"OPEN",headRefName:$branch,headRefOid:$head,baseRefOid:$base,title:"test pull request"}' \
           <<< "$ALUCARD_TEST_COMMENTS" ;;
       *comments*)          printf '%s\n' "$ALUCARD_TEST_COMMENTS" ;;
       *reviews*)           printf '\n' ;;

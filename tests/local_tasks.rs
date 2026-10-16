@@ -3174,6 +3174,7 @@ fn continue_passes_selected_human_comments_to_feedback() {
             "origin",
             "main",
         ]));
+        let base_sha = head_sha(&repository);
         run(Command::new("git").args([
             "-C",
             repository.to_str().unwrap(),
@@ -3211,7 +3212,7 @@ fn continue_passes_selected_human_comments_to_feedback() {
         fs::write(
             &pr,
             format!(
-                r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{sha}","title":"Test PR","comments":{comments}}}"#
+                r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{sha}","baseRefOid":"{base_sha}","title":"Test PR","comments":{comments}}}"#
             ),
         )
         .unwrap();

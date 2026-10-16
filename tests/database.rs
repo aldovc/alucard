@@ -80,6 +80,7 @@ fn continue_run_adopts_an_unrecorded_recovery_pull_request() {
         "head",
         "recovery title",
         true,
+        "base",
     )
     .unwrap();
     let connection = open(&path).unwrap();
@@ -216,11 +217,13 @@ fn repository_identity_shares_continue_merge_and_relative_local_tasks() {
         Err(ClaimError::ClaimedBy { .. })
     ));
     let (continued, claim) = start_continue_run(
-        &path, &first, &logs, "image", 10, "branch", "sha", "title", false,
+        &path, &first, &logs, "image", 10, "branch", "sha", "title", false, "base",
     )
     .unwrap();
     assert!(matches!(
-        start_continue_run(&path, &second, &logs, "image", 10, "branch", "sha", "title", false,),
+        start_continue_run(
+            &path, &second, &logs, "image", 10, "branch", "sha", "title", false, "base",
+        ),
         Err(ClaimError::ClaimedBy { .. })
     ));
     release(&path, &claim.id, &continued.run.id).unwrap();
@@ -1165,6 +1168,7 @@ fn task_run_pr_lease_blocks_continue_and_merge_without_overwriting_metadata() {
             "contender-sha",
             "contender title",
             false,
+            "base",
         ),
         Err(ClaimError::ClaimedBy { .. })
     ));
@@ -1196,6 +1200,7 @@ fn task_run_pr_lease_blocks_continue_and_merge_without_overwriting_metadata() {
         "sha",
         "title",
         false,
+        "base",
     )
     .unwrap();
     release(&path, &unrelated_claim.id, &unrelated.run.id).unwrap();
