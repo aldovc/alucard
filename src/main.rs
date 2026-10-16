@@ -1537,16 +1537,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         let mut attempt_run = run;
         let mut attempt = 1;
         let iteration_started = Instant::now();
-        let exit_failed_attempt = |run_id: Option<&str>,
-                                   usage_log_dirs: Option<&[PathBuf]>,
-                                   usage_before_release,
-                                   message: &str,
-                                   exit_code| {
-            if usage_before_release {
-                if let Some(directories) = usage_log_dirs {
-                    print!("{}", usage_report_for_dirs(directories));
-                }
-            }
+        let abandon_attempt = |run_id: &str, usage_log_dirs: &[PathBuf]| {
+            print!("{}", usage_report_for_dirs(usage_log_dirs));
             release_without_pr(
                 &database,
                 &selected,
@@ -1554,31 +1546,14 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 &owner_run_id,
                 &options.queue.repository,
             );
-            if let Some(run_id) = run_id {
-                let _ = finish_run(&database, run_id, "failed");
-            }
-            if !usage_before_release {
-                if let Some(directories) = usage_log_dirs {
-                    print!("{}", usage_report_for_dirs(directories));
-                }
-            }
-            eprintln!("alucard: {message}");
-            exit_code
-        };
-        let fail_attempt = |run_id, usage_log_dirs, usage_before_release, message| {
-            exit_failed_attempt(
-                run_id,
-                usage_log_dirs,
-                usage_before_release,
-                message,
-                ExitCode::FAILURE,
-            )
+            let _ = finish_run(&database, run_id, "failed");
         };
         let mut prepared =
             match prepare_attempt(&database, &options, &cache, &selected, &attempt_run) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    return fail_attempt(Some(&attempt_run.id), None, false, &error.to_string())
+                    abandon_attempt(&attempt_run.id, &[]);
+                    return fail(&format!("alucard: {error}"));
                 }
             };
         let mut usage_log_dirs = vec![prepared.directory.clone()];
@@ -1609,7 +1584,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         let commits = match recent_base_commits(&prepared.clone, &options.base) {
             Ok(commits) => commits,
             Err(error) => {
-                return fail_attempt(Some(&attempt_run.id), None, false, &error.to_string())
+                abandon_attempt(&attempt_run.id, &[]);
+                return fail(&format!("alucard: {error}"));
             }
         };
         let (postgres, playwright_cache, toolchain_status) = match prepare_iteration_environment(
@@ -1620,7 +1596,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         ) {
             Ok(environment) => environment,
             Err(error) => {
-                return fail_attempt(Some(&attempt_run.id), None, false, &error.to_string())
+                abandon_attempt(&attempt_run.id, &[]);
+                return fail(&format!("alucard: {error}"));
             }
         };
         if interrupted() {
@@ -1636,7 +1613,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         ) {
             Ok(prompt) => prompt,
             Err(error) => {
-                return fail_attempt(Some(&attempt_run.id), None, false, &error.to_string())
+                abandon_attempt(&attempt_run.id, &[]);
+                return fail(&format!("alucard: {error}"));
             }
         };
         write_run_measurement(
@@ -1887,13 +1865,11 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 }
                 Ok(None) => {
                     if classification == alucard::AgentExit::Billing {
-                        return exit_failed_attempt(
-                            Some(&attempt_run.id),
-                            Some(usage_log_dirs.as_slice()),
-                            true,
-                            "provider returned billing_error (credit balance too low)",
-                            ExitCode::from(2),
+                        abandon_attempt(&attempt_run.id, &usage_log_dirs);
+                        eprintln!(
+                            "alucard: provider returned billing_error (credit balance too low)"
                         );
+                        return ExitCode::from(2);
                     }
                     if classification == alucard::AgentExit::Transport
                         && attempt < options.transport_attempts
@@ -1910,12 +1886,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         ) {
                             Ok(run) => run,
                             Err(error) => {
-                                return fail_attempt(
-                                    None,
-                                    Some(usage_log_dirs.as_slice()),
-                                    false,
-                                    &error.to_string(),
-                                )
+                                abandon_attempt(&attempt_run.id, &usage_log_dirs);
+                                return fail(&format!("alucard: {error}"));
                             }
                         };
                         prepared = match prepare_attempt(
@@ -1927,12 +1899,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         ) {
                             Ok(prepared) => prepared,
                             Err(error) => {
-                                return fail_attempt(
-                                    Some(&attempt_run.id),
-                                    Some(usage_log_dirs.as_slice()),
-                                    false,
-                                    &error.to_string(),
-                                )
+                                abandon_attempt(&attempt_run.id, &usage_log_dirs);
+                                return fail(&format!("alucard: {error}"));
                             }
                         };
                         usage_log_dirs.push(prepared.directory.clone());
@@ -2034,12 +2002,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     break;
                 }
                 Err(error) => {
-                    return fail_attempt(
-                        Some(&attempt_run.id),
-                        Some(usage_log_dirs.as_slice()),
-                        false,
-                        &error.to_string(),
-                    )
+                    abandon_attempt(&attempt_run.id, &usage_log_dirs);
+                    return fail(&format!("alucard: {error}"));
                 }
             }
         }
