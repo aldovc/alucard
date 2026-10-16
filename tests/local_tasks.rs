@@ -2920,6 +2920,7 @@ esac
     for arguments in [
         vec![repository, "--image", "x"],
         vec![repository, "--logs-root", "logs"],
+        vec![repository, "-n", "1"],
         vec![repository, "-t", "5"],
         vec![repository, "--base", "main"],
         vec![repository, "--no-build"],
@@ -2936,6 +2937,20 @@ esac
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
+    }
+
+    for (option, expected) in [
+        ("--base", "--base requires a branch name"),
+        ("--image", "--image requires an image name"),
+        ("--logs-root", "--logs-root requires a path"),
+    ] {
+        let output = Command::new(binary)
+            .env("PATH", &root)
+            .args(["queue", repository, option, ""])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
     }
 
     for (option, value, expected) in [

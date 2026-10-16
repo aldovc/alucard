@@ -6343,13 +6343,19 @@ impl QueueOptions {
                     }
                 }
                 "--base" => {
-                    args.next().ok_or("--base requires a branch name")?;
+                    args.next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--base requires a branch name")?;
                 }
                 "--image" => {
-                    args.next().ok_or("--image requires an image name")?;
+                    args.next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--image requires an image name")?;
                 }
                 "--logs-root" => {
-                    args.next().ok_or("--logs-root requires a path")?;
+                    args.next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--logs-root requires a path")?;
                 }
                 "--max-review-cycles" => {
                     let value = args.next().ok_or("--max-review-cycles requires a number")?;
