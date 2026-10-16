@@ -11,9 +11,23 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// The command currently running on behalf of the orchestrator.
+pub static ACTIVE_COMMAND_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Stops the command that is currently running on behalf of the orchestrator.
+pub fn interrupt_active_command() {
+    let pid = ACTIVE_COMMAND_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
 
 /// The provider selected for an agent role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2487,6 +2501,8 @@ impl AgentInvocation<'_> {
         let mut child = command
             .spawn()
             .map_err(|error| format!("cannot start docker: {error}"))?;
+        ACTIVE_COMMAND_PID.store(child.id() as i32, Ordering::SeqCst);
+        let active_command = ActiveCommand(child.id() as i32);
         let status = (|| {
             if provider == Provider::Codex {
                 child
@@ -2500,6 +2516,7 @@ impl AgentInvocation<'_> {
                 .wait()
                 .map_err(|error| format!("cannot wait for docker: {error}"))
         })();
+        drop(active_command);
         cleanup_docker_container(self.name);
         let status = status?;
         let log = fs::read_to_string(log_file).unwrap_or_default();
@@ -2508,6 +2525,14 @@ impl AgentInvocation<'_> {
             status: status.code(),
             classification,
         })
+    }
+}
+
+struct ActiveCommand(i32);
+
+impl Drop for ActiveCommand {
+    fn drop(&mut self) {
+        let _ = ACTIVE_COMMAND_PID.compare_exchange(self.0, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 

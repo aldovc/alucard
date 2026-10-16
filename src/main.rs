@@ -26,6 +26,7 @@ use fs2::FileExt;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
 
@@ -37,6 +38,50 @@ const RECOVERY_MARKER_PREFIX: &str = "**🤖 Alucard recovery PR parked**";
 const RECOVERY_TITLE_PREFIX: &str = "wip: alucard recovery";
 const BLOCKED_FINDINGS_MARKER: &str = "**🤖 Alucard blocked findings**";
 const POSTGRES_URL: &str = "postgresql://postgres:postgres@postgres:5432/postgres";
+
+static INTERRUPTED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn record_interrupt(signal: libc::c_int) {
+    if INTERRUPTED_SIGNAL
+        .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        alucard::interrupt_active_command();
+    }
+}
+
+fn install_interrupt_handlers() -> Result<(), String> {
+    let action = libc::sigaction {
+        sa_sigaction: record_interrupt as usize,
+        sa_mask: unsafe { std::mem::zeroed() },
+        sa_flags: 0,
+        sa_restorer: None,
+    };
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+fn interruptible(command: impl FnOnce() -> ExitCode) -> ExitCode {
+    INTERRUPTED_SIGNAL.store(0, Ordering::SeqCst);
+    if let Err(error) = install_interrupt_handlers() {
+        return fail(&format!(
+            "alucard: could not install interrupt handlers: {error}"
+        ));
+    }
+    let exit = command();
+    match INTERRUPTED_SIGNAL.load(Ordering::SeqCst) {
+        0 => exit,
+        signal => ExitCode::from((128 + signal) as u8),
+    }
+}
+
+fn interrupted() -> bool {
+    INTERRUPTED_SIGNAL.load(Ordering::SeqCst) != 0
+}
 
 struct RunPostgres {
     network: String,
@@ -220,15 +265,15 @@ fn main() -> ExitCode {
         },
         Some("doctor") => doctor_command(&commands[1..], db_path),
         Some("queue") => queue_command(&commands[1..], db_path),
-        Some("run") => run_command(&commands[1..], db_path),
-        Some("continue") => continue_command(&commands[1..], db_path),
+        Some("run") => interruptible(|| run_command(&commands[1..], db_path)),
+        Some("continue") => interruptible(|| continue_command(&commands[1..], db_path)),
         Some("merge") => merge_command(&commands[1..], db_path),
         Some("build") => build_command(&commands[1..]),
         Some("runs") => match database_path(db_path) {
             Ok(path) => runs_command(&commands[1..], &path),
             Err(error) => fail(&format!("alucard: {error}")),
         },
-        Some(cmd) if Path::new(cmd).is_dir() => run_command(&commands, db_path),
+        Some(cmd) if Path::new(cmd).is_dir() => interruptible(|| run_command(&commands, db_path)),
         Some(cmd) => fail(&format!("alucard: unknown command: {cmd}")),
         None => unreachable!("empty commands return before dispatch"),
     }
@@ -1594,6 +1639,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 extra_env: &[],
             }
             .invoke(&settings, &log);
+            if interrupted() {
+                print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                return ExitCode::SUCCESS;
+            }
             let classification = result
                 .as_ref()
                 .map(|result| result.classification)
