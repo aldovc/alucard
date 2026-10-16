@@ -115,9 +115,17 @@ fn role_mounts_and_extra_environment_match_bash_contract() {
             worktree_read_only: true,
             output_dir: Some(output),
             extra_env: &[("ALUCARD_ITER", "7-review-2")],
+            network: Some("alucard-test"),
+            database_url: Some("postgresql://postgres:postgres@postgres:5432/postgres"),
             ..invocation(role)
         };
         let args = invocation.docker_args(&agent_settings).unwrap();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--network", "alucard-test"]));
+        assert!(args.iter().any(|arg| {
+            arg == "DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres"
+        }));
         assert!(args.iter().any(|arg| arg == "/tmp/worktree:/work:ro"));
         assert!(args.iter().any(|arg| arg == "/tmp/output:/work-output:rw"));
         assert!(args.iter().any(|arg| arg == "ALUCARD_ITER=7-review-2"));

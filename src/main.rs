@@ -46,6 +46,16 @@ struct RunPostgres {
 
 impl RunPostgres {
     fn setup(repository: &Path, base: &str, run_id: &str) -> Result<Option<Self>, String> {
+        Self::setup_with_attempts(repository, base, run_id, 60, std::thread::sleep)
+    }
+
+    fn setup_with_attempts(
+        repository: &Path,
+        base: &str,
+        run_id: &str,
+        attempts: usize,
+        sleep: impl FnMut(Duration),
+    ) -> Result<Option<Self>, String> {
         let image = git_output(
             repository,
             &["show", &format!("origin/{base}:.alucard/postgres")],
@@ -69,11 +79,15 @@ impl RunPostgres {
             network,
             image,
         };
-        postgres.start()?;
+        postgres.start_with_attempts(attempts, sleep)?;
         Ok(Some(postgres))
     }
 
-    fn start(&self) -> Result<(), String> {
+    fn start_with_attempts(
+        &self,
+        attempts: usize,
+        mut sleep: impl FnMut(Duration),
+    ) -> Result<(), String> {
         self.remove_container();
         let started = Command::new("docker")
             .args([
@@ -100,7 +114,7 @@ impl RunPostgres {
         if !started.success() {
             return Err(format!("cannot start Postgres from {}", self.image));
         }
-        for _ in 0..60 {
+        for _ in 0..attempts {
             if Command::new("docker")
                 .args([
                     "exec",
@@ -119,7 +133,7 @@ impl RunPostgres {
             {
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_secs(1));
+            sleep(Duration::from_secs(1));
         }
         Err(format!("Postgres from {} not ready after 60s", self.image))
     }
@@ -6463,6 +6477,86 @@ mod tests {
     use std::collections::VecDeque;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
+    use std::sync::Mutex;
+
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    struct PathGuard(std::ffi::OsString);
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            std::env::set_var("PATH", &self.0);
+        }
+    }
+
+    fn install_docker_stub(root: &Path, ready: bool) -> (PathBuf, PathGuard) {
+        let bin = root.join("bin");
+        let docker = bin.join("docker");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            &docker,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.trace\"\nif [ \"$1\" = exec ] && [ -f \"$0.not-ready\" ]; then exit 1; fi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&docker, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        if !ready {
+            fs::write(docker.with_extension("not-ready"), "").unwrap();
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![bin];
+        path_entries.extend(std::env::split_paths(&path));
+        std::env::set_var("PATH", std::env::join_paths(path_entries).unwrap());
+        (docker, PathGuard(path))
+    }
+
+    fn git(repository: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn postgres_repository(
+        root: &Path,
+        base_image: Option<&str>,
+        pr_image: Option<&str>,
+    ) -> PathBuf {
+        let repository = root.join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "alucard@example.com"],
+        );
+        git(&repository, &["config", "user.name", "Alucard"]);
+        fs::write(repository.join("README"), "test\n").unwrap();
+        git(&repository, &["add", "README"]);
+        git(&repository, &["commit", "-m", "initial"]);
+        if let Some(image) = base_image {
+            fs::create_dir_all(repository.join(".alucard")).unwrap();
+            fs::write(repository.join(".alucard/postgres"), image).unwrap();
+            git(&repository, &["add", ".alucard/postgres"]);
+            git(&repository, &["commit", "-m", "postgres on base"]);
+        }
+        git(
+            &repository,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        if let Some(image) = pr_image {
+            git(&repository, &["checkout", "-b", "pr"]);
+            fs::create_dir_all(repository.join(".alucard")).unwrap();
+            fs::write(repository.join(".alucard/postgres"), image).unwrap();
+            git(&repository, &["add", ".alucard/postgres"]);
+            git(&repository, &["commit", "-m", "postgres on pr"]);
+        }
+        repository
+    }
 
     #[test]
     fn ci_poll_interval_defaults_to_the_production_interval() {
@@ -7614,5 +7708,87 @@ printf '%s' "$prompt""#,
         assert!(postgres_toolchain_status("ready".to_string(), true).contains(
             "Postgres runs beside this container, fresh for each iteration, at DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres."
         ));
+    }
+
+    #[test]
+    fn postgres_setup_skips_docker_without_a_base_declaration() {
+        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("alucard-postgres-none-{}", uuid::Uuid::new_v4()));
+        let repository = postgres_repository(&root, None, None);
+        let (docker, _path) = install_docker_stub(&root, true);
+
+        assert!(RunPostgres::setup(&repository, "main", "run")
+            .unwrap()
+            .is_none());
+        assert!(!docker.with_extension("trace").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn postgres_setup_uses_the_base_declaration_and_replaces_each_iteration() {
+        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("alucard-postgres-base-{}", uuid::Uuid::new_v4()));
+        let repository = postgres_repository(&root, Some("postgres:16"), None);
+        let (docker, _path) = install_docker_stub(&root, true);
+
+        let first = RunPostgres::setup(&repository, "main", "first")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.image, "postgres:16");
+        assert_eq!(first.network, "alucard-first");
+        drop(first);
+        let second = RunPostgres::setup(&repository, "main", "second")
+            .unwrap()
+            .unwrap();
+        drop(second);
+
+        let trace = fs::read_to_string(docker.with_extension("trace")).unwrap();
+        for run in ["first", "second"] {
+            assert!(trace.contains(&format!("network create alucard-{run}")));
+            assert!(trace.contains(&format!(
+                "run -d --rm --name alucard-postgres-{run} --network alucard-{run}"
+            )));
+            assert!(trace.contains(&format!(
+                "exec alucard-postgres-{run} pg_isready -q -h 127.0.0.1 -U postgres"
+            )));
+            assert!(trace.contains(&format!("rm -f -v alucard-postgres-{run}")));
+            assert!(trace.contains(&format!("network rm alucard-{run}")));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn postgres_setup_ignores_a_pr_only_declaration() {
+        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("alucard-postgres-pr-{}", uuid::Uuid::new_v4()));
+        let repository = postgres_repository(&root, None, Some("postgres:16"));
+        let (docker, _path) = install_docker_stub(&root, true);
+
+        assert!(RunPostgres::setup(&repository, "main", "run")
+            .unwrap()
+            .is_none());
+        assert!(!docker.with_extension("trace").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn postgres_readiness_timeout_cleans_up_its_container_and_network() {
+        let _path_lock = PATH_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("alucard-postgres-timeout-{}", uuid::Uuid::new_v4()));
+        let repository = postgres_repository(&root, Some("postgres:16"), None);
+        let (docker, _path) = install_docker_stub(&root, false);
+
+        let error = RunPostgres::setup_with_attempts(&repository, "main", "run", 1, |_| {})
+            .err()
+            .unwrap();
+        assert_eq!(error, "Postgres from postgres:16 not ready after 60s");
+        let trace = fs::read_to_string(docker.with_extension("trace")).unwrap();
+        assert!(trace.contains("rm -f -v alucard-postgres-run"));
+        assert!(trace.contains("network rm alucard-run"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
