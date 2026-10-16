@@ -408,7 +408,7 @@ fn merge_checkout(
             );
             merge_post(checkout, options.pr_number, &body, options.dry_run);
             if !options.dry_run {
-                add_pr_label(checkout, options.pr_number, "needs-human");
+                let _ = add_pr_label(checkout, options.pr_number, "needs-human");
             }
             return Err(format!(
                 "rebase of PR #{} failed; nothing pushed or merged",
@@ -1848,7 +1848,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     &["pr", "comment", &pr_number.to_string(), "--body", &comment],
                     "could not post feedback handoff",
                 );
-                add_pr_label(&repository, pr_number, "needs-human");
+                let _ = add_pr_label(&repository, pr_number, "needs-human");
                 return Ok(());
             }
             if feedback.status.unwrap_or(0) != 0 {
@@ -2495,14 +2495,8 @@ fn replay_recovery_annotation(
         "alucard-label" if labelled("alucard") => Ok(()),
         "needs-human-label" if labelled("needs-human") => Ok(()),
         "recovery_marker" if marked => Ok(()),
-        "alucard-label" => {
-            add_pr_label(repository, number, "alucard");
-            Ok(())
-        }
-        "needs-human-label" => {
-            add_pr_label(repository, number, "needs-human");
-            Ok(())
-        }
+        "alucard-label" => add_pr_label(repository, number, "alucard"),
+        "needs-human-label" => add_pr_label(repository, number, "needs-human"),
         "recovery_marker" => gh_output(
             repository,
             &["pr", "comment", number, "--body", RECOVERY_MARKER_BODY],
@@ -3650,7 +3644,7 @@ fn review_gate(
                             None,
                         );
                         if ci_handoff.is_some() {
-                            add_pr_label(&prepared.clone, pr_number, "needs-human");
+                            let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                         }
                         record_task_pr_review(
                             database,
@@ -3690,7 +3684,7 @@ fn review_gate(
                             None,
                         );
                         if verdict == ReviewVerdict::Blocked {
-                            add_pr_label(&prepared.clone, pr_number, "needs-human");
+                            let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                         }
                         record_task_pr_review(
                             database,
@@ -3711,7 +3705,7 @@ fn review_gate(
                                     &prepared.clone,
                                     None,
                                 );
-                                add_pr_label(&prepared.clone, pr_number, "needs-human");
+                                let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                                 return Ok(ReviewOutcome {
                                     ci_result,
                                     verdict: Some(verdict),
@@ -3758,7 +3752,7 @@ fn review_gate(
                                     &prepared.clone,
                                     None,
                                 );
-                                add_pr_label(&prepared.clone, pr_number, "needs-human");
+                                let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                                 return Ok(ReviewOutcome {
                                     ci_result,
                                     verdict: Some(verdict),
@@ -3817,7 +3811,7 @@ fn review_gate(
                             &prepared.clone,
                             None,
                         );
-                        add_pr_label(&prepared.clone, pr_number, "needs-human");
+                        let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                         record_task_pr_review(
                             database,
                             task_id,
@@ -4199,7 +4193,11 @@ fn gh_text(repository: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn add_pr_label(repository: &Path, number: impl std::fmt::Display, label: &str) {
+fn add_pr_label(
+    repository: &Path,
+    number: impl std::fmt::Display,
+    label: &str,
+) -> Result<(), String> {
     let number = number.to_string();
     let labels = format!("labels[]={label}");
     let endpoint = format!("repos/{{owner}}/{{repo}}/issues/{number}/labels");
@@ -4209,9 +4207,22 @@ fn add_pr_label(repository: &Path, number: impl std::fmt::Display, label: &str) 
         repository,
         None,
     );
-    if !matches!(output, Ok(ref output) if output.status.success()) {
+    let result = match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if error.is_empty() {
+                format!("could not label PR #{number} as '{label}'")
+            } else {
+                error
+            })
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    if result.is_err() {
         eprintln!("Could not label PR #{number} as '{label}'.");
     }
+    result
 }
 
 fn remove_pr_label(repository: &Path, number: i64, label: &str) -> bool {
@@ -4646,10 +4657,21 @@ fn record_recovery(
     let alucard_label = alucard_label?;
     let label = label?;
     let marker = marker?;
-    add_pr_label(&prepared.clone, number, "alucard");
-    finish_operation(database, &alucard_label, None).map_err(|error| error.to_string())?;
-    add_pr_label(&prepared.clone, number, "needs-human");
-    finish_operation(database, &label, None).map_err(|error| error.to_string())?;
+    let alucard_label_error = add_pr_label(&prepared.clone, number, "alucard").err();
+    finish_operation(database, &alucard_label, alucard_label_error.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = alucard_label_error {
+        finish_operation(database, &label, Some(&error)).map_err(|error| error.to_string())?;
+        finish_operation(database, &marker, Some(&error)).map_err(|error| error.to_string())?;
+        return Err(error);
+    }
+    let label_error = add_pr_label(&prepared.clone, number, "needs-human").err();
+    finish_operation(database, &label, label_error.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = label_error {
+        finish_operation(database, &marker, Some(&error)).map_err(|error| error.to_string())?;
+        return Err(error);
+    }
     let comment = gh_output(
         &prepared.clone,
         &[
@@ -6957,6 +6979,65 @@ printf '\n</failure_log>'"#,
         assert!(local.starts_with("Task: 7\n\n"));
         assert!(local.contains("the harness flips the task to `[x]` when this PR merges."));
         assert!(local.contains("task flips back to `[ ]` at the next queue build"));
+    }
+
+    #[test]
+    fn recovery_label_replay_retries_after_a_failed_rest_request() {
+        let root = std::env::temp_dir().join(format!(
+            "alucard-recovery-label-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let checkout = root.join("checkout");
+        let database = root.join("alucard.db");
+        let bin = root.join("bin");
+        let gh = bin.join("gh");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then\n  printf '%s\\n' '{\"labels\":[],\"comments\":[]}'\n  exit 0\nfi\nif [ \"$1\" = api ] && [ ! -f \"$0.success\" ]; then\n  echo 'label POST failed' >&2\n  exit 1\nfi\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        migrate(&database).unwrap();
+        let repository_id = "recovery-label-replay";
+        open(&database)
+            .unwrap()
+            .execute(
+                "INSERT INTO repositories (id, owner, name, cache_path, created_at) VALUES (?1, '', '', '', datetime('now'))",
+                [repository_id],
+            )
+            .unwrap();
+        begin_operation(
+            &database,
+            repository_id,
+            "recovery-pr:91",
+            "needs-human-label",
+        )
+        .unwrap();
+
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![bin.clone()];
+        path_entries.extend(std::env::split_paths(&path));
+        std::env::set_var("PATH", std::env::join_paths(path_entries).unwrap());
+        assert!(replay_recovery_operations(&database, &checkout, repository_id).is_err());
+        assert_eq!(
+            alucard::pending_operations(&database, repository_id)
+                .unwrap()
+                .iter()
+                .map(|operation| operation.operation_type.as_str())
+                .collect::<Vec<_>>(),
+            ["needs-human-label"]
+        );
+
+        fs::write(gh.with_extension("success"), "").unwrap();
+        replay_recovery_operations(&database, &checkout, repository_id).unwrap();
+        assert!(alucard::pending_operations(&database, repository_id)
+            .unwrap()
+            .is_empty());
+        std::env::set_var("PATH", path);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

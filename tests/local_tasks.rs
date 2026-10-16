@@ -614,7 +614,7 @@ esac
                 .query_row("SELECT status FROM tasks", [], |row| row
                     .get::<_, String>(0))
                 .unwrap(),
-            if matches!(scenario, "success" | "label" | "alucard_label") {
+            if scenario == "success" {
                 "in_flight"
             } else {
                 "human"
@@ -635,8 +635,8 @@ esac
                 trace.contains("issues/91/labels -f labels[]=needs-human"),
                 "{trace}"
             );
-            assert!(trace.contains("pr comment"), "{trace}");
-            assert!(root.join("recovery-marker").exists(), "{trace}");
+            assert!(!trace.contains("pr comment"), "{trace}");
+            assert!(!root.join("recovery-marker").exists(), "{trace}");
             let phase: String = connection
                 .query_row(
                     "SELECT phase FROM operations WHERE target = 'recovery-pr:91' AND operation_type = 'needs-human-label'",
@@ -644,7 +644,7 @@ esac
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(phase, "done");
+            assert_eq!(phase, "failed");
         }
         if scenario == "alucard_label" {
             let phase: String = connection
@@ -654,7 +654,7 @@ esac
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(phase, "done");
+            assert_eq!(phase, "failed");
         }
         if scenario == "success" {
             let body = fs::read_to_string(root.join("recovery-body")).unwrap();
@@ -1620,7 +1620,7 @@ esac
         };
 
         let first = invoke(case.failure);
-        if case.failure.is_empty() || matches!(case.name, "alucard-label" | "needs-human-label") {
+        if case.failure.is_empty() {
             assert!(first.status.success(), "{}: {first:?}", case.name);
             assert_eq!(
                 open(&database)
@@ -1679,7 +1679,7 @@ esac
             "alucard-label" => assert!(!root.join("alucard").exists()),
             "needs-human-label" => {
                 assert!(!root.join("needs-human").exists());
-                assert!(root.join("marker").exists());
+                assert!(!root.join("marker").exists());
             }
             "marker" => assert!(!root.join("marker").exists()),
             "pr-adoption" | "pr-closed-adoption" => {
