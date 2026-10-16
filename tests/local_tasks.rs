@@ -2966,6 +2966,25 @@ esac
         assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
     }
 
+    for (option, expected) in [
+        ("-n", "-n requires a number"),
+        ("--iterations", "--iterations requires a number"),
+        ("-t", "-t requires a number"),
+        ("--timeout-minutes", "--timeout-minutes requires a number"),
+        (
+            "--max-review-cycles",
+            "--max-review-cycles requires a number",
+        ),
+    ] {
+        let output = Command::new(binary)
+            .env("PATH", &root)
+            .args(["queue", repository, option, ""])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+
     let unknown = Command::new(binary)
         .env("PATH", &root)
         .args(["queue", repository, "--unknown"])

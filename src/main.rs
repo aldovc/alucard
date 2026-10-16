@@ -6327,6 +6327,7 @@ impl QueueOptions {
                 "-n" | "--iterations" => {
                     let value = args
                         .next()
+                        .filter(|value| !value.is_empty())
                         .ok_or_else(|| format!("{arg} requires a number"))?;
                     if !is_uint(value) {
                         return Err("iterations must be a positive integer".to_string());
@@ -6337,6 +6338,7 @@ impl QueueOptions {
                 "-t" | "--timeout-minutes" => {
                     let value = args
                         .next()
+                        .filter(|value| !value.is_empty())
                         .ok_or_else(|| format!("{arg} requires a number"))?;
                     if !is_uint(value) {
                         return Err("timeout must be a positive integer".to_string());
@@ -6358,7 +6360,10 @@ impl QueueOptions {
                         .ok_or("--logs-root requires a path")?;
                 }
                 "--max-review-cycles" => {
-                    let value = args.next().ok_or("--max-review-cycles requires a number")?;
+                    let value = args
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--max-review-cycles requires a number")?;
                     if !is_uint(value) {
                         return Err("max-review-cycles must be a positive integer".to_string());
                     }
