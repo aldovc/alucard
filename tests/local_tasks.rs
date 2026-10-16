@@ -3362,7 +3362,7 @@ fn run_uses_the_current_origin_base_without_changing_the_checkout() {
     };
 
     let checkout_head = head_sha(&repository);
-    let output = invoke("main");
+    let output = invoke("HEAD");
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         open(&database)
@@ -3381,6 +3381,31 @@ fn run_uses_the_current_origin_base_without_changing_the_checkout() {
         .status()
         .unwrap()
         .success());
+
+    fs::write(upstream.join("README.md"), "origin main again\n").unwrap();
+    run(Command::new("git").args([
+        "-C",
+        upstream.to_str().unwrap(),
+        "commit",
+        "-am",
+        "advance main again",
+    ]));
+    let advanced_main_sha = head_sha(&upstream);
+    run(Command::new("git").args(["-C", upstream.to_str().unwrap(), "push"]));
+
+    let output = invoke("HEAD");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT base_sha FROM runs ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        advanced_main_sha
+    );
 
     run(Command::new("git").args([
         "-C",

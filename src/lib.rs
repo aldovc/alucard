@@ -4388,28 +4388,22 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
             base = options.base
         );
         let base_ref = (options.base != "HEAD").then_some(base_ref.as_str());
-        run_checked(
-            "git",
-            &[
-                "fetch",
-                "--quiet",
-                "origin",
-                base_ref.unwrap_or(options.base),
-            ],
-            &repository,
-        )?;
-        if cache.exists() {
-            run_checked("git", &["remote", "set-url", "origin", origin_url], &cache)?;
+        if let Some(base_ref) = base_ref {
             run_checked(
                 "git",
-                &[
-                    "fetch",
-                    "--quiet",
-                    "origin",
-                    base_ref.unwrap_or(options.base),
-                ],
-                &cache,
+                &["fetch", "--quiet", "origin", base_ref],
+                &repository,
             )?;
+        } else {
+            run_checked("git", &["fetch", "--quiet", "origin"], &repository)?;
+        }
+        if cache.exists() {
+            run_checked("git", &["remote", "set-url", "origin", origin_url], &cache)?;
+            if let Some(base_ref) = base_ref {
+                run_checked("git", &["fetch", "--quiet", "origin", base_ref], &cache)?;
+            } else {
+                run_checked("git", &["fetch", "--quiet", "origin"], &cache)?;
+            }
         } else {
             run_checked(
                 "git",
@@ -4421,16 +4415,11 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
                 ],
                 options.cache_root,
             )?;
-            run_checked(
-                "git",
-                &[
-                    "fetch",
-                    "--quiet",
-                    "origin",
-                    base_ref.unwrap_or(options.base),
-                ],
-                &cache,
-            )?;
+            if let Some(base_ref) = base_ref {
+                run_checked("git", &["fetch", "--quiet", "origin", base_ref], &cache)?;
+            } else {
+                run_checked("git", &["fetch", "--quiet", "origin"], &cache)?;
+            }
         }
         if options.base != "HEAD" {
             run_checked(
