@@ -408,22 +408,7 @@ fn merge_checkout(
             );
             merge_post(checkout, options.pr_number, &body, options.dry_run);
             if !options.dry_run {
-                let _ = execute_command(
-                    "gh",
-                    &[
-                        "api",
-                        "-X",
-                        "POST",
-                        &format!(
-                            "repos/{{owner}}/{{repo}}/issues/{}/labels",
-                            options.pr_number
-                        ),
-                        "-f",
-                        "labels[]=needs-human",
-                    ],
-                    checkout,
-                    None,
-                );
+                let _ = add_pr_label(checkout, options.pr_number, "needs-human");
             }
             return Err(format!(
                 "rebase of PR #{} failed; nothing pushed or merged",
@@ -1863,17 +1848,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     &["pr", "comment", &pr_number.to_string(), "--body", &comment],
                     "could not post feedback handoff",
                 );
-                let _ = gh_output(
-                    &repository,
-                    &[
-                        "pr",
-                        "edit",
-                        &pr_number.to_string(),
-                        "--add-label",
-                        "needs-human",
-                    ],
-                    "could not add needs-human label",
-                );
+                let _ = add_pr_label(&repository, pr_number, "needs-human");
                 return Ok(());
             }
             if feedback.status.unwrap_or(0) != 0 {
@@ -2520,18 +2495,8 @@ fn replay_recovery_annotation(
         "alucard-label" if labelled("alucard") => Ok(()),
         "needs-human-label" if labelled("needs-human") => Ok(()),
         "recovery_marker" if marked => Ok(()),
-        "alucard-label" => gh_output(
-            repository,
-            &["pr", "edit", number, "--add-label", "alucard"],
-            "could not label recovery PR",
-        )
-        .map(|_| ()),
-        "needs-human-label" => gh_output(
-            repository,
-            &["pr", "edit", number, "--add-label", "needs-human"],
-            "could not label recovery PR",
-        )
-        .map(|_| ()),
+        "alucard-label" => add_pr_label(repository, number, "alucard"),
+        "needs-human-label" => add_pr_label(repository, number, "needs-human"),
         "recovery_marker" => gh_output(
             repository,
             &["pr", "comment", number, "--body", RECOVERY_MARKER_BODY],
@@ -3070,20 +3035,7 @@ fn unpark_recovery_pr(
             .iter()
             .any(|label| label.name.eq_ignore_ascii_case("needs-human"))
     {
-        let removed = execute_command(
-            "gh",
-            &[
-                "api",
-                "--silent",
-                "-X",
-                "DELETE",
-                &format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/labels/needs-human"),
-            ],
-            repository,
-            None,
-        )
-        .map(|output| output.status.success())
-        .unwrap_or(false);
+        let removed = remove_pr_label(repository, pr_number, "needs-human");
         if removed {
             notes.push("- Removed `needs-human`: the step it asked of a human — finishing this recovery PR — is done by this approval.".to_string());
         } else {
@@ -3132,22 +3084,7 @@ fn unpark_recovery_pr(
         pull_request.title.clone()
     };
     if new_title != pull_request.title || new_body != pull_request.body {
-        let edited = execute_command(
-            "gh",
-            &[
-                "pr",
-                "edit",
-                &pr_number.to_string(),
-                "--title",
-                &new_title,
-                "--body",
-                &new_body,
-            ],
-            repository,
-            None,
-        )
-        .map(|output| output.status.success())
-        .unwrap_or(false);
+        let edited = update_pr_title_body(repository, pr_number, &new_title, &new_body);
         if edited {
             if new_body != pull_request.body {
                 println!("Review gate: PR #{pr_number} body now closes #{ticket}.");
@@ -3707,18 +3644,7 @@ fn review_gate(
                             None,
                         );
                         if ci_handoff.is_some() {
-                            let _ = execute_command(
-                                "gh",
-                                &[
-                                    "pr",
-                                    "edit",
-                                    &pr_number.to_string(),
-                                    "--add-label",
-                                    "needs-human",
-                                ],
-                                &prepared.clone,
-                                None,
-                            );
+                            let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                         }
                         record_task_pr_review(
                             database,
@@ -3758,18 +3684,7 @@ fn review_gate(
                             None,
                         );
                         if verdict == ReviewVerdict::Blocked {
-                            let _ = execute_command(
-                                "gh",
-                                &[
-                                    "pr",
-                                    "edit",
-                                    &pr_number.to_string(),
-                                    "--add-label",
-                                    "needs-human",
-                                ],
-                                &prepared.clone,
-                                None,
-                            );
+                            let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                         }
                         record_task_pr_review(
                             database,
@@ -3790,18 +3705,7 @@ fn review_gate(
                                     &prepared.clone,
                                     None,
                                 );
-                                let _ = execute_command(
-                                    "gh",
-                                    &[
-                                        "pr",
-                                        "edit",
-                                        &pr_number.to_string(),
-                                        "--add-label",
-                                        "needs-human",
-                                    ],
-                                    &prepared.clone,
-                                    None,
-                                );
+                                let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                                 return Ok(ReviewOutcome {
                                     ci_result,
                                     verdict: Some(verdict),
@@ -3848,18 +3752,7 @@ fn review_gate(
                                     &prepared.clone,
                                     None,
                                 );
-                                let _ = execute_command(
-                                    "gh",
-                                    &[
-                                        "pr",
-                                        "edit",
-                                        &pr_number.to_string(),
-                                        "--add-label",
-                                        "needs-human",
-                                    ],
-                                    &prepared.clone,
-                                    None,
-                                );
+                                let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                                 return Ok(ReviewOutcome {
                                     ci_result,
                                     verdict: Some(verdict),
@@ -3918,18 +3811,7 @@ fn review_gate(
                             &prepared.clone,
                             None,
                         );
-                        let _ = execute_command(
-                            "gh",
-                            &[
-                                "pr",
-                                "edit",
-                                &pr_number.to_string(),
-                                "--add-label",
-                                "needs-human",
-                            ],
-                            &prepared.clone,
-                            None,
-                        );
+                        let _ = add_pr_label(&prepared.clone, pr_number, "needs-human");
                         record_task_pr_review(
                             database,
                             task_id,
@@ -4309,6 +4191,77 @@ fn gh_text(repository: &Path, args: &[&str]) -> Result<String, String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+fn add_pr_label(
+    repository: &Path,
+    number: impl std::fmt::Display,
+    label: &str,
+) -> Result<(), String> {
+    let number = number.to_string();
+    let labels = format!("labels[]={label}");
+    let endpoint = format!("repos/{{owner}}/{{repo}}/issues/{number}/labels");
+    let output = execute_command(
+        "gh",
+        &["api", "--silent", "-X", "POST", &endpoint, "-f", &labels],
+        repository,
+        None,
+    );
+    let result = match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if error.is_empty() {
+                format!("could not label PR #{number} as '{label}'")
+            } else {
+                error
+            })
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    if result.is_err() {
+        eprintln!("Could not label PR #{number} as '{label}'.");
+    }
+    result
+}
+
+fn remove_pr_label(repository: &Path, number: i64, label: &str) -> bool {
+    let encoded_label = label
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect::<String>();
+    let endpoint = format!("repos/{{owner}}/{{repo}}/issues/{number}/labels/{encoded_label}");
+    let output = execute_command(
+        "gh",
+        &["api", "--silent", "-X", "DELETE", &endpoint],
+        repository,
+        None,
+    );
+    let removed = matches!(output, Ok(ref output) if output.status.success());
+    if !removed {
+        eprintln!("Could not remove label '{label}' from PR #{number}.");
+    }
+    removed
+}
+
+fn update_pr_title_body(repository: &Path, number: i64, title: &str, body: &str) -> bool {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}");
+    let title = format!("title={title}");
+    let body = format!("body={body}");
+    let output = execute_command(
+        "gh",
+        &[
+            "api", "--silent", "-X", "PATCH", &endpoint, "-f", &title, "-f", &body,
+        ],
+        repository,
+        None,
+    );
+    matches!(output, Ok(ref output) if output.status.success())
 }
 
 fn git_output(repository: &Path, args: &[&str]) -> Result<String, String> {
@@ -4704,12 +4657,7 @@ fn record_recovery(
     let alucard_label = alucard_label?;
     let label = label?;
     let marker = marker?;
-    let alucard_labelled = gh_output(
-        &prepared.clone,
-        &["pr", "edit", &number.to_string(), "--add-label", "alucard"],
-        "could not label recovery PR",
-    );
-    let alucard_label_error = alucard_labelled.err();
+    let alucard_label_error = add_pr_label(&prepared.clone, number, "alucard").err();
     finish_operation(database, &alucard_label, alucard_label_error.as_deref())
         .map_err(|error| error.to_string())?;
     if let Some(error) = alucard_label_error {
@@ -4717,18 +4665,7 @@ fn record_recovery(
         finish_operation(database, &marker, Some(&error)).map_err(|error| error.to_string())?;
         return Err(error);
     }
-    let labelled = gh_output(
-        &prepared.clone,
-        &[
-            "pr",
-            "edit",
-            &number.to_string(),
-            "--add-label",
-            "needs-human",
-        ],
-        "could not label recovery PR",
-    );
-    let label_error = labelled.err();
+    let label_error = add_pr_label(&prepared.clone, number, "needs-human").err();
     finish_operation(database, &label, label_error.as_deref())
         .map_err(|error| error.to_string())?;
     if let Some(error) = label_error {
@@ -7042,6 +6979,65 @@ printf '\n</failure_log>'"#,
         assert!(local.starts_with("Task: 7\n\n"));
         assert!(local.contains("the harness flips the task to `[x]` when this PR merges."));
         assert!(local.contains("task flips back to `[ ]` at the next queue build"));
+    }
+
+    #[test]
+    fn recovery_label_replay_retries_after_a_failed_rest_request() {
+        let root = std::env::temp_dir().join(format!(
+            "alucard-recovery-label-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let checkout = root.join("checkout");
+        let database = root.join("alucard.db");
+        let bin = root.join("bin");
+        let gh = bin.join("gh");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then\n  printf '%s\\n' '{\"labels\":[],\"comments\":[]}'\n  exit 0\nfi\nif [ \"$1\" = api ] && [ ! -f \"$0.success\" ]; then\n  echo 'label POST failed' >&2\n  exit 1\nfi\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        migrate(&database).unwrap();
+        let repository_id = "recovery-label-replay";
+        open(&database)
+            .unwrap()
+            .execute(
+                "INSERT INTO repositories (id, owner, name, cache_path, created_at) VALUES (?1, '', '', '', datetime('now'))",
+                [repository_id],
+            )
+            .unwrap();
+        begin_operation(
+            &database,
+            repository_id,
+            "recovery-pr:91",
+            "needs-human-label",
+        )
+        .unwrap();
+
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut path_entries = vec![bin.clone()];
+        path_entries.extend(std::env::split_paths(&path));
+        std::env::set_var("PATH", std::env::join_paths(path_entries).unwrap());
+        assert!(replay_recovery_operations(&database, &checkout, repository_id).is_err());
+        assert_eq!(
+            alucard::pending_operations(&database, repository_id)
+                .unwrap()
+                .iter()
+                .map(|operation| operation.operation_type.as_str())
+                .collect::<Vec<_>>(),
+            ["needs-human-label"]
+        );
+
+        fs::write(gh.with_extension("success"), "").unwrap();
+        replay_recovery_operations(&database, &checkout, repository_id).unwrap();
+        assert!(alucard::pending_operations(&database, repository_id)
+            .unwrap()
+            .is_empty());
+        std::env::set_var("PATH", path);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

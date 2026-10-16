@@ -556,10 +556,10 @@ case "$1 $2" in
       if [ "$1" = --body ]; then printf '%s\n' "$2" >> "$ALUCARD_RECOVERY_MARKER"; break; fi
       shift
     done ;;
-  'pr edit')
+  'api --silent')
     for argument in "$@"; do
-      if [ "$ALUCARD_RECOVERY_SCENARIO" = label ] && [ "$argument" = needs-human ]; then echo 'label denied' >&2; exit 1; fi
-      if [ "$ALUCARD_RECOVERY_SCENARIO" = alucard_label ] && [ "$argument" = alucard ]; then echo 'alucard label denied' >&2; exit 1; fi
+      if [ "$ALUCARD_RECOVERY_SCENARIO" = label ] && [ "$argument" = labels[]=needs-human ]; then echo 'label denied' >&2; exit 1; fi
+      if [ "$ALUCARD_RECOVERY_SCENARIO" = alucard_label ] && [ "$argument" = labels[]=alucard ]; then echo 'alucard label denied' >&2; exit 1; fi
     done ;;
 esac
 "#,
@@ -624,12 +624,15 @@ esac
         if scenario == "marker" {
             let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
             assert!(trace.contains("pr comment"), "{scenario}: {trace}");
-            assert!(trace.contains("pr edit"), "{scenario}: {trace}");
+            assert!(
+                trace.contains("api --silent -X POST"),
+                "{scenario}: {trace}"
+            );
         }
         if scenario == "label" {
             let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
             assert!(
-                trace.contains("pr edit 91 --add-label needs-human"),
+                trace.contains("issues/91/labels -f labels[]=needs-human"),
                 "{trace}"
             );
             assert!(!trace.contains("pr comment"), "{trace}");
@@ -674,7 +677,7 @@ esac
             assert!(comments.contains("**🤖 Alucard token usage (iteration 1)**"));
             let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
             assert!(
-                trace.find("pr edit 91 --add-label needs-human")
+                trace.find("issues/91/labels -f labels[]=needs-human")
                     < trace.find("pr comment 91 --body"),
                 "{trace}"
             );
@@ -827,8 +830,8 @@ case "$1 $2" in
     printf '],"comments":['
     if [ -f "$ALUCARD_REPLAY_MARKER" ]; then printf '%s' '{"body":"**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket'"'"'s."}' ; fi
     printf ']}\n' ;;
-  'pr edit')
-    case "$*" in *'--add-label alucard'*) : > "$ALUCARD_REPLAY_ALUCARD" ;; *'--add-label needs-human'*) : > "$ALUCARD_REPLAY_HUMAN" ;; esac ;;
+  'api --silent')
+    case "$*" in *alucard*) : > "$ALUCARD_REPLAY_ALUCARD" ;; *needs-human*) : > "$ALUCARD_REPLAY_HUMAN" ;; esac ;;
   'pr comment')
     if [ "$ALUCARD_REPLAY_FAIL_MARKER" = 1 ]; then echo 'marker unavailable' >&2; exit 1; fi
     : > "$ALUCARD_REPLAY_MARKER" ;;
@@ -1022,7 +1025,7 @@ esac
         assert_eq!(
             trace
                 .lines()
-                .filter(|line| line.starts_with("pr edit") && line.contains(label))
+                .filter(|line| line.starts_with("api --silent") && line.contains(label))
                 .count(),
             1,
             "{trace}"
@@ -1035,7 +1038,9 @@ esac
     let replay_calls = |trace: &str| {
         trace
             .lines()
-            .filter(|line| line.starts_with("pr "))
+            .filter(|line| {
+                line.starts_with("pr create") || line.starts_with("api --silent -X POST")
+            })
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
@@ -1475,10 +1480,10 @@ case "$1 $2" in
     printf '],"comments":['
     if [ -f "$ALUCARD_REPLAY_MARKER" ]; then printf '%s' '{"body":"**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket'"'"'s."}'; fi
     printf ']}\n' ;;
-  'pr edit')
+  'api --silent')
     case "$*" in
-      *'--add-label alucard'*) [ "$ALUCARD_REPLAY_FAILURE" = alucard-edit ] && exit 1; : > "$ALUCARD_REPLAY_ALUCARD" ;;
-      *'--add-label needs-human'*) [ "$ALUCARD_REPLAY_FAILURE" = human-edit ] && exit 1; : > "$ALUCARD_REPLAY_HUMAN" ;;
+      *alucard*) [ "$ALUCARD_REPLAY_FAILURE" = alucard-edit ] && exit 1; : > "$ALUCARD_REPLAY_ALUCARD" ;;
+      *needs-human*) [ "$ALUCARD_REPLAY_FAILURE" = human-edit ] && exit 1; : > "$ALUCARD_REPLAY_HUMAN" ;;
     esac ;;
   'pr comment')
     [ "$ALUCARD_REPLAY_FAILURE" = marker ] && exit 1
@@ -1802,6 +1807,7 @@ case "$1 $2" in
     esac ;;
   'repo view') echo 'owner/repo' ;;
   'api graphql') echo '[]' ;;
+  'api --silent') : ;;
   'pr list')
     if [ -f "$ALUCARD_GITHUB_RECOVERY_CREATED" ]; then echo '[{"number":91,"headRefName":"recovery","headRefOid":"abc"}]'; else echo '[]'; fi ;;
   'pr create')
@@ -1934,7 +1940,7 @@ fn test_worker_recovery() {
     assert!(comments.contains("**🤖 Alucard token usage (iteration 1)**"));
     let trace = fs::read_to_string(root.join("gh-trace")).unwrap();
     assert!(
-        trace.contains("pr edit 91 --add-label needs-human"),
+        trace.contains("POST repos/{owner}/{repo}/issues/91/labels -f labels[]=needs-human"),
         "{trace}"
     );
     assert!(
