@@ -60,7 +60,9 @@ fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (Option<S
     git_repository(&repository);
     if matches!(
         case.name,
-        "postgres-agent-environment" | "postgres-two-iterations"
+        "postgres-agent-environment"
+            | "postgres-agent-environment-unseeded"
+            | "postgres-two-iterations"
     ) {
         fs::create_dir(repository.join(".alucard")).unwrap();
         fs::write(repository.join(".alucard/postgres"), "postgres:16\n").unwrap();
@@ -79,7 +81,10 @@ fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (Option<S
     }
     if matches!(
         case.name,
-        "feedback-toolchain-ok" | "feedback-toolchain-broken"
+        "feedback-toolchain-ok"
+            | "feedback-toolchain-broken"
+            | "postgres-agent-environment"
+            | "postgres-agent-environment-unseeded"
     ) {
         fs::write(repository.join("package-lock.json"), "{}\n").unwrap();
         run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
@@ -152,7 +157,17 @@ fi
 case "${1:-}" in network|exec|rm) exit 0 ;; esac
 case " $* " in *" --name alucard-postgres-"*) exit 0 ;; esac
 case " $* " in
-  *" --name alucard-preflight-"*) exit "${ALUCARD_PREFLIGHT_RC:-0}" ;;
+  *" --name alucard-preflight-"*)
+    for argument in "$@"; do
+      case "$argument" in *:/opt/alucard-browsers:rw) browsers=${argument%:/opt/alucard-browsers:rw} ;; esac
+    done
+    if [ "${ALUCARD_CASE}" != postgres-agent-environment-unseeded ]; then
+      mkdir -p "$browsers"
+      printf stamp > "$browsers/.alucard-seeded"
+    fi
+    printf '%s\n' 'alucard-playwright-pin: playwright 1.2.3 wants chromium 1234; the image bakes chromium 5678'
+    exit "${ALUCARD_PREFLIGHT_RC:-0}"
+    ;;
 esac
 work= output=
 for argument in "$@"; do
@@ -358,7 +373,7 @@ case "$1 $2" in
     ;;
   'pr checks')
     case "$ALUCARD_CASE" in recovery-unpark|recovery-old-head|recovery-untrusted|recovery-formal-approved) exit 0 ;; esac
-    if [ "$ALUCARD_CASE" = postgres-agent-environment ] || [ "$ALUCARD_CASE" = postgres-two-iterations ]; then echo "checks failed" >&2; exit 1; fi
+    case "$ALUCARD_CASE" in postgres-agent-environment*|postgres-two-iterations) echo "checks failed" >&2; exit 1 ;; esac
     case "$ALUCARD_CASE" in
       ci-stale-checks-green) advance_head; exit 0 ;;
       ci-stale-checks-failed) advance_head; echo "checks failed" >&2; exit 1 ;;
@@ -382,9 +397,9 @@ case "$1 $2" in
   'pr view')
     case "$*" in
       *state,headRefName,headRefOid,baseRefOid,title,comments*)
-        if [ "$ALUCARD_CASE" = postgres-agent-environment ] || [ "$ALUCARD_CASE" = postgres-two-iterations ]; then
+        case "$ALUCARD_CASE" in postgres-agent-environment*|postgres-two-iterations)
           printf '{"state":"OPEN","headRefName":"%s","headRefOid":"%s","baseRefOid":"%s","title":"Review task","comments":[]}\n' "$branch" "$(sha)" "$(git --git-dir="$ALUCARD_REMOTE" rev-parse refs/heads/main)"
-        fi ;;
+        esac ;;
       *headRefOid*)
         if [ "$ALUCARD_CASE" = registration-unverified ]; then
           printf '%s\n' 0000000000000000000000000000000000000000
@@ -1367,7 +1382,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
     }
 }
 
-fn assert_postgres_agent_invocations(trace: &str, required_roles: &[&str]) {
+fn assert_agent_invocations(trace: &str, required_roles: &[&str], cache_mounted: bool) {
     let mut seen = Vec::new();
     for line in trace.lines() {
         let arguments = line.split_whitespace().collect::<Vec<_>>();
@@ -1403,6 +1418,17 @@ fn assert_postgres_agent_invocations(trace: &str, required_roles: &[&str]) {
                 == "DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres"),
             "{line}"
         );
+        for argument in [
+            "/opt/alucard-browsers:rw",
+            "PLAYWRIGHT_BROWSERS_PATH=/opt/alucard-browsers",
+            "PLAYWRIGHT_SKIP_BROWSER_GC=1",
+        ] {
+            assert_eq!(
+                arguments.iter().any(|value| value.contains(argument)),
+                cache_mounted,
+                "{line}"
+            );
+        }
         seen.push(role);
     }
     for role in required_roles {
@@ -1428,7 +1454,7 @@ fn postgres_agent_environment_reaches_run_and_continue_agent_launches() {
     let (root, _, _, _) = run_review_case(&case);
     let docker_trace = root.join("docker-trace");
     let run_trace = fs::read_to_string(&docker_trace).unwrap();
-    assert_postgres_agent_invocations(&run_trace, &["worker", "fix", "review", "feedback"]);
+    assert_agent_invocations(&run_trace, &["worker", "fix", "review", "feedback"], true);
 
     let repository = root.join("repository");
     let remote = root.join("remote.git");
@@ -1486,10 +1512,32 @@ fn postgres_agent_environment_reaches_run_and_continue_agent_launches() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let continue_trace = fs::read_to_string(&docker_trace).unwrap();
-    assert_postgres_agent_invocations(
+    assert_agent_invocations(
         &continue_trace[run_trace.len()..],
         &["fix", "review", "feedback"],
+        true,
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unseeded_playwright_cache_is_not_mounted_for_agent_launches() {
+    let case = ReviewCase {
+        name: "postgres-agent-environment-unseeded",
+        review_policy: None,
+        oversized_policy: false,
+        review_policy_max_bytes: None,
+        file_verdict: "CHANGES_REQUESTED",
+        formal_verdict: "",
+        reviewer_outcomes: "verdict\nverdict",
+        comments_json: "{\"comments\":[]}",
+        advance_head: false,
+        expected_verdict: "CHANGES_REQUESTED",
+        expected_state: "review_changes_requested",
+    };
+    let (root, _, _, _) = run_review_case(&case);
+    let trace = fs::read_to_string(root.join("docker-trace")).unwrap();
+    assert_agent_invocations(&trace, &["worker", "fix", "review", "feedback"], false);
     fs::remove_dir_all(root).unwrap();
 }
 
