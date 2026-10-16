@@ -4966,7 +4966,7 @@ command_merge() {
     wt=$(claim_unique_dir "${REPO_ABS}/.alucard-worktrees/merge-${pr_num}-$$")
   fi
   # shellcheck disable=SC2064
-  trap "rm -rf '$wt'" EXIT
+  trap "$(printf 'rm -rf -- %q' "$wt")" EXIT
 
   # The branch ref, not refs/pull/N/head, which can trail the tip by a commit.
   make_agent_clone "$branch" "$wt" "$(git -C "$REPO_ABS" remote get-url origin)" >/dev/null 2>&1 \
