@@ -3823,12 +3823,12 @@ fn run_feedback_once(
     let cloned = match cloned {
         Ok(cloned) => cloned,
         Err(error) => {
-            cleanup_feedback_root(&root, &checkout);
+            let _ = fs::remove_dir_all(&root);
             return Err(error.to_string());
         }
     };
     if !cloned.status.success() {
-        cleanup_feedback_root(&root, &checkout);
+        let _ = fs::remove_dir_all(&root);
         return Err(String::from_utf8_lossy(&cloned.stderr).trim().to_string());
     }
     let policy = read_review_policy(&checkout)?;

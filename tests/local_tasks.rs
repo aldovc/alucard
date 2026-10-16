@@ -5470,7 +5470,7 @@ fn sigterm_during_feedback_clone_removes_the_temporary_checkout_and_postgres() {
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
     let git = bin.join("git");
-    fs::write(&git, "#!/bin/sh\nif [ \"$1\" = clone ] && [ \"$2\" != --local ]; then\n  for argument do checkout=\"$argument\"; done\n  printf '%s' \"$checkout\" > \"$ALUCARD_FEEDBACK_CHECKOUT\"\n  : > \"$ALUCARD_FEEDBACK_CLONE_STARTED\"\n  while :; do sleep 1; done\nfi\nexec /usr/bin/git \"$@\"\n").unwrap();
+    fs::write(&git, "#!/bin/sh\nif [ \"$1\" = clone ] && [ \"$2\" != --local ]; then\n  for argument do checkout=\"$argument\"; done\n  mkdir -p \"$checkout/.git\"\n  printf '%s' \"$checkout\" > \"$ALUCARD_FEEDBACK_CHECKOUT\"\n  : > \"$ALUCARD_FEEDBACK_CLONE_STARTED\"\n  while :; do sleep 1; done\nfi\nexec /usr/bin/git \"$@\"\n").unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
     let gh = bin.join("gh");
     fs::write(&gh, "#!/bin/sh\ncase \"$*\" in\n  *'api user'*) echo alucard ;;\n  *'state,headRefName,headRefOid,baseRefOid,title,comments'*) cat \"$ALUCARD_PULL\" ;;\n  *'--json comments'*) echo '{\"comments\":[]}' ;;\n  *'headRefOid'*) echo \"$ALUCARD_HEAD\" ;;\nesac\n").unwrap();
