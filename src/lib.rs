@@ -1678,6 +1678,7 @@ pub struct StageMeasurement<'a> {
     pub base_sha: &'a str,
     pub prev_sha: &'a str,
     pub head_sha: &'a str,
+    pub baseline_source: &'a str,
 }
 
 /// Writes a stage record, preserving unavailable diffs instead of treating them as zero.
@@ -1695,6 +1696,7 @@ pub fn write_stage_measurement(
         base_sha,
         prev_sha,
         head_sha,
+        baseline_source,
     } = measurement;
     write_measurement(
         log_dir,
@@ -1702,7 +1704,7 @@ pub fn write_stage_measurement(
             "format": 1, "record": "stage", "ts": timestamp(), "repo_id": repository_id(repository),
             "iter": iteration.to_string(), "pr": pr.map(|number| number.to_string()).unwrap_or_default(),
             "stage": stage, "cycle": cycle, "base_sha": base_sha, "prev_sha": prev_sha, "head_sha": head_sha,
-            "is_merge": is_merge_commit(repository, head_sha), "base_drifted": base_drifted(repository, base_branch, base_sha), "baseline_source": "pinned",
+            "is_merge": is_merge_commit(repository, head_sha), "base_drifted": base_drifted(repository, base_branch, base_sha), "baseline_source": baseline_source,
             "from_base": diff_measurement(repository, base_sha, head_sha),
             "from_prev": if prev_sha == head_sha { json!({}) } else { diff_measurement(repository, prev_sha, head_sha) }
         }),
@@ -1745,6 +1747,7 @@ pub struct IterationMeasurement<'a> {
     pub iteration: usize,
     pub pr: Option<i64>,
     pub base_sha: &'a str,
+    pub baseline_source: &'a str,
     pub status: Option<i32>,
     pub duration: u64,
     pub ci_result: &'a str,
@@ -1762,6 +1765,7 @@ pub fn write_iteration_measurement(measurement: IterationMeasurement<'_>) {
         iteration,
         pr,
         base_sha,
+        baseline_source,
         status,
         duration,
         ci_result,
@@ -1826,7 +1830,7 @@ pub fn write_iteration_measurement(measurement: IterationMeasurement<'_>) {
         json!({
             "format": 1, "record": "iteration", "ts": timestamp(), "iter": iteration.to_string(),
             "pr": pr.map(|number| number.to_string()).unwrap_or_default(), "base_sha": base_sha,
-            "baseline_source": "pinned", "rc": status.map(|value| value.to_string()).unwrap_or_default(),
+            "baseline_source": baseline_source, "rc": status.map(|value| value.to_string()).unwrap_or_default(),
             "duration_s": duration, "ci_result": ci_result, "review_verdict": review_verdict, "review_cycles": review_cycles,
             "cost_complete": complete, "costed_invocations": costed, "total_invocations": total, "roles": roles
         }),
@@ -3060,6 +3064,53 @@ pub struct ContinueRun {
     pub task_id: String,
 }
 
+/// Returns the first recorded measurement base for a pull request.
+pub fn prior_stage_base_for_pr(
+    database: &Path,
+    repository: &Path,
+    number: i64,
+) -> Result<Option<(String, String)>, DatabaseError> {
+    let connection = open(database)?;
+    let repository_id = repository_id(repository);
+    let mut statement = connection.prepare(
+        "SELECT logs_path FROM runs WHERE repository_id = ?1 AND logs_path IS NOT NULL ORDER BY started_at, rowid",
+    )?;
+    let paths = statement.query_map([&repository_id], |row| row.get::<_, String>(0))?;
+    for path in paths.flatten() {
+        let Ok(records) = fs::read_to_string(Path::new(&path).join("measurements.jsonl")) else {
+            continue;
+        };
+        for record in records
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        {
+            let matches_pr = record["pr"]
+                .as_str()
+                .is_some_and(|value| value.parse::<i64>().ok() == Some(number))
+                || record["pr"] == number;
+            let base_sha = record["base_sha"].as_str().unwrap_or_default();
+            if record["record"] != "stage"
+                || record["repo_id"] != repository_id
+                || !matches_pr
+                || base_sha.is_empty()
+            {
+                continue;
+            }
+            let source = record["baseline_source"].as_str().unwrap_or("pinned");
+            return Ok(Some((
+                base_sha.to_string(),
+                if source == "pinned" {
+                    "prior-run"
+                } else {
+                    source
+                }
+                .to_string(),
+            )));
+        }
+    }
+    Ok(None)
+}
+
 pub struct RunOptions<'a> {
     pub repository: &'a Path,
     pub logs_root: &'a Path,
@@ -3572,6 +3623,7 @@ pub fn start_continue_run(
     head_sha: &str,
     title: &str,
     recovery: bool,
+    base_sha: &str,
 ) -> Result<(ContinueRun, Claim), ClaimError> {
     migrate(path)?;
     let repository = repository.canonicalize().map_err(DatabaseError::from)?;
@@ -3598,11 +3650,12 @@ pub fn start_continue_run(
         )
         .optional()?;
     transaction.execute(
-        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, image, logs_path, branch, pid, hostname)
-         VALUES (?1, ?2, 'continue', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO runs (id, repository_id, command, status, started_at, heartbeat_at, base_sha, image, logs_path, branch, pid, hostname)
+         VALUES (?1, ?2, 'continue', 'running', datetime('now'), datetime('now'), ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             run_id,
             repository_id,
+            base_sha,
             image,
             logs_path,
             branch,
@@ -3643,7 +3696,7 @@ pub fn start_continue_run(
                 repository_id,
                 command: "continue".to_string(),
                 status: "running".to_string(),
-                base_sha: None,
+                base_sha: Some(base_sha.to_string()),
                 image: Some(image.to_string()),
                 logs_path: Some(logs_path),
             },

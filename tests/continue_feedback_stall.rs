@@ -48,4 +48,15 @@ fn continue_feedback_stall_contract_matches_the_bash_workflow() {
             .unwrap(),
         "recovery"
     );
+    assert_eq!(
+        open(&ledger)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM measurement_summaries WHERE iteration = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
 }

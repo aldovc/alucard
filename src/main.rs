@@ -8,14 +8,15 @@ use alucard::{
     import_local_tasks, iteration_usage_comment_for_dirs, local_queue_with_open_issues,
     local_queue_with_open_prs, lock_recovery_operations, log_event,
     mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
-    pending_recovery_operations, prepare_run, recent_runs, reconcile_github_task_pull_request,
-    record_recovery_failure, record_recovery_pr, record_task_pr, record_task_pr_gate_state,
-    record_task_pr_review, release, release_abandoned_pull_request_claim,
-    release_abandoned_task_claim, repository_ledger_id, repository_source_path, run_claims,
-    run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
-    run_retry_attempts, start_continue_run, start_merge_run, start_task_retry_run, start_task_run,
-    status, task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
-    usage_report_for_dirs, warn_if_stale_image, write_iteration_measurement, write_run_measurement,
+    pending_recovery_operations, prepare_run, prior_stage_base_for_pr, recent_runs,
+    reconcile_github_task_pull_request, record_recovery_failure, record_recovery_pr,
+    record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
+    release_abandoned_pull_request_claim, release_abandoned_task_claim, repository_ledger_id,
+    repository_source_path, run_claims, run_command as execute_command, run_pull_requests,
+    run_reconciliation_reason, run_recovery, run_retry_attempts, start_continue_run,
+    start_merge_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
+    task_is_pending, toolchain_preflight, transition_task, usage_report_for_dirs,
+    warn_if_stale_image, write_iteration_measurement, write_run_measurement,
     write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentResult,
     AgentRole, AgentSettings, GithubPullRequest, GithubPullRequestState, GithubTask,
     IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, StageMeasurement,
@@ -223,7 +224,7 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         },
     );
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(&format!("alucard: {error}")),
     }
 }
@@ -1387,6 +1388,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             stage: "worker",
                             cycle: 0,
                             base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            baseline_source: "pinned",
                             prev_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
                             head_sha: &sha,
                         },
@@ -1467,6 +1469,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &mut checks_available,
                         &mut StageProgress {
                             base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            baseline_source: "pinned",
                             previous_sha: &mut previous_stage_sha,
                         },
                     ) {
@@ -1503,6 +1506,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &toolchain_status,
                         &mut StageProgress {
                             base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                            baseline_source: "pinned",
                             previous_sha: &mut previous_stage_sha,
                         },
                     ) {
@@ -1527,6 +1531,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         iteration,
                         pr: Some(number),
                         base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        baseline_source: "pinned",
                         status: result.as_ref().ok().and_then(|value| value.status),
                         duration: iteration_started.elapsed().as_secs(),
                         ci_result: review
@@ -1664,6 +1669,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         iteration,
                         pr: recovery_pr,
                         base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        baseline_source: "pinned",
                         status: result.as_ref().ok().and_then(|value| value.status),
                         duration: iteration_started.elapsed().as_secs(),
                         ci_result: "",
@@ -1787,6 +1793,16 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             pull.state
         ));
     }
+    let (base_sha, baseline_source) =
+        match prior_stage_base_for_pr(&database, &repository, pr_number) {
+            Ok(Some(base)) => base,
+            Ok(None) => continue_measurement_base(&repository, &options.base, pr_number, &pull),
+            Err(error) => {
+                return fail(&format!(
+                    "alucard: could not read prior measurements: {error}"
+                ))
+            }
+        };
     let (continued, claim) = match start_continue_run(
         &database,
         &repository,
@@ -1797,11 +1813,13 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         &pull.head_sha,
         &pull.title,
         pull.recovery(login.trim()),
+        &base_sha,
     ) {
         Ok(continued) => continued,
         Err(error) => return fail(&format!("alucard: could not start continue run: {error}")),
     };
-    let result: Result<(), String> = (|| {
+    let iteration_started = Instant::now();
+    let result: Result<ReviewOutcome, String> = (|| {
         fs::create_dir_all(continued.run.logs_path.as_deref().unwrap_or_default())
             .map_err(|error| error.to_string())?;
         let prepared = alucard::PreparedRun {
@@ -1849,7 +1867,29 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     "could not post feedback handoff",
                 );
                 let _ = add_pr_label(&repository, pr_number, "needs-human");
-                return Ok(());
+                return Ok(ReviewOutcome {
+                    ci_result: None,
+                    verdict: None,
+                    cycles: 0,
+                });
+            }
+            if let Some(head_sha) = remote_branch_sha(&prepared.clone, &pull.branch) {
+                write_stage_measurement(
+                    &prepared.directory,
+                    &prepared.clone,
+                    &options.base,
+                    StageMeasurement {
+                        iteration: 1,
+                        pr: Some(pr_number),
+                        stage: "feedback",
+                        cycle: 1,
+                        base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                        baseline_source: &baseline_source,
+                        prev_sha: &previous_stage_sha,
+                        head_sha: &head_sha,
+                    },
+                );
+                previous_stage_sha = head_sha;
             }
             if feedback.status.unwrap_or(0) != 0 {
                 let comment = format!("**🤖 Alucard continue: feedback agent failed after pushing** (rc={}, branch advanced={})", feedback.status.unwrap_or(1), advanced.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()));
@@ -1887,6 +1927,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             &mut checks_available,
             &mut StageProgress {
                 base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                baseline_source: &baseline_source,
                 previous_sha: &mut previous_stage_sha,
             },
         ) {
@@ -1905,7 +1946,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 None
             }
         };
-        if let Err(error) = review_gate(
+        let review = match review_gate(
             &database,
             &tools,
             &options,
@@ -1920,13 +1961,56 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             &toolchain_status,
             &mut StageProgress {
                 base_sha: prepared.run.base_sha.as_deref().unwrap_or_default(),
+                baseline_source: &baseline_source,
                 previous_sha: &mut previous_stage_sha,
             },
         ) {
-            eprintln!("alucard: review gate for PR #{pr_number}: {error}");
-        }
-        Ok(())
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("alucard: review gate for PR #{pr_number}: {error}");
+                ReviewOutcome {
+                    ci_result,
+                    verdict: None,
+                    cycles: 0,
+                }
+            }
+        };
+        Ok(review)
     })();
+    let outcome = result.as_ref().copied().unwrap_or(ReviewOutcome {
+        ci_result: None,
+        verdict: None,
+        cycles: 0,
+    });
+    let log_dir = PathBuf::from(continued.run.logs_path.as_deref().unwrap_or_default());
+    write_iteration_measurement(IterationMeasurement {
+        database: &database,
+        run_id: &continued.run.id,
+        log_dir: &log_dir,
+        log_dirs: &[log_dir.as_path()],
+        iteration: 1,
+        pr: Some(pr_number),
+        base_sha: &base_sha,
+        baseline_source: &baseline_source,
+        status: None,
+        duration: iteration_started.elapsed().as_secs(),
+        ci_result: outcome
+            .ci_result
+            .map(CiResult::measurement_value)
+            .unwrap_or_default(),
+        review_verdict: outcome
+            .verdict
+            .map(ReviewVerdict::as_str)
+            .unwrap_or_default(),
+        review_cycles: outcome.cycles,
+    });
+    post_iteration_usage(
+        &repository,
+        &[log_dir],
+        1,
+        pr_number,
+        iteration_started.elapsed().as_secs(),
+    );
     let _ = release(&database, &claim.id, &continued.run.id);
     let _ = finish_run(
         &database,
@@ -1938,7 +2022,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         },
     );
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(&format!("alucard: {error}")),
     }
 }
@@ -1950,6 +2034,8 @@ struct ContinuePullRequest {
     branch: String,
     #[serde(rename = "headRefOid")]
     head_sha: String,
+    #[serde(rename = "baseRefOid")]
+    base_sha: String,
     #[serde(default)]
     title: String,
     #[serde(default)]
@@ -1987,10 +2073,33 @@ fn continue_pull_request(repository: &Path, number: i64) -> Result<ContinuePullR
             "view",
             &number.to_string(),
             "--json",
-            "state,headRefName,headRefOid,title,comments",
+            "state,headRefName,headRefOid,baseRefOid,title,comments",
         ],
     )?)
     .map_err(|error| error.to_string())
+}
+
+fn continue_measurement_base(
+    repository: &Path,
+    base_branch: &str,
+    pr_number: i64,
+    pull: &ContinuePullRequest,
+) -> (String, String) {
+    if remote_branch_sha(repository, &pull.branch).is_some() {
+        let remote_base = format!("origin/{base_branch}");
+        if let Ok(base_sha) = git_output(repository, &["merge-base", &remote_base, &pull.head_sha])
+        {
+            let base_sha = base_sha.trim();
+            if !base_sha.is_empty() {
+                return (base_sha.to_string(), "merge-base".to_string());
+            }
+        }
+    }
+    eprintln!(
+        "Measurement: no pinned base for PR #{} — comparing against the current base branch.",
+        pr_number
+    );
+    (pull.base_sha.clone(), "current-base".to_string())
 }
 
 fn continue_feedback_findings(comments: &[ContinueComment], login: &str) -> String {
@@ -2737,6 +2846,7 @@ struct CiGate<'a> {
 
 struct StageProgress<'a> {
     base_sha: &'a str,
+    baseline_source: &'a str,
     previous_sha: &'a mut String,
 }
 
@@ -2876,6 +2986,7 @@ impl CiGate<'_> {
                             stage: "cifix",
                             cycle: attempt,
                             base_sha: stage_progress.base_sha,
+                            baseline_source: stage_progress.baseline_source,
                             prev_sha: stage_progress.previous_sha,
                             head_sha: &head_sha,
                         },
@@ -3736,6 +3847,7 @@ fn review_gate(
                                         stage: "feedback",
                                         cycle,
                                         base_sha: stage_progress.base_sha,
+                                        baseline_source: stage_progress.baseline_source,
                                         prev_sha: stage_progress.previous_sha,
                                         head_sha: &head_sha,
                                     },
@@ -7313,6 +7425,7 @@ printf '%s' "$prompt""#,
             state: "OPEN".to_string(),
             branch: "branch".to_string(),
             head_sha: "sha".to_string(),
+            base_sha: "base".to_string(),
             title: String::new(),
             comments,
         };
