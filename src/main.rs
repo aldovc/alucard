@@ -17,8 +17,8 @@ use alucard::{
     start_merge_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
     task_is_pending, toolchain_preflight, transition_task, usage_report_for_dirs,
     warn_if_stale_image, write_iteration_measurement, write_run_measurement,
-    write_stage_measurement, write_task_headings, AgentExit, AgentInvocation, AgentResult,
-    AgentRole, AgentSettings, GithubPullRequest, GithubPullRequestState, GithubTask,
+    write_stage_measurement, write_task_headings, ActiveCommand, AgentExit, AgentInvocation,
+    AgentResult, AgentRole, AgentSettings, GithubPullRequest, GithubPullRequestState, GithubTask,
     IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, StageMeasurement,
     TaskHeadingUpdate, TaskState, TaskStatus,
 };
@@ -110,20 +110,23 @@ impl RunPostgres {
         let Some(image) = image else {
             return Ok(None);
         };
-        let network = format!("alucard-{run_id}");
-        let created = Command::new("docker")
-            .args(["network", "create", &network])
-            .stdout(Stdio::null())
-            .status()
-            .map_err(|error| format!("cannot create Docker network {network}: {error}"))?;
-        if !created.success() {
-            return Err(format!("cannot create Docker network {network}"));
-        }
         let postgres = Self {
             container: format!("alucard-postgres-{run_id}"),
-            network,
+            network: format!("alucard-{run_id}"),
             image,
         };
+        let created = postgres
+            .docker_status(
+                Command::new("docker")
+                    .args(["network", "create", &postgres.network])
+                    .stdout(Stdio::null()),
+            )
+            .map_err(|error| {
+                format!("cannot create Docker network {}: {error}", postgres.network)
+            })?;
+        if !created.success() {
+            return Err(format!("cannot create Docker network {}", postgres.network));
+        }
         postgres.start_with_attempts(attempts, sleep)?;
         Ok(Some(postgres))
     }
@@ -133,54 +136,88 @@ impl RunPostgres {
         attempts: usize,
         mut sleep: impl FnMut(Duration),
     ) -> Result<(), String> {
-        self.remove_container();
-        let started = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--rm",
-                "--name",
-                &self.container,
-                "--network",
-                &self.network,
-                "--network-alias",
-                "postgres",
-                "--memory",
-                "1g",
-                "--security-opt",
-                "no-new-privileges",
-                "-e",
-                "POSTGRES_PASSWORD=postgres",
-                &self.image,
-            ])
-            .stdout(Stdio::null())
-            .status()
+        self.remove_container_interruptibly()?;
+        let started = self
+            .docker_status(
+                Command::new("docker")
+                    .args([
+                        "run",
+                        "-d",
+                        "--rm",
+                        "--name",
+                        &self.container,
+                        "--network",
+                        &self.network,
+                        "--network-alias",
+                        "postgres",
+                        "--memory",
+                        "1g",
+                        "--security-opt",
+                        "no-new-privileges",
+                        "-e",
+                        "POSTGRES_PASSWORD=postgres",
+                        &self.image,
+                    ])
+                    .stdout(Stdio::null()),
+            )
             .map_err(|error| format!("cannot start Postgres from {}: {error}", self.image))?;
         if !started.success() {
             return Err(format!("cannot start Postgres from {}", self.image));
         }
         for _ in 0..attempts {
-            if Command::new("docker")
-                .args([
-                    "exec",
-                    &self.container,
-                    "pg_isready",
-                    "-q",
-                    "-h",
-                    "127.0.0.1",
-                    "-U",
-                    "postgres",
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+            if self
+                .docker_status(
+                    Command::new("docker")
+                        .args([
+                            "exec",
+                            &self.container,
+                            "pg_isready",
+                            "-q",
+                            "-h",
+                            "127.0.0.1",
+                            "-U",
+                            "postgres",
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null()),
+                )
                 .is_ok_and(|status| status.success())
             {
                 return Ok(());
             }
+            if interrupted() {
+                return Err("interrupted".to_string());
+            }
             sleep(Duration::from_secs(1));
+            if interrupted() {
+                return Err("interrupted".to_string());
+            }
         }
         Err(format!("Postgres from {} not ready after 60s", self.image))
+    }
+
+    fn docker_status(&self, command: &mut Command) -> Result<ExitStatus, String> {
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let active_command = ActiveCommand::register(child.id());
+        let status = child.wait().map_err(|error| error.to_string());
+        drop(active_command);
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
+        status
+    }
+
+    fn remove_container_interruptibly(&self) -> Result<(), String> {
+        self.docker_status(
+            Command::new("docker")
+                .args(["rm", "-f", "-v", &self.container])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .map(|_| ())
     }
 
     fn remove_container(&self) {

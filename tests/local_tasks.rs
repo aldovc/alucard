@@ -5148,25 +5148,22 @@ fn sigterm_cleans_up_postgres_for_an_interrupted_run() {
 }
 
 #[test]
-fn sigterm_during_run_preflight_stops_before_starting_an_agent() {
-    let root = temporary_path("sigterm-run-preflight");
+fn sigterm_during_run_postgres_startup_stops_before_starting_an_agent() {
+    let root = temporary_path("sigterm-run-postgres-startup");
     let repository = root.join("repository");
     let origin = root.join("origin.git");
     let bin = root.join("bin");
     let trace = root.join("docker-trace");
-    let started = root.join("preflight-started");
-    let release = root.join("preflight-release");
+    let started = root.join("postgres-started");
     fs::create_dir_all(&bin).unwrap();
     git_repository(&repository);
     fs::create_dir_all(repository.join(".alucard")).unwrap();
     fs::write(repository.join(".alucard/postgres"), "postgres:16\n").unwrap();
-    fs::write(repository.join("package-lock.json"), "{}\n").unwrap();
     run(Command::new("git").args([
         "-C",
         repository.to_str().unwrap(),
         "add",
         ".alucard/postgres",
-        "package-lock.json",
     ]));
     run(Command::new("git").args([
         "-C",
@@ -5177,7 +5174,7 @@ fn sigterm_during_run_preflight_stops_before_starting_an_agent() {
         "user.name=Test",
         "commit",
         "-qm",
-        "preflight",
+        "postgres startup",
     ]));
     run(Command::new("git").args(["init", "-q", "--bare", origin.to_str().unwrap()]));
     run(Command::new("git").args([
@@ -5199,7 +5196,7 @@ fn sigterm_during_run_preflight_stops_before_starting_an_agent() {
     let docker = bin.join("docker");
     fs::write(
         &docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$*\" in\n  *'--name alucard-preflight-'*) : > \"$ALUCARD_PREFLIGHT_STARTED\"; while [ ! -f \"$ALUCARD_PREFLIGHT_RELEASE\" ]; do sleep 0.01; done ;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in\n  'run -d') : > \"$ALUCARD_POSTGRES_STARTED\"; while :; do sleep 1; done ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
@@ -5225,8 +5222,7 @@ fn sigterm_during_run_preflight_stops_before_starting_an_agent() {
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("ALUCARD_DOCKER_TRACE", &trace)
-        .env("ALUCARD_PREFLIGHT_STARTED", &started)
-        .env("ALUCARD_PREFLIGHT_RELEASE", &release)
+        .env("ALUCARD_POSTGRES_STARTED", &started)
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
         .args([
             "--db-path",
@@ -5244,7 +5240,6 @@ fn sigterm_during_run_preflight_stops_before_starting_an_agent() {
     let mut process = command.spawn().unwrap();
     wait_for_file(&started);
     unsafe { libc::kill(process.id() as i32, libc::SIGTERM) };
-    fs::write(&release, "").unwrap();
     assert_eq!(process.wait().unwrap().code(), Some(143));
     let trace = fs::read_to_string(trace).unwrap();
     assert!(trace.contains("rm -f -v alucard-postgres-"), "{trace}");
@@ -5259,13 +5254,13 @@ fn sigterm_during_run_preflight_stops_before_starting_an_agent() {
 }
 
 #[test]
-fn sigterm_during_continue_review_stops_following_stages_and_cleans_postgres() {
-    let root = temporary_path("sigterm-continue-review");
+fn sigterm_during_continue_postgres_startup_stops_before_starting_an_agent() {
+    let root = temporary_path("sigterm-continue-postgres-startup");
     let repository = root.join("repository");
     let origin = root.join("origin.git");
     let bin = root.join("bin");
     let trace = root.join("docker-trace");
-    let started = root.join("review-started");
+    let started = root.join("postgres-started");
     fs::create_dir_all(&bin).unwrap();
     git_repository(&repository);
     fs::create_dir_all(repository.join(".alucard")).unwrap();
@@ -5333,7 +5328,7 @@ fn sigterm_during_continue_review_stops_following_stages_and_cleans_postgres() {
     let pull = root.join("pull.json");
     fs::write(&pull, format!(r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{head_sha}","baseRefOid":"{base_sha}","title":"Test PR","comments":[]}}"#)).unwrap();
     let docker = bin.join("docker");
-    fs::write(&docker, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$*\" in\n  *'--name alucard-review-'*) : > \"$ALUCARD_REVIEW_STARTED\"; while :; do sleep 1; done ;;\nesac\n").unwrap();
+    fs::write(&docker, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in\n  'run -d') : > \"$ALUCARD_POSTGRES_STARTED\"; while :; do sleep 1; done ;;\nesac\n").unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
     let gh = bin.join("gh");
     fs::write(&gh, "#!/bin/sh\ncase \"$*\" in\n  *'api user'*) echo alucard ;;\n  *'state,headRefName,headRefOid,baseRefOid,title,comments'*) cat \"$ALUCARD_PULL\" ;;\n  *'--json comments'*) echo '{\"comments\":[]}' ;;\n  *'headRefOid'*) echo \"$ALUCARD_HEAD\" ;;\n  *'reviews'*) : ;;\n  *'pr checks'*) : ;;\nesac\n").unwrap();
@@ -5351,7 +5346,7 @@ fn sigterm_during_continue_review_stops_following_stages_and_cleans_postgres() {
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("ALUCARD_DOCKER_TRACE", &trace)
-        .env("ALUCARD_REVIEW_STARTED", &started)
+        .env("ALUCARD_POSTGRES_STARTED", &started)
         .env("ALUCARD_PULL", &pull)
         .env("ALUCARD_HEAD", &head_sha)
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
@@ -5374,6 +5369,11 @@ fn sigterm_during_continue_review_stops_following_stages_and_cleans_postgres() {
     let trace = fs::read_to_string(trace).unwrap();
     assert!(trace.contains("rm -f -v alucard-postgres-"), "{trace}");
     assert!(trace.contains("network rm alucard-"), "{trace}");
-    assert!(!trace.contains("--name alucard-feedback-"), "{trace}");
+    for agent in ["worker", "feedback", "ci", "review"] {
+        assert!(
+            !trace.contains(&format!("--name alucard-{agent}-")),
+            "{trace}"
+        );
+    }
     fs::remove_dir_all(root).unwrap();
 }

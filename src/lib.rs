@@ -2501,8 +2501,7 @@ impl AgentInvocation<'_> {
         let mut child = command
             .spawn()
             .map_err(|error| format!("cannot start docker: {error}"))?;
-        ACTIVE_COMMAND_PID.store(child.id() as i32, Ordering::SeqCst);
-        let active_command = ActiveCommand(child.id() as i32);
+        let active_command = ActiveCommand::register(child.id());
         let status = (|| {
             if provider == Provider::Codex {
                 child
@@ -2528,7 +2527,15 @@ impl AgentInvocation<'_> {
     }
 }
 
-struct ActiveCommand(i32);
+pub struct ActiveCommand(i32);
+
+impl ActiveCommand {
+    pub fn register(pid: u32) -> Self {
+        let pid = pid as i32;
+        ACTIVE_COMMAND_PID.store(pid, Ordering::SeqCst);
+        Self(pid)
+    }
+}
 
 impl Drop for ActiveCommand {
     fn drop(&mut self) {
