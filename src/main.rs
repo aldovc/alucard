@@ -919,8 +919,10 @@ fn github_ref(path: &std::path::Path) -> Option<String> {
     [owner, name]
         .iter()
         .all(|part| {
-            part.bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+            !matches!(*part, "." | "..")
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
         })
         .then(|| format!("{owner}/{name}"))
 }

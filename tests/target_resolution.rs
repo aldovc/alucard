@@ -214,5 +214,21 @@ fn target_resolution_cli_matches_bash_and_reuses_the_cache() {
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("alucard: target repo does not exist: example.invalid/owner/repository"));
 
+    for (index, target) in ["./repository", "../repository", "owner/.", "owner/.."]
+        .iter()
+        .enumerate()
+    {
+        let cache = root.join(format!("cache-dot-segment-{index}"));
+        let output = run_target(
+            &root,
+            &cache,
+            &root.join(format!("dot-segment-{index}.db")),
+            target,
+        );
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("alucard: target repo does not exist: {target}")));
+        assert!(!cache.exists());
+    }
+
     fs::remove_dir_all(root).unwrap();
 }
