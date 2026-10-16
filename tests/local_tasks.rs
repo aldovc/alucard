@@ -5065,9 +5065,13 @@ fn retry_allocation_failure_finishes_prior_attempt_and_releases_claim_once() {
     let connection = open(&database).unwrap();
     connection
         .execute_batch(
-            "CREATE TRIGGER reject_retry_run BEFORE INSERT ON runs
+            "CREATE TABLE retry_cleanup_audit (action TEXT NOT NULL);
+             CREATE TRIGGER reject_retry_run BEFORE INSERT ON runs
              WHEN NEW.retry_owner_run_id IS NOT NULL
-             BEGIN SELECT RAISE(FAIL, 'retry allocation failed'); END;",
+             BEGIN SELECT RAISE(FAIL, 'retry allocation failed'); END;
+             CREATE TRIGGER record_failed_run AFTER UPDATE OF status ON runs
+             WHEN NEW.status = 'failed'
+             BEGIN INSERT INTO retry_cleanup_audit VALUES ('finish'); END;",
         )
         .unwrap();
     drop(connection);
@@ -5075,6 +5079,16 @@ fn retry_allocation_failure_finishes_prior_attempt_and_releases_claim_once() {
     let output = transport_command(&root, "transport", 1).output().unwrap();
     assert!(!output.status.success(), "{output:?}");
     let connection = open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM retry_cleanup_audit WHERE action = 'finish'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
     assert_eq!(
         connection
             .query_row("SELECT state FROM claims", [], |row| row

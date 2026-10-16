@@ -1874,9 +1874,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                     if classification == alucard::AgentExit::Transport
                         && attempt < options.transport_attempts
                     {
-                        let _ = finish_run(&database, &attempt_run.id, "failed");
                         attempt += 1;
-                        attempt_run = match start_task_retry_run(
+                        let retry_run = match start_task_retry_run(
                             &database,
                             &options.queue.repository,
                             &options.logs_root,
@@ -1890,6 +1889,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                                 return fail(&format!("alucard: {error}"));
                             }
                         };
+                        let _ = finish_run(&database, &attempt_run.id, "failed");
+                        attempt_run = retry_run;
                         prepared = match prepare_attempt(
                             &database,
                             &options,
