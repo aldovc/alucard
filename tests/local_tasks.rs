@@ -2916,6 +2916,108 @@ esac
         "10"
     );
 
+    let repository = root.to_str().unwrap();
+    for arguments in [
+        vec![repository, "--image", "x"],
+        vec![repository, "--logs-root", "logs"],
+        vec![repository, "-n", "1"],
+        vec![repository, "-t", "5"],
+        vec![repository, "--base", "main"],
+        vec![repository, "--no-build"],
+        vec![repository, "--max-review-cycles", "3"],
+    ] {
+        let output = Command::new(binary)
+            .env("PATH", &root)
+            .args([
+                "--db-path",
+                root.join("queue.db").to_str().unwrap(),
+                "queue",
+            ])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    for (option, expected) in [
+        ("--base", "--base requires a branch name"),
+        ("--image", "--image requires an image name"),
+        ("--logs-root", "--logs-root requires a path"),
+        ("--tasks", "--tasks requires a path"),
+        ("--env-file", "--env-file requires a path"),
+        ("-C", "-C requires a path"),
+        ("--repo", "--repo requires a path"),
+    ] {
+        let output = Command::new(binary)
+            .env("PATH", &root)
+            .args(["queue", repository, option, ""])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+
+    for (option, value, expected) in [
+        ("-n", "nope", "iterations must be a positive integer"),
+        ("-t", "nope", "timeout must be a positive integer"),
+    ] {
+        let output = Command::new(binary)
+            .env("PATH", &root)
+            .args(["queue", repository, option, value])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+
+    for (option, expected) in [
+        ("-n", "-n requires a number"),
+        ("--iterations", "--iterations requires a number"),
+        ("-t", "-t requires a number"),
+        ("--timeout-minutes", "--timeout-minutes requires a number"),
+        ("--issue", "--issue requires a number"),
+        (
+            "--max-review-cycles",
+            "--max-review-cycles requires a number",
+        ),
+    ] {
+        let output = Command::new(binary)
+            .env("PATH", &root)
+            .args(["queue", repository, option, ""])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+
+    let unknown = Command::new(binary)
+        .env("PATH", &root)
+        .args(["queue", repository, "--unknown"])
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown option: --unknown"));
+
+    let help = Command::new(binary)
+        .env("PATH", &root)
+        .args(["queue", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success(), "{help:?}");
+
+    let terminator = Command::new(binary)
+        .env("PATH", &root)
+        .args([
+            "--db-path",
+            root.join("queue.db").to_str().unwrap(),
+            "queue",
+            "--github",
+            "--",
+        ])
+        .output()
+        .unwrap();
+    assert!(terminator.status.success(), "{terminator:?}");
+
     let failed = Command::new(binary)
         .env("PATH", &root)
         .env("ALUCARD_GH_FAIL", "1")

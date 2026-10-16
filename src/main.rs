@@ -5905,6 +5905,10 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(options) => options,
         Err(message) => return fail(&format!("alucard: {message}")),
     };
+    if options.help {
+        print_usage();
+        return ExitCode::SUCCESS;
+    }
     if options.issue.is_some() {
         return fail("alucard: --issue is only valid with alucard run");
     }
@@ -6296,6 +6300,7 @@ struct QueueOptions {
     github: bool,
     issue: Option<i64>,
     env_file: PathBuf,
+    help: bool,
 }
 
 impl QueueOptions {
@@ -6312,18 +6317,72 @@ impl QueueOptions {
             env_file: nonempty_environment("ALUCARD_ENV_FILE")
                 .map(PathBuf::from)
                 .unwrap_or(default_env_file),
+            help: false,
         };
         let mut args = args.iter();
+        let mut iterations_from_flag = false;
+        let mut iterations_is_one = true;
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "-n" | "--iterations" => {
+                    let value = args
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| format!("{arg} requires a number"))?;
+                    if !is_uint(value) {
+                        return Err("iterations must be a positive integer".to_string());
+                    }
+                    iterations_from_flag = true;
+                    iterations_is_one = value.trim_start_matches('0') == "1";
+                }
+                "-t" | "--timeout-minutes" => {
+                    let value = args
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| format!("{arg} requires a number"))?;
+                    if !is_uint(value) {
+                        return Err("timeout must be a positive integer".to_string());
+                    }
+                }
+                "--base" => {
+                    args.next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--base requires a branch name")?;
+                }
+                "--image" => {
+                    args.next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--image requires an image name")?;
+                }
+                "--logs-root" => {
+                    args.next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--logs-root requires a path")?;
+                }
+                "--max-review-cycles" => {
+                    let value = args
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--max-review-cycles requires a number")?;
+                    if !is_uint(value) {
+                        return Err("max-review-cycles must be a positive integer".to_string());
+                    }
+                }
+                "--no-build" => {}
                 "--tasks" => {
-                    options.tasks =
-                        Some(PathBuf::from(args.next().ok_or("--tasks requires a path")?));
+                    options.tasks = Some(PathBuf::from(
+                        args.next()
+                            .filter(|value| !value.is_empty())
+                            .ok_or("--tasks requires a path")?,
+                    ));
                     options.tasks_from_flag = true;
                 }
                 "--github" => options.github = true,
                 "--issue" => {
-                    let value = args.next().ok_or("--issue requires a number")?;
+                    let value = args
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("--issue requires a number")?;
                     let number = value
                         .parse::<i64>()
                         .ok()
@@ -6332,13 +6391,33 @@ impl QueueOptions {
                     options.issue = Some(number);
                 }
                 "--env-file" => {
-                    options.env_file =
-                        PathBuf::from(args.next().ok_or("--env-file requires a path")?)
+                    options.env_file = PathBuf::from(
+                        args.next()
+                            .filter(|value| !value.is_empty())
+                            .ok_or("--env-file requires a path")?,
+                    )
                 }
                 "-C" | "--repo" => {
-                    options.repository =
-                        PathBuf::from(args.next().ok_or("--repo requires a path")?);
+                    options.repository = PathBuf::from(
+                        args.next()
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| format!("{arg} requires a path"))?,
+                    );
                     options.repository_set = true;
+                }
+                "-h" | "--help" => {
+                    options.help = true;
+                    break;
+                }
+                "--" => {
+                    let remaining = args.map(String::as_str).collect::<Vec<_>>();
+                    if !remaining.is_empty() {
+                        return Err(format!(
+                            "unexpected arguments after --: {}",
+                            remaining.join(" ")
+                        ));
+                    }
+                    break;
                 }
                 value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
                 value if !options.repository_set => {
@@ -6347,6 +6426,9 @@ impl QueueOptions {
                 }
                 value => return Err(format!("unexpected argument: {value}")),
             }
+        }
+        if options.issue.is_some() && iterations_from_flag && !iterations_is_one {
+            return Err("--issue runs exactly one iteration".to_string());
         }
         if options.tasks_from_flag && (options.github || options.issue.is_some()) {
             return Err(if options.issue.is_some() {
