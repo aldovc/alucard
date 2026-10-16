@@ -152,6 +152,39 @@ impl AgentSettings {
         self.get(key).is_some()
     }
 
+    pub fn require_credentials(&self, env_file: &Path) -> Result<(), String> {
+        if !self.has_value("GITHUB_TOKEN") {
+            return Err(format!("GITHUB_TOKEN is empty in {}", env_file.display()));
+        }
+        for role in [
+            AgentRole::Worker,
+            AgentRole::CiFix,
+            AgentRole::Reviewer,
+            AgentRole::Feedback,
+        ] {
+            match self.provider_name(role) {
+                "claude" if !self.has_value("ANTHROPIC_API_KEY") => {
+                    return Err(format!(
+                        "ANTHROPIC_API_KEY is empty in {}",
+                        env_file.display()
+                    ));
+                }
+                "codex" if !self.has_value("OPENAI_API_KEY") => {
+                    return Err(format!("OPENAI_API_KEY is empty in {}", env_file.display()));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn apply_to_process(&self) {
+        for (key, value) in &self.values {
+            // This process runs exactly one CLI command, so its child commands share this env.
+            std::env::set_var(key, value);
+        }
+    }
+
     /// Returns an operator-provided setting loaded from the environment or env file.
     pub fn value(&self, key: &str) -> Option<&str> {
         self.get(key)

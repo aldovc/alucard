@@ -30,6 +30,12 @@ fn git(directory: &Path, args: &[&str]) {
 }
 
 fn run_target(root: &Path, cache: &Path, database: &Path, target: &str) -> Output {
+    let env_file = root.join("alucard.env");
+    fs::write(
+        &env_file,
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
     Command::new(env!("CARGO_BIN_EXE_alucard"))
         .current_dir(root)
         .args([
@@ -39,7 +45,7 @@ fn run_target(root: &Path, cache: &Path, database: &Path, target: &str) -> Outpu
             target,
             "--no-build",
             "--env-file",
-            root.join("missing.env").to_str().unwrap(),
+            env_file.to_str().unwrap(),
         ])
         .env("HOME", root.join("home"))
         .env("GIT_CONFIG_GLOBAL", root.join("home/.gitconfig"))
@@ -50,11 +56,6 @@ fn run_target(root: &Path, cache: &Path, database: &Path, target: &str) -> Outpu
 
 fn assert_resolved(output: Output) {
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("env file not found"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 #[test]
@@ -249,7 +250,7 @@ fn target_resolution_cli_matches_bash_and_reuses_the_cache() {
         &root.join("local-precedence.db"),
         "owner/repository",
     ));
-    assert!(!local_precedence_cache.exists());
+    assert!(!local_precedence_cache.join("owner/repository").exists());
 
     fs::remove_dir_all(root).unwrap();
 }

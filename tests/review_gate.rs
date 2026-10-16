@@ -396,7 +396,7 @@ esac
     fs::write(
         &environment,
         format!(
-            "ALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER={}\nANTHROPIC_API_KEY=test\n",
+            "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER={}\nANTHROPIC_API_KEY=test\nOPENAI_API_KEY=test\n",
             if case.name == "feedback-invocation-failure" {
                 "unsupported"
             } else {
@@ -416,6 +416,10 @@ esac
     let gh_trace = root.join("gh-trace");
     let database = root.join("ledger.db");
     let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
         .env(
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),

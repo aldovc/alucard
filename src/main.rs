@@ -162,16 +162,17 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(options) => options,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
+    let settings = match optional_settings(&options.env_file) {
+        Ok(settings) => settings,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    settings.apply_to_process();
     let database = match database_path(db_path) {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
     let repository = match resolve_repository_target(&options.repository) {
         Ok(path) => path,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    let settings = match AgentSettings::from_environment(Some(&options.env_file)) {
-        Ok(settings) => settings,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
     let Some(check_command) = options
@@ -608,6 +609,19 @@ const REQUIRED_TOOL_FILES: &str = include_str!("../required-tool-files.txt");
 
 fn nonempty_environment(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn required_settings(env_file: &Path) -> Result<AgentSettings, String> {
+    if !env_file.is_file() {
+        return Err(format!("missing env file: {}", env_file.display()));
+    }
+    let settings = AgentSettings::from_environment(Some(env_file))?;
+    settings.require_credentials(env_file)?;
+    Ok(settings)
+}
+
+fn optional_settings(env_file: &Path) -> Result<AgentSettings, String> {
+    AgentSettings::from_environment(env_file.is_file().then_some(env_file))
 }
 
 struct DoctorOptions {
@@ -1150,7 +1164,7 @@ impl RunCommandOptions {
                 _ => queue_args.push(value.clone()),
             }
         }
-        let queue = QueueOptions::parse(&queue_args)?;
+        let queue = QueueOptions::parse(&queue_args, tools.join("alucard.env"))?;
         if queue.issue.is_some() {
             if iterations_from_flag && iterations != 1 {
                 return Err("--issue runs exactly one iteration".to_string());
@@ -1190,6 +1204,11 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(options) => options,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
+    let settings = match required_settings(&options.env_file) {
+        Ok(settings) => settings,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    settings.apply_to_process();
     let database = match database_path(db_path) {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
@@ -1201,16 +1220,6 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     if let Err(error) = reconcile_startup(&database, &options.queue.repository) {
         return fail(&format!("alucard: reconciliation failed: {error}"));
     }
-    if !options.env_file.is_file() {
-        return fail(&format!(
-            "alucard: env file not found: {}",
-            options.env_file.display()
-        ));
-    }
-    let settings = match AgentSettings::from_environment(Some(&options.env_file)) {
-        Ok(settings) => settings,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
     let cache = cache_root();
     let playwright_cache = fs::create_dir_all(cache.join("playwright-browsers"))
         .ok()
@@ -1756,6 +1765,11 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Err(error) => return fail(&format!("alucard: {error}")),
     };
     options.queue.tasks = None;
+    let settings = match required_settings(&options.env_file) {
+        Ok(settings) => settings,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    settings.apply_to_process();
     let database = match database_path(db_path) {
         Ok(path) => path,
         Err(error) => return fail(&format!("alucard: {error}")),
@@ -1771,16 +1785,6 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     if let Err(error) = reconcile_startup(&database, &repository) {
         return fail(&format!("alucard: reconciliation failed: {error}"));
     }
-    if !options.env_file.is_file() {
-        return fail(&format!(
-            "alucard: env file not found: {}",
-            options.env_file.display()
-        ));
-    }
-    let settings = match AgentSettings::from_environment(Some(&options.env_file)) {
-        Ok(settings) => settings,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
     if !options.no_build {
         if let Err(error) = build_image(&tools, &options.image) {
             return fail(&format!("alucard: {error}"));
@@ -5604,13 +5608,21 @@ fn cache_root() -> PathBuf {
 }
 
 fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
-    let options = match QueueOptions::parse(args) {
+    let Some(tools) = tool_dir() else {
+        return fail("alucard: could not locate tool files");
+    };
+    let options = match QueueOptions::parse(args, tools.join("alucard.env")) {
         Ok(options) => options,
         Err(message) => return fail(&format!("alucard: {message}")),
     };
     if options.issue.is_some() {
         return fail("alucard: --issue is only valid with alucard run");
     }
+    let settings = match optional_settings(&options.env_file) {
+        Ok(settings) => settings,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    settings.apply_to_process();
     let task_file = match options.task_file() {
         Ok(Some(path)) => path,
         Ok(None) => return github_queue_command(&options, db_path),
@@ -5993,10 +6005,11 @@ struct QueueOptions {
     tasks_from_flag: bool,
     github: bool,
     issue: Option<i64>,
+    env_file: PathBuf,
 }
 
 impl QueueOptions {
-    fn parse(args: &[String]) -> Result<Self, String> {
+    fn parse(args: &[String], default_env_file: PathBuf) -> Result<Self, String> {
         let mut options = Self {
             repository: std::env::var_os("ALUCARD_TARGET_REPO")
                 .map(PathBuf::from)
@@ -6006,6 +6019,9 @@ impl QueueOptions {
             tasks_from_flag: false,
             github: false,
             issue: None,
+            env_file: nonempty_environment("ALUCARD_ENV_FILE")
+                .map(PathBuf::from)
+                .unwrap_or(default_env_file),
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -6024,6 +6040,10 @@ impl QueueOptions {
                         .filter(|number| *number > 0)
                         .ok_or("--issue requires a positive integer")?;
                     options.issue = Some(number);
+                }
+                "--env-file" => {
+                    options.env_file =
+                        PathBuf::from(args.next().ok_or("--env-file requires a path")?)
                 }
                 "-C" | "--repo" => {
                     options.repository =
