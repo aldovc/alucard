@@ -183,10 +183,32 @@ fn postgres_agent_environment(postgres: Option<&RunPostgres>) -> (Option<&str>, 
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (db_path, commands) = match parse_db_path(&args) {
+    let (db_path, mut commands) = match parse_db_path(&args) {
         Ok(parsed) => parsed,
         Err(message) => return fail(&message),
     };
+    if commands.is_empty()
+        || matches!(
+            commands.first().map(String::as_str),
+            Some("help" | "-h" | "--help")
+        )
+    {
+        print_usage();
+        return ExitCode::SUCCESS;
+    }
+    if commands.first().is_some_and(|command| is_uint(command)) {
+        let iterations = commands.remove(0);
+        let timeout = commands
+            .first()
+            .is_some_and(|command| is_uint(command))
+            .then(|| commands.remove(0));
+        let mut run = vec!["run".to_string(), "--iterations".to_string(), iterations];
+        if let Some(timeout) = timeout {
+            run.extend(["--timeout-minutes".to_string(), timeout]);
+        }
+        run.append(&mut commands);
+        commands = run;
+    }
     match commands.first().map(String::as_str) {
         Some("version" | "--version" | "-V") => {
             println!("{}", version());
@@ -206,11 +228,22 @@ fn main() -> ExitCode {
             Ok(path) => runs_command(&commands[1..], &path),
             Err(error) => fail(&format!("alucard: {error}")),
         },
+        Some(cmd) if Path::new(cmd).is_dir() => run_command(&commands, db_path),
         Some(cmd) => fail(&format!("alucard: unknown command: {cmd}")),
-        None => {
-            fail("usage: alucard [--db-path PATH] {version|build|queue|runs|doctor|db migrate|db status}")
-        }
+        None => unreachable!("empty commands return before dispatch"),
     }
+}
+
+fn is_uint(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn print_usage() {
+    let (_, usage) = include_str!("../alucard")
+        .split_once("usage() {\n  cat <<'EOF'\n")
+        .expect("Bash usage declaration");
+    let (usage, _) = usage.split_once("\nEOF\n}").expect("Bash usage terminator");
+    println!("{usage}");
 }
 
 struct MergeOptions {
