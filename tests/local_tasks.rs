@@ -3248,6 +3248,191 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
 }
 
 #[test]
+fn run_uses_the_current_origin_base_without_changing_the_checkout() {
+    let root = temporary_path("run-origin-base");
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let upstream = root.join("upstream");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    git_repository(&repository);
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-u",
+        "origin",
+        "main",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        remote.to_str().unwrap(),
+        "symbolic-ref",
+        "HEAD",
+        "refs/heads/main",
+    ]));
+    run(Command::new("git").args([
+        "clone",
+        "-q",
+        remote.to_str().unwrap(),
+        upstream.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        upstream.to_str().unwrap(),
+        "config",
+        "user.email",
+        "test@example.com",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        upstream.to_str().unwrap(),
+        "config",
+        "user.name",
+        "Test",
+    ]));
+    fs::write(upstream.join("README.md"), "origin main\n").unwrap();
+    run(Command::new("git").args([
+        "-C",
+        upstream.to_str().unwrap(),
+        "commit",
+        "-am",
+        "advance main",
+    ]));
+    let main_sha = head_sha(&upstream);
+    run(Command::new("git").args(["-C", upstream.to_str().unwrap(), "push"]));
+
+    let tasks = root.join("tasks.md");
+    fs::write(&tasks, "## [ ] first: First task\n\nBody\n").unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\ncase \"$1 $2\" in 'image inspect') echo stamp ;; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2\" in 'issue list'|'pr list') echo '[]' ;; 'api --paginate') echo '[[]]' ;; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "ALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let database = root.join("ledger.db");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let invoke = |base: &str| {
+        Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .env("PATH", &path)
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .args([
+                "--db-path",
+                database.to_str().unwrap(),
+                "run",
+                "--iterations",
+                "1",
+                "--base",
+                base,
+                "--tasks",
+                tasks.to_str().unwrap(),
+                "--env-file",
+                environment.to_str().unwrap(),
+                "--logs-root",
+                root.join("logs").to_str().unwrap(),
+                "--no-build",
+                repository.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let checkout_head = head_sha(&repository);
+    let output = invoke("main");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT base_sha FROM runs ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        main_sha
+    );
+    assert_eq!(head_sha(&repository), checkout_head);
+    assert!(Command::new("git")
+        .args(["-C", repository.to_str().unwrap(), "diff", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+
+    run(Command::new("git").args([
+        "-C",
+        upstream.to_str().unwrap(),
+        "switch",
+        "-q",
+        "-c",
+        "feature",
+    ]));
+    fs::write(upstream.join("feature"), "origin only\n").unwrap();
+    run(Command::new("git").args(["-C", upstream.to_str().unwrap(), "add", "feature"]));
+    run(Command::new("git").args(["-C", upstream.to_str().unwrap(), "commit", "-qm", "feature"]));
+    let feature_sha = head_sha(&upstream);
+    run(Command::new("git").args([
+        "-C",
+        upstream.to_str().unwrap(),
+        "push",
+        "-u",
+        "origin",
+        "feature",
+    ]));
+    assert!(!Command::new("git")
+        .args([
+            "-C",
+            repository.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/feature"
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    let output = invoke("feature");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT base_sha FROM runs ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        feature_sha
+    );
+    assert_eq!(head_sha(&repository), checkout_head);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
     for scenario in [
         "active-retry",

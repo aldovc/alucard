@@ -4376,14 +4376,74 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|url| !url.is_empty())
-        .map(|url| github_https_url(&url));
+        .filter(|url| !url.is_empty());
     let cache_key = repository_cache_key(&repository);
     let cache = options.cache_root.join(&cache_key);
     fs::create_dir_all(options.cache_root)?;
     let lock = File::create(options.cache_root.join(format!("{cache_key}.lock")))?;
     lock.lock_exclusive()?;
-    if cache.exists() {
+    if let Some(origin_url) = origin_url.as_deref() {
+        let base_ref = format!(
+            "+refs/heads/{base}:refs/remotes/origin/{base}",
+            base = options.base
+        );
+        let base_ref = (options.base != "HEAD").then_some(base_ref.as_str());
+        run_checked(
+            "git",
+            &[
+                "fetch",
+                "--quiet",
+                "origin",
+                base_ref.unwrap_or(options.base),
+            ],
+            &repository,
+        )?;
+        if cache.exists() {
+            run_checked("git", &["remote", "set-url", "origin", origin_url], &cache)?;
+            run_checked(
+                "git",
+                &[
+                    "fetch",
+                    "--quiet",
+                    "origin",
+                    base_ref.unwrap_or(options.base),
+                ],
+                &cache,
+            )?;
+        } else {
+            run_checked(
+                "git",
+                &[
+                    "clone",
+                    "--quiet",
+                    origin_url,
+                    cache.to_str().unwrap_or_default(),
+                ],
+                options.cache_root,
+            )?;
+            run_checked(
+                "git",
+                &[
+                    "fetch",
+                    "--quiet",
+                    "origin",
+                    base_ref.unwrap_or(options.base),
+                ],
+                &cache,
+            )?;
+        }
+        if options.base != "HEAD" {
+            run_checked(
+                "git",
+                &[
+                    "update-ref",
+                    &format!("refs/heads/{}", options.base),
+                    &format!("refs/remotes/origin/{}", options.base),
+                ],
+                &cache,
+            )?;
+        }
+    } else if cache.exists() {
         run_checked("git", &["fetch", "--quiet", "origin"], &cache)?;
     } else {
         run_checked(
@@ -4421,7 +4481,8 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         &directory,
     )?;
     if let Some(origin_url) = origin_url.as_deref() {
-        run_checked("git", &["remote", "set-url", "origin", origin_url], &clone)?;
+        let origin_url = github_https_url(origin_url);
+        run_checked("git", &["remote", "set-url", "origin", &origin_url], &clone)?;
     }
     FileExt::unlock(&lock)?;
     if !clone.join(".git").is_dir() {
