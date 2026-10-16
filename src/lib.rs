@@ -1847,7 +1847,11 @@ pub fn repository_id(repository: &Path) -> String {
     let Some(owner) = segments.next().filter(|owner| !owner.is_empty()) else {
         return fallback();
     };
-    format!("{owner}/{name}")
+    format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        name.to_ascii_lowercase()
+    )
 }
 
 /// Returns a task-file path relative to its repository when possible.
@@ -3179,10 +3183,9 @@ impl From<rusqlite::Error> for ClaimError {
 
 fn migrate_repository_identity(
     connection: &mut Connection,
-    repository: &Path,
+    legacy_id: &str,
     repository_id: &str,
 ) -> Result<(), DatabaseError> {
-    let legacy_id = repository.canonicalize()?.to_string_lossy().to_string();
     if legacy_id == repository_id {
         return Ok(());
     }
@@ -3201,12 +3204,12 @@ fn migrate_repository_identity(
                AND current.source_path = substr(legacy.source_path, length(?1) + 2)
                AND current.external_id = legacy.external_id
            )",
-        (&legacy_id, repository_id),
+        (legacy_id, repository_id),
     )?;
     transaction.execute(
         "UPDATE tasks SET source_path = substr(source_path, length(?1) + 2)
          WHERE repository_id = ?1 AND source = 'local' AND source_path LIKE ?1 || '/%'",
-        [&legacy_id],
+        [legacy_id],
     )?;
     transaction.execute(
         "DELETE FROM tasks AS legacy
@@ -3220,7 +3223,7 @@ fn migrate_repository_identity(
                AND current.source = legacy.source AND current.source_path = legacy.source_path
                AND current.external_id = legacy.external_id
            )",
-        (&legacy_id, repository_id),
+        (legacy_id, repository_id),
     )?;
     let conflict: bool = transaction.query_row(
         "SELECT EXISTS(
@@ -3242,7 +3245,7 @@ fn migrate_repository_identity(
               AND current.state = 'active'
             WHERE legacy.repository_id = ?2 AND legacy.state = 'active'
         )",
-        (repository_id, &legacy_id),
+        (repository_id, legacy_id),
         |row| row.get(0),
     )?;
     if conflict {
@@ -3253,15 +3256,15 @@ fn migrate_repository_identity(
     transaction.execute(
         "INSERT OR IGNORE INTO repositories (id, owner, name, cache_path, created_at)
          SELECT ?1, owner, name, cache_path, created_at FROM repositories WHERE id = ?2",
-        (repository_id, &legacy_id),
+        (repository_id, legacy_id),
     )?;
     for table in ["runs", "tasks", "claims", "pull_requests", "operations"] {
         transaction.execute(
             &format!("UPDATE {table} SET repository_id = ?1 WHERE repository_id = ?2"),
-            (repository_id, &legacy_id),
+            (repository_id, legacy_id),
         )?;
     }
-    transaction.execute("DELETE FROM repositories WHERE id = ?1", [&legacy_id])?;
+    transaction.execute("DELETE FROM repositories WHERE id = ?1", [legacy_id])?;
     transaction.commit()?;
     Ok(())
 }
@@ -3271,7 +3274,21 @@ fn migrate_ledger_repository_id(
     repository: &Path,
 ) -> Result<String, DatabaseError> {
     let repository_id = repository_ledger_id(repository)?;
-    migrate_repository_identity(connection, repository, &repository_id)?;
+    let legacy_id = repository.canonicalize()?.to_string_lossy().to_string();
+    let repository_ids = connection
+        .prepare("SELECT id FROM repositories")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for candidate in repository_ids {
+        let is_matching_path = Path::new(&candidate).is_absolute()
+            && repository_ledger_id(Path::new(&candidate)).is_ok_and(|id| id == repository_id);
+        if candidate == legacy_id
+            || candidate.eq_ignore_ascii_case(&repository_id)
+            || is_matching_path
+        {
+            migrate_repository_identity(connection, &candidate, &repository_id)?;
+        }
+    }
     Ok(repository_id)
 }
 
