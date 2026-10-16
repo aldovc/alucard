@@ -215,15 +215,12 @@ run_continue
 assert_eq "continue exits zero after handing off" "0" "$CONTINUE_RC"
 assert_eq "only the feedback agent ran — gates did not" \
   "1" "$(grep -c '^agent launch$' "$TRACE" || true)"
-if "$USES_RUST_BINARY"; then
-  assert_contains "the PR gets the needs-human label" \
-    "pr edit 88 --add-label needs-human" "$GH"
-else
+if ! "$USES_RUST_BINARY"; then
   assert_contains "the stall is logged" \
     "stopping before gates" "$EVENTS"
-  assert_contains "the PR gets the needs-human label" \
-    "issues/88/labels" "$GH"
 fi
+assert_contains "the PR gets the needs-human label" \
+  "issues/88/labels" "$GH"
 assert_contains "the comment names the continue stall" \
   "feedback agent stopped without publishing — needs human" "$GH"
 if ! "$USES_RUST_BINARY"; then

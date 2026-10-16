@@ -63,7 +63,7 @@ case "$1 $2" in
            '{state: "OPEN", headRefName: $b, baseRefName: "main",
              isCrossRepository: false, comments: $c}' ;;
     esac ;;
-  "pr edit") : > "$ALUCARD_TEST_STATE/recovery-labelled" ;;
+  "api --silent") : > "$ALUCARD_TEST_STATE/recovery-labelled" ;;
   "pr comment")
     while [ "$#" -gt 0 ]; do
       [ "$1" = "--body" ] && { printf '%s\n' "$2" >> "$ALUCARD_TEST_STATE/comments"; break; }
@@ -314,7 +314,8 @@ if "$USES_RUST_BINARY"; then
   assert_eq "dry run leaves recovery pending" "pending" "$(pending_recovery_annotation_phase)"
   run_merge --check-command 'true'
   assert_eq "a real merge replays recovery" "done" "$(pending_recovery_annotation_phase)"
-  assert_contains "the pending recovery annotation is replayed" "pr edit 7 --add-label alucard" "$TRACE"
+  assert_contains "the pending recovery annotation is replayed" \
+    "api --silent -X POST" "$TRACE"
 fi
 
 finish
