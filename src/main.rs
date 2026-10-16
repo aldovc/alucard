@@ -266,6 +266,29 @@ fn postgres_agent_environment(postgres: Option<&RunPostgres>) -> (Option<&str>, 
     )
 }
 
+fn prepare_iteration_environment(
+    repository: &Path,
+    options: &RunCommandOptions,
+    run_id: &str,
+    cache: &Path,
+) -> Result<(Option<RunPostgres>, Option<PathBuf>, String), String> {
+    let postgres = RunPostgres::setup(repository, &options.base, run_id)?;
+    let preflight = toolchain_preflight(
+        repository,
+        &options.base,
+        &options.image,
+        &options.env_file,
+        options.timeout_minutes,
+        &cache.join("playwright-browsers"),
+    )
+    .unwrap_or_else(|error| alucard::ToolchainPreflight {
+        status: format!("Preflight unavailable: {error}"),
+        playwright_cache: None,
+    });
+    let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+    Ok((postgres, preflight.playwright_cache, toolchain_status))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (db_path, mut commands) = match parse_db_path(&args) {
@@ -420,43 +443,33 @@ impl MergeOptions {
 }
 
 fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
-    let Some(tools) = tool_dir() else {
-        return fail("alucard: could not locate tool files");
-    };
-    let options = match MergeOptions::parse(args, &tools) {
-        Ok(options) => options,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    let settings = match optional_settings(&options.env_file) {
-        Ok(settings) => settings,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    settings.apply_to_process();
-    let database = match database_path(db_path) {
-        Ok(path) => path,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    let repository = match resolve_repository_target(&options.repository) {
-        Ok(path) => path,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    let Some(check_command) = options
-        .check_command
-        .as_deref()
-        .or_else(|| settings.value("ALUCARD_CHECK_COMMAND"))
-    else {
-        return fail(
-            "alucard: no check command: pass --check-command CMD or set ALUCARD_CHECK_COMMAND",
-        );
-    };
-    if !options.dry_run {
-        if let Err(error) = reconcile_startup(&database, &repository) {
-            return fail(&format!("alucard: reconciliation failed: {error}"));
+    let (options, database, repository, check_command) = match (|| -> Result<_, String> {
+        let tools = tool_dir().ok_or_else(|| "could not locate tool files".to_string())?;
+        let options = MergeOptions::parse(args, &tools)?;
+        let settings = optional_settings(&options.env_file)?;
+        settings.apply_to_process();
+        let database = database_path(db_path).map_err(|error| error.to_string())?;
+        let repository = resolve_repository_target(&options.repository)?;
+        let check_command = options
+            .check_command
+            .as_deref()
+            .or_else(|| settings.value("ALUCARD_CHECK_COMMAND"))
+            .ok_or_else(|| {
+                "no check command: pass --check-command CMD or set ALUCARD_CHECK_COMMAND"
+                    .to_string()
+            })?
+            .to_string();
+        if !options.dry_run {
+            reconcile_startup(&database, &repository)
+                .map_err(|error| format!("reconciliation failed: {error}"))?;
         }
-    }
-    if let Err(error) = warn_if_volatile_log_root(&options.logs_root) {
-        return fail(&format!("alucard: could not prepare log root: {error}"));
-    }
+        warn_if_volatile_log_root(&options.logs_root)
+            .map_err(|error| format!("could not prepare log root: {error}"))?;
+        Ok((options, database, repository, check_command))
+    })() {
+        Ok(startup) => startup,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
     let run = match start_merge_run(&database, &repository, &options.logs_root) {
         Ok(run) => run,
         Err(error) => return fail(&format!("alucard: could not start merge run: {error}")),
@@ -474,7 +487,7 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     let result = merge_pr(
         &repository,
         &options,
-        check_command,
+        &check_command,
         run.logs_path.as_deref().unwrap_or_default(),
     );
     let _ = release(&database, &claim.id, &run.id);
@@ -1467,47 +1480,40 @@ impl RunCommandOptions {
 }
 
 fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
-    let Some(tools) = tool_dir() else {
-        return fail("alucard: could not locate tool files");
-    };
-    let mut options = match RunCommandOptions::parse(args, &tools) {
-        Ok(options) => options,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    let settings = match required_settings(&options.env_file) {
-        Ok(settings) => settings,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    settings.apply_to_process();
-    let database = match database_path(db_path) {
-        Ok(path) => path,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    options.queue.repository = match resolve_repository_target(&options.queue.repository) {
-        Ok(path) => path,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    if let Err(error) = reconcile_startup(&database, &options.queue.repository) {
-        return fail(&format!("alucard: reconciliation failed: {error}"));
-    }
-    let cache = cache_root();
-    let playwright_cache_path = cache.join("playwright-browsers");
-    let github_repo = github_repo_slug(&options.queue.repository);
+    let (tools, options, settings, database, cache, github_repo, task_file) =
+        match (|| -> Result<_, String> {
+            let tools = tool_dir().ok_or_else(|| "could not locate tool files".to_string())?;
+            let mut options = RunCommandOptions::parse(args, &tools)?;
+            let settings = required_settings(&options.env_file)?;
+            settings.apply_to_process();
+            let database = database_path(db_path).map_err(|error| error.to_string())?;
+            options.queue.repository = resolve_repository_target(&options.queue.repository)?;
+            reconcile_startup(&database, &options.queue.repository)
+                .map_err(|error| format!("reconciliation failed: {error}"))?;
+            let cache = cache_root();
+            let github_repo = github_repo_slug(&options.queue.repository);
+            if options.no_build {
+                warn_if_stale_image(&tools, &options.image)?;
+            } else {
+                build_image(&tools, &options.image)?;
+            }
+            let task_file = options.queue.task_file()?;
+            warn_if_volatile_log_root(&options.logs_root)
+                .map_err(|error| format!("could not prepare log root: {error}"))?;
+            Ok((
+                tools,
+                options,
+                settings,
+                database,
+                cache,
+                github_repo,
+                task_file,
+            ))
+        })() {
+            Ok(startup) => startup,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        };
     let mut checks_available = true;
-    if !options.no_build {
-        if let Err(error) = build_image(&tools, &options.image) {
-            return fail(&format!("alucard: {error}"));
-        }
-    } else if let Err(error) = warn_if_stale_image(&tools, &options.image) {
-        return fail(&format!("alucard: {error}"));
-    }
-    let task_file = match options.queue.task_file() {
-        Ok(file) => file,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    if let Err(error) = warn_if_volatile_log_root(&options.logs_root) {
-        return fail(&format!("alucard: could not prepare log root: {error}"));
-    }
     let mut iteration = 1;
     while iteration <= options.iterations {
         let selected = match select_run_task(&options.queue, task_file.as_deref(), &database) {
@@ -1585,35 +1591,25 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 return fail(&format!("alucard: {error}"));
             }
         };
-        let postgres =
-            match RunPostgres::setup(&options.queue.repository, &options.base, &attempt_run.id) {
-                Ok(postgres) => postgres,
-                Err(error) => {
-                    release_without_pr(
-                        &database,
-                        &selected,
-                        &claim.id,
-                        &owner_run_id,
-                        &options.queue.repository,
-                    );
-                    let _ = finish_run(&database, &attempt_run.id, "failed");
-                    return fail(&format!("alucard: {error}"));
-                }
-            };
-        let preflight = toolchain_preflight(
+        let (postgres, playwright_cache, toolchain_status) = match prepare_iteration_environment(
             &options.queue.repository,
-            &options.base,
-            &options.image,
-            &options.env_file,
-            options.timeout_minutes,
-            &playwright_cache_path,
-        )
-        .unwrap_or_else(|error| alucard::ToolchainPreflight {
-            status: format!("Preflight unavailable: {error}"),
-            playwright_cache: None,
-        });
-        let playwright_cache = preflight.playwright_cache;
-        let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+            &options,
+            &attempt_run.id,
+            &cache,
+        ) {
+            Ok(environment) => environment,
+            Err(error) => {
+                release_without_pr(
+                    &database,
+                    &selected,
+                    &claim.id,
+                    &owner_run_id,
+                    &options.queue.repository,
+                );
+                let _ = finish_run(&database, &attempt_run.id, "failed");
+                return fail(&format!("alucard: {error}"));
+            }
+        };
         if interrupted() {
             print!("{}", usage_report_for_dirs(&usage_log_dirs));
             return ExitCode::SUCCESS;
@@ -2065,79 +2061,85 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
 }
 
 fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
-    let Some(tools) = tool_dir() else {
-        return fail("alucard: could not locate tool files");
-    };
-    let pr_number = args
-        .first()
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|number| *number > 0)
-        .ok_or("usage: alucard continue <PR_NUM> [options] — PR_NUM must be a positive integer");
-    let Ok(pr_number) = pr_number else {
-        return fail(&format!("alucard: {}", pr_number.unwrap_err()));
-    };
-    let mut options = match RunCommandOptions::parse(&args[1..], &tools) {
-        Ok(options)
-            if options.queue.issue.is_none()
-                && !options.queue.github
-                && !options.queue.tasks_from_flag =>
-        {
-            options
-        }
-        Ok(_) => return fail("alucard: continue does not accept task selection options"),
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    options.queue.tasks = None;
-    let settings = match required_settings(&options.env_file) {
-        Ok(settings) => settings,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    settings.apply_to_process();
-    let database = match database_path(db_path) {
-        Ok(path) => path,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    let repository = match resolve_repository_target(&options.queue.repository) {
-        Ok(path) => path,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    let login = match gh_text(&repository, &["api", "user", "--jq", ".login"]) {
-        Ok(login) if !login.trim().is_empty() => login,
-        _ => return fail("alucard: could not read the GitHub login the harness posts as"),
-    };
-    if let Err(error) = reconcile_startup(&database, &repository) {
-        return fail(&format!("alucard: reconciliation failed: {error}"));
-    }
-    if !options.no_build {
-        if let Err(error) = build_image(&tools, &options.image) {
-            return fail(&format!("alucard: {error}"));
-        }
-    } else if let Err(error) = warn_if_stale_image(&tools, &options.image) {
-        return fail(&format!("alucard: {error}"));
-    }
-    let pull = match continue_pull_request(&repository, pr_number) {
-        Ok(pull) => pull,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
-    if pull.state != "OPEN" {
-        return fail(&format!(
-            "alucard: PR #{pr_number} is not open (state: {})",
-            pull.state
-        ));
-    }
-    let (base_sha, baseline_source) =
-        match prior_stage_base_for_pr(&database, &repository, pr_number) {
-            Ok(Some(base)) => base,
-            Ok(None) => continue_measurement_base(&repository, &options.base, pr_number, &pull),
-            Err(error) => {
-                return fail(&format!(
-                    "alucard: could not read prior measurements: {error}"
-                ))
+    let (
+        tools,
+        options,
+        settings,
+        database,
+        repository,
+        login,
+        pr_number,
+        pull,
+        base_sha,
+        baseline_source,
+    ) = match (|| -> Result<_, String> {
+        let tools = tool_dir().ok_or_else(|| "could not locate tool files".to_string())?;
+        let pr_number = args
+            .first()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|number| *number > 0)
+            .ok_or_else(|| {
+                "usage: alucard continue <PR_NUM> [options] — PR_NUM must be a positive integer"
+                    .to_string()
+            })?;
+        let mut options = match RunCommandOptions::parse(&args[1..], &tools) {
+            Ok(options)
+                if options.queue.issue.is_none()
+                    && !options.queue.github
+                    && !options.queue.tasks_from_flag =>
+            {
+                options
             }
+            Ok(_) => return Err("continue does not accept task selection options".to_string()),
+            Err(error) => return Err(error),
         };
-    if let Err(error) = warn_if_volatile_log_root(&options.logs_root) {
-        return fail(&format!("alucard: could not prepare log root: {error}"));
-    }
+        options.queue.tasks = None;
+        let settings = required_settings(&options.env_file)?;
+        settings.apply_to_process();
+        let database = database_path(db_path).map_err(|error| error.to_string())?;
+        let repository = resolve_repository_target(&options.queue.repository)?;
+        let login = match gh_text(&repository, &["api", "user", "--jq", ".login"]) {
+            Ok(login) if !login.trim().is_empty() => login,
+            _ => return Err("could not read the GitHub login the harness posts as".to_string()),
+        };
+        reconcile_startup(&database, &repository)
+            .map_err(|error| format!("reconciliation failed: {error}"))?;
+        if options.no_build {
+            warn_if_stale_image(&tools, &options.image)?;
+        } else {
+            build_image(&tools, &options.image)?;
+        }
+        let pull = continue_pull_request(&repository, pr_number)?;
+        if pull.state != "OPEN" {
+            return Err(format!(
+                "PR #{pr_number} is not open (state: {})",
+                pull.state
+            ));
+        }
+        let (base_sha, baseline_source) =
+            match prior_stage_base_for_pr(&database, &repository, pr_number) {
+                Ok(Some(base)) => base,
+                Ok(None) => continue_measurement_base(&repository, &options.base, pr_number, &pull),
+                Err(error) => return Err(format!("could not read prior measurements: {error}")),
+            };
+        warn_if_volatile_log_root(&options.logs_root)
+            .map_err(|error| format!("could not prepare log root: {error}"))?;
+        Ok((
+            tools,
+            options,
+            settings,
+            database,
+            repository,
+            login,
+            pr_number,
+            pull,
+            base_sha,
+            baseline_source,
+        ))
+    })() {
+        Ok(startup) => startup,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
     let (continued, claim) = match start_continue_run(
         &database,
         &repository,
@@ -2172,22 +2174,8 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             local_body: String::new(),
             parent_context: String::new(),
         };
-        let postgres = RunPostgres::setup(&repository, &options.base, &continued.run.id)?;
-        let playwright_cache_path = cache_root().join("playwright-browsers");
-        let preflight = toolchain_preflight(
-            &repository,
-            &options.base,
-            &options.image,
-            &options.env_file,
-            options.timeout_minutes,
-            &playwright_cache_path,
-        )
-        .unwrap_or_else(|error| alucard::ToolchainPreflight {
-            status: format!("Preflight unavailable: {error}"),
-            playwright_cache: None,
-        });
-        let playwright_cache = preflight.playwright_cache;
-        let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+        let (postgres, playwright_cache, toolchain_status) =
+            prepare_iteration_environment(&repository, &options, &continued.run.id, &cache_root())?;
         if interrupted() {
             return Err("interrupted".to_string());
         }
