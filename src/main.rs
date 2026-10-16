@@ -1765,6 +1765,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             None
                         }
                     };
+                    if interrupted() {
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                        return ExitCode::SUCCESS;
+                    }
                     let review = match review_gate(
                         &database,
                         &tools,
@@ -1796,6 +1800,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             }
                         }
                     };
+                    if interrupted() {
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                        return ExitCode::SUCCESS;
+                    }
                     write_iteration_measurement(IterationMeasurement {
                         database: &database,
                         run_id: &attempt_run.id,
@@ -1897,7 +1905,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         usage_log_dirs.push(prepared.directory.clone());
                         continue;
                     }
-                    let recovery_pr = match recover_worker_changes(
+                    let recovery = recover_worker_changes(
                         &database,
                         &tools,
                         &options,
@@ -1910,7 +1918,12 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         classification,
                         result.as_ref().ok().and_then(|value| value.status),
                         &log,
-                    ) {
+                    );
+                    if interrupted() {
+                        print!("{}", usage_report_for_dirs(&usage_log_dirs));
+                        return ExitCode::SUCCESS;
+                    }
+                    let recovery_pr = match recovery {
                         Ok(Some(number)) => {
                             post_iteration_usage(
                                 &options.queue.repository,
@@ -2146,6 +2159,9 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 postgres.as_ref(),
                 playwright_cache.as_deref(),
             )?;
+            if interrupted() {
+                return Err("interrupted".to_string());
+            }
             if advanced == Some(false) && (feedback.status.unwrap_or(1) != 0 || retained) {
                 let comment = format!("**🤖 Alucard continue: feedback agent stopped without publishing — needs human** (rc={})\n\nThe feedback agent pushed nothing, so this branch is still at the commit the previous review already read. Alucard stopped rather than re-run CI and review against it.", feedback.status.unwrap_or(1));
                 let _ = gh_output(
@@ -2236,6 +2252,9 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 None
             }
         };
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
         let review = match review_gate(
             &database,
             &tools,
@@ -2267,8 +2286,14 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 }
             }
         };
+        if interrupted() {
+            return Err("interrupted".to_string());
+        }
         Ok(review)
     })();
+    if interrupted() {
+        return ExitCode::SUCCESS;
+    }
     let outcome = result.as_ref().copied().unwrap_or(ReviewOutcome {
         ci_result: None,
         verdict: None,
@@ -3162,6 +3187,9 @@ impl CiGate<'_> {
         let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
         let remote = remote.trim();
         for attempt in 1..=3 {
+            if interrupted() {
+                return Err("interrupted".to_string());
+            }
             let Some(head) = wait_for_current_pr_head(&prepared.clone, pr_number, branch)? else {
                 eprintln!(
                     "CI gate: PR #{pr_number} did not register the current origin head; CI status is unverified."
@@ -3198,6 +3226,10 @@ impl CiGate<'_> {
                 }
                 CiResult::Failed => {}
                 CiResult::Unverified => unreachable!("CI probes do not return unverified results"),
+            }
+
+            if interrupted() {
+                return Err("interrupted".to_string());
             }
 
             if !pr_head_matches_origin(&prepared.clone, pr_number, branch, &head)? {
@@ -3269,6 +3301,9 @@ impl CiGate<'_> {
             })();
             if agent_invoked {
                 cleanup_repair_checkout(&checkout);
+                if interrupted() {
+                    return Err("interrupted".to_string());
+                }
                 if let Some(head_sha) = remote_branch_sha(&prepared.clone, branch) {
                     write_stage_measurement(
                         &prepared.directory,
@@ -3778,6 +3813,13 @@ fn run_feedback_once(
         status: None,
         classification: AgentExit::Failed,
     });
+    if interrupted() {
+        let retained = cleanup_repair_checkout(&checkout);
+        if !retained {
+            let _ = fs::remove_dir_all(&root);
+        }
+        return Err("interrupted".to_string());
+    }
     let after = remote_branch_sha(&prepared.clone, branch);
     let advanced = before.zip(after).map(|(before, after)| before != after);
     let blocked = fs::read_to_string(output.join(".alucard-blocked")).unwrap_or_default();
@@ -3955,6 +3997,9 @@ fn review_gate(
                     extra_env: &[],
                 }
                 .invoke(settings, &log)?;
+                if interrupted() {
+                    return Err("interrupted".to_string());
+                }
                 let current_head = gh_text(
                     &prepared.clone,
                     &[
@@ -4799,6 +4844,9 @@ fn recover_worker_changes(
     } else {
         None
     };
+    if interrupted() {
+        return Err("interrupted".to_string());
+    }
     let dirty = execute_command("git", &["status", "--porcelain"], &prepared.clone, None)
         .map_err(|error| error.to_string())?;
     let dirty = !dirty.stdout.is_empty();

@@ -5146,3 +5146,123 @@ fn sigterm_cleans_up_postgres_for_an_interrupted_run() {
     assert!(trace.contains("network rm alucard-"), "{trace}");
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn sigterm_during_continue_review_stops_following_stages_and_cleans_postgres() {
+    let root = temporary_path("sigterm-continue-review");
+    let repository = root.join("repository");
+    let origin = root.join("origin.git");
+    let bin = root.join("bin");
+    let trace = root.join("docker-trace");
+    let started = root.join("review-started");
+    fs::create_dir_all(&bin).unwrap();
+    git_repository(&repository);
+    fs::create_dir_all(repository.join(".alucard")).unwrap();
+    fs::write(repository.join(".alucard/postgres"), "postgres:16\n").unwrap();
+    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "postgres",
+    ]));
+    let base_sha = head_sha(&repository);
+    run(Command::new("git").args(["init", "-q", "--bare", origin.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        origin.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-qu",
+        "origin",
+        "main",
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "switch",
+        "-qc",
+        "feature",
+    ]));
+    fs::write(repository.join("feature.txt"), "feature\n").unwrap();
+    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "feature",
+    ]));
+    let head_sha = head_sha(&repository);
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-qu",
+        "origin",
+        "feature",
+    ]));
+    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "switch", "-q", "main"]));
+    let pull = root.join("pull.json");
+    fs::write(&pull, format!(r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{head_sha}","baseRefOid":"{base_sha}","title":"Test PR","comments":[]}}"#)).unwrap();
+    let docker = bin.join("docker");
+    fs::write(&docker, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$*\" in\n  *'--name alucard-review-'*) : > \"$ALUCARD_REVIEW_STARTED\"; while :; do sleep 1; done ;;\nesac\n").unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\ncase \"$*\" in\n  *'api user'*) echo alucard ;;\n  *'state,headRefName,headRefOid,baseRefOid,title,comments'*) cat \"$ALUCARD_PULL\" ;;\n  *'--json comments'*) echo '{\"comments\":[]}' ;;\n  *'headRefOid'*) echo \"$ALUCARD_HEAD\" ;;\n  *'reviews'*) : ;;\n  *'pr checks'*) : ;;\nesac\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
+    command
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_DOCKER_TRACE", &trace)
+        .env("ALUCARD_REVIEW_STARTED", &started)
+        .env("ALUCARD_PULL", &pull)
+        .env("ALUCARD_HEAD", &head_sha)
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "continue",
+            "91",
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            repository.to_str().unwrap(),
+        ]);
+    let mut process = command.spawn().unwrap();
+    wait_for_file(&started);
+    unsafe { libc::kill(process.id() as i32, libc::SIGTERM) };
+    assert_eq!(process.wait().unwrap().code(), Some(143));
+    let trace = fs::read_to_string(trace).unwrap();
+    assert!(trace.contains("rm -f -v alucard-postgres-"), "{trace}");
+    assert!(trace.contains("network rm alucard-"), "{trace}");
+    assert!(!trace.contains("--name alucard-feedback-"), "{trace}");
+    fs::remove_dir_all(root).unwrap();
+}
