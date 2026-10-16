@@ -2679,62 +2679,102 @@ $(printf '%s' "$feedback_findings" | xml_escape)
 # the watch path. Reset in setup_run_environment.
 CI_CHECKS_AVAILABLE=""
 
+# GitHub registers a pushed head with the PR and its CI a few seconds to a
+# minute after the push (#183). The gate probes this many times, this many
+# seconds apart, before it calls a head unregistered or its CI missing.
+CI_REGISTRATION_PROBES=4
+CI_POLL_INTERVAL="${CI_POLL_INTERVAL:-30}"
+
+# Echoes the PR's head SHA once it matches the branch tip on origin. Right
+# after a push the PR still names the old head, and that head's checks say
+# nothing about the new one. Fails if the two never agree within $3 probes
+# (default CI_REGISTRATION_PROBES), or either lookup keeps failing.
+# $1=pr_num $2=branch $3=probes
+current_pr_head() {
+  local pr_num="$1" branch="$2" probes="${3:-$CI_REGISTRATION_PROBES}" tip head probe
+  for probe in $(seq "$probes"); do
+    tip=$(remote_branch_sha "$REPO_ABS" "$branch") || tip=""
+    head=$(cd "$REPO_ABS" && \
+      gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+    if [ -n "$tip" ] && [ "$head" = "$tip" ]; then
+      printf '%s\n' "$head"
+      return 0
+    fi
+    [ "$probe" -lt "$probes" ] && sleep "$CI_POLL_INTERVAL"
+  done
+  return 1
+}
+
+# No CI result can be trusted for the PR's head. Like no CI: review goes on,
+# but an approval is flagged for a human rather than read as ready to merge.
+# $1=pr_num $2=reason
+ci_gate_unverified() {
+  local pr_num="$1" reason="$2"
+  log_event "CI gate: PR #$pr_num head not verified — ${reason}; reviewing, then flagging for human."
+  MEASURE_CI_RESULT="unverified"
+  cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
+    "${BOT_COMMENT_PREFIX} CI gate: head not verified — not green**
+
+${reason^}. CI results for another commit cannot qualify this PR's head.
+
+Review continues, but an approval will not mark this PR ready to merge. Run the full checks on the head commit before merging." 2>/dev/null || true
+}
+
 # Poll CI via the Actions run list. Echoes 0 (green), 1 (failed), or 2 (no run
 # for the PR's head: nothing ran, which is not a pass).
 # $1=pr_num $2=branch $3=pr_head_sha (may be empty)
 # Uses globals: REPO_ABS
 #
-# An empty SHA-filtered set is not "CI has not started yet". The branch may
-# already have runs for older commits, and waiting 45 minutes will not create
-# a run for HEAD. Two empty-HEAD probes (one 30s lag for enqueue) then skip
-# with a distinct log. A truly empty branch still gets a short window, then
-# the same no-CI result. The 2700s deadline is for in-progress
-# runs on the current HEAD only.
+# An empty SHA-filtered set is not "CI has not started yet" forever. The
+# branch may already have runs for older commits, and waiting 45 minutes will
+# not create a run for HEAD. After CI_REGISTRATION_PROBES empty probes the
+# poll reports no CI, with a log that says whether older SHAs ran. The 2700s
+# deadline is for queued and in-progress runs on the current HEAD only.
+#
+# Green needs every run to conclude success, neutral or skipped. A cancelled,
+# stale or unknown conclusion is not a pass.
 #
 # log_event is redirected to stderr here: this function's stdout is captured
 # as ci_rc and must stay a single integer.
 poll_ci_via_run_list() {
   local pr_num="$1" branch="$2" pr_head_sha="${3:-}"
   local deadline=$(( $(date +%s) + 2700 ))
-  local empty_head_probes=0 empty_branch_probes=0
-  local empty_head_limit=2 empty_branch_limit=4
+  local empty_probes=0
   local run_json branch_runs total in_progress failed
   local result=1
 
   while [ "$(date +%s)" -lt "$deadline" ]; do
     run_json=$(cd "$REPO_ABS" && \
       gh run list --branch "$branch" --json status,conclusion,databaseId,headSha \
-        --jq '[.[] | select(.status != "queued")]' 2>/dev/null || echo "[]")
+        2>/dev/null || echo "[]")
     branch_runs=$(echo "$run_json" | jq 'length')
     if [ -n "${pr_head_sha:-}" ]; then
       run_json=$(echo "$run_json" | jq --arg sha "$pr_head_sha" '[.[] | select(.headSha == $sha)]')
     fi
     total=$(echo "$run_json" | jq 'length')
     in_progress=$(echo "$run_json" | jq '[.[] | select(.status != "completed")] | length')
-    failed=$(echo "$run_json" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length')
+    failed=$(echo "$run_json" | jq '[.[] | select(.conclusion | IN("success", "neutral", "skipped") | not)] | length')
     if [ "$total" -eq 0 ]; then
-      if [ "$branch_runs" -gt 0 ]; then
-        empty_head_probes=$((empty_head_probes + 1))
-        if [ "$empty_head_probes" -ge "$empty_head_limit" ]; then
+      empty_probes=$((empty_probes + 1))
+      if [ "$empty_probes" -ge "$CI_REGISTRATION_PROBES" ]; then
+        if [ "$branch_runs" -gt 0 ]; then
           log_event "CI gate: no run for current HEAD ${pr_head_sha}; older SHAs on this branch did run." >&2
-          result=2
-          break
+        else
+          log_event "CI gate: no CI runs visible for PR #$pr_num (Actions may be off, or the token may lack 'actions' read permission)." >&2
         fi
-        echo "No run for current HEAD yet. Waiting..." >&2
-        sleep 30; continue
-      fi
-      empty_branch_probes=$((empty_branch_probes + 1))
-      if [ "$empty_branch_probes" -ge "$empty_branch_limit" ]; then
-        log_event "CI gate: no CI runs visible for PR #$pr_num (Actions may be off, or the token may lack 'actions' read permission)." >&2
         result=2
         break
       fi
-      echo "No workflow runs found yet — waiting..." >&2
-      sleep 30; continue
+      if [ "$branch_runs" -gt 0 ]; then
+        echo "No run for current HEAD yet. Waiting..." >&2
+      else
+        echo "No workflow runs found yet — waiting..." >&2
+      fi
+      sleep "$CI_POLL_INTERVAL"; continue
     fi
     if [ "$in_progress" -gt 0 ]; then
-      echo "Runs still in progress ($in_progress/$total) — waiting..." >&2
-      sleep 30; continue
+      echo "Runs still queued or in progress ($in_progress/$total) — waiting..." >&2
+      sleep "$CI_POLL_INTERVAL"; continue
     fi
     if [ "$failed" -gt 0 ]; then
       result=1
@@ -2763,10 +2803,13 @@ ci_gate() {
   echo "=== CI gate: PR #$pr_num on $branch ==="
 
   local ci_attempt ci_rc failed_run_id failure_log wt_fix fix_log _ci_err_file _ci_err pr_head_sha
+  local _probe
   for ci_attempt in 1 2 3; do
     # Refresh each attempt so a fix-agent push moves to the new HEAD SHA.
-    pr_head_sha=$(cd "$REPO_ABS" && \
-      gh pr view "$pr_num" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+    if ! pr_head_sha=$(current_pr_head "$pr_num" "$branch"); then
+      ci_gate_unverified "$pr_num" "the PR's head never matched origin's $branch"
+      return 0
+    fi
     echo "Polling CI (attempt $ci_attempt/3)..."
 
     # Prefer `gh pr checks --watch` when the token can reach statusCheckRollup.
@@ -2775,17 +2818,27 @@ ci_gate() {
     if [ "${CI_CHECKS_AVAILABLE:-}" = "false" ]; then
       ci_rc=$(poll_ci_via_run_list "$pr_num" "$branch" "${pr_head_sha:-}")
     else
-      _ci_err_file="$(mktemp /tmp/alucard_ci_err.XXXXXX)"
-      set +e
-      (cd "$REPO_ABS" && timeout 2700 gh pr checks "$pr_num" --watch --interval 30) \
-        2>"$_ci_err_file"
-      ci_rc=$?
-      _ci_err="$(cat "$_ci_err_file" 2>/dev/null || true)"
-      rm -f "$_ci_err_file"
-      [ -n "$_ci_err" ] && echo "$_ci_err" >&2
-      set -e
+      for _probe in $(seq "$CI_REGISTRATION_PROBES"); do
+        _ci_err_file="$(mktemp /tmp/alucard_ci_err.XXXXXX)"
+        set +e
+        (cd "$REPO_ABS" && timeout 2700 gh pr checks "$pr_num" --watch --interval 30) \
+          2>"$_ci_err_file"
+        ci_rc=$?
+        _ci_err="$(cat "$_ci_err_file" 2>/dev/null || true)"
+        rm -f "$_ci_err_file"
+        [ -n "$_ci_err" ] && echo "$_ci_err" >&2
+        set -e
+        if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "no checks reported" \
+          && [ "$_probe" -lt "$CI_REGISTRATION_PROBES" ]; then
+          echo "No checks registered for the head yet — waiting..." >&2
+          sleep "$CI_POLL_INTERVAL"
+          continue
+        fi
+        break
+      done
 
-      # No CI workflows configured (or none triggered for this PR's changed
+      # Still no checks after the registration wait: no CI workflows configured
+      # (or none triggered for this PR's changed
       # paths, or Actions disabled). Not a failure: a fix agent cannot repair
       # CI that does not exist. Not a pass either (#107).
       if [ "$ci_rc" -ne 0 ] && echo "$_ci_err" | grep -q "no checks reported"; then
@@ -2805,6 +2858,13 @@ ci_gate() {
         # Any other outcome means the checks surface answered.
         CI_CHECKS_AVAILABLE=true
       fi
+    fi
+
+    # A push while CI was polled leaves a result for a head that is gone.
+    # Neither green nor a reason to launch a fix agent.
+    if [ "$(current_pr_head "$pr_num" "$branch" 1 || true)" != "$pr_head_sha" ]; then
+      ci_gate_unverified "$pr_num" "the head moved from ${pr_head_sha} while CI was polled"
+      return 0
     fi
 
     if [ "$ci_rc" -eq 0 ]; then
@@ -3288,14 +3348,17 @@ _(Verdict \`${review_state}\` comes from the reviewer agent's decision file — 
 "
     fi
 
-    if [ "$review_state" = "APPROVED" ] && [ "${MEASURE_CI_RESULT:-}" = "none" ]; then
+    if [ "$review_state" = "APPROVED" ] && \
+      { [ "${MEASURE_CI_RESULT:-}" = "none" ] || [ "${MEASURE_CI_RESULT:-}" = "unverified" ]; }; then
       # An approval with no CI behind it is a code review, not a merge signal
       # (#107). A parked recovery PR stays parked for the same reason.
-      log_event "Review gate: PR #$pr_num approved, but no CI ran — flagging for human."
+      local _no_ci="no CI ran"
+      [ "$MEASURE_CI_RESULT" = "unverified" ] && _no_ci="CI was not verified for its head"
+      log_event "Review gate: PR #$pr_num approved, but ${_no_ci} — flagging for human."
       cd "$REPO_ABS" && gh pr comment "$pr_num" --body \
-        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED — no CI ran, needs human**
+        "${BOT_COMMENT_PREFIX} review cycle ${review_cycle}/${MAX_REVIEW_CYCLES}: APPROVED — ${_no_ci}, needs human**
 
-${_reviewed_line}The reviewer approved the code, but no CI ran on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.
+${_reviewed_line}The reviewer approved the code, but ${_no_ci} on this PR, so it is not ready to merge. Run the repository's full checks on the head commit before merging.
 
 ${review_comments}${_self_review_note}" 2>/dev/null || true
       add_pr_label "$REPO_ABS" "$pr_num" "needs-human"

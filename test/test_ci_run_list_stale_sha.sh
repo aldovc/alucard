@@ -51,12 +51,27 @@ git -C "$REPO" checkout -q main
 cat > "$MOCK_BIN/gh" <<'MOCK'
 #!/bin/bash
 set -euo pipefail
+# Apply --jq to run list output as gh does, so the caller's filter is tested.
+if [ "$1 $2" = "run list" ] && [[ " $* " == *" --jq "* ]]; then
+  args=(); filter=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--jq" ]; then filter="$2"; shift 2; else args+=("$1"); shift; fi
+  done
+  "$0" "${args[@]}" | jq -c "$filter"
+  exit "${PIPESTATUS[0]}"
+fi
 printf '%s\n' "$*" >> "$ALUCARD_TEST_GH_TRACE"
 case "$1 $2" in
   "pr list")
     printf '479\n' ;;
   "pr view")
-    printf '%s\n' "$ALUCARD_TEST_HEAD_SHA" ;;
+    # PR_HEADS: the head each successive view names; the last one repeats.
+    read -ra heads <<<"${ALUCARD_TEST_PR_HEADS:-$ALUCARD_TEST_HEAD_SHA}"
+    v=0
+    [ -s "$ALUCARD_TEST_VIEW_COUNT" ] && v=$(<"$ALUCARD_TEST_VIEW_COUNT")
+    printf '%s\n' "$((v + 1))" > "$ALUCARD_TEST_VIEW_COUNT"
+    [ "$v" -lt "${#heads[@]}" ] || v=$((${#heads[@]} - 1))
+    printf '%s\n' "${heads[$v]}" ;;
   "pr checks")
     echo "GraphQL: Resource not accessible by personal access token" >&2
     exit 1 ;;
@@ -89,6 +104,18 @@ case "$1 $2" in
           printf '[{"databaseId":22,"status":"completed","conclusion":"success","headSha":"%s"}]\n' \
             "$ALUCARD_TEST_HEAD_SHA"
         fi ;;
+      queued_then_success)
+        # Queued past the registration window: still pending, not missing.
+        if [ "$n" -le 5 ]; then
+          printf '[{"databaseId":22,"status":"queued","conclusion":"","headSha":"%s"}]\n' \
+            "$ALUCARD_TEST_HEAD_SHA"
+        else
+          printf '[{"databaseId":22,"status":"completed","conclusion":"success","headSha":"%s"}]\n' \
+            "$ALUCARD_TEST_HEAD_SHA"
+        fi ;;
+      head_cancelled|head_skipped)
+        printf '[{"databaseId":22,"status":"completed","conclusion":"success","headSha":"%s"},{"databaseId":23,"status":"completed","conclusion":"%s","headSha":"%s"}]\n' \
+          "$ALUCARD_TEST_HEAD_SHA" "${ALUCARD_TEST_RUN_MODE#head_}" "$ALUCARD_TEST_HEAD_SHA" ;;
       head_failure)
         printf '[{"databaseId":33,"status":"completed","conclusion":"failure","headSha":"%s"}]\n' \
           "$ALUCARD_TEST_HEAD_SHA" ;;
@@ -140,6 +167,7 @@ export ALUCARD_TEST_SLEEP_TRACE="$SLEEP_TRACE"
 export ALUCARD_TEST_OLD_SHA="$OLD_SHA"
 export ALUCARD_TEST_HEAD_SHA="$HEAD_SHA"
 export ALUCARD_TEST_RUN_COUNT="$TEST_DIR/run-count"
+export ALUCARD_TEST_VIEW_COUNT="$TEST_DIR/view-count"
 
 REPO_ABS="$REPO"
 WT_ROOT="$TEST_DIR/wt"
@@ -167,6 +195,20 @@ reset_traces() {
   : > "$SLEEP_TRACE"
   : > "$EVENTS"
   : > "$ALUCARD_TEST_RUN_COUNT"
+  : > "$ALUCARD_TEST_VIEW_COUNT"
+}
+
+# ci_gate on the run-list path with the PR naming $2 in turn; sets EV.
+run_gate() {
+  reset_traces
+  export ALUCARD_TEST_RUN_MODE="$1" ALUCARD_TEST_PR_HEADS="$2"
+  CI_CHECKS_AVAILABLE=false
+  MEASURE_CI_RESULT=""
+  set +e
+  ci_gate 1 feature "$REMOTE" 479 >"$TEST_DIR/out-gate" 2>&1
+  set -e
+  unset ALUCARD_TEST_PR_HEADS
+  EV=$(<"$EVENTS")
 }
 
 run_poll() {
@@ -198,8 +240,8 @@ assert_not_contains "does not blame Actions permissions" \
   "actions' read permission" "$EV"
 assert_not_contains "does not print the empty-branch wait line" \
   "No workflow runs found yet" "$POLL_ERR"
-assert_eq "probes twice (one lag, then skip)" "2" "$RUN_N"
-assert_eq "sleeps once between the two probes" "1" "$SLEEP_N"
+assert_eq "probes through the registration window, then skips" "4" "$RUN_N"
+assert_eq "sleeps between those probes only" "3" "$SLEEP_N"
 
 # ── Empty branch: no CI after a short wait ───────────────────────────────────
 echo ""
@@ -233,8 +275,26 @@ run_poll in_progress_then_success
 
 assert_eq "in-progress HEAD completes as green" "0" "$POLL_RC"
 assert_contains "in-progress wait message still fires" \
-  "Runs still in progress" "$POLL_ERR"
+  "Runs still queued or in progress" "$POLL_ERR"
 assert_eq "waits once for the in-progress run" "1" "$SLEEP_N"
+
+# ── Queued HEAD is pending, not missing (#183) ──────────────────────────────
+echo ""
+echo "── queued HEAD waits past the registration window ──"
+run_poll queued_then_success
+
+assert_eq "a long-queued HEAD run completes as green" "0" "$POLL_RC"
+assert_not_contains "a queued HEAD run is not reported as no CI" \
+  "no CI runs visible" "$EV"
+
+# ── Only success, neutral and skipped are green (#183) ──────────────────────
+echo ""
+echo "── cancelled HEAD run is not green ──"
+run_poll head_cancelled
+assert_eq "a cancelled HEAD run is not green" "1" "$POLL_RC"
+
+run_poll head_skipped
+assert_eq "a skipped workflow beside a green one stays green" "0" "$POLL_RC"
 
 # ── Failing HEAD still returns 1 ─────────────────────────────────────────────
 echo ""
@@ -266,6 +326,33 @@ assert_not_contains "ci_gate does not sit on the empty-branch wait line" \
   "No workflow runs found yet" "$OUT"
 assert_eq "ci_gate records that no CI ran" "none" "$MEASURE_CI_RESULT"
 assert_not_contains "and does not call the PR green" "green — ready" "$EV"
+
+# ── ci_gate: waits for the PR to name the pushed head (#183) ────────────────
+echo ""
+echo "── ci_gate: grades the pushed head, not the PR's stale one ──"
+run_gate head_success "$OLD_SHA $HEAD_SHA"
+assert_eq "a PR head that lags the push still grades the pushed head" \
+  "green" "$MEASURE_CI_RESULT"
+
+# ── ci_gate: a head that never registers is not graded (#183) ──────────────
+echo ""
+echo "── ci_gate: the PR never names the pushed head ──"
+# Older SHAs ran green; the PR keeps naming one of them.
+run_gate stale "$OLD_SHA"
+assert_eq "a stale PR head is unverified, not green" "unverified" "$MEASURE_CI_RESULT"
+assert_contains "the handoff names the mismatch" "never matched origin's feature" "$EV"
+assert_not_contains "no fix agent for an unverified head" "launching fix agent" "$EV"
+
+# ── ci_gate: a push while CI is polled voids the result (#183) ──────────────
+echo ""
+echo "── ci_gate: the head moves while CI is polled ──"
+run_gate head_success "$HEAD_SHA $OLD_SHA"
+assert_eq "a green result for a head that moved is unverified" "unverified" "$MEASURE_CI_RESULT"
+assert_contains "the handoff says the head moved" "moved from $HEAD_SHA" "$EV"
+
+run_gate head_failure "$HEAD_SHA $OLD_SHA"
+assert_eq "a red result for a head that moved is unverified" "unverified" "$MEASURE_CI_RESULT"
+assert_not_contains "and launches no fix agent" "launching fix agent" "$EV"
 
 # ── ci_gate: failing HEAD still launches the fix agent ───────────────────────
 echo ""
