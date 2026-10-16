@@ -369,11 +369,13 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             return fail(&format!("alucard: reconciliation failed: {error}"));
         }
     }
+    if let Err(error) = warn_if_volatile_log_root(&options.logs_root) {
+        return fail(&format!("alucard: could not prepare log root: {error}"));
+    }
     let run = match start_merge_run(&database, &repository, &options.logs_root) {
         Ok(run) => run,
         Err(error) => return fail(&format!("alucard: could not start merge run: {error}")),
     };
-    warn_if_volatile_log_root(&options.logs_root);
     let claim = match acquire_pr(&database, &run.repository_id, options.pr_number, &run.id) {
         Ok(claim) => claim,
         Err(error) => {
@@ -788,13 +790,18 @@ fn default_logs_root() -> Result<PathBuf, String> {
         .ok_or_else(|| "log root is not set; use --logs-root or ALUCARD_LOG_ROOT".to_string())
 }
 
-fn warn_if_volatile_log_root(logs_root: &Path) {
-    if logs_root.starts_with("/tmp") || logs_root.starts_with("/private/tmp") {
+fn warn_if_volatile_log_root(logs_root: &Path) -> Result<(), String> {
+    fs::create_dir_all(logs_root).map_err(|error| error.to_string())?;
+    let resolved = logs_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if resolved.starts_with("/tmp") || resolved.starts_with("/private/tmp") {
         eprintln!(
             "Warning: --logs-root {} is under /tmp — these run logs will not survive a reboot.",
-            logs_root.display()
+            resolved.display()
         );
     }
+    Ok(())
 }
 
 fn required_settings(env_file: &Path) -> Result<AgentSettings, String> {
@@ -1413,7 +1420,9 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(file) => file,
         Err(error) => return fail(&format!("alucard: {error}")),
     };
-    warn_if_volatile_log_root(&options.logs_root);
+    if let Err(error) = warn_if_volatile_log_root(&options.logs_root) {
+        return fail(&format!("alucard: could not prepare log root: {error}"));
+    }
     let mut iteration = 1;
     while iteration <= options.iterations {
         let selected = match select_run_task(&options.queue, task_file.as_deref(), &database) {
@@ -2019,6 +2028,9 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 ))
             }
         };
+    if let Err(error) = warn_if_volatile_log_root(&options.logs_root) {
+        return fail(&format!("alucard: could not prepare log root: {error}"));
+    }
     let (continued, claim) = match start_continue_run(
         &database,
         &repository,
@@ -2034,7 +2046,6 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(continued) => continued,
         Err(error) => return fail(&format!("alucard: could not start continue run: {error}")),
     };
-    warn_if_volatile_log_root(&options.logs_root);
     let iteration_started = Instant::now();
     let result: Result<ReviewOutcome, String> = (|| {
         fs::create_dir_all(continued.run.logs_path.as_deref().unwrap_or_default())

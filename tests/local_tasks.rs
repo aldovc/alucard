@@ -209,6 +209,7 @@ fn merge_cli_uses_the_shared_log_root_sources() {
             None,
         ),
         ("default", None, None, Some(root.join("state"))),
+        ("relative", Some(PathBuf::from("logs")), None, None),
     ] {
         let database = root.join(format!("{name}.db"));
         let expected_root = flag_root
@@ -216,6 +217,10 @@ fn merge_cli_uses_the_shared_log_root_sources() {
             .or(environment_root.as_ref())
             .cloned()
             .unwrap_or_else(|| state_home.as_ref().unwrap().join("alucard/logs"));
+        let expected_warning_root = expected_root
+            .is_absolute()
+            .then(|| expected_root.clone())
+            .unwrap_or_else(|| repository.join(&expected_root));
         let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
         command
             .current_dir(&repository)
@@ -249,7 +254,7 @@ fn merge_cli_uses_the_shared_log_root_sources() {
         assert!(!output.status.success(), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
             "Warning: --logs-root {} is under /tmp — these run logs will not survive a reboot.",
-            expected_root.display()
+            expected_warning_root.display()
         )));
         let connection = open(&database).unwrap();
         let logs_path: String = connection
