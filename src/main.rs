@@ -266,6 +266,29 @@ fn postgres_agent_environment(postgres: Option<&RunPostgres>) -> (Option<&str>, 
     )
 }
 
+fn prepare_iteration_environment(
+    repository: &Path,
+    options: &RunCommandOptions,
+    run_id: &str,
+    cache: &Path,
+) -> Result<(Option<RunPostgres>, Option<PathBuf>, String), String> {
+    let postgres = RunPostgres::setup(repository, &options.base, run_id)?;
+    let preflight = toolchain_preflight(
+        repository,
+        &options.base,
+        &options.image,
+        &options.env_file,
+        options.timeout_minutes,
+        &cache.join("playwright-browsers"),
+    )
+    .unwrap_or_else(|error| alucard::ToolchainPreflight {
+        status: format!("Preflight unavailable: {error}"),
+        playwright_cache: None,
+    });
+    let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+    Ok((postgres, preflight.playwright_cache, toolchain_status))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (db_path, mut commands) = match parse_db_path(&args) {
@@ -1490,7 +1513,6 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             Ok(startup) => startup,
             Err(error) => return fail(&format!("alucard: {error}")),
         };
-    let playwright_cache_path = cache.join("playwright-browsers");
     let mut checks_available = true;
     let mut iteration = 1;
     while iteration <= options.iterations {
@@ -1569,35 +1591,25 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 return fail(&format!("alucard: {error}"));
             }
         };
-        let postgres =
-            match RunPostgres::setup(&options.queue.repository, &options.base, &attempt_run.id) {
-                Ok(postgres) => postgres,
-                Err(error) => {
-                    release_without_pr(
-                        &database,
-                        &selected,
-                        &claim.id,
-                        &owner_run_id,
-                        &options.queue.repository,
-                    );
-                    let _ = finish_run(&database, &attempt_run.id, "failed");
-                    return fail(&format!("alucard: {error}"));
-                }
-            };
-        let preflight = toolchain_preflight(
+        let (postgres, playwright_cache, toolchain_status) = match prepare_iteration_environment(
             &options.queue.repository,
-            &options.base,
-            &options.image,
-            &options.env_file,
-            options.timeout_minutes,
-            &playwright_cache_path,
-        )
-        .unwrap_or_else(|error| alucard::ToolchainPreflight {
-            status: format!("Preflight unavailable: {error}"),
-            playwright_cache: None,
-        });
-        let playwright_cache = preflight.playwright_cache;
-        let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+            &options,
+            &attempt_run.id,
+            &cache,
+        ) {
+            Ok(environment) => environment,
+            Err(error) => {
+                release_without_pr(
+                    &database,
+                    &selected,
+                    &claim.id,
+                    &owner_run_id,
+                    &options.queue.repository,
+                );
+                let _ = finish_run(&database, &attempt_run.id, "failed");
+                return fail(&format!("alucard: {error}"));
+            }
+        };
         if interrupted() {
             print!("{}", usage_report_for_dirs(&usage_log_dirs));
             return ExitCode::SUCCESS;
@@ -2162,22 +2174,8 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             local_body: String::new(),
             parent_context: String::new(),
         };
-        let playwright_cache_path = cache_root().join("playwright-browsers");
-        let postgres = RunPostgres::setup(&repository, &options.base, &continued.run.id)?;
-        let preflight = toolchain_preflight(
-            &repository,
-            &options.base,
-            &options.image,
-            &options.env_file,
-            options.timeout_minutes,
-            &playwright_cache_path,
-        )
-        .unwrap_or_else(|error| alucard::ToolchainPreflight {
-            status: format!("Preflight unavailable: {error}"),
-            playwright_cache: None,
-        });
-        let playwright_cache = preflight.playwright_cache;
-        let toolchain_status = postgres_toolchain_status(preflight.status, postgres.is_some());
+        let (postgres, playwright_cache, toolchain_status) =
+            prepare_iteration_environment(&repository, &options, &continued.run.id, &cache_root())?;
         if interrupted() {
             return Err("interrupted".to_string());
         }
