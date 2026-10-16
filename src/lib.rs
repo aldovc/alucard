@@ -379,6 +379,20 @@ pub struct ToolchainPreflight {
     pub playwright_cache: Option<PathBuf>,
 }
 
+fn playwright_pin_mismatch_message(output: &str, cache_available: bool) -> Option<String> {
+    let pin = output
+        .lines()
+        .find_map(|line| line.strip_prefix("alucard-playwright-pin: "))?;
+    let cache_note = if cache_available {
+        "The shared cache holds both, so this costs one download rather than one per iteration — align the repo's pin to stop carrying a second revision."
+    } else {
+        "There is no shared cache this run, so the repo downloads its own browser inside every iteration — align the repo's pin with the image's."
+    };
+    Some(format!(
+        "Playwright pin mismatch: this repo's {pin}. {cache_note}"
+    ))
+}
+
 /// Runs dependency installs in a fresh clone of the base branch.
 pub fn toolchain_preflight(
     repository: &Path,
@@ -471,16 +485,8 @@ pub fn toolchain_preflight(
             cleanup_docker_container(&name);
             let output = output.map_err(|error| format!("cannot start docker: {error}"))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(pin) = stdout
-                .lines()
-                .find_map(|line| line.strip_prefix("alucard-playwright-pin: "))
-            {
-                let cache_note = if cache_available {
-                    "The shared cache holds both, so this costs one download rather than one per iteration — align the repo's pin to stop carrying a second revision."
-                } else {
-                    "There is no shared cache this run, so the repo downloads its own browser inside every iteration — align the repo's pin with the image's."
-                };
-                eprintln!("Playwright pin mismatch: this repo's {pin}. {cache_note}");
+            if let Some(message) = playwright_pin_mismatch_message(&stdout, cache_available) {
+                eprintln!("{message}");
             }
             let rc = output.status.code().unwrap_or(1);
             results.push((install, rc));
@@ -795,7 +801,7 @@ mod agent_tests {
         fs::write(
             bin.join("docker"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; *:/opt/alucard-browsers:rw) browsers=${{argument%:/opt/alucard-browsers:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  if [ \"${{ALUCARD_SEED_CACHE:-}}\" = 1 ]; then mkdir -p \"$browsers\"; printf unknown > \"$browsers/.alucard-seeded\"; fi\n  if [ \"${{ALUCARD_RESEED_FAIL:-}}\" = 1 ]; then case \"$*\" in *'rm -f \"$marker\"'*) rm -f \"$browsers/.alucard-seeded\" ;; esac; fi\n  exit 23\nfi\n",
+                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; *:/opt/alucard-browsers:rw) browsers=${{argument%:/opt/alucard-browsers:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  if [ \"${{ALUCARD_SEED_CACHE:-}}\" = 1 ]; then mkdir -p \"$browsers\"; printf unknown > \"$browsers/.alucard-seeded\"; fi\n  if [ \"${{ALUCARD_RESEED_FAIL:-}}\" = 1 ]; then case \"$*\" in *'rm -f \"$marker\"'*) rm -f \"$browsers/.alucard-seeded\" ;; esac; fi\n  printf '%s\\n' 'alucard-playwright-pin: playwright 1.2.3 wants chromium 1234; the image bakes chromium 5678'\n  exit 23\nfi\n",
                 trace.display(),
                 non_default_ran.display()
             ),
@@ -856,6 +862,13 @@ mod agent_tests {
         assert!(status
             .status
             .contains("`npm ci` at the repo root fails inside the container (rc=23)"));
+        assert_eq!(
+            super::playwright_pin_mismatch_message(
+                "alucard-playwright-pin: playwright 1.2.3 wants chromium 1234; the image bakes chromium 5678\n",
+                true,
+            ),
+            Some("Playwright pin mismatch: this repo's playwright 1.2.3 wants chromium 1234; the image bakes chromium 5678. The shared cache holds both, so this costs one download rather than one per iteration — align the repo's pin to stop carrying a second revision.".into())
+        );
         assert!(status.playwright_cache.is_none());
         env::set_var("ALUCARD_SEED_CACHE", "1");
         let seeded = super::toolchain_preflight(
