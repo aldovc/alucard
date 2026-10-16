@@ -1895,9 +1895,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             &options.queue.repository,
                         );
                         let _ = finish_run(&database, &attempt_run.id, "failed");
-                        return fail(
-                            "alucard: provider returned billing_error (credit balance too low)",
+                        eprintln!(
+                            "alucard: provider returned billing_error (credit balance too low)"
                         );
+                        return ExitCode::from(2);
                     }
                     if classification == alucard::AgentExit::Transport
                         && attempt < options.transport_attempts

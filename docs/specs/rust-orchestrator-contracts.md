@@ -132,11 +132,14 @@ least one configured role uses Codex.
 Turn/budget settings are `ALUCARD_{WORKER,CI_FIX,REVIEWER,FEEDBACK,WRAPUP}_MAX_TURNS`
 and `_MAX_BUDGET`; retry count is `ALUCARD_TRANSPORT_RETRY_ATTEMPTS`.
 
-Exit 0 means the requested command completed. Invalid arguments, unavailable
-prerequisites, malformed task files, command/agent failures, and failed gates
-exit 1. An agent whose worktree is absent uses 78 (`NO_WORKTREE_RC`) so the
-run classifies it as retryable; `timeout` uses 124 and hard-kill handling sees
-137. Agent commands otherwise retain their process exit code for classification.
+`run` and `continue` exit 0 after completion, an empty queue, max iterations,
+or a gate/recovery outcome that leaves work for a human. A provider
+`billing_error` aborts `run` with 2. Invalid arguments, unavailable
+prerequisites, malformed task files, and setup errors exit 1. SIGINT and
+SIGTERM exit 130 and 143. An agent whose worktree is absent uses 78
+(`NO_WORKTREE_RC`) so the run classifies it as retryable; `timeout` uses 124
+and hard-kill handling sees 137. Agent commands otherwise retain their process
+exit code for classification.
 
 ## Queue JSON contract
 

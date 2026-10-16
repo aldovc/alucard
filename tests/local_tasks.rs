@@ -5015,7 +5015,7 @@ fn test_pr_binding() {
 fn test_transport_recovery() {
     let billing_root = temporary_path("transport-billing");
     let billing = run_transport_case(&billing_root, "billing", 2);
-    assert!(!billing.status.success(), "{billing:?}");
+    assert_eq!(billing.status.code(), Some(2), "{billing:?}");
     assert_eq!(
         fs::read_to_string(billing_root.join("trace"))
             .unwrap()
