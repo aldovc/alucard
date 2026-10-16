@@ -1598,11 +1598,16 @@ mod measurement_tests {
         let https_checkout = directory.join("checkout");
         let cached_checkout = directory.join("cache/example/web");
         let ssh_checkout = directory.join("ssh-checkout");
+        let trailing_slash_checkout = directory.join("trailing-slash-checkout");
         let no_remote = directory.join("no-remote");
         for (checkout, origin) in [
             (&https_checkout, "https://github.com/example/web.git"),
             (&cached_checkout, "https://github.com/example/web.git"),
             (&ssh_checkout, "git@github.com:example/web.git"),
+            (
+                &trailing_slash_checkout,
+                "https://github.com/example/web.git/",
+            ),
             (&no_remote, ""),
         ] {
             fs::create_dir_all(checkout).unwrap();
@@ -1625,6 +1630,7 @@ mod measurement_tests {
         assert_eq!(repository_id(&https_checkout), "example/web");
         assert_eq!(repository_id(&cached_checkout), "example/web");
         assert_eq!(repository_id(&ssh_checkout), "example/web");
+        assert_eq!(repository_id(&trailing_slash_checkout), "example/web");
         assert_eq!(repository_id(&no_remote), "no-remote");
 
         fs::remove_dir_all(directory).unwrap();
@@ -1834,6 +1840,7 @@ pub fn repository_id(repository: &Path) -> String {
     let url = String::from_utf8_lossy(&output.stdout);
     let url = url
         .trim()
+        .trim_end_matches('/')
         .strip_suffix(".git")
         .unwrap_or(url.trim())
         .trim_end_matches('/');
@@ -3284,6 +3291,9 @@ fn migrate_ledger_repository_id(
             && repository_ledger_id(Path::new(&candidate)).is_ok_and(|id| id == repository_id);
         if candidate == legacy_id
             || candidate.eq_ignore_ascii_case(&repository_id)
+            || candidate
+                .strip_suffix(".git")
+                .is_some_and(|legacy| legacy.eq_ignore_ascii_case(&repository_id))
             || is_matching_path
         {
             migrate_repository_identity(connection, &candidate, &repository_id)?;
