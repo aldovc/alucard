@@ -2579,6 +2579,11 @@ impl ActiveCommand {
     pub fn register(pid: u32) -> Self {
         let pid = pid as i32;
         ACTIVE_COMMAND_PID.store(pid, Ordering::SeqCst);
+        if COMMAND_INTERRUPTED.load(Ordering::SeqCst) {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
         Self(pid)
     }
 }

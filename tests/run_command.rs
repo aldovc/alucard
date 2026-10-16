@@ -1,4 +1,7 @@
-use alucard::{interrupt_active_command, reset_command_interrupt, run_command, ACTIVE_COMMAND_PID};
+use alucard::{
+    interrupt_active_command, reset_command_interrupt, run_command, ActiveCommand,
+    ACTIVE_COMMAND_PID,
+};
 use std::fs;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -37,4 +40,22 @@ fn run_command_interrupts_the_child_while_waiting() {
 
     reset_command_interrupt();
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn registration_terminates_a_child_when_already_interrupted() {
+    reset_command_interrupt();
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+
+    interrupt_active_command();
+    let active_command = ActiveCommand::register(child.id());
+
+    assert!(!child.wait().unwrap().success());
+    drop(active_command);
+    assert_eq!(ACTIVE_COMMAND_PID.load(Ordering::SeqCst), 0);
+    reset_command_interrupt();
 }
