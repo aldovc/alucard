@@ -58,7 +58,10 @@ fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (Option<S
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir(&repository).unwrap();
     git_repository(&repository);
-    if case.name == "postgres-agent-environment" {
+    if matches!(
+        case.name,
+        "postgres-agent-environment" | "postgres-two-iterations"
+    ) {
         fs::create_dir(repository.join(".alucard")).unwrap();
         fs::write(repository.join(".alucard/postgres"), "postgres:16\n").unwrap();
         run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
@@ -284,6 +287,10 @@ printf 'worker change\n' > "$work/change.txt"
 git -C "$work" add change.txt
 git -C "$work" commit -qm worker
 branch=$(git -C "$work" branch --show-current)
+if [ "$ALUCARD_CASE" = postgres-two-iterations ]; then
+  number=$(($(cat "$ALUCARD_PR_NUMBER_FILE") + 1))
+  printf '%s\n' "$number" > "$ALUCARD_PR_NUMBER_FILE"
+fi
 printf '%s\n' "$branch" > "$ALUCARD_BRANCH_FILE"
 git -C "$work" push -q origin "HEAD:$branch"
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
@@ -344,10 +351,14 @@ case "$1 $2" in
   'issue view') printf '%s\n' 'Recovered task' ;;
   'pr edit') echo 'Projects (classic) is being deprecated' >&2; exit 1 ;;
   'api --silent') : ;;
-  'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
+  'pr list')
+    number=77
+    if [ "$ALUCARD_CASE" = postgres-two-iterations ]; then number=$(cat "$ALUCARD_PR_NUMBER_FILE"); fi
+    printf '[{"number":%s,"headRefName":"%s","headRefOid":"%s"}]\n' "$number" "$branch" "$(sha)"
+    ;;
   'pr checks')
     case "$ALUCARD_CASE" in recovery-unpark|recovery-old-head|recovery-untrusted|recovery-formal-approved) exit 0 ;; esac
-    if [ "$ALUCARD_CASE" = postgres-agent-environment ]; then echo "checks failed" >&2; exit 1; fi
+    if [ "$ALUCARD_CASE" = postgres-agent-environment ] || [ "$ALUCARD_CASE" = postgres-two-iterations ]; then echo "checks failed" >&2; exit 1; fi
     case "$ALUCARD_CASE" in
       ci-stale-checks-green) advance_head; exit 0 ;;
       ci-stale-checks-failed) advance_head; echo "checks failed" >&2; exit 1 ;;
@@ -371,7 +382,7 @@ case "$1 $2" in
   'pr view')
     case "$*" in
       *state,headRefName,headRefOid,baseRefOid,title,comments*)
-        if [ "$ALUCARD_CASE" = postgres-agent-environment ]; then
+        if [ "$ALUCARD_CASE" = postgres-agent-environment ] || [ "$ALUCARD_CASE" = postgres-two-iterations ]; then
           printf '{"state":"OPEN","headRefName":"%s","headRefOid":"%s","baseRefOid":"%s","title":"Review task","comments":[]}\n' "$branch" "$(sha)" "$(git --git-dir="$ALUCARD_REMOTE" rev-parse refs/heads/main)"
         fi ;;
       *headRefOid*)
@@ -415,7 +426,15 @@ esac
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
 
     let tasks = root.join("tasks.md");
-    fs::write(&tasks, "## [ ] review: Review task\n").unwrap();
+    fs::write(
+        &tasks,
+        if case.name == "postgres-two-iterations" {
+            "## [ ] first: First task\n\n## [ ] second: Second task\n"
+        } else {
+            "## [ ] review: Review task\n"
+        },
+    )
+    .unwrap();
     let environment = root.join("agent.env");
     fs::write(
         &environment,
@@ -437,6 +456,8 @@ esac
     let review_heads = root.join("review-heads");
     fs::write(&review_heads, "").unwrap();
     let branch_file = root.join("branch");
+    let pr_number_file = root.join("pr-number");
+    fs::write(&pr_number_file, "76\n").unwrap();
     let gh_trace = root.join("gh-trace");
     let docker_trace = root.join("docker-trace");
     let database = root.join("ledger.db");
@@ -452,6 +473,7 @@ esac
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
         .env("ALUCARD_REMOTE", &remote)
         .env("ALUCARD_BRANCH_FILE", &branch_file)
+        .env("ALUCARD_PR_NUMBER_FILE", &pr_number_file)
         .env("ALUCARD_REVIEW_ARGS", &review_args)
         .env("ALUCARD_REVIEW_ATTEMPTS", &review_attempts)
         .env("ALUCARD_REVIEW_HEADS", &review_heads)
@@ -511,7 +533,11 @@ esac
             database.to_str().unwrap(),
             "run",
             "--iterations",
-            "1",
+            if case.name == "postgres-two-iterations" {
+                "2"
+            } else {
+                "1"
+            },
             "--tasks",
             tasks.to_str().unwrap(),
             "--env-file",
@@ -1464,5 +1490,45 @@ fn postgres_agent_environment_reaches_run_and_continue_agent_launches() {
         &continue_trace[run_trace.len()..],
         &["fix", "review", "feedback"],
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn postgres_is_recreated_for_each_run_iteration() {
+    let case = ReviewCase {
+        name: "postgres-two-iterations",
+        review_policy: None,
+        oversized_policy: false,
+        review_policy_max_bytes: None,
+        file_verdict: "CHANGES_REQUESTED",
+        formal_verdict: "",
+        reviewer_outcomes: "verdict\nverdict",
+        comments_json: "{\"comments\":[]}",
+        advance_head: false,
+        expected_verdict: "CHANGES_REQUESTED",
+        expected_state: "review_changes_requested",
+    };
+    let (root, _, _, _) = run_review_case(&case);
+    let trace = fs::read_to_string(root.join("docker-trace")).unwrap();
+    let networks = trace
+        .lines()
+        .filter_map(|line| line.strip_prefix("network create "))
+        .collect::<Vec<_>>();
+    assert_eq!(networks.len(), 2, "{trace}");
+    assert_ne!(networks[0], networks[1], "{trace}");
+
+    let first_removed = trace.find(&format!("network rm {}", networks[0])).unwrap();
+    let second_created = trace
+        .find(&format!("network create {}", networks[1]))
+        .unwrap();
+    assert!(first_removed < second_created, "{trace}");
+    for network in networks {
+        let run_id = network.strip_prefix("alucard-").unwrap();
+        assert!(trace.contains(&format!(
+            "run -d --rm --name alucard-postgres-{run_id} --network {network}"
+        )));
+        assert!(trace.contains(&format!("rm -f -v alucard-postgres-{run_id}")));
+        assert!(trace.contains(&format!("network rm {network}")));
+    }
     fs::remove_dir_all(root).unwrap();
 }
