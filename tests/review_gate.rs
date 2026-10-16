@@ -323,7 +323,7 @@ case "$1 $2" in
   'api user') printf '%s\n' alucard-bot ;;
   'pr ready') : ;;
   'issue view') printf '%s\n' 'Recovered task' ;;
-  'pr edit') : ;;
+  'pr edit') echo 'Projects (classic) is being deprecated' >&2; exit 1 ;;
   'api --silent') : ;;
   'pr list') printf '[{"number":77,"headRefName":"%s","headRefOid":"%s"}]\n' "$branch" "$(sha)" ;;
   'pr checks')
@@ -1082,7 +1082,7 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
                 "{trace}"
             );
             assert!(
-                trace.contains("pr edit 77 --title Recovered task --body Closes #77"),
+                trace.contains("PATCH repos/{owner}/{repo}/pulls/77 -f title=Recovered task -f body=Closes #77"),
                 "{trace}"
             );
             assert!(trace.contains("Marked ready for review"), "{trace}");
@@ -1283,9 +1283,12 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             assert!(event.contains("Unpublished work preserved at"), "{event}");
         }
         match case.expected_state {
-            "review_blocked" => assert!(trace.contains("pr edit 77 --add-label needs-human")),
+            "review_blocked" => assert!(trace
+                .contains("POST repos/{owner}/{repo}/issues/77/labels -f labels[]=needs-human")),
             "review_needs_human" => {
-                assert!(trace.contains("pr edit 77 --add-label needs-human"));
+                assert!(trace.contains(
+                    "POST repos/{owner}/{repo}/issues/77/labels -f labels[]=needs-human"
+                ));
                 if !matches!(
                     case.name,
                     "registration-unverified"
