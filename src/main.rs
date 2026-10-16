@@ -36,6 +36,129 @@ const RECOVERY_MARKER_BODY: &str = "**🤖 Alucard recovery PR parked** — open
 const RECOVERY_MARKER_PREFIX: &str = "**🤖 Alucard recovery PR parked**";
 const RECOVERY_TITLE_PREFIX: &str = "wip: alucard recovery";
 const BLOCKED_FINDINGS_MARKER: &str = "**🤖 Alucard blocked findings**";
+const POSTGRES_URL: &str = "postgresql://postgres:postgres@postgres:5432/postgres";
+
+struct RunPostgres {
+    network: String,
+    container: String,
+    image: String,
+}
+
+impl RunPostgres {
+    fn setup(repository: &Path, base: &str, run_id: &str) -> Result<Option<Self>, String> {
+        let image = git_output(
+            repository,
+            &["show", &format!("origin/{base}:.alucard/postgres")],
+        )
+        .ok()
+        .and_then(|contents| postgres_image(&contents));
+        let Some(image) = image else {
+            return Ok(None);
+        };
+        let network = format!("alucard-{run_id}");
+        let created = Command::new("docker")
+            .args(["network", "create", &network])
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|error| format!("cannot create Docker network {network}: {error}"))?;
+        if !created.success() {
+            return Err(format!("cannot create Docker network {network}"));
+        }
+        let postgres = Self {
+            container: format!("alucard-postgres-{run_id}"),
+            network,
+            image,
+        };
+        postgres.start()?;
+        Ok(Some(postgres))
+    }
+
+    fn start(&self) -> Result<(), String> {
+        self.remove_container();
+        let started = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                &self.container,
+                "--network",
+                &self.network,
+                "--network-alias",
+                "postgres",
+                "--memory",
+                "1g",
+                "--security-opt",
+                "no-new-privileges",
+                "-e",
+                "POSTGRES_PASSWORD=postgres",
+                &self.image,
+            ])
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|error| format!("cannot start Postgres from {}: {error}", self.image))?;
+        if !started.success() {
+            return Err(format!("cannot start Postgres from {}", self.image));
+        }
+        for _ in 0..60 {
+            if Command::new("docker")
+                .args([
+                    "exec",
+                    &self.container,
+                    "pg_isready",
+                    "-q",
+                    "-h",
+                    "127.0.0.1",
+                    "-U",
+                    "postgres",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        Err(format!("Postgres from {} not ready after 60s", self.image))
+    }
+
+    fn remove_container(&self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", "-v", &self.container])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+impl Drop for RunPostgres {
+    fn drop(&mut self) {
+        self.remove_container();
+        let _ = Command::new("docker")
+            .args(["network", "rm", &self.network])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn postgres_image(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let image: String = line
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        (!image.is_empty() && !image.starts_with('#')).then_some(image)
+    })
+}
+
+fn postgres_toolchain_status(status: String, configured: bool) -> String {
+    configured.then(|| format!(
+        "{status} Postgres runs beside this container, fresh for each iteration, at DATABASE_URL={POSTGRES_URL}. Run the database-backed checks against it; Docker is not needed."
+    )).unwrap_or(status)
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1300,14 +1423,32 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 return fail(&format!("alucard: {error}"));
             }
         };
-        let toolchain_status = toolchain_preflight(
-            &options.queue.repository,
-            &options.base,
-            &options.image,
-            &options.env_file,
-            options.timeout_minutes,
-        )
-        .unwrap_or_else(|error| format!("Preflight unavailable: {error}"));
+        let postgres =
+            match RunPostgres::setup(&options.queue.repository, &options.base, &attempt_run.id) {
+                Ok(postgres) => postgres,
+                Err(error) => {
+                    release_without_pr(
+                        &database,
+                        &selected,
+                        &claim.id,
+                        &owner_run_id,
+                        &options.queue.repository,
+                    );
+                    let _ = finish_run(&database, &attempt_run.id, "failed");
+                    return fail(&format!("alucard: {error}"));
+                }
+            };
+        let toolchain_status = postgres_toolchain_status(
+            toolchain_preflight(
+                &options.queue.repository,
+                &options.base,
+                &options.image,
+                &options.env_file,
+                options.timeout_minutes,
+            )
+            .unwrap_or_else(|error| format!("Preflight unavailable: {error}")),
+            postgres.is_some(),
+        );
         let prompt = match worker_prompt(
             &tools,
             &selected,
@@ -1363,9 +1504,9 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 worktree: &prepared.clone,
                 prompt: &prompt,
                 timeout_minutes: options.timeout_minutes,
-                network: None,
+                network: postgres.as_ref().map(|value| value.network.as_str()),
                 playwright_cache: playwright_cache.as_deref(),
-                database_url: None,
+                database_url: postgres.as_ref().map(|_| POSTGRES_URL),
                 github_repo: github_repo.as_deref(),
                 worktree_read_only: false,
                 output_dir: None,
@@ -1457,6 +1598,8 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         options: &options,
                         playwright_cache: playwright_cache.as_deref(),
                         github_repo: github_repo.as_deref(),
+                        network: postgres.as_ref().map(|value| value.network.as_str()),
+                        database_url: postgres.as_ref().map(|_| POSTGRES_URL),
                     })
                     .run(
                         &prepared,
@@ -1509,6 +1652,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             baseline_source: "pinned",
                             previous_sha: &mut previous_stage_sha,
                         },
+                        postgres.as_ref(),
                     ) {
                         Ok(outcome) => outcome,
                         Err(error) => {
@@ -1837,14 +1981,18 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             local_body: String::new(),
             parent_context: String::new(),
         };
-        let toolchain_status = toolchain_preflight(
-            &repository,
-            &options.base,
-            &options.image,
-            &options.env_file,
-            options.timeout_minutes,
-        )
-        .unwrap_or_else(|error| format!("Preflight unavailable: {error}"));
+        let postgres = RunPostgres::setup(&repository, &options.base, &continued.run.id)?;
+        let toolchain_status = postgres_toolchain_status(
+            toolchain_preflight(
+                &repository,
+                &options.base,
+                &options.image,
+                &options.env_file,
+                options.timeout_minutes,
+            )
+            .unwrap_or_else(|error| format!("Preflight unavailable: {error}")),
+            postgres.is_some(),
+        );
         let findings = continue_feedback_findings(&pull.comments, login.trim());
         if !findings.is_empty() {
             let (feedback, blocked, advanced, retained) = run_feedback_once(
@@ -1858,6 +2006,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 1,
                 1,
                 &toolchain_status,
+                postgres.as_ref(),
             )?;
             if advanced == Some(false) && (feedback.status.unwrap_or(1) != 0 || retained) {
                 let comment = format!("**🤖 Alucard continue: feedback agent stopped without publishing — needs human** (rc={})\n\nThe feedback agent pushed nothing, so this branch is still at the commit the previous review already read. Alucard stopped rather than re-run CI and review against it.", feedback.status.unwrap_or(1));
@@ -1915,6 +2064,8 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             options: &options,
             playwright_cache: None,
             github_repo: github_repo_slug(&repository).as_deref(),
+            network: postgres.as_ref().map(|value| value.network.as_str()),
+            database_url: postgres.as_ref().map(|_| POSTGRES_URL),
         })
         .run(
             &prepared,
@@ -1964,6 +2115,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                 baseline_source: &baseline_source,
                 previous_sha: &mut previous_stage_sha,
             },
+            postgres.as_ref(),
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -2842,6 +2994,8 @@ struct CiGate<'a> {
     options: &'a RunCommandOptions,
     playwright_cache: Option<&'a Path>,
     github_repo: Option<&'a str>,
+    network: Option<&'a str>,
+    database_url: Option<&'a str>,
 }
 
 struct StageProgress<'a> {
@@ -2962,9 +3116,9 @@ impl CiGate<'_> {
                     worktree: &checkout,
                     prompt: &prompt,
                     timeout_minutes: self.options.timeout_minutes,
-                    network: None,
+                    network: self.network,
                     playwright_cache: self.playwright_cache,
-                    database_url: None,
+                    database_url: self.database_url,
                     github_repo: self.github_repo,
                     worktree_read_only: false,
                     output_dir: None,
@@ -3422,6 +3576,7 @@ fn run_feedback_once(
     cycle: usize,
     iteration: usize,
     toolchain_status: &str,
+    postgres: Option<&RunPostgres>,
 ) -> Result<(AgentResult, Option<String>, Option<bool>, bool), String> {
     let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
     let before = remote_branch_sha(&prepared.clone, branch);
@@ -3468,9 +3623,9 @@ fn run_feedback_once(
         worktree: &checkout,
         prompt: &prompt,
         timeout_minutes: options.timeout_minutes,
-        network: None,
+        network: postgres.map(|value| value.network.as_str()),
         playwright_cache: None,
-        database_url: None,
+        database_url: postgres.map(|_| POSTGRES_URL),
         github_repo: github_repo_slug(&options.queue.repository).as_deref(),
         worktree_read_only: false,
         output_dir: Some(&output),
@@ -3588,6 +3743,7 @@ fn review_gate(
     iteration: usize,
     toolchain_status: &str,
     stage_progress: &mut StageProgress<'_>,
+    postgres: Option<&RunPostgres>,
 ) -> Result<ReviewOutcome, String> {
     println!("Review gate: PR #{pr_number} on {branch}.");
     let remote = git_output(&prepared.clone, &["remote", "get-url", "origin"])?;
@@ -3646,9 +3802,9 @@ fn review_gate(
                     worktree: &checkout,
                     prompt: &prompt,
                     timeout_minutes: options.timeout_minutes,
-                    network: None,
+                    network: postgres.map(|value| value.network.as_str()),
                     playwright_cache: None,
-                    database_url: None,
+                    database_url: postgres.map(|_| POSTGRES_URL),
                     github_repo: github_repo_slug(&options.queue.repository).as_deref(),
                     worktree_read_only: true,
                     output_dir: Some(&output_dir),
@@ -3835,6 +3991,7 @@ fn review_gate(
                                 cycle,
                                 iteration,
                                 toolchain_status,
+                                postgres,
                             )?;
                             if let Some(head_sha) = remote_branch_sha(&prepared.clone, branch) {
                                 write_stage_measurement(
@@ -3895,6 +4052,8 @@ fn review_gate(
                                 options,
                                 playwright_cache: None,
                                 github_repo: github_repo_slug(&options.queue.repository).as_deref(),
+                                network: postgres.map(|value| value.network.as_str()),
+                                database_url: postgres.map(|_| POSTGRES_URL),
                             })
                             .run(
                                 prepared,
@@ -7435,5 +7594,25 @@ printf '%s' "$prompt""#,
             continue_feedback_findings(&pull.comments, "alucard"),
             "- @reviewer at 2026-01-04:\nplease add coverage"
         );
+    }
+
+    #[test]
+    fn postgres_image_uses_first_non_comment_line_without_whitespace() {
+        assert_eq!(
+            postgres_image("\n # pinned image\n pgvector / pgvector : pg16 \npostgres:16\n"),
+            Some("pgvector/pgvector:pg16".to_string())
+        );
+        assert_eq!(postgres_image(" # comment\n\t\n"), None);
+    }
+
+    #[test]
+    fn postgres_toolchain_status_is_only_extended_when_configured() {
+        assert_eq!(
+            postgres_toolchain_status("ready".to_string(), false),
+            "ready"
+        );
+        assert!(postgres_toolchain_status("ready".to_string(), true).contains(
+            "Postgres runs beside this container, fresh for each iteration, at DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres."
+        ));
     }
 }
