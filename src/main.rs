@@ -454,7 +454,7 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     command
         .args(["-c", "source \"$1\"; command_merge \"${@:2}\"", "bash"])
         .arg(script)
-        .args(args)
+        .args(merge_command_args(args))
         .env("ALUCARD_LOG_ROOT", &options.logs_root);
     if let Some(logs_path) = &run.logs_path {
         command.env(
@@ -478,6 +478,17 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Ok(_) => ExitCode::FAILURE,
         Err(error) => fail(&format!("alucard: could not run merge command: {error}")),
     }
+}
+
+fn merge_command_args(args: &[String]) -> Vec<String> {
+    let mut command_args = args.to_vec();
+    if !command_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-t" | "--timeout-minutes"))
+    {
+        command_args.extend(["--timeout-minutes".to_string(), "60".to_string()]);
+    }
+    command_args
 }
 
 fn finish_claimed_run<T>(
@@ -6403,6 +6414,24 @@ mod tests {
     use std::sync::Mutex;
 
     static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn merge_defaults_timeout_without_overriding_supplied_values() {
+        assert_eq!(
+            merge_command_args(&["9".to_string()]),
+            ["9", "--timeout-minutes", "60"]
+        );
+        assert_eq!(
+            merge_command_args(&[
+                "9".to_string(),
+                "-t".to_string(),
+                "45".to_string(),
+                "--timeout-minutes".to_string(),
+                "90".to_string(),
+            ]),
+            ["9", "-t", "45", "--timeout-minutes", "90"]
+        );
+    }
 
     struct PathGuard(std::ffi::OsString);
 
