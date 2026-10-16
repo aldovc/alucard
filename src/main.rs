@@ -356,9 +356,9 @@ fn print_usage() {
 
 struct MergeOptions {
     pr_number: i64,
-    repository: PathBuf,
-    env_file: PathBuf,
+    queue: QueueOptions,
     logs_root: PathBuf,
+    env_file: PathBuf,
     check_command: Option<String>,
     timeout_minutes: u64,
     dry_run: bool,
@@ -371,74 +371,49 @@ impl MergeOptions {
             .and_then(|value| value.parse().ok())
             .filter(|n: &i64| *n > 0)
             .ok_or("usage: alucard merge <PR_NUM> [options] — PR_NUM must be a positive integer")?;
-        let mut logs_root = None;
-        let mut options = Self {
-            pr_number,
-            repository: nonempty_environment("ALUCARD_TARGET_REPO")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().expect("current directory")),
-            env_file: nonempty_environment("ALUCARD_ENV_FILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| tools.join("alucard.env")),
-            logs_root: PathBuf::new(),
-            check_command: None,
-            timeout_minutes: 60,
-            dry_run: false,
-        };
-        let mut repository_set = false;
+        let mut check_command = None;
+        let mut dry_run = false;
+        let mut rest = Vec::new();
         let mut values = args[1..].iter();
         while let Some(value) = values.next() {
             match value.as_str() {
-                "-C" | "--repo" => {
-                    options.repository =
-                        PathBuf::from(values.next().ok_or("--repo requires a path")?)
-                }
-                "--env-file" => {
-                    options.env_file =
-                        PathBuf::from(values.next().ok_or("--env-file requires a path")?)
-                }
-                "--logs-root" => {
-                    logs_root = Some(PathBuf::from(
-                        values.next().ok_or("--logs-root requires a path")?,
-                    ))
-                }
                 "--check-command" => {
-                    options.check_command = Some(
+                    check_command = Some(
                         values
                             .next()
                             .ok_or("--check-command requires a command")?
                             .clone(),
                     )
                 }
-                "-t" | "--timeout-minutes" => {
-                    options.timeout_minutes = values
-                        .next()
-                        .ok_or("--timeout-minutes requires a number")?
-                        .parse()
-                        .ok()
-                        .filter(|n: &u64| *n > 0)
-                        .ok_or("timeout must be greater than zero")?
-                }
-                "--dry-run" => options.dry_run = true,
-                "-h" | "--help" => return Err(
-                    "usage: alucard merge <PR_NUM> [TARGET_REPO] [--check-command CMD] [--dry-run]"
-                        .to_string(),
-                ),
-                option if option.starts_with('-') => {
-                    return Err(format!("unknown merge option: {option}"))
-                }
-                repository if !repository_set => {
-                    options.repository = PathBuf::from(repository);
-                    repository_set = true;
-                }
-                value => return Err(format!("unexpected argument: {value}")),
+                "--dry-run" => dry_run = true,
+                _ => rest.push(value.clone()),
             }
         }
-        options.logs_root = match logs_root {
-            Some(logs_root) => logs_root,
-            None => default_logs_root()?,
-        };
-        Ok(options)
+        let mut run = RunCommandOptions::parse(&rest, tools)?;
+        if run.queue.help {
+            return Err(
+                "usage: alucard merge <PR_NUM> [TARGET_REPO] [--check-command CMD] [--dry-run]"
+                    .to_string(),
+            );
+        }
+        if run.queue.issue.is_some() {
+            return Err("--issue is only valid with alucard run".to_string());
+        }
+        if !rest
+            .iter()
+            .any(|value| matches!(value.as_str(), "-t" | "--timeout-minutes"))
+        {
+            run.timeout_minutes = 60;
+        }
+        Ok(Self {
+            pr_number,
+            queue: run.queue,
+            logs_root: run.logs_root,
+            env_file: run.env_file,
+            check_command,
+            timeout_minutes: run.timeout_minutes,
+            dry_run,
+        })
     }
 }
 
@@ -449,7 +424,7 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         let settings = optional_settings(&options.env_file)?;
         settings.apply_to_process();
         let database = database_path(db_path).map_err(|error| error.to_string())?;
-        let repository = resolve_repository_target(&options.repository)?;
+        let repository = resolve_repository_target(&options.queue.repository)?;
         let check_command = options
             .check_command
             .as_deref()
@@ -490,17 +465,7 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         &check_command,
         run.logs_path.as_deref().unwrap_or_default(),
     );
-    let _ = release(&database, &claim.id, &run.id);
-    let _ = finish_run(
-        &database,
-        &run.id,
-        if result.is_ok() {
-            "completed"
-        } else {
-            "failed"
-        },
-    );
-    match result {
+    match finish_claimed_run(&database, &run.id, &claim.id, result) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(&format!("alucard: {error}")),
     }
@@ -515,16 +480,7 @@ struct MergePullRequest {
     base: String,
     #[serde(rename = "isCrossRepository")]
     cross_repository: bool,
-    comments: Vec<MergeComment>,
-}
-#[derive(serde::Deserialize)]
-struct MergeComment {
-    author: MergeAuthor,
-    body: String,
-}
-#[derive(serde::Deserialize)]
-struct MergeAuthor {
-    login: String,
+    comments: Vec<ContinueComment>,
 }
 
 fn merge_pr(
@@ -569,8 +525,8 @@ fn merge_pr(
     fs::create_dir_all(logs_path).map_err(|error| error.to_string())?;
     let checkout = PathBuf::from(logs_path).join("repository");
     let origin = git_output(repository, &["remote", "get-url", "origin"])?;
-    let clone = execute_command(
-        "git",
+    git_output(
+        repository,
         &[
             "clone",
             "--quiet",
@@ -579,19 +535,14 @@ fn merge_pr(
             origin.trim(),
             checkout.to_str().ok_or("invalid checkout path")?,
         ],
-        repository,
-        Some(Duration::from_secs(120)),
     )
-    .map_err(|error| error.to_string())?;
-    if !clone.status.success() {
-        return Err("could not fetch PR branch".to_string());
-    }
+    .map_err(|_| "could not fetch PR branch".to_string())?;
     let result = merge_checkout(&checkout, &metadata, &approved, options, check_command);
     let _ = fs::remove_dir_all(&checkout);
     result
 }
 
-fn harness_approved_sha(comments: &[MergeComment], login: &str) -> Option<String> {
+fn harness_approved_sha(comments: &[ContinueComment], login: &str) -> Option<String> {
     let comment = comments.iter().rev().find(|comment| {
         comment.author.login == login && comment.body.starts_with("**🤖 Alucard review cycle ")
     })?;
@@ -626,50 +577,23 @@ fn merge_checkout(
             options.pr_number
         ));
     }
-    let fetch = execute_command(
-        "git",
-        &[
-            "fetch",
-            "--quiet",
-            "origin",
-            &format!(
-                "+refs/heads/{}:refs/remotes/origin/{}",
-                metadata.base, metadata.base
-            ),
-        ],
-        checkout,
-        Some(Duration::from_secs(120)),
-    )
-    .map_err(|error| error.to_string())?;
-    if !fetch.status.success() {
-        return Err(format!("could not fetch {}", metadata.base));
-    }
+    let base_ref = format!(
+        "+refs/heads/{}:refs/remotes/origin/{}",
+        metadata.base, metadata.base
+    );
+    git_output(checkout, &["fetch", "--quiet", "origin", &base_ref])
+        .map_err(|_| format!("could not fetch {}", metadata.base))?;
     let base = git_output(
         checkout,
         &["rev-parse", &format!("origin/{}", metadata.base)],
     )?
     .trim()
     .to_string();
-    let ancestor = execute_command(
-        "git",
-        &["merge-base", "--is-ancestor", &base, "HEAD"],
-        checkout,
-        None,
-    )
-    .map_err(|error| error.to_string())?
-    .status
-    .success();
+    let ancestor = commit_is_ancestor(checkout, &base, "HEAD")?;
     let (new_head, rebased) = if ancestor {
         (head.clone(), false)
     } else {
-        let rebase = execute_command(
-            "git",
-            &["rebase", &base],
-            checkout,
-            Some(Duration::from_secs(120)),
-        )
-        .map_err(|error| error.to_string())?;
-        if !rebase.status.success() {
+        if git_output(checkout, &["rebase", &base]).is_err() {
             let conflicts = git_output(checkout, &["diff", "--name-only", "--diff-filter=U"])
                 .unwrap_or_default();
             let _ = execute_command("git", &["rebase", "--abort"], checkout, None);
@@ -708,7 +632,24 @@ fn merge_checkout(
         &check_log_path,
     )?;
     let check_log = fs::read_to_string(&check_log_path).unwrap_or_default();
-    let evidence = format!("**🤖 Alucard merge: checks {}**\n\nRan `{}` on `{}`: exit {}.\n\n<details><summary>Last lines of output</summary>\n\n```\n{}\n```\n\n</details>", if check.success() { "passed" } else { "failed — not merged" }, check_command, new_head, check.code().unwrap_or(1), check_log.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+    let outcome = if check.success() {
+        "passed"
+    } else {
+        "failed — not merged"
+    };
+    let output = check_log
+        .lines()
+        .rev()
+        .take(25)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let evidence = format!(
+        "**🤖 Alucard merge: checks {outcome}**\n\nRan `{check_command}` on `{new_head}`: exit {}.\n\n<details><summary>Last lines of output</summary>\n\n```\n{output}\n```\n\n</details>",
+        check.code().unwrap_or(1)
+    );
     if !check.success() {
         merge_post(checkout, options.pr_number, &evidence, options.dry_run);
         return Err(format!(
@@ -726,22 +667,9 @@ fn merge_checkout(
     }
     if rebased {
         let lease = format!("--force-with-lease=refs/heads/{}:{}", metadata.branch, head);
-        let push = execute_command(
-            "git",
-            &[
-                "push",
-                "--quiet",
-                &lease,
-                "origin",
-                &format!("HEAD:refs/heads/{}", metadata.branch),
-            ],
-            checkout,
-            Some(Duration::from_secs(120)),
-        )
-        .map_err(|error| error.to_string())?;
-        if !push.status.success() {
-            return Err("push of rebased PR was rejected: the branch moved since it was checked. Nothing merged.".to_string());
-        }
+        let branch_ref = format!("HEAD:refs/heads/{}", metadata.branch);
+        git_output(checkout, &["push", "--quiet", &lease, "origin", &branch_ref])
+            .map_err(|_| "push of rebased PR was rejected: the branch moved since it was checked. Nothing merged.".to_string())?;
         for _ in 0..30 {
             let pr_head = gh_text(
                 checkout,
@@ -838,6 +766,25 @@ fn merge_post(repository: &Path, number: i64, body: &str, dry_run: bool) {
             None,
         );
     }
+}
+
+fn finish_claimed_run<T>(
+    database: &Path,
+    run_id: &str,
+    claim_id: &str,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    let _ = release(database, claim_id, run_id);
+    let _ = finish_run(
+        database,
+        run_id,
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    result
 }
 
 fn build_command(args: &[String]) -> ExitCode {
@@ -1392,7 +1339,7 @@ impl RunCommandOptions {
             .and_then(|value| value.into_string().ok())
             .unwrap_or_else(|| "ghcr.io/aldovc/alucard:latest".to_string());
         let mut no_build = false;
-        let mut logs_root = default_logs_root()?;
+        let mut logs_root = PathBuf::new();
         let mut env_file = nonempty_environment("ALUCARD_ENV_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| tools.join("alucard.env"));
@@ -1464,6 +1411,9 @@ impl RunCommandOptions {
             .transpose()?
             .unwrap_or(2)
             .saturating_add(1);
+        if logs_root.as_os_str().is_empty() {
+            logs_root = default_logs_root()?;
+        }
         Ok(Self {
             queue,
             iterations,
@@ -2317,17 +2267,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         pr_number,
         iteration_started.elapsed().as_secs(),
     );
-    let _ = release(&database, &claim.id, &continued.run.id);
-    let _ = finish_run(
-        &database,
-        &continued.run.id,
-        if result.is_ok() {
-            "completed"
-        } else {
-            "failed"
-        },
-    );
-    match result {
+    match finish_claimed_run(&database, &continued.run.id, &claim.id, result) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => fail(&format!("alucard: {error}")),
     }
