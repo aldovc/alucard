@@ -943,9 +943,10 @@ fn resolve_repository_target(target: &Path) -> Result<PathBuf, String> {
             .map_err(|error| format!("could not resolve target repository: {error}"))?;
         return git_repository_root(&path)
             .map(|_| path)
-            .ok_or_else(|| "target repository is not a git repository".to_string());
+            .ok_or_else(|| format!("target path is not inside a git repo: {}", target.display()));
     }
-    let repository = github_ref(target).ok_or_else(|| "target repo does not exist".to_string())?;
+    let repository = github_ref(target)
+        .ok_or_else(|| format!("target repo does not exist: {}", target.display()))?;
     let cache = cache_path(&repository);
     let parent = cache
         .parent()
