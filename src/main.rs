@@ -2651,8 +2651,11 @@ const CI_REGISTRATION_PROBES: usize = 4;
 const CI_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 fn ci_poll_interval() -> Duration {
-    std::env::var("ALUCARD_CI_POLL_INTERVAL")
-        .ok()
+    ci_poll_interval_from(std::env::var("ALUCARD_CI_POLL_INTERVAL").ok().as_deref())
+}
+
+fn ci_poll_interval_from(value: Option<&str>) -> Duration {
+    value
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(CI_POLL_INTERVAL)
@@ -6158,6 +6161,16 @@ mod tests {
     use std::collections::VecDeque;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
+
+    #[test]
+    fn ci_poll_interval_defaults_to_the_production_interval() {
+        assert_eq!(ci_poll_interval_from(None), Duration::from_secs(30));
+        assert_eq!(
+            ci_poll_interval_from(Some("invalid")),
+            Duration::from_secs(30)
+        );
+        assert_eq!(ci_poll_interval_from(Some("0")), Duration::ZERO);
+    }
 
     fn command_output(stdout: &str, stderr: &str, status: i32) -> Output {
         Output {
