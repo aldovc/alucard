@@ -263,6 +263,7 @@ impl MergeOptions {
             .and_then(|value| value.parse().ok())
             .filter(|n: &i64| *n > 0)
             .ok_or("usage: alucard merge <PR_NUM> [options] — PR_NUM must be a positive integer")?;
+        let mut logs_root = None;
         let mut options = Self {
             pr_number,
             repository: nonempty_environment("ALUCARD_TARGET_REPO")
@@ -271,7 +272,7 @@ impl MergeOptions {
             env_file: nonempty_environment("ALUCARD_ENV_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| tools.join("alucard.env")),
-            logs_root: default_logs_root()?,
+            logs_root: PathBuf::new(),
             check_command: None,
             timeout_minutes: 60,
             dry_run: false,
@@ -289,8 +290,9 @@ impl MergeOptions {
                         PathBuf::from(values.next().ok_or("--env-file requires a path")?)
                 }
                 "--logs-root" => {
-                    options.logs_root =
-                        PathBuf::from(values.next().ok_or("--logs-root requires a path")?)
+                    logs_root = Some(PathBuf::from(
+                        values.next().ok_or("--logs-root requires a path")?,
+                    ))
                 }
                 "--check-command" => {
                     options.check_command = Some(
@@ -324,6 +326,10 @@ impl MergeOptions {
                 value => return Err(format!("unexpected argument: {value}")),
             }
         }
+        options.logs_root = match logs_root {
+            Some(logs_root) => logs_root,
+            None => default_logs_root()?,
+        };
         Ok(options)
     }
 }
