@@ -67,6 +67,7 @@ fn install_interrupt_handlers() -> Result<(), String> {
 
 fn interruptible(command: impl FnOnce() -> ExitCode) -> ExitCode {
     INTERRUPTED_SIGNAL.store(0, Ordering::SeqCst);
+    alucard::reset_command_interrupt();
     if let Err(error) = install_interrupt_handlers() {
         return fail(&format!(
             "alucard: could not install interrupt handlers: {error}"

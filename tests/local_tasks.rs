@@ -5047,13 +5047,13 @@ fn test_transport_recovery() {
 }
 
 #[test]
-fn sigterm_cleans_up_postgres_for_an_interrupted_run() {
-    let root = temporary_path("sigterm-postgres");
+fn sigterm_during_preflight_cleans_up_postgres_without_starting_an_agent() {
+    let root = temporary_path("sigterm-preflight");
     let repository = root.join("repository");
     let origin = root.join("origin.git");
     let bin = root.join("bin");
     let trace = root.join("docker-trace");
-    let started = root.join("agent-started");
+    let started = root.join("preflight-started");
     fs::create_dir_all(&bin).unwrap();
     git_repository(&repository);
     run(Command::new("git").args(["init", "-q", "--bare", origin.to_str().unwrap()]));
@@ -5067,12 +5067,8 @@ fn sigterm_cleans_up_postgres_for_an_interrupted_run() {
     ]));
     fs::create_dir_all(repository.join(".alucard")).unwrap();
     fs::write(repository.join(".alucard/postgres"), "postgres:16\n").unwrap();
-    run(Command::new("git").args([
-        "-C",
-        repository.to_str().unwrap(),
-        "add",
-        ".alucard/postgres",
-    ]));
+    fs::write(repository.join("package-lock.json"), "{}\n").unwrap();
+    run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
     run(Command::new("git").args([
         "-C",
         repository.to_str().unwrap(),
@@ -5095,7 +5091,7 @@ fn sigterm_cleans_up_postgres_for_an_interrupted_run() {
     let docker = bin.join("docker");
     fs::write(
         &docker,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$*\" in\n  *'--name alucard-worker-'*) : > \"$ALUCARD_AGENT_STARTED\"; while :; do sleep 1; done ;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$*\" in\n  *'--name alucard-preflight-'*) : > \"$ALUCARD_PREFLIGHT_STARTED\"; while :; do sleep 1; done ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
@@ -5106,6 +5102,13 @@ fn sigterm_cleans_up_postgres_for_an_interrupted_run() {
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let timeout = bin.join("timeout");
+    fs::write(
+        &timeout,
+        "#!/bin/sh\nif [ \"$1\" = --kill-after ]; then shift 2; fi\nshift\nexec \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&timeout, fs::Permissions::from_mode(0o755)).unwrap();
     let environment = root.join("agent.env");
     fs::write(
         &environment,
@@ -5121,7 +5124,7 @@ fn sigterm_cleans_up_postgres_for_an_interrupted_run() {
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("ALUCARD_DOCKER_TRACE", &trace)
-        .env("ALUCARD_AGENT_STARTED", &started)
+        .env("ALUCARD_PREFLIGHT_STARTED", &started)
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
         .args([
             "--db-path",
@@ -5144,6 +5147,12 @@ fn sigterm_cleans_up_postgres_for_an_interrupted_run() {
     let trace = fs::read_to_string(trace).unwrap();
     assert!(trace.contains("rm -f -v alucard-postgres-"), "{trace}");
     assert!(trace.contains("network rm alucard-"), "{trace}");
+    for agent in ["worker", "feedback", "ci", "review"] {
+        assert!(
+            !trace.contains(&format!("--name alucard-{agent}-")),
+            "{trace}"
+        );
+    }
     fs::remove_dir_all(root).unwrap();
 }
 
