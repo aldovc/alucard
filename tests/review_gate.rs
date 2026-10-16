@@ -396,7 +396,7 @@ esac
     fs::write(
         &environment,
         format!(
-            "ALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER={}\nANTHROPIC_API_KEY=test\n",
+            "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER={}\nANTHROPIC_API_KEY=test\n",
             if case.name == "feedback-invocation-failure" {
                 "unsupported"
             } else {
