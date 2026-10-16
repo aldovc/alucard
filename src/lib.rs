@@ -795,7 +795,7 @@ mod agent_tests {
         fs::write(
             bin.join("docker"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  exit 23\nfi\n",
+                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; *:/opt/alucard-browsers:rw) browsers=${{argument%:/opt/alucard-browsers:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  if [ \"${{ALUCARD_SEED_CACHE:-}}\" = 1 ]; then mkdir -p \"$browsers\"; printf unknown > \"$browsers/.alucard-seeded\"; fi\n  exit 23\nfi\n",
                 trace.display(),
                 non_default_ran.display()
             ),
@@ -856,6 +856,19 @@ mod agent_tests {
         assert!(status
             .status
             .contains("`npm ci` at the repo root fails inside the container (rc=23)"));
+        assert!(status.playwright_cache.is_none());
+        env::set_var("ALUCARD_SEED_CACHE", "1");
+        let seeded = super::toolchain_preflight(
+            &repository,
+            "preflight-base",
+            "alucard:test",
+            &env_file,
+            7,
+            &dir.join("seeded-browsers"),
+        )
+        .unwrap();
+        env::remove_var("ALUCARD_SEED_CACHE");
+        assert_eq!(seeded.playwright_cache, Some(dir.join("seeded-browsers")));
         env::set_var("PATH", path);
         assert!(non_default_ran.exists());
         fs::remove_dir_all(dir).unwrap();
