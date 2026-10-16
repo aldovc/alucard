@@ -2228,11 +2228,15 @@ fn replay_recovery_push(
             .trim()
             .to_string(),
     };
-    let remote_sha = recovery_remote_branch_sha(repository, branch).map_err(|error| {
-        format!(
-            "recovery push deferred: expected commit {expected_sha} could not read remote branch {branch}: {error}"
-        )
-    })?;
+    let remote_sha = match recovery_remote_branch_sha(repository, branch) {
+        Ok(remote_sha) => remote_sha,
+        Err(error) => {
+            ensure_recovery_commit_ref(&payload.checkout, branch, &expected_sha)?;
+            return Err(format!(
+                "recovery push deferred: expected commit {expected_sha} could not read remote branch {branch}: {error}"
+            ));
+        }
+    };
     if remote_sha.as_deref() == Some(&expected_sha) {
         return Ok(());
     }
