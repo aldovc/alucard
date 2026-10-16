@@ -435,14 +435,15 @@ pub fn toolchain_preflight(
         }
 
         let name = format!("alucard-preflight-{}", std::process::id());
-        let cache_available = fs::create_dir_all(playwright_cache).is_ok();
         let baked_stamp = Command::new("docker")
             .args(["image", "inspect", "-f", "{{.Id}}", image])
             .output()
             .ok()
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            .unwrap_or_else(|| "unknown".into());
+            .filter(|stamp| !stamp.is_empty());
+        let cache_available = baked_stamp.is_some() && fs::create_dir_all(playwright_cache).is_ok();
+        let baked_stamp = baked_stamp.unwrap_or_default();
         let mut results = Vec::new();
         for install in installs {
             let working_directory = format!("/work/{}", install.directory.display());
@@ -801,7 +802,7 @@ mod agent_tests {
         fs::write(
             bin.join("docker"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; *:/opt/alucard-browsers:rw) browsers=${{argument%:/opt/alucard-browsers:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  if [ \"${{ALUCARD_SEED_CACHE:-}}\" = 1 ]; then mkdir -p \"$browsers\"; printf unknown > \"$browsers/.alucard-seeded\"; fi\n  if [ \"${{ALUCARD_RESEED_FAIL:-}}\" = 1 ]; then case \"$*\" in *'rm -f \"$marker\"'*) rm -f \"$browsers/.alucard-seeded\" ;; esac; fi\n  printf '%s\\n' 'alucard-playwright-pin: playwright 1.2.3 wants chromium 1234; the image bakes chromium 5678'\n  exit 23\nfi\n",
+                "#!/bin/sh\nprintf '%s\\n' \"docker $*\" >> {}\nif [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n  [ \"${{ALUCARD_IMAGE_INSPECT_FAIL:-}}\" = 1 ] && exit 1\n  printf '%s\\n' sha256:stub\n  exit 0\nfi\nif [ \"$1\" = run ]; then\n  for argument in \"$@\"; do case \"$argument\" in *:/work:rw) clone=${{argument%:/work:rw}} ;; *:/opt/alucard-browsers:rw) browsers=${{argument%:/opt/alucard-browsers:rw}} ;; esac; done\n  if [ \"$(cat \"$clone/package-lock.json\")\" = non-default ]; then : > {}; fi\n  if [ \"${{ALUCARD_SEED_CACHE:-}}\" = 1 ]; then mkdir -p \"$browsers\"; printf sha256:stub > \"$browsers/.alucard-seeded\"; fi\n  if [ \"${{ALUCARD_RESEED_FAIL:-}}\" = 1 ]; then case \"$*\" in *'rm -f \"$marker\"'*) rm -f \"$browsers/.alucard-seeded\" ;; esac; fi\n  printf '%s\\n' 'alucard-playwright-pin: playwright 1.2.3 wants chromium 1234; the image bakes chromium 5678'\n  exit 23\nfi\n",
                 trace.display(),
                 non_default_ran.display()
             ),
@@ -828,10 +829,9 @@ mod agent_tests {
         )
         .unwrap();
 
-        let trace = fs::read_to_string(trace).unwrap();
-        assert!(
-            trace.contains("timeout --kill-after 30s 7m docker run --rm --name alucard-preflight-")
-        );
+        let trace_output = fs::read_to_string(&trace).unwrap();
+        assert!(trace_output
+            .contains("timeout --kill-after 30s 7m docker run --rm --name alucard-preflight-"));
         for argument in [
             "--network bridge",
             "--memory 4g",
@@ -845,20 +845,22 @@ mod agent_tests {
             "--cap-drop ALL",
         ] {
             assert!(
-                trace.contains(argument),
+                trace_output.contains(argument),
                 "missing sandbox argument {argument}"
             );
         }
-        assert!(trace.contains(&format!(
+        assert!(trace_output.contains(&format!(
             "--user {}:{}",
             unsafe { libc::geteuid() },
             unsafe { libc::getegid() }
         )));
-        assert!(trace.contains(&format!(
+        assert!(trace_output.contains(&format!(
             "docker rm -f alucard-preflight-{}",
             std::process::id()
         )));
-        assert!(trace.find("docker run").unwrap() < trace.find("docker rm -f").unwrap());
+        assert!(
+            trace_output.find("docker run").unwrap() < trace_output.find("docker rm -f").unwrap()
+        );
         assert!(status
             .status
             .contains("`npm ci` at the repo root fails inside the container (rc=23)"));
@@ -869,6 +871,24 @@ mod agent_tests {
             ),
             Some("Playwright pin mismatch: this repo's playwright 1.2.3 wants chromium 1234; the image bakes chromium 5678. The shared cache holds both, so this costs one download rather than one per iteration — align the repo's pin to stop carrying a second revision.".into())
         );
+        if env::var_os("ALUCARD_CAPTURE_PREFLIGHT_STDERR").is_some() {
+            env::set_var("PATH", path);
+            fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent_tests::preflight_reaps_failed_containers_and_reports_their_status",
+                "--nocapture",
+            ])
+            .env("ALUCARD_CAPTURE_PREFLIGHT_STDERR", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(
+            "Playwright pin mismatch: this repo's playwright 1.2.3 wants chromium 1234; the image bakes chromium 5678. The shared cache holds both",
+        ));
         assert!(status.playwright_cache.is_none());
         env::set_var("ALUCARD_SEED_CACHE", "1");
         let seeded = super::toolchain_preflight(
@@ -898,6 +918,28 @@ mod agent_tests {
         env::remove_var("ALUCARD_RESEED_FAIL");
         assert!(reseed_failed.playwright_cache.is_none());
         assert!(!stale_cache.join(".alucard-seeded").exists());
+        let unavailable_cache = dir.join("unavailable-browsers");
+        fs::create_dir_all(&unavailable_cache).unwrap();
+        fs::write(unavailable_cache.join(".alucard-seeded"), "unknown").unwrap();
+        env::set_var("ALUCARD_IMAGE_INSPECT_FAIL", "1");
+        let unavailable = super::toolchain_preflight(
+            &repository,
+            "preflight-base",
+            "alucard:test",
+            &env_file,
+            7,
+            &unavailable_cache,
+        )
+        .unwrap();
+        env::remove_var("ALUCARD_IMAGE_INSPECT_FAIL");
+        assert!(unavailable.playwright_cache.is_none());
+        let trace = fs::read_to_string(&trace).unwrap();
+        let unavailable_run = trace
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("docker run "))
+            .unwrap();
+        assert!(!unavailable_run.contains(":/opt/alucard-browsers:rw"));
         env::set_var("PATH", path);
         assert!(non_default_ran.exists());
         fs::remove_dir_all(dir).unwrap();
