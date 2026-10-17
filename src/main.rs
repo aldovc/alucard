@@ -4737,9 +4737,7 @@ fn recover_worker_changes(
     status: Option<i32>,
     worker_log: &Path,
 ) -> Result<Option<i64>, String> {
-    if classification == alucard::AgentExit::Clean
-        || (classification == alucard::AgentExit::Transport && status == Some(0))
-    {
+    if classification == alucard::AgentExit::Transport && status == Some(0) {
         return release_pending(
             database,
             task,
@@ -4931,7 +4929,7 @@ fn recover_worker_changes(
         )
         .map(Some);
     }
-    let (pr, title, body) = pr.expect("recovery PR intent is required after a non-clean push");
+    let (pr, title, body) = pr.expect("recovery PR intent is required after a worker-commit push");
     let output = execute_command(
         "gh",
         &[
@@ -5186,6 +5184,7 @@ fn recovery_stop_description(classification: alucard::AgentExit) -> &'static str
             "wedged its shell (every tool call failed after /work went missing)"
         }
         alucard::AgentExit::Transport => "lost its provider connection",
+        alucard::AgentExit::Clean => "ended its session",
         alucard::AgentExit::NoWorktree => {
             "never started: its checkout was empty when the container mounted it"
         }

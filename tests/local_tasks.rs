@@ -574,7 +574,16 @@ fn run_transport_case(root: &Path, scenario: &str, retries: usize) -> std::proce
 
 #[test]
 fn recovery_publication_failures_are_retained_and_parked_for_humans() {
-    for scenario in ["push", "pr", "marker", "label", "alucard_label", "success"] {
+    for scenario in [
+        "push",
+        "pr",
+        "marker",
+        "label",
+        "alucard_label",
+        "success",
+        "clean",
+        "clean_idle",
+    ] {
         let root = temporary_path(&format!("recovery-{scenario}"));
         let repository = root.join("repository");
         let remote = root.join("remote.git");
@@ -615,9 +624,15 @@ case "$1 $2" in
   'image inspect') echo stamp ;;
   'run '*)
     for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; esac; done
-    printf 'unfinished\n' > "$worktree/recovery.txt"
-    git -C "$worktree" add recovery.txt
-    git -C "$worktree" -c user.email=test@example.com -c user.name=Test commit -qm recovery
+    if [ "$ALUCARD_RECOVERY_SCENARIO" != clean_idle ]; then
+      printf 'unfinished\n' > "$worktree/recovery.txt"
+      git -C "$worktree" add recovery.txt
+      git -C "$worktree" -c user.email=test@example.com -c user.name=Test commit -qm recovery
+    fi
+    if [ "${ALUCARD_RECOVERY_SCENARIO#clean}" != "$ALUCARD_RECOVERY_SCENARIO" ]; then
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"I will open the PR later."}'
+      exit 0
+    fi
     printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"failed"}'
     exit 1 ;;
 esac
@@ -701,12 +716,23 @@ esac
         let output = invoke();
         assert!(output.status.success(), "{scenario}: {output:?}");
         let connection = open(&database).unwrap();
+        if scenario == "clean_idle" {
+            let status: String = connection
+                .query_row("SELECT status FROM tasks", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(status, "pending");
+            let trace = fs::read_to_string(root.join("recovery-trace")).unwrap_or_default();
+            assert!(!trace.contains("pr create"), "{trace}");
+            drop(connection);
+            fs::remove_dir_all(root).unwrap();
+            continue;
+        }
         assert_eq!(
             connection
                 .query_row("SELECT status FROM tasks", [], |row| row
                     .get::<_, String>(0))
                 .unwrap(),
-            if scenario == "success" {
+            if matches!(scenario, "success" | "clean") {
                 "in_flight"
             } else {
                 "human"
@@ -793,6 +819,32 @@ esac
             assert_eq!(iteration["review_verdict"], "");
             assert_eq!(iteration["review_cycles"], 0);
             assert_eq!(iteration["roles"]["worker"]["invocations"], 2);
+        }
+        if scenario == "clean" {
+            let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
+            assert!(trace.contains("pr create"), "{trace}");
+            assert!(trace.contains("--draft"), "{trace}");
+            assert!(
+                trace.contains("issues/91/labels -f labels[]=needs-human"),
+                "{trace}"
+            );
+            let branches = Command::new("git")
+                .args([
+                    "--git-dir",
+                    remote.to_str().unwrap(),
+                    "log",
+                    "--all",
+                    "--format=%s",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8(branches.stdout)
+                    .unwrap()
+                    .lines()
+                    .any(|subject| subject == "recovery"),
+                "worker commit was not pushed"
+            );
         }
         let run_id: String = connection
             .query_row("SELECT id FROM runs", [], |row| row.get(0))
