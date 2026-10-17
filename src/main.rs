@@ -5991,10 +5991,12 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Err(error) => return fail(&format!("alucard: {error}")),
     };
     settings.apply_to_process();
-    options.repository = match resolve_repository_target(&options.repository) {
-        Ok(repository) => repository,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
+    if !options.repository.is_dir() {
+        options.repository = match resolve_repository_target(&options.repository) {
+            Ok(repository) => repository,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        };
+    }
     let task_file = match options.task_file() {
         Ok(Some(path)) => path,
         Ok(None) => return github_queue_command(&options, db_path),

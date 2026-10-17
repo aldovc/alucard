@@ -379,7 +379,7 @@ fn startup_reconciliation_creates_missing_ledger_directories() {
     fs::write(&docker, "#!/bin/sh\necho stamp\n").unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
     let gh = bin.join("gh");
-    fs::write(&gh, "#!/bin/sh\nprintf '[[]]\\n'\n").unwrap();
+    fs::write(&gh, "#!/bin/sh\n[ \"$1\" = api ] || printf '[[]]\\n'\n").unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
 
     for (name, database) in [
@@ -2610,7 +2610,7 @@ fn queue_resolves_explicit_environment_and_detected_task_sources() {
     let detected = task_directory.join("tasks.md");
     fs::copy("test/fixtures/contracts/local-tasks.md", &detected).unwrap();
     let gh = root.join("gh");
-    fs::write(&gh, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
+    fs::write(&gh, "#!/bin/sh\n[ \"$1\" = api ] || printf '[]\\n'\n").unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     let binary = env!("CARGO_BIN_EXE_alucard");
 
@@ -2649,10 +2649,14 @@ fn queue_resolves_explicit_environment_and_detected_task_sources() {
 
     let github_overrides_environment = Command::new(binary)
         .env("ALUCARD_TASKS_FILE", &detected)
+        .env("PATH", &no_local_source)
         .args(["queue", "--github"])
         .output()
         .unwrap();
-    assert!(!github_overrides_environment.status.success());
+    assert!(
+        String::from_utf8_lossy(&github_overrides_environment.stderr)
+            .contains("could not list GitHub issues")
+    );
 
     let conflict = Command::new(binary)
         .args(["queue", "--tasks", detected.to_str().unwrap(), "--github"])
@@ -3264,7 +3268,7 @@ fn run_reports_worker_usage_when_pr_lookup_fails_after_invocation() {
         ),
         (
             "gh",
-            "#!/bin/sh\nif [ ! -f \"$ALUCARD_TEST_WORKER_RAN\" ]; then printf '[]\\n'; exit 0; fi\nprintf 'GitHub unavailable\\n' >&2\nexit 1\n",
+            "#!/bin/sh\nif [ ! -f \"$ALUCARD_TEST_WORKER_RAN\" ]; then [ \"$1\" = api ] || printf '[]\\n'; exit 0; fi\nprintf 'GitHub unavailable\\n' >&2\nexit 1\n",
         ),
     ] {
         let path = bin.join(name);
@@ -3844,7 +3848,7 @@ fn run_loads_env_file_for_host_commands_and_rejects_missing_credentials_early() 
     fs::write(
         bin.join("gh"),
         format!(
-            "#!/bin/sh\n[ -n \"$GITHUB_TOKEN\" ] && echo present >> {}\nprintf '[]\\n'\n",
+            "#!/bin/sh\n[ -n \"$GITHUB_TOKEN\" ] && echo present >> {}\n[ \"$1\" = api ] || printf '[]\\n'\n",
             gh_trace.display()
         ),
     )
