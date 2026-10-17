@@ -2274,7 +2274,7 @@ fn queue_cli_matches_local_contract_and_reimport_is_unchanged() {
     let gh = gh_root.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') printf '%s\\n' '[[]]' ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2329,7 +2329,7 @@ fn queue_cli_omits_claimed_local_tasks() {
     let gh = root.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') printf '%s\\n' '[[]]' ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') ;;\n  *) echo 'gh stub failed' >&2; exit 1 ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2712,7 +2712,7 @@ fn queue_excludes_reset_task_with_matching_open_pr_on_later_page() {
     let gh = root.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') printf '%s\\n' '[[],[{\"number\":12,\"title\":\"Open work\",\"body\":\"Task: task\"}]]' ;;\n  *) exit 1 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate')\n    case \" $* \" in *' --slurp '*) exit 1 ;; esac\n    printf '%s\\n' '{\"number\":11,\"title\":\"Other work\",\"body\":\"Task: other\"}' '{\"number\":12,\"title\":\"Open work\",\"body\":\"Task: task\"}' ;;\n  *) exit 1 ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3170,7 +3170,7 @@ fn run_leaves_in_flight_task_unchanged_when_pr_lookup_fails() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr view') echo 'lookup failed' >&2; exit 1 ;;\n  'api --paginate') echo '[[]]' ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr view') echo 'lookup failed' >&2; exit 1 ;;\n  'api --paginate') ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3726,7 +3726,7 @@ fn run_dispatches_one_local_task_and_returns_it_to_pending_without_a_pr() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list')\n    if mkdir \"$ALUCARD_SELECTION/lock\" 2>/dev/null; then : > \"$ALUCARD_SELECTION/first\"; fi\n    : > \"$ALUCARD_SELECTION/$$\"\n    while [ \"$(find \"$ALUCARD_SELECTION\" -maxdepth 1 -type f ! -name first | wc -l)\" -lt 2 ]; do sleep 0.01; done\n    echo '[]' ;;\n  'api --paginate') echo '[[]]' ;;\n  'pr list') echo '[]' ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'issue list')\n    if mkdir \"$ALUCARD_SELECTION/lock\" 2>/dev/null; then : > \"$ALUCARD_SELECTION/first\"; fi\n    : > \"$ALUCARD_SELECTION/$$\"\n    while [ \"$(find \"$ALUCARD_SELECTION\" -maxdepth 1 -type f ! -name first | wc -l)\" -lt 2 ]; do sleep 0.01; done\n    echo '[]' ;;\n  'api --paginate') ;;\n  'pr list') echo '[]' ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3995,7 +3995,7 @@ fn run_uses_the_current_origin_base_without_changing_the_checkout() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in 'issue list'|'pr list') echo '[]' ;; 'api --paginate') echo '[[]]' ;; esac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in 'issue list'|'pr list') echo '[]' ;; 'api --paginate') ;; esac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -4650,7 +4650,7 @@ fn startup_reconciliation_keeps_pr_lease_while_retry_feedback_runs() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate'|'pr list') echo '[]' ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') ;;\n  'pr list') echo '[]' ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -4751,7 +4751,7 @@ fn startup_reconciliation_keeps_pr_lease_while_merge_check_runs() {
     let gh = bin.join("gh");
     fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate'|'pr list') echo '[]' ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'api --paginate') ;;\n  'pr list') echo '[]' ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
