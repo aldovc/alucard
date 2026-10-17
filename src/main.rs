@@ -1675,27 +1675,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                             return fail(&format!("alucard: {error}"));
                         }
                     };
-                    if let Some(local_id) = selected.local_id.as_ref() {
-                        let Some(file) = task_file.as_deref() else {
-                            unreachable!("local task has a task file");
-                        };
-                        let contents = fs::read_to_string(file).map_err(|error| error.to_string());
-                        match contents.and_then(|contents| {
-                            write_task_headings(
-                                file,
-                                &contents,
-                                &[TaskHeadingUpdate {
-                                    id: local_id.clone(),
-                                    state: TaskState::InFlight,
-                                    pr_number: Some(number),
-                                    previous_pr_number: None,
-                                }],
-                            )
-                        }) {
-                            Ok(()) => {}
-                            Err(error) => eprintln!("alucard: {error}"),
-                        }
-                    }
+                    mark_local_task_in_flight(task_file.as_deref(), &selected, number);
                     let (network, database_url) = postgres_agent_environment(postgres.as_ref());
                     let ci_result = match (CiGate {
                         tools: &tools,
@@ -1864,6 +1844,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         &options,
                         &settings,
                         &selected,
+                        task_file.as_deref(),
                         &claim.id,
                         &owner_run_id,
                         &prepared,
@@ -4734,6 +4715,7 @@ fn recover_worker_changes(
     options: &RunCommandOptions,
     settings: &AgentSettings,
     task: &SelectedRunTask,
+    task_file: Option<&Path>,
     lease_id: &str,
     run_id: &str,
     prepared: &alucard::PreparedRun,
@@ -4922,6 +4904,7 @@ fn recover_worker_changes(
         return record_recovery(
             database,
             task,
+            task_file,
             lease_id,
             run_id,
             prepared,
@@ -4977,6 +4960,7 @@ fn recover_worker_changes(
     record_recovery(
         database,
         task,
+        task_file,
         lease_id,
         run_id,
         prepared,
@@ -5036,6 +5020,7 @@ fn release_pending(
 fn record_recovery(
     database: &Path,
     task: &SelectedRunTask,
+    task_file: Option<&Path>,
     lease_id: &str,
     run_id: &str,
     prepared: &alucard::PreparedRun,
@@ -5060,6 +5045,7 @@ fn record_recovery(
         },
     )
     .map_err(|error| error.to_string())?;
+    mark_local_task_in_flight(task_file, task, number);
     let target = format!("recovery-pr:{number}");
     let annotations =
         ["alucard-label", "needs-human-label", "recovery_marker"].map(|operation_type| {
@@ -5588,6 +5574,31 @@ fn select_run_task(
         local_body: String::new(),
         parent_context: String::new(),
     }))
+}
+
+/// Marks a local task's heading in flight on PR `number`, reporting a write failure on stderr.
+fn mark_local_task_in_flight(task_file: Option<&Path>, task: &SelectedRunTask, number: i64) {
+    let Some(local_id) = task.local_id.as_ref() else {
+        return;
+    };
+    let Some(file) = task_file else {
+        unreachable!("local task has a task file");
+    };
+    let contents = fs::read_to_string(file).map_err(|error| error.to_string());
+    if let Err(error) = contents.and_then(|contents| {
+        write_task_headings(
+            file,
+            &contents,
+            &[TaskHeadingUpdate {
+                id: local_id.clone(),
+                state: TaskState::InFlight,
+                pr_number: Some(number),
+                previous_pr_number: None,
+            }],
+        )
+    }) {
+        eprintln!("alucard: {error}");
+    }
 }
 
 fn reconcile_local_tasks(

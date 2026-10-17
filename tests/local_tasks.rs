@@ -739,6 +739,15 @@ esac
             },
             "{scenario}"
         );
+        assert_eq!(
+            fs::read_to_string(&tasks).unwrap(),
+            if matches!(scenario, "push" | "pr") {
+                "## [ ] 1: Recovery task\n\nBody\n"
+            } else {
+                "## [>] 1: Recovery task (PR #91)\n\nBody\n"
+            },
+            "{scenario}"
+        );
         if scenario == "marker" {
             let trace = fs::read_to_string(root.join("recovery-trace")).unwrap();
             assert!(trace.contains("pr comment"), "{scenario}: {trace}");
