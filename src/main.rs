@@ -2281,7 +2281,7 @@ struct ContinuePullRequest {
     branch: String,
     #[serde(rename = "headRefOid")]
     head_sha: String,
-    #[serde(rename = "baseRefOid")]
+    #[serde(skip)]
     base_sha: String,
     #[serde(default)]
     title: String,
@@ -2313,17 +2313,22 @@ impl ContinuePullRequest {
 }
 
 fn continue_pull_request(repository: &Path, number: i64) -> Result<ContinuePullRequest, String> {
-    serde_json::from_str(&gh_text(
+    let mut pull: ContinuePullRequest = serde_json::from_str(&gh_text(
         repository,
         &[
             "pr",
             "view",
             &number.to_string(),
             "--json",
-            "state,headRefName,headRefOid,baseRefOid,title,comments",
+            "state,headRefName,headRefOid,title,comments",
         ],
     )?)
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}");
+    pull.base_sha = gh_text(repository, &["api", &endpoint, "--jq", ".base.sha"])?
+        .trim()
+        .to_string();
+    Ok(pull)
 }
 
 fn continue_measurement_base(

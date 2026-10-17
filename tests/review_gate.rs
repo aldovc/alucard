@@ -400,9 +400,9 @@ case "$1 $2" in
     ;;
   'pr view')
     case "$*" in
-      *state,headRefName,headRefOid,baseRefOid,title,comments*)
+      *state,headRefName,headRefOid,title,comments*)
         case "$ALUCARD_CASE" in postgres-agent-environment*|postgres-two-iterations)
-          printf '{"state":"OPEN","headRefName":"%s","headRefOid":"%s","baseRefOid":"%s","title":"Review task","comments":[]}\n' "$branch" "$(sha)" "$(git --git-dir="$ALUCARD_REMOTE" rev-parse refs/heads/main)"
+          printf '{"state":"OPEN","headRefName":"%s","headRefOid":"%s","title":"Review task","comments":[]}\n' "$branch" "$(sha)"
         esac ;;
       *headRefOid*)
         if [ "$ALUCARD_CASE" = registration-unverified ]; then
