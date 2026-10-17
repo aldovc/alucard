@@ -603,7 +603,7 @@ fn recovery_publication_failures_are_retained_and_parked_for_humans() {
         let git = bin.join("git");
         fs::write(
             &git,
-            "#!/bin/sh\nif [ \"$1\" = push ] && [ \"$ALUCARD_RECOVERY_SCENARIO\" = push ]; then echo 'push denied' >&2; exit 1; fi\nexec \"$ALUCARD_REAL_GIT\" \"$@\"\n",
+            "#!/bin/sh\nif [ \"$1\" = push ] && [ \"$GIT_TERMINAL_PROMPT\" != 0 ]; then echo 'terminal prompt enabled' >&2; exit 1; fi\nif [ \"$1\" = push ] && [ \"$ALUCARD_RECOVERY_SCENARIO\" = push ]; then echo 'push denied' >&2; exit 1; fi\nexec \"$ALUCARD_REAL_GIT\" \"$@\"\n",
         )
         .unwrap();
         fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
@@ -672,6 +672,7 @@ esac
                     format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
                 )
                 .envs(origin_env.clone())
+                .env_remove("GIT_TERMINAL_PROMPT")
                 .env("ALUCARD_REAL_GIT", "/usr/bin/git")
                 .env("ALUCARD_RECOVERY_SCENARIO", scenario)
                 .env("ALUCARD_RECOVERY_CREATED", root.join("recovery-created"))
