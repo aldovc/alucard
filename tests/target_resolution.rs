@@ -1,5 +1,6 @@
 use alucard::repository_ledger_id;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -125,6 +126,42 @@ fn target_resolution_cli_matches_bash_and_reuses_the_cache() {
             repository_ledger_id(&local).unwrap()
         );
     }
+
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("gh"),
+        "#!/bin/sh\n[ \"$1\" = repo ] && echo owner/repository || echo '[]'\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let cache = root.join("cache-queue");
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .current_dir(&root)
+        .args([
+            "--db-path",
+            root.join("queue.db").to_str().unwrap(),
+            "queue",
+            "owner/repository",
+            "--github",
+            "--env-file",
+            root.join("alucard.env").to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("ALUCARD_CACHE_DIR", &cache)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
+    assert_eq!(
+        repository_ledger_id(&cache.join("owner/repository")).unwrap(),
+        repository_ledger_id(&local).unwrap()
+    );
 
     let cache = root.join("cache-reuse");
     let database = root.join("reuse.db");

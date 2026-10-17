@@ -5975,7 +5975,7 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     let Some(tools) = tool_dir() else {
         return fail("alucard: could not locate tool files");
     };
-    let options = match QueueOptions::parse(args, tools.join("alucard.env")) {
+    let mut options = match QueueOptions::parse(args, tools.join("alucard.env")) {
         Ok(options) => options,
         Err(message) => return fail(&format!("alucard: {message}")),
     };
@@ -5991,6 +5991,12 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         Err(error) => return fail(&format!("alucard: {error}")),
     };
     settings.apply_to_process();
+    if !options.repository.is_dir() {
+        options.repository = match resolve_repository_target(&options.repository) {
+            Ok(repository) => repository,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        };
+    }
     let task_file = match options.task_file() {
         Ok(Some(path)) => path,
         Ok(None) => return github_queue_command(&options, db_path),
@@ -6254,16 +6260,15 @@ fn fetch_open_local_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, Str
         &[
             "api",
             "--paginate",
-            "--slurp",
             "repos/{owner}/{repo}/pulls?state=open&per_page=100",
+            "--jq",
+            ".[]",
         ],
         "could not list open pull requests",
     )?;
-    if output.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Vec::new());
-    }
-    serde_json::from_slice::<Vec<Vec<GithubPullRequest>>>(&output)
-        .map(|pages| pages.into_iter().flatten().collect())
+    serde_json::Deserializer::from_slice(&output)
+        .into_iter::<GithubPullRequest>()
+        .collect::<Result<_, _>>()
         .map_err(|error| format!("could not parse open pull requests: {error}"))
 }
 
@@ -6307,6 +6312,8 @@ fn fetch_open_issue_numbers_required(repository: &Path) -> Result<Vec<i64>, Stri
         .collect()
 }
 
+const OPEN_PRS_QUERY: &str = "query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){pullRequests(states:OPEN,first:100){nodes{number,title,body,closingIssuesReferences(first:25){nodes{number}}}}}}";
+
 fn fetch_open_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
     let owner = String::from_utf8(gh_output(
         repository,
@@ -6325,14 +6332,13 @@ fn fetch_open_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
     let (owner, name) = owner
         .split_once('/')
         .ok_or_else(|| "could not list open pull requests".to_string())?;
-    let query = "query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){pullRequests(states:OPEN,first:100){nodes{number,title,body,closingIssuesReferences(first:25){nodes{number}}}}}}}";
     let output = gh_output(
         repository,
         &[
             "api",
             "graphql",
             "-f",
-            &format!("query={query}"),
+            &format!("query={OPEN_PRS_QUERY}"),
             "-f",
             &format!("owner={owner}"),
             "-f",
@@ -6691,6 +6697,15 @@ mod tests {
     use std::sync::Mutex;
 
     static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn open_prs_query_braces_are_balanced() {
+        let depth = OPEN_PRS_QUERY.chars().try_fold(0i32, |depth, character| {
+            let depth = depth + i32::from(character == '{') - i32::from(character == '}');
+            (depth >= 0).then_some(depth)
+        });
+        assert_eq!(depth, Some(0));
+    }
 
     struct PathGuard(std::ffi::OsString);
 

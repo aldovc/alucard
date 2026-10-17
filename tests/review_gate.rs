@@ -423,7 +423,7 @@ case "$1 $2" in
       *reviews*'.body'*) printf '%s\n' "$ALUCARD_FORMAL_BODY" ;;
       *reviews*) printf '%s\n' "$ALUCARD_FORMAL_VERDICT" ;;
     esac ;;
-  'api --paginate') echo '[[]]' ;;
+  'api --paginate') ;;
   'run list')
     case "$ALUCARD_CASE" in
       ci-stale-runs-green)
