@@ -599,6 +599,7 @@ fn recovery_publication_failures_are_retained_and_parked_for_humans() {
             "origin",
             "main",
         ]));
+        let origin_env = test_support::github_ssh_origin(&root, &repository, &remote);
         let git = bin.join("git");
         fs::write(
             &git,
@@ -670,6 +671,7 @@ esac
                     "PATH",
                     format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
                 )
+                .envs(origin_env.clone())
                 .env("ALUCARD_REAL_GIT", "/usr/bin/git")
                 .env("ALUCARD_RECOVERY_SCENARIO", scenario)
                 .env("ALUCARD_RECOVERY_CREATED", root.join("recovery-created"))
