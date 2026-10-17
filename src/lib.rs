@@ -2446,6 +2446,12 @@ impl AgentInvocation<'_> {
             "-e".into(),
             "GIT_CONFIG_GLOBAL=/tmp/alucard-gitconfig".into(),
             "-e".into(),
+            "GIT_CONFIG_COUNT=1".into(),
+            "-e".into(),
+            "GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf".into(),
+            "-e".into(),
+            "GIT_CONFIG_VALUE_0=git@github.com:".into(),
+            "-e".into(),
             "GH_CONFIG_DIR=/tmp/gh".into(),
             "-v".into(),
             format!(
@@ -4666,8 +4672,7 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         &directory,
     )?;
     if let Some(origin_url) = origin_url.as_deref() {
-        let origin_url = github_https_url(origin_url);
-        run_checked("git", &["remote", "set-url", "origin", &origin_url], &clone)?;
+        run_checked("git", &["remote", "set-url", "origin", origin_url], &clone)?;
     }
     FileExt::unlock(&lock)?;
     if !clone.join(".git").is_dir() {
@@ -4738,10 +4743,6 @@ pub fn prepare_run(path: &Path, options: RunOptions<'_>) -> Result<PreparedRun, 
         clone,
         branch,
     })
-}
-
-fn github_https_url(url: &str) -> String {
-    url.replacen("git@github.com:", "https://github.com/", 1)
 }
 
 fn repository_cache_key(repository: &Path) -> String {

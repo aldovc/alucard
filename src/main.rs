@@ -290,6 +290,7 @@ fn prepare_iteration_environment(
 }
 
 fn main() -> ExitCode {
+    std::env::set_var("GIT_TERMINAL_PROMPT", "0");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (db_path, mut commands) = match parse_db_path(&args) {
         Ok(parsed) => parsed,

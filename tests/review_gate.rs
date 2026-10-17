@@ -143,6 +143,10 @@ fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (Option<S
         "origin",
         "main",
     ]));
+    let origin_env = (case.name == "ssh-origin")
+        .then(|| test_support::github_ssh_origin(&root, &repository, &remote))
+        .into_iter()
+        .flatten();
 
     let docker = bin.join("docker");
     fs::write(
@@ -307,7 +311,7 @@ if [ "$ALUCARD_CASE" = postgres-two-iterations ]; then
   printf '%s\n' "$number" > "$ALUCARD_PR_NUMBER_FILE"
 fi
 printf '%s\n' "$branch" > "$ALUCARD_BRANCH_FILE"
-git -C "$work" push -q origin "HEAD:$branch"
+git -C "$work" push -q "$ALUCARD_REMOTE" "HEAD:$branch"
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
 "#,
     )
@@ -372,7 +376,7 @@ case "$1 $2" in
     printf '[{"number":%s,"headRefName":"%s","headRefOid":"%s"}]\n' "$number" "$branch" "$(sha)"
     ;;
   'pr checks')
-    case "$ALUCARD_CASE" in recovery-unpark|recovery-old-head|recovery-untrusted|recovery-formal-approved) exit 0 ;; esac
+    case "$ALUCARD_CASE" in recovery-unpark|recovery-old-head|recovery-untrusted|recovery-formal-approved|ssh-origin) exit 0 ;; esac
     case "$ALUCARD_CASE" in postgres-agent-environment*|postgres-two-iterations) echo "checks failed" >&2; exit 1 ;; esac
     case "$ALUCARD_CASE" in
       ci-stale-checks-green) advance_head; exit 0 ;;
@@ -486,6 +490,7 @@ esac
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
         .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .envs(origin_env)
         .env("ALUCARD_REMOTE", &remote)
         .env("ALUCARD_BRANCH_FILE", &branch_file)
         .env("ALUCARD_PR_NUMBER_FILE", &pr_number_file)
@@ -625,6 +630,19 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             reviewer_outcomes: "verdict",
             comments_json: "{\"comments\":[]}",
             advance_head: true,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "ssh-origin",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
             expected_verdict: "APPROVED",
             expected_state: "review_approved",
         },
@@ -1084,6 +1102,10 @@ fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
             _ => assert!(
                 prompt.contains("<review_policy>\nReview policy from the target repository.")
             ),
+        }
+        if case.name == "ssh-origin" {
+            assert!(!trace.contains("unverified"), "{trace}");
+            assert!(prompt.contains("GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf\n-e\nGIT_CONFIG_VALUE_0=git@github.com:\n"));
         }
         if matches!(
             case.name,
