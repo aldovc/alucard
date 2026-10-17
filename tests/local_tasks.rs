@@ -3424,7 +3424,6 @@ fn continue_passes_selected_human_comments_to_feedback() {
             "origin",
             "main",
         ]));
-        let base_sha = head_sha(&repository);
         run(Command::new("git").args([
             "-C",
             repository.to_str().unwrap(),
@@ -3462,7 +3461,7 @@ fn continue_passes_selected_human_comments_to_feedback() {
         fs::write(
             &pr,
             format!(
-                r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{sha}","baseRefOid":"{base_sha}","title":"Test PR","comments":{comments}}}"#
+                r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{sha}","title":"Test PR","comments":{comments}}}"#
             ),
         )
         .unwrap();
@@ -3646,7 +3645,7 @@ fn continue_records_the_selected_measurement_base_source() {
         fs::write(
             &pr,
             format!(
-                r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{pr_head}","baseRefOid":"{base_sha}","title":"Test PR","comments":[]}}"#
+                r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{pr_head}","title":"Test PR","comments":[]}}"#
             ),
         )
         .unwrap();
@@ -3657,7 +3656,7 @@ fn continue_records_the_selected_measurement_base_source() {
         .unwrap();
         fs::write(
             bin.join("gh"),
-            "#!/bin/sh\ncase \"$1 $2\" in\n  'api user') echo alucard ;;\n  'pr checks') exit 1 ;;\n  'pr view') case \"$*\" in *'--jq .headRefOid'*) echo \"$ALUCARD_CONTINUE_HEAD\" ;; *reviews*) ;; *) cat \"$ALUCARD_CONTINUE_PR\" ;; esac ;;\n  'pr comment'|'pr edit') ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1 $2\" in\n  'api user') echo alucard ;;\n  'api repos/{owner}/{repo}/pulls/91') echo \"$ALUCARD_CONTINUE_BASE\" ;;\n  'pr checks') exit 1 ;;\n  'pr view') case \"$*\" in *baseRefOid*) echo 'Unknown JSON field: \"baseRefOid\"' >&2; exit 1 ;; *'--jq .headRefOid'*) echo \"$ALUCARD_CONTINUE_HEAD\" ;; *reviews*) ;; *) cat \"$ALUCARD_CONTINUE_PR\" ;; esac ;;\n  'pr comment'|'pr edit') ;;\nesac\n",
         )
         .unwrap();
         for command in ["docker", "gh"] {
@@ -3678,6 +3677,7 @@ fn continue_records_the_selected_measurement_base_source() {
             .env("ALUCARD_CACHE_DIR", root.join("cache"))
             .env("ALUCARD_CONTINUE_PR", &pr)
             .env("ALUCARD_CONTINUE_HEAD", pr_head)
+            .env("ALUCARD_CONTINUE_BASE", &base_sha)
             .args([
                 "--db-path",
                 database.to_str().unwrap(),
@@ -5387,7 +5387,6 @@ fn sigterm_during_continue_postgres_startup_stops_before_starting_an_agent() {
         "-qm",
         "postgres",
     ]));
-    let base_sha = head_sha(&repository);
     run(Command::new("git").args(["init", "-q", "--bare", origin.to_str().unwrap()]));
     run(Command::new("git").args([
         "-C",
@@ -5436,12 +5435,12 @@ fn sigterm_during_continue_postgres_startup_stops_before_starting_an_agent() {
     ]));
     run(Command::new("git").args(["-C", repository.to_str().unwrap(), "switch", "-q", "main"]));
     let pull = root.join("pull.json");
-    fs::write(&pull, format!(r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{head_sha}","baseRefOid":"{base_sha}","title":"Test PR","comments":[]}}"#)).unwrap();
+    fs::write(&pull, format!(r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{head_sha}","title":"Test PR","comments":[]}}"#)).unwrap();
     let docker = bin.join("docker");
     fs::write(&docker, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ALUCARD_DOCKER_TRACE\"\ncase \"$1 $2\" in\n  'run -d') : > \"$ALUCARD_POSTGRES_STARTED\"; while :; do sleep 1; done ;;\nesac\n").unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
     let gh = bin.join("gh");
-    fs::write(&gh, "#!/bin/sh\ncase \"$*\" in\n  *'api user'*) echo alucard ;;\n  *'state,headRefName,headRefOid,baseRefOid,title,comments'*) cat \"$ALUCARD_PULL\" ;;\n  *'--json comments'*) echo '{\"comments\":[]}' ;;\n  *'headRefOid'*) echo \"$ALUCARD_HEAD\" ;;\n  *'reviews'*) : ;;\n  *'pr checks'*) : ;;\nesac\n").unwrap();
+    fs::write(&gh, "#!/bin/sh\ncase \"$*\" in\n  *'api user'*) echo alucard ;;\n  *'state,headRefName,headRefOid,title,comments'*) cat \"$ALUCARD_PULL\" ;;\n  *'--json comments'*) echo '{\"comments\":[]}' ;;\n  *'headRefOid'*) echo \"$ALUCARD_HEAD\" ;;\n  *'reviews'*) : ;;\n  *'pr checks'*) : ;;\nesac\n").unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     let environment = root.join("agent.env");
     fs::write(
@@ -5522,7 +5521,6 @@ fn assert_sigterm_during_feedback_agent(dirty_checkout: bool) {
         "-qm",
         "postgres",
     ]));
-    let base_sha = head_sha(&repository);
     run(Command::new("git").args(["init", "-q", "--bare", origin.to_str().unwrap()]));
     run(Command::new("git").args([
         "-C",
@@ -5571,7 +5569,7 @@ fn assert_sigterm_during_feedback_agent(dirty_checkout: bool) {
     ]));
     run(Command::new("git").args(["-C", repository.to_str().unwrap(), "switch", "-q", "main"]));
     let pull = root.join("pull.json");
-    fs::write(&pull, format!(r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{head_sha}","baseRefOid":"{base_sha}","title":"Test PR","comments":[{{"body":"**🤖 Alucard review cycle 1/2: CHANGES_REQUESTED**\\n\\nfix this","createdAt":"2026-01-01T00:00:00Z","author":{{"login":"alucard"}}}}]}}"#)).unwrap();
+    fs::write(&pull, format!(r#"{{"state":"OPEN","headRefName":"feature","headRefOid":"{head_sha}","title":"Test PR","comments":[{{"body":"**🤖 Alucard review cycle 1/2: CHANGES_REQUESTED**\\n\\nfix this","createdAt":"2026-01-01T00:00:00Z","author":{{"login":"alucard"}}}}]}}"#)).unwrap();
     let docker = bin.join("docker");
     fs::write(
         &docker,
@@ -5583,7 +5581,7 @@ fn assert_sigterm_during_feedback_agent(dirty_checkout: bool) {
     fs::write(&git, "#!/bin/sh\n/usr/bin/git \"$@\"\nstatus=$?\nif [ \"$1\" = clone ] && [ \"$2\" != --local ] && [ \"$status\" -eq 0 ]; then\n  for argument do checkout=\"$argument\"; done\n  printf '%s' \"$checkout\" > \"$ALUCARD_FEEDBACK_CHECKOUT\"\nfi\nexit \"$status\"\n").unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
     let gh = bin.join("gh");
-    fs::write(&gh, "#!/bin/sh\ncase \"$*\" in\n  *'api user'*) echo alucard ;;\n  *'state,headRefName,headRefOid,baseRefOid,title,comments'*) cat \"$ALUCARD_PULL\" ;;\n  *'--json comments'*) echo '{\"comments\":[]}' ;;\n  *'headRefOid'*) echo \"$ALUCARD_HEAD\" ;;\nesac\n").unwrap();
+    fs::write(&gh, "#!/bin/sh\ncase \"$*\" in\n  *'api user'*) echo alucard ;;\n  *'state,headRefName,headRefOid,title,comments'*) cat \"$ALUCARD_PULL\" ;;\n  *'--json comments'*) echo '{\"comments\":[]}' ;;\n  *'headRefOid'*) echo \"$ALUCARD_HEAD\" ;;\nesac\n").unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
     let environment = root.join("agent.env");
     fs::write(
