@@ -3232,6 +3232,25 @@ pub fn github_task_pull_requests(
         .map_err(Into::into)
 }
 
+/// Lists local task ids from `source_path` that the ledger holds in flight on a PR.
+pub fn local_task_pull_requests(
+    connection: &Connection,
+    repository: &str,
+    source_path: &str,
+) -> Result<Vec<(String, i64)>, DatabaseError> {
+    connection
+        .prepare(
+            "SELECT external_id, pr_number FROM tasks
+             WHERE repository_id = ?1 AND source = 'local' AND source_path = ?2
+               AND status = 'in_flight' AND pr_number IS NOT NULL",
+        )?
+        .query_map([repository, source_path], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(Into::into)
+}
+
 /// Updates an unclaimed GitHub task after GitHub confirms its PR is terminal.
 pub fn reconcile_github_task_pull_request(
     connection: &Connection,
