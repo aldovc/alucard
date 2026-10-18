@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
 
 jobs:
   test:
@@ -31,3 +33,88 @@ jobs:
         run: |
           shellcheck --severity=warning --exclude=SC2034 \
             alucard entrypoint.sh install.sh test-*.sh test/*.sh
+
+  rust:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rustup reads the pinned toolchain from rust-toolchain.toml.
+      - name: Lint and test
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      # The release binary must run on hosts with no matching libc, so a
+      # dynamic loader or any shared-library dependency fails the job.
+      - name: Static musl build
+        run: |
+          target="$(uname -m)-unknown-linux-musl"
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add "$target"
+          cargo build --release --target "$target"
+          bin="target/$target/release/alucard"
+          file "$bin"
+          if readelf -lW "$bin" | grep -q INTERP || readelf -dW "$bin" | grep -q NEEDED; then
+            echo "$bin is not statically linked" >&2
+            exit 1
+          fi
+          "$bin" version
+          mkdir -p dist
+          cp "$bin" "dist/alucard-$target"
+
+      # Installs this checkout with the binary just built in place of the
+      # release download.
+      - name: Install
+        run: |
+          home="$RUNNER_TEMP/alucard"
+          # The checkout has no release tags; install from a throwaway one
+          version="v0.0.0-ci"
+          git tag -f "$version" HEAD
+          mkdir -p "$RUNNER_TEMP/release/$version"
+          cp dist/alucard-* "$RUNNER_TEMP/release/$version/"
+          ALUCARD_HOME="$home" ALUCARD_BIN_DIR="$RUNNER_TEMP/bin" ALUCARD_VERSION="$version" \
+            ALUCARD_REPO_URL="file://$PWD" ALUCARD_RELEASE_URL="file://$RUNNER_TEMP/release" \
+            bash install.sh
+          "$RUNNER_TEMP/bin/alucard" version
+          "$RUNNER_TEMP/bin/alucard-bash" version
+          doctor="$("$RUNNER_TEMP/bin/alucard" doctor 2>&1 || true)"
+          echo "$doctor"
+          grep -qxF "ok: tool files in $home" <<<"$doctor"
+          grep -qxF "ok: env file $home/alucard.env" <<<"$doctor"
+
+      - name: Keep release binary
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: alucard-${{ matrix.runner }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, rust]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -l dist
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+          fi

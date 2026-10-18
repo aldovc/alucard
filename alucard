@@ -348,6 +348,45 @@ with_repo_lock() {
   fi
 }
 
+# Refuse to start while the Rust implementation operates on the same repository.
+# Each implementation holds a shared flock on its own file for its lifetime,
+# so runs of one implementation coexist and a dead holder's lock is gone with
+# it. A GitHub repository is keyed by its lowercased slug in the cache, so a
+# checkout, owner/repo and a URL meet; any other checkout by its git dir.
+claim_implementation_guard() {
+  local target="$1" command_line="$2" slug="" key base holder pid holders=""
+  [ "$HAVE_FLOCK" = true ] || return 0
+  if [ -d "$target" ]; then
+    key=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) || return 0
+    slug=$(github_repo_slug "$key")
+    base="$(git -C "$key" rev-parse --absolute-git-dir)/alucard-guard"
+  else
+    slug=$(is_github_ref "$target")
+    [ -n "$slug" ] || return 0
+  fi
+  if [ -n "$slug" ]; then
+    slug=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')
+    key="github.com/$slug"
+    base="$DEFAULT_CACHE_DIR/guards/$slug"
+    mkdir -p "$(dirname "$base")"
+  fi
+  printf '%s\n' "$command_line" > "$base.bash.$$"
+  exec 8>>"$base.bash.lock"
+  flock -s 8
+  if ( flock -n 9 && rm -f "$base".rust.[0-9]* ) 9>>"$base.rust.lock"; then
+    for holder in "$base".bash.[0-9]*; do
+      kill -0 "${holder##*.}" 2>/dev/null || rm -f "$holder"
+    done
+    return 0
+  fi
+  for holder in "$base".rust.[0-9]*; do
+    pid=${holder##*.}
+    kill -0 "$pid" 2>/dev/null && holders+="${holders:+;} pid $pid: $(cat "$holder" 2>/dev/null)"
+  done
+  rm -f "$base.bash.$$"
+  die "the Rust alucard is already running on $key:${holders:- pid unknown}; refusing to start alucard-bash on the same repository"
+}
+
 # Clone or fetch the cached clone of a GitHub repo. Runs under the repo lock:
 # a second process arriving while the first is still cloning waits, then finds
 # the clone in place and fetches.
@@ -2410,22 +2449,15 @@ command_queue() {
   get_task_queue "$REPO_ABS"
 }
 
-# Files that must exist in TOOL_DIR for a run to work. `doctor` reports each
-# missing one; the test suite reads this list to check nothing new is shipped
-# without being checked for.
-REQUIRED_TOOL_FILES=(
-  Dockerfile
-  entrypoint.sh
-  alucard-worker-prompt.md
-  alucard-worker-github-prompt.md
-  alucard-worker-github-issue-prompt.md
-  alucard-worker-local-prompt.md
-  alucard-reviewer-prompt.md
-  alucard-ci-fix-prompt.md
-  alucard-feedback-prompt.md
-  alucard-wrapup-prompt.md
-  alucard-engineering-policy.md
-)
+# Files that must exist in TOOL_DIR for a run to work. The Rust doctor and
+# tests read this manifest too, so the list has one source of truth.
+REQUIRED_TOOL_FILES_FILE="$TOOL_DIR/required-tool-files.txt"
+
+required_tool_files() {
+  while IFS= read -r file || [ -n "$file" ]; do
+    [ -n "$file" ] && printf '%s\n' "$file"
+  done < "$REQUIRED_TOOL_FILES_FILE"
+}
 
 command_doctor() {
   parse_repo_options "$@"
@@ -2441,17 +2473,22 @@ command_doctor() {
     fi
   done
 
-  local _missing_files=false
-  for _f in "${REQUIRED_TOOL_FILES[@]}"; do
-    if [ ! -f "$TOOL_DIR/$_f" ]; then
-      echo "missing: $TOOL_DIR/$_f"
-      _missing_files=true
-    fi
-  done
-  if [ "$_missing_files" = "false" ]; then
-    echo "ok: tool files in $TOOL_DIR"
-  else
+  if [ ! -f "$REQUIRED_TOOL_FILES_FILE" ]; then
+    echo "missing: $REQUIRED_TOOL_FILES_FILE"
     ok=false
+  else
+    local _missing_files=false
+    while IFS= read -r _f; do
+      if [ ! -f "$TOOL_DIR/$_f" ]; then
+        echo "missing: $TOOL_DIR/$_f"
+        _missing_files=true
+      fi
+    done < <(required_tool_files)
+    if [ "$_missing_files" = "false" ]; then
+      echo "ok: tool files in $TOOL_DIR"
+    else
+      ok=false
+    fi
   fi
 
   if [ -f "$ENV_FILE" ]; then
@@ -4176,6 +4213,7 @@ ${_toolchain_esc}
 
 command_run() {
   parse_repo_options "$@"
+  claim_implementation_guard "$TARGET_REPO" "$0 run $*"
 
   need_cmd git
   need_cmd gh
@@ -4699,6 +4737,7 @@ command_continue() {
 
   parse_repo_options "$@"
   [ -z "${PIN_ISSUE:-}" ] || die "--issue is only valid with alucard run"
+  claim_implementation_guard "$TARGET_REPO" "$0 continue $pr_num $*"
 
   need_cmd git
   need_cmd gh
@@ -4920,6 +4959,7 @@ command_merge() {
   done
   parse_repo_options ${rest[@]+"${rest[@]}"}
   [ -z "${PIN_ISSUE:-}" ] || die "--issue is only valid with alucard run"
+  claim_implementation_guard "$TARGET_REPO" "$0 merge $pr_num ${rest[*]+${rest[*]}}"
 
   need_cmd git
   need_cmd gh

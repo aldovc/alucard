@@ -1,0 +1,5 @@
+[
+  {"number": 10, "title": "Eligible", "body": "Ready to work.", "labels": [{"name": "ready-for-agent"}]},
+  {"number": 11, "title": "Blocked", "body": "Blocked by #99", "labels": [{"name": "ready-for-agent"}]},
+  {"number": 12, "title": "Occupied", "body": "Already has a PR.", "labels": [{"name": "ready-for-agent"}]}
+]

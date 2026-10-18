@@ -1,0 +1,1604 @@
+mod test_support;
+
+use alucard::open;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn temporary_path(name: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("alucard-{name}-{}-{unique}", std::process::id()))
+}
+
+fn run(command: &mut Command) {
+    assert!(command.status().unwrap().success());
+}
+
+fn git_repository(root: &Path) {
+    run(Command::new("git").args(["init", "-q", "-b", "main", root.to_str().unwrap()]));
+    fs::write(root.join("README.md"), "test\n").unwrap();
+    run(Command::new("git").args(["-C", root.to_str().unwrap(), "add", "."]));
+    run(Command::new("git").args([
+        "-C",
+        root.to_str().unwrap(),
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "initial",
+    ]));
+}
+
+struct ReviewCase<'a> {
+    name: &'a str,
+    review_policy: Option<&'a str>,
+    oversized_policy: bool,
+    review_policy_max_bytes: Option<usize>,
+    file_verdict: &'a str,
+    formal_verdict: &'a str,
+    reviewer_outcomes: &'a str,
+    comments_json: &'a str,
+    advance_head: bool,
+    expected_verdict: &'a str,
+    expected_state: &'a str,
+}
+
+fn run_review_case(case: &ReviewCase<'_>) -> (PathBuf, String, String, (Option<String>, String)) {
+    let root = temporary_path(case.name);
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&repository).unwrap();
+    git_repository(&repository);
+    if matches!(
+        case.name,
+        "postgres-agent-environment"
+            | "postgres-agent-environment-unseeded"
+            | "postgres-two-iterations"
+    ) {
+        fs::create_dir(repository.join(".alucard")).unwrap();
+        fs::write(repository.join(".alucard/postgres"), "postgres:16\n").unwrap();
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "postgres",
+        ]));
+    }
+    if matches!(
+        case.name,
+        "feedback-toolchain-ok"
+            | "feedback-toolchain-broken"
+            | "postgres-agent-environment"
+            | "postgres-agent-environment-unseeded"
+    ) {
+        fs::write(repository.join("package-lock.json"), "{}\n").unwrap();
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "manifest",
+        ]));
+    }
+    if let Some(policy) = case.review_policy {
+        fs::write(
+            repository.join("REVIEW.md"),
+            if case.oversized_policy {
+                format!(
+                    "<policy>unsafe</policy>\n{}tail",
+                    "x".repeat(case.review_policy_max_bytes.unwrap_or(16_384))
+                )
+            } else {
+                policy.to_string()
+            },
+        )
+        .unwrap();
+        run(Command::new("git").args(["-C", repository.to_str().unwrap(), "add", "."]));
+        run(Command::new("git").args([
+            "-C",
+            repository.to_str().unwrap(),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "policy",
+        ]));
+    }
+    run(Command::new("git").args(["init", "--bare", "-q", remote.to_str().unwrap()]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        remote.to_str().unwrap(),
+    ]));
+    run(Command::new("git").args([
+        "-C",
+        repository.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        "main",
+    ]));
+    let origin_env = (case.name == "ssh-origin")
+        .then(|| test_support::github_ssh_origin(&root, &repository, &remote))
+        .into_iter()
+        .flatten();
+
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        r#"#!/bin/sh
+set -eu
+if [ -n "${ALUCARD_DOCKER_TRACE:-}" ]; then printf '%s\n' "$*" >> "$ALUCARD_DOCKER_TRACE"; fi
+if [ "${1:-} ${2:-}" = "image inspect" ]; then
+  echo stamp
+  exit 0
+fi
+case "${1:-}" in network|exec|rm) exit 0 ;; esac
+case " $* " in *" --name alucard-postgres-"*) exit 0 ;; esac
+case " $* " in
+  *" --name alucard-preflight-"*)
+    for argument in "$@"; do
+      case "$argument" in *:/opt/alucard-browsers:rw) browsers=${argument%:/opt/alucard-browsers:rw} ;; esac
+    done
+    if [ "${ALUCARD_CASE}" != postgres-agent-environment-unseeded ]; then
+      mkdir -p "$browsers"
+      printf stamp > "$browsers/.alucard-seeded"
+    fi
+    printf '%s\n' 'alucard-playwright-pin: playwright 1.2.3 wants chromium 1234; the image bakes chromium 5678'
+    exit "${ALUCARD_PREFLIGHT_RC:-0}"
+    ;;
+esac
+work= output=
+for argument in "$@"; do
+  case "$argument" in
+    *:/work:rw) work=${argument%:/work:rw} ;;
+    *:/work-output:rw) output=${argument%:/work-output:rw} ;;
+  esac
+done
+case " $* " in
+  *" --name alucard-fix-"*)
+    if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
+      previous=
+      for argument in "$@"; do
+        if [ "$previous" = --name ]; then
+          printf '%s\n' "$argument" >> "$ALUCARD_CI_FIX_ATTEMPTS"
+          break
+        fi
+        previous=$argument
+      done
+      printf 'uncommitted ci repair\n' > "$work/ci-repair.txt"
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+      exit 0
+    fi
+    ;;
+esac
+if [ -n "$output" ]; then
+  printf '%s\n' "$@" >> "$ALUCARD_REVIEW_ARGS"
+  role=review
+  case " $* " in *" --name alucard-feedback-"*) role=feedback ;; esac
+  attempts="$ALUCARD_REVIEW_ATTEMPTS"
+  outcomes="$ALUCARD_REVIEW_OUTCOMES"
+  if [ "$role" = feedback ]; then
+    attempts="$ALUCARD_FEEDBACK_ATTEMPTS"
+    outcomes="$ALUCARD_FEEDBACK_OUTCOMES"
+  fi
+  attempt=$(($(wc -l < "$attempts") + 1))
+  printf '%s\n' "$attempt" >> "$attempts"
+  outcome=$(printf '%s\n' "$outcomes" | sed -n "${attempt}p")
+  if [ "$role" = feedback ] && [ -z "$outcome" ]; then outcome=push; fi
+  if [ "$role" = review ] && [ -z "$outcome" ]; then outcome=verdict; fi
+  if [ "$role" = feedback ]; then
+    case "$ALUCARD_CASE" in
+      feedback-stall) outcome=stall-fail ;;
+      feedback-retained) outcome=retained ;;
+      feedback-unpublished) outcome=unpublished ;;
+    esac
+  fi
+  prompt=
+  if [ "$role" = feedback ]; then
+    prompt=$(cat)
+  else
+    for argument in "$@"; do prompt=$argument; done
+  fi
+  printf '%s' "$prompt" > "$ALUCARD_PROMPTS/$role-$attempt.txt"
+  if [ "$role" = review ]; then
+    git -C "$work" rev-parse HEAD >> "$ALUCARD_REVIEW_HEADS"
+  fi
+  if [ "$role" = feedback ]; then
+    case "$outcome" in
+      *blocked*) printf '%s\n' 'blocked finding' > "$output/.alucard-blocked" ;;
+    esac
+    case "$outcome" in
+      push*|*push*)
+        git -C "$work" config user.email test@example.com
+        git -C "$work" config user.name Test
+        printf 'feedback %s\n' "$attempt" > "$work/feedback-$attempt.txt"
+        git -C "$work" add "feedback-$attempt.txt"
+        git -C "$work" commit -qm feedback
+        git -C "$work" push -q origin "HEAD:$(git -C "$work" branch --show-current)"
+        ;;
+      retained) printf 'uncommitted feedback\n' > "$work/retained.txt" ;;
+      unpublished)
+        git -C "$work" config user.email test@example.com
+        git -C "$work" config user.name Test
+        printf 'unpublished feedback\n' > "$work/unpublished.txt"
+        git -C "$work" add unpublished.txt
+        git -C "$work" commit -qm unpublished
+        ;;
+    esac
+    case "$outcome" in
+      *fail*) printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500}'; exit 1 ;;
+    esac
+    printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+    exit 0
+  fi
+  if [ "$outcome" = verdict ] || [ "$outcome" = transport-verdict ]; then
+    verdict="$ALUCARD_REVIEW_VERDICT"
+    body='review body'
+    case "$ALUCARD_CASE:$attempt" in
+      findings-handoff:1)
+        verdict=CHANGES_REQUESTED
+        body='## Findings
+
+KEEP-FINDING
+
+## Too large for this loop
+
+DROP-TOO-LARGE
+
+## Non-blocking
+
+DROP-NON-BLOCKING' ;;
+      feedback-stall:1) verdict=CHANGES_REQUESTED ;;
+      feedback-ci-missing-after-push:1) verdict=CHANGES_REQUESTED ;;
+    esac
+    printf '%s\n' "$verdict" > "$output/.alucard-review"
+    printf '%s\n' "$body" > "$output/.alucard-review-body"
+  fi
+  if [ "$ALUCARD_ADVANCE_HEAD" = 1 ] && [ "$attempt" = 1 ]; then
+    advance="$ALUCARD_ADVANCE_CHECKOUT"
+    git clone -q "$ALUCARD_REMOTE" "$advance"
+    git -C "$advance" checkout -q "$(cat "$ALUCARD_BRANCH_FILE")"
+    git -C "$advance" config user.email test@example.com
+    git -C "$advance" config user.name Test
+    printf 'head advance\n' > "$advance/head-advance.txt"
+    git -C "$advance" add head-advance.txt
+    git -C "$advance" commit -qm advance
+    git -C "$advance" push -q origin HEAD:$(cat "$ALUCARD_BRANCH_FILE")
+  fi
+  case "$outcome" in
+    transport|transport-verdict) printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500}'; exit 1 ;;
+    no-worktree) exit 78 ;;
+    exhausted) printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true}'; exit 1 ;;
+    timeout) exit 124 ;;
+    *) printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}' ;;
+  esac
+  exit 0
+fi
+git -C "$work" config user.email test@example.com
+git -C "$work" config user.name Test
+printf 'worker change\n' > "$work/change.txt"
+git -C "$work" add change.txt
+git -C "$work" commit -qm worker
+branch=$(git -C "$work" branch --show-current)
+if [ "$ALUCARD_CASE" = postgres-two-iterations ]; then
+  number=$(($(cat "$ALUCARD_PR_NUMBER_FILE") + 1))
+  printf '%s\n' "$number" > "$ALUCARD_PR_NUMBER_FILE"
+fi
+printf '%s\n' "$branch" > "$ALUCARD_BRANCH_FILE"
+git -C "$work" push -q "$ALUCARD_REMOTE" "HEAD:$branch"
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        r#"#!/bin/sh
+set -eu
+if [ "${ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP:-0}" = 1 ] && [ "${1:-}" = clone ] && [ "${2:-}" = --quiet ] && [ "${3:-}" = --branch ]; then
+  case "${6:-}" in
+    *alucard-feedback-*/checkout)
+      advance="$ALUCARD_ADVANCE_CHECKOUT"
+      /usr/bin/git clone -q "$ALUCARD_REMOTE" "$advance"
+      /usr/bin/git -C "$advance" checkout -q "$(cat "$ALUCARD_BRANCH_FILE")"
+      /usr/bin/git -C "$advance" config user.email test@example.com
+      /usr/bin/git -C "$advance" config user.name Test
+      printf 'feedback setup advance\n' > "$advance/feedback-setup-advance.txt"
+      /usr/bin/git -C "$advance" add feedback-setup-advance.txt
+      /usr/bin/git -C "$advance" commit -qm advance
+      /usr/bin/git -C "$advance" push -q origin "HEAD:$(cat "$ALUCARD_BRANCH_FILE")"
+      export ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP=0
+      ;;
+  esac
+fi
+exec /usr/bin/git "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$ALUCARD_GH_TRACE"
+branch=$(cat "$ALUCARD_BRANCH_FILE" 2>/dev/null || true)
+sha() { git --git-dir="$ALUCARD_REMOTE" rev-parse "refs/heads/$branch"; }
+advance_head() {
+  advance=$(mktemp -d "$ALUCARD_ADVANCE_ROOT/ci-head.XXXXXX")
+  git clone -q "$ALUCARD_REMOTE" "$advance"
+  git -C "$advance" checkout -q "$branch"
+  git -C "$advance" config user.email test@example.com
+  git -C "$advance" config user.name Test
+  printf 'CI head advance %s\n' "$(sha)" > "$advance/ci-head-advance.txt"
+  git -C "$advance" add ci-head-advance.txt
+  git -C "$advance" commit -qm advance
+  git -C "$advance" push -q origin "HEAD:$branch"
+}
+case "$1 $2" in
+  'api user') printf '%s\n' alucard-bot ;;
+  'pr ready') : ;;
+  'issue view') printf '%s\n' 'Recovered task' ;;
+  'pr edit') echo 'Projects (classic) is being deprecated' >&2; exit 1 ;;
+  'api --silent') : ;;
+  'pr list')
+    number=77
+    if [ "$ALUCARD_CASE" = postgres-two-iterations ]; then number=$(cat "$ALUCARD_PR_NUMBER_FILE"); fi
+    printf '[{"number":%s,"headRefName":"%s","headRefOid":"%s"}]\n' "$number" "$branch" "$(sha)"
+    ;;
+  'pr checks')
+    case "$ALUCARD_CASE" in recovery-unpark|recovery-old-head|recovery-untrusted|recovery-formal-approved|ssh-origin) exit 0 ;; esac
+    case "$ALUCARD_CASE" in postgres-agent-environment*|postgres-two-iterations) echo "checks failed" >&2; exit 1 ;; esac
+    case "$ALUCARD_CASE" in
+      ci-stale-checks-green) advance_head; exit 0 ;;
+      ci-stale-checks-failed) advance_head; echo "checks failed" >&2; exit 1 ;;
+      ci-stale-runs-green|ci-stale-runs-failed) echo "Resource not accessible" >&2; exit 1 ;;
+    esac
+    if [ "$ALUCARD_CASE" = feedback-ci-repair-after-push ]; then
+      feedback_attempts=$(wc -l < "$ALUCARD_FEEDBACK_ATTEMPTS")
+      repair_attempts=$(wc -l < "$ALUCARD_CI_FIX_ATTEMPTS")
+      if [ "$repair_attempts" -eq $(((feedback_attempts + 1) * 2)) ]; then
+        exit 0
+      fi
+      echo "checks failed" >&2
+      exit 1
+    fi
+    if [ "$ALUCARD_CASE" = feedback-ci-missing-after-push ] && [ ! -s "$ALUCARD_FEEDBACK_ATTEMPTS" ]; then
+      exit 0
+    fi
+    echo "no checks reported" >&2
+    exit 1
+    ;;
+  'pr view')
+    case "$*" in
+      *state,headRefName,headRefOid,title,comments*)
+        case "$ALUCARD_CASE" in postgres-agent-environment*|postgres-two-iterations)
+          printf '{"state":"OPEN","headRefName":"%s","headRefOid":"%s","title":"Review task","comments":[]}\n' "$branch" "$(sha)"
+        esac ;;
+      *headRefOid*)
+        if [ "$ALUCARD_CASE" = registration-unverified ]; then
+          printf '%s\n' 0000000000000000000000000000000000000000
+        else
+          sha
+        fi ;;
+      *comments*isDraft*)
+        case "$ALUCARD_CASE" in
+          recovery-unpark|recovery-old-head|recovery-missing-ci)
+            printf '%s\n' '{"comments":[{"author":{"login":"alucard-bot"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft"}],"author":{"login":"alucard-bot"},"isDraft":true,"labels":[{"name":"needs-human"}],"title":"wip: alucard recovery — iter 1","body":"Refs #77\n\nunfinished"}' ;;
+          recovery-untrusted)
+            printf '%s\n' '{"comments":[{"author":{"login":"other"},"body":"**🤖 Alucard recovery PR parked** — opened as a draft"}],"author":{"login":"other"},"isDraft":true,"labels":[{"name":"needs-human"}],"title":"wip: alucard recovery — iter 1","body":"Refs #77\n\nunfinished"}' ;;
+          *) printf '%s\n' "$ALUCARD_PR_COMMENTS" ;;
+        esac ;;
+      *--json\ comments*)
+        if [ "$ALUCARD_CASE" = feedback-blocked ] && [ -s "$ALUCARD_FEEDBACK_ATTEMPTS" ]; then
+          printf '%s\n' '{"comments":[{"body":"**🤖 Alucard blocked findings** (cycle 1/2)\n\nblocked finding"}]}'
+        else
+          printf '%s\n' "$ALUCARD_PR_COMMENTS"
+        fi ;;
+      *reviews*'.body'*) printf '%s\n' "$ALUCARD_FORMAL_BODY" ;;
+      *reviews*) printf '%s\n' "$ALUCARD_FORMAL_VERDICT" ;;
+    esac ;;
+  'api --paginate') ;;
+  'run list')
+    case "$ALUCARD_CASE" in
+      ci-stale-runs-green)
+        head=$(sha); advance_head
+        printf '[{"headSha":"%s","status":"completed","conclusion":"success"}]\n' "$head" ;;
+      ci-stale-runs-failed)
+        head=$(sha); advance_head
+        printf '[{"headSha":"%s","status":"completed","conclusion":"failure"}]\n' "$head" ;;
+      *) echo '[[]]' ;;
+    esac ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let tasks = root.join("tasks.md");
+    fs::write(
+        &tasks,
+        if case.name == "postgres-two-iterations" {
+            "## [ ] first: First task\n\n## [ ] second: Second task\n"
+        } else {
+            "## [ ] review: Review task\n"
+        },
+    )
+    .unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        format!(
+            "GITHUB_TOKEN=test\nALUCARD_PROVIDER=claude\nALUCARD_REVIEWER_PROVIDER=claude\nALUCARD_FEEDBACK_PROVIDER={}\nANTHROPIC_API_KEY=test\nOPENAI_API_KEY=test\n",
+            if case.name == "feedback-invocation-failure" {
+                "unsupported"
+            } else {
+                "codex"
+            }
+        ),
+    )
+    .unwrap();
+    let review_args = root.join("review-args");
+    let review_attempts = root.join("review-attempts");
+    fs::write(&review_attempts, "").unwrap();
+    fs::write(root.join("feedback-attempts"), "").unwrap();
+    fs::write(root.join("ci-fix-attempts"), "").unwrap();
+    let review_heads = root.join("review-heads");
+    fs::write(&review_heads, "").unwrap();
+    let branch_file = root.join("branch");
+    let pr_number_file = root.join("pr-number");
+    fs::write(&pr_number_file, "76\n").unwrap();
+    let gh_trace = root.join("gh-trace");
+    let docker_trace = root.join("docker-trace");
+    let database = root.join("ledger.db");
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .envs(origin_env)
+        .env("ALUCARD_REMOTE", &remote)
+        .env("ALUCARD_BRANCH_FILE", &branch_file)
+        .env("ALUCARD_PR_NUMBER_FILE", &pr_number_file)
+        .env("ALUCARD_REVIEW_ARGS", &review_args)
+        .env("ALUCARD_REVIEW_ATTEMPTS", &review_attempts)
+        .env("ALUCARD_REVIEW_HEADS", &review_heads)
+        .env("ALUCARD_FEEDBACK_ATTEMPTS", root.join("feedback-attempts"))
+        .env("ALUCARD_CI_FIX_ATTEMPTS", root.join("ci-fix-attempts"))
+        .env("ALUCARD_PROMPTS", {
+            let prompts = root.join("prompts");
+            fs::create_dir(&prompts).unwrap();
+            prompts
+        })
+        .env("ALUCARD_GH_TRACE", &gh_trace)
+        .env("ALUCARD_DOCKER_TRACE", &docker_trace)
+        .env("ALUCARD_REVIEW_VERDICT", case.file_verdict)
+        .env("ALUCARD_CASE", case.name)
+        .env("ALUCARD_FORMAL_VERDICT", case.formal_verdict)
+        .env("ALUCARD_FORMAL_BODY", "formal body")
+        .env("ALUCARD_PR_COMMENTS", case.comments_json)
+        .env(
+            "REVIEW_POLICY_MAX_BYTES",
+            case.review_policy_max_bytes.unwrap_or(16_384).to_string(),
+        )
+        .env("ALUCARD_REVIEW_OUTCOMES", case.reviewer_outcomes)
+        .env(
+            "ALUCARD_FEEDBACK_OUTCOMES",
+            match case.name {
+                "feedback-blocked" => "push-blocked",
+                "feedback-fails-after-push" => "push-fail",
+                "feedback-setup-advance" => "stall",
+                "feedback-unpublished" => "unpublished",
+                _ => "push",
+            },
+        )
+        .env(
+            "ALUCARD_PREFLIGHT_RC",
+            if case.name == "feedback-toolchain-broken" {
+                "23"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            "ALUCARD_ADVANCE_HEAD",
+            if case.advance_head { "1" } else { "0" },
+        )
+        .env(
+            "ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP",
+            if case.name == "feedback-setup-advance" {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env("ALUCARD_ADVANCE_CHECKOUT", root.join("advance"))
+        .env("ALUCARD_ADVANCE_ROOT", &root)
+        .args([
+            "--db-path",
+            database.to_str().unwrap(),
+            "run",
+            "--iterations",
+            if case.name == "postgres-two-iterations" {
+                "2"
+            } else {
+                "1"
+            },
+            "--tasks",
+            tasks.to_str().unwrap(),
+            "--env-file",
+            environment.to_str().unwrap(),
+            "--logs-root",
+            root.join("logs").to_str().unwrap(),
+            "--no-build",
+            "--max-review-cycles",
+            "2",
+            repository.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let connection = open(&database).unwrap();
+    let result = connection
+        .query_row(
+            "SELECT review_verdict, gate_state, reviewer_approved_sha, head_sha FROM pull_requests WHERE number = 77",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?)),
+        )
+        .unwrap();
+    assert_eq!(result.0, case.expected_verdict, "{}", case.name);
+    assert_eq!(result.1, case.expected_state, "{}", case.name);
+    drop(connection);
+    (
+        root,
+        fs::read_to_string(review_args).unwrap(),
+        fs::read_to_string(gh_trace).unwrap(),
+        (result.2, result.3),
+    )
+}
+
+#[test]
+fn run_reconciles_reviewer_verdicts_and_injects_review_policy() {
+    let cases = [
+        ReviewCase {
+            name: "recovery-unpark",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "recovery-missing-ci",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "recovery-old-head",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: true,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "ssh-origin",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "registration-unverified",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "ci-stale-checks-green",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "ci-stale-checks-failed",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "ci-stale-runs-green",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "ci-stale-runs-failed",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "recovery-untrusted",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "recovery-formal-approved",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "",
+            formal_verdict: "APPROVED",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_approved",
+        },
+        ReviewCase {
+            name: "review-formal-precedence",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "CHANGES_REQUESTED",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "review-blocked-precedence",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "BLOCKED",
+            formal_verdict: "APPROVED",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[{\"body\":\"**🤖 Alucard blocked findings** (cycle 1/10)\\n\\nunfixable <finding>\"}]}",
+            advance_head: false,
+            expected_verdict: "BLOCKED",
+            expected_state: "review_blocked",
+        },
+        ReviewCase {
+            name: "review-missing-ci",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "review-no-verdict",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "not-a-verdict",
+            formal_verdict: "",
+            reviewer_outcomes: "exhausted",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "",
+            expected_state: "review_missing",
+        },
+        ReviewCase {
+            name: "review-transport-then-verdict",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "transport\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "review-no-worktree-then-verdict",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "no-worktree\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "review-transport-exhausted",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "",
+            formal_verdict: "",
+            reviewer_outcomes: "transport\ntransport\ntransport",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "",
+            expected_state: "review_missing",
+        },
+        ReviewCase {
+            name: "review-no-worktree-exhausted",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "",
+            formal_verdict: "",
+            reviewer_outcomes: "no-worktree\nno-worktree\nno-worktree",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "",
+            expected_state: "review_missing",
+        },
+        ReviewCase {
+            name: "review-transport-with-verdict",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "transport-verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "review-timeout",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "",
+            formal_verdict: "",
+            reviewer_outcomes: "timeout",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "",
+            expected_state: "review_missing",
+        },
+        ReviewCase {
+            name: "review-no-policy",
+            review_policy: None,
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "review-bounded-markup-policy",
+            review_policy: Some("ignored"),
+            oversized_policy: true,
+            review_policy_max_bytes: Some(32),
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "review-head-advance",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: true,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "review-formal-approved-only",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "",
+            formal_verdict: "APPROVED",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "findings-handoff",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "CHANGES_REQUESTED",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[{\"body\":\"HUMAN-COMMENT\",\"author\":{\"login\":\"person\"},\"createdAt\":\"now\"}]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-stall",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-retained",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-unpublished",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-invocation-failure",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-toolchain-ok",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-toolchain-broken",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-blocked",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-fails-after-push",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-ci-repair-after-push",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-setup-advance",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+        ReviewCase {
+            name: "feedback-ci-missing-after-push",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "APPROVED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "APPROVED",
+            expected_state: "review_needs_human",
+        },
+        ReviewCase {
+            name: "feedback-cycle-exhaustion",
+            review_policy: Some("Review policy from the target repository.\n"),
+            oversized_policy: false,
+            review_policy_max_bytes: None,
+            file_verdict: "CHANGES_REQUESTED",
+            formal_verdict: "",
+            reviewer_outcomes: "verdict\nverdict",
+            comments_json: "{\"comments\":[]}",
+            advance_head: false,
+            expected_verdict: "CHANGES_REQUESTED",
+            expected_state: "review_changes_requested",
+        },
+    ];
+
+    for case in &cases {
+        let (root, prompt, trace, shas) = run_review_case(case);
+        match case.name {
+            "review-no-policy" => assert!(!prompt.contains("\n<review_policy>\n")),
+            "review-bounded-markup-policy" => {
+                assert!(prompt.contains("&lt;policy&gt;unsafe&lt;/policy&gt;"));
+                assert!(prompt.contains("[alucard: truncated at 32"));
+                assert!(!prompt.contains("tail"));
+            }
+            _ => assert!(
+                prompt.contains("<review_policy>\nReview policy from the target repository.")
+            ),
+        }
+        if case.name == "ssh-origin" {
+            assert!(!trace.contains("unverified"), "{trace}");
+            assert!(prompt.contains("GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf\n-e\nGIT_CONFIG_VALUE_0=git@github.com:\n"));
+        }
+        if matches!(
+            case.name,
+            "review-transport-then-verdict" | "review-no-worktree-then-verdict"
+        ) {
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+        if case.name == "review-blocked-precedence" {
+            assert!(prompt.contains(
+                "<known_blockers>\n**🤖 Alucard blocked findings** (cycle 1/10)\n\nunfixable &lt;finding&gt;\n</known_blockers>"
+            ));
+        }
+        if matches!(
+            case.name,
+            "review-transport-exhausted" | "review-no-worktree-exhausted"
+        ) {
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                3
+            );
+            assert!(trace.contains(match case.name {
+                "review-transport-exhausted" => "class=transport",
+                "review-no-worktree-exhausted" => "class=no_worktree",
+                _ => unreachable!(),
+            }));
+        }
+        if case.name == "review-transport-with-verdict" {
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        if case.name == "review-timeout" {
+            assert!(trace.contains("class=exhausted"));
+            assert!(trace
+                .contains("Raise `ALUCARD_REVIEWER_MAX_TURNS` / `ALUCARD_REVIEWER_MAX_BUDGET`"));
+        }
+        if case.name == "review-head-advance" {
+            let approved_sha = shas.0.as_deref().unwrap();
+            assert_ne!(approved_sha, shas.1);
+            assert!(trace.contains(&format!("Reviewed head: `{approved_sha}`")));
+        }
+        if case.name == "review-formal-approved-only" {
+            assert!(!trace.contains("Reviewed head:"));
+            assert_eq!(shas.0, None);
+        }
+        if case.name == "recovery-unpark" {
+            assert!(trace.contains("pr ready 77"), "{trace}");
+            assert!(
+                trace.contains("DELETE repos/{owner}/{repo}/issues/77/labels/needs-human"),
+                "{trace}"
+            );
+            assert!(
+                trace.contains("PATCH repos/{owner}/{repo}/pulls/77 -f title=Recovered task -f body=Closes #77"),
+                "{trace}"
+            );
+            assert!(trace.contains("Marked ready for review"), "{trace}");
+        }
+        if case.name == "review-missing-ci" {
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let measurement = fs::read_to_string(log_dir.join("measurements.jsonl")).unwrap();
+            let iteration: serde_json::Value = measurement
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .find(|record: &serde_json::Value| record["record"] == "iteration")
+                .unwrap();
+            assert_eq!(iteration["ci_result"], "none");
+            assert_eq!(iteration["review_verdict"], "APPROVED");
+            assert_eq!(iteration["review_cycles"], 1);
+        }
+        if case.name == "recovery-missing-ci" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(
+                !trace.contains("DELETE repos/{owner}/{repo}/issues/77/labels/needs-human"),
+                "{trace}"
+            );
+            assert!(!trace.contains("pr edit 77 --title"), "{trace}");
+        }
+        if case.name == "recovery-old-head" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(!trace.contains("labels/needs-human"), "{trace}");
+            assert!(!trace.contains("pr edit 77 --title"), "{trace}");
+        }
+        if matches!(
+            case.name,
+            "registration-unverified"
+                | "ci-stale-checks-green"
+                | "ci-stale-checks-failed"
+                | "ci-stale-runs-green"
+                | "ci-stale-runs-failed"
+        ) {
+            assert!(trace.contains("current-head CI is unverified"), "{trace}");
+            assert!(
+                trace.contains("APPROVED — CI status is unverified, needs human"),
+                "{trace}"
+            );
+            assert!(fs::read_to_string(root.join("ci-fix-attempts"))
+                .unwrap()
+                .is_empty());
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let measurement = fs::read_to_string(log_dir.join("measurements.jsonl")).unwrap();
+            let iteration: serde_json::Value = measurement
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .find(|record: &serde_json::Value| record["record"] == "iteration")
+                .unwrap();
+            assert_eq!(iteration["ci_result"], "unverified");
+        }
+        if case.name == "recovery-untrusted" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(!trace.contains("labels/needs-human"), "{trace}");
+        }
+        if case.name == "recovery-formal-approved" {
+            assert!(!trace.contains("pr ready 77"), "{trace}");
+            assert!(!trace.contains("labels/needs-human"), "{trace}");
+        }
+        if case.name == "findings-handoff" {
+            let feedback = fs::read_to_string(root.join("prompts/feedback-1.txt")).unwrap();
+            assert!(feedback.contains("KEEP-FINDING"), "{feedback}");
+            assert!(feedback.contains("HUMAN-COMMENT"));
+            assert!(!feedback.contains("DROP-TOO-LARGE"));
+            assert!(!feedback.contains("DROP-NON-BLOCKING"));
+            assert!(feedback.contains("No Python or Node manifest found"));
+        }
+        if matches!(
+            case.name,
+            "feedback-toolchain-ok" | "feedback-toolchain-broken"
+        ) {
+            let feedback = fs::read_to_string(root.join("prompts/feedback-1.txt")).unwrap();
+            let expected = if case.name == "feedback-toolchain-ok" {
+                "OK — `npm ci` at the repo root completes"
+            } else {
+                "BROKEN — `npm ci` at the repo root fails inside the container (rc=23)"
+            };
+            assert!(feedback.contains(expected));
+        }
+        if case.name == "feedback-blocked" {
+            let second_review = fs::read_to_string(root.join("prompts/review-2.txt")).unwrap();
+            assert!(trace.contains("Alucard blocked findings"));
+            assert!(second_review.contains("blocked finding"));
+        }
+        if case.name == "feedback-fails-after-push" {
+            assert!(trace.contains("feedback agent failed after pushing"));
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+        if case.name == "feedback-ci-repair-after-push" {
+            let repairs = fs::read_to_string(root.join("ci-fix-attempts")).unwrap();
+            assert_eq!(repairs.lines().count(), 4);
+            assert!(repairs.contains("-0-1"), "{repairs}");
+            assert!(repairs.contains("-0-2"), "{repairs}");
+            assert!(repairs.contains("-1-1"), "{repairs}");
+            assert!(repairs.contains("-1-2"), "{repairs}");
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let records = fs::read_to_string(log_dir.join("measurements.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let stages = records
+                .iter()
+                .filter(|record| record["record"] == "stage")
+                .collect::<Vec<_>>();
+            assert_eq!(stages[0]["stage"], "worker");
+            assert_eq!(stages[1]["stage"], "cifix");
+            assert_eq!(stages[3]["stage"], "feedback");
+            assert_eq!(stages[4]["stage"], "cifix");
+            assert_eq!(stages[0]["head_sha"], stages[1]["prev_sha"]);
+            assert_eq!(stages[3]["head_sha"], stages[4]["prev_sha"]);
+            let iteration = records
+                .iter()
+                .find(|record| record["record"] == "iteration")
+                .unwrap();
+            assert_eq!(iteration["roles"]["cifix"]["invocations"], 4);
+            assert_eq!(iteration["roles"]["feedback"]["invocations"], 1);
+        }
+        if case.name == "feedback-setup-advance" {
+            assert!(!trace.contains("feedback agent stopped without publishing"));
+            assert_eq!(trace.matches("pr checks").count(), 8);
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
+        if case.name == "feedback-cycle-exhaustion" {
+            assert!(trace.contains("gave up after 2/2 review cycles — needs human"));
+            assert_eq!(
+                fs::read_to_string(root.join("feedback-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        if case.name == "feedback-ci-missing-after-push" {
+            assert!(trace.contains("APPROVED — no CI ran, needs human"));
+            assert!(!trace.contains("Alucard review cycle 2/2: APPROVED**"));
+        }
+        if case.name == "feedback-toolchain-ok" {
+            let heads = fs::read_to_string(root.join("review-heads")).unwrap();
+            let heads = heads.lines().collect::<Vec<_>>();
+            assert_eq!(heads.len(), 2);
+            assert_ne!(heads[0], heads[1]);
+        }
+        if matches!(
+            case.name,
+            "feedback-stall"
+                | "feedback-retained"
+                | "feedback-unpublished"
+                | "feedback-invocation-failure"
+        ) {
+            assert!(trace.contains("feedback agent stopped without publishing"));
+            assert_eq!(
+                fs::read_to_string(root.join("review-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        if case.name == "feedback-unpublished" {
+            let log_dir = fs::read_dir(root.join("logs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let event = fs::read_to_string(log_dir.join("events.log")).unwrap();
+            assert!(event.contains("Unpublished work preserved at"), "{event}");
+        }
+        match case.expected_state {
+            "review_blocked" => assert!(trace
+                .contains("POST repos/{owner}/{repo}/issues/77/labels -f labels[]=needs-human")),
+            "review_needs_human" => {
+                assert!(trace.contains(
+                    "POST repos/{owner}/{repo}/issues/77/labels -f labels[]=needs-human"
+                ));
+                if !matches!(
+                    case.name,
+                    "registration-unverified"
+                        | "ci-stale-checks-green"
+                        | "ci-stale-checks-failed"
+                        | "ci-stale-runs-green"
+                        | "ci-stale-runs-failed"
+                ) {
+                    assert!(trace.contains("APPROVED — no CI ran, needs human"));
+                }
+            }
+            "review_missing" => {
+                assert!(trace.contains(match case.name {
+                    "review-transport-exhausted" => "class=transport",
+                    "review-no-worktree-exhausted" => "class=no_worktree",
+                    _ => "class=exhausted",
+                }));
+                assert!(trace.contains("no review posted — needs human"));
+            }
+            "review_approved" => assert!(trace.contains("APPROVED")),
+            _ => assert!(trace.contains("CHANGES_REQUESTED")),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn assert_agent_invocations(trace: &str, required_roles: &[&str], cache_mounted: bool) {
+    let mut seen = Vec::new();
+    for line in trace.lines() {
+        let arguments = line.split_whitespace().collect::<Vec<_>>();
+        let Some(name) = arguments
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--name").then_some(pair[1]))
+        else {
+            continue;
+        };
+        let Some((role, suffix)) =
+            ["worker", "fix", "review", "feedback"]
+                .iter()
+                .find_map(|role| {
+                    name.strip_prefix(&format!("alucard-{role}-"))
+                        .map(|suffix| (*role, suffix))
+                })
+        else {
+            continue;
+        };
+        let run_id = match role {
+            "worker" | "feedback" => suffix.rsplit_once('-').unwrap().0,
+            "fix" | "review" => suffix.rsplitn(3, '-').last().unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--network", &format!("alucard-{run_id}")]),
+            "{line}"
+        );
+        assert!(
+            arguments.iter().any(|argument| *argument
+                == "DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres"),
+            "{line}"
+        );
+        for argument in [
+            "/opt/alucard-browsers:rw",
+            "PLAYWRIGHT_BROWSERS_PATH=/opt/alucard-browsers",
+            "PLAYWRIGHT_SKIP_BROWSER_GC=1",
+        ] {
+            assert_eq!(
+                arguments.iter().any(|value| value.contains(argument)),
+                cache_mounted,
+                "{line}"
+            );
+        }
+        seen.push(role);
+    }
+    for role in required_roles {
+        assert!(seen.contains(role), "missing {role} invocation: {trace}");
+    }
+}
+
+#[test]
+fn postgres_agent_environment_reaches_run_and_continue_agent_launches() {
+    let case = ReviewCase {
+        name: "postgres-agent-environment",
+        review_policy: None,
+        oversized_policy: false,
+        review_policy_max_bytes: None,
+        file_verdict: "CHANGES_REQUESTED",
+        formal_verdict: "",
+        reviewer_outcomes: "verdict\nverdict",
+        comments_json: "{\"comments\":[]}",
+        advance_head: false,
+        expected_verdict: "CHANGES_REQUESTED",
+        expected_state: "review_changes_requested",
+    };
+    let (root, _, _, _) = run_review_case(&case);
+    let docker_trace = root.join("docker-trace");
+    let run_trace = fs::read_to_string(&docker_trace).unwrap();
+    assert_agent_invocations(&run_trace, &["worker", "fix", "review", "feedback"], true);
+
+    let repository = root.join("repository");
+    let remote = root.join("remote.git");
+    let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("ALUCARD_CACHE_DIR", root.join("cache"))
+        .env("ALUCARD_REMOTE", remote)
+        .env("ALUCARD_BRANCH_FILE", root.join("branch"))
+        .env("ALUCARD_REVIEW_ARGS", root.join("review-args"))
+        .env("ALUCARD_REVIEW_ATTEMPTS", root.join("review-attempts"))
+        .env("ALUCARD_REVIEW_HEADS", root.join("review-heads"))
+        .env("ALUCARD_FEEDBACK_ATTEMPTS", root.join("feedback-attempts"))
+        .env("ALUCARD_CI_FIX_ATTEMPTS", root.join("ci-fix-attempts"))
+        .env("ALUCARD_PROMPTS", root.join("prompts"))
+        .env("ALUCARD_GH_TRACE", root.join("gh-trace"))
+        .env("ALUCARD_DOCKER_TRACE", &docker_trace)
+        .env("ALUCARD_REVIEW_VERDICT", "CHANGES_REQUESTED")
+        .env("ALUCARD_CASE", case.name)
+        .env("ALUCARD_FORMAL_VERDICT", "")
+        .env("ALUCARD_FORMAL_BODY", "formal body")
+        .env("ALUCARD_PR_COMMENTS", case.comments_json)
+        .env("ALUCARD_REVIEW_OUTCOMES", case.reviewer_outcomes)
+        .env("ALUCARD_FEEDBACK_OUTCOMES", "push")
+        .env("ALUCARD_PREFLIGHT_RC", "0")
+        .env("ALUCARD_ADVANCE_HEAD", "0")
+        .env("ALUCARD_ADVANCE_DURING_FEEDBACK_SETUP", "0")
+        .env("ALUCARD_ADVANCE_CHECKOUT", root.join("advance"))
+        .env("ALUCARD_ADVANCE_ROOT", &root)
+        .args([
+            "--db-path",
+            root.join("ledger.db").to_str().unwrap(),
+            "continue",
+            "77",
+            "--env-file",
+            root.join("agent.env").to_str().unwrap(),
+            "--logs-root",
+            root.join("continue-logs").to_str().unwrap(),
+            "--no-build",
+            "--max-review-cycles",
+            "2",
+            repository.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let continue_trace = fs::read_to_string(&docker_trace).unwrap();
+    assert_agent_invocations(
+        &continue_trace[run_trace.len()..],
+        &["fix", "review", "feedback"],
+        true,
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unseeded_playwright_cache_is_not_mounted_for_agent_launches() {
+    let case = ReviewCase {
+        name: "postgres-agent-environment-unseeded",
+        review_policy: None,
+        oversized_policy: false,
+        review_policy_max_bytes: None,
+        file_verdict: "CHANGES_REQUESTED",
+        formal_verdict: "",
+        reviewer_outcomes: "verdict\nverdict",
+        comments_json: "{\"comments\":[]}",
+        advance_head: false,
+        expected_verdict: "CHANGES_REQUESTED",
+        expected_state: "review_changes_requested",
+    };
+    let (root, _, _, _) = run_review_case(&case);
+    let trace = fs::read_to_string(root.join("docker-trace")).unwrap();
+    assert_agent_invocations(&trace, &["worker", "fix", "review", "feedback"], false);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn postgres_is_recreated_for_each_run_iteration() {
+    let case = ReviewCase {
+        name: "postgres-two-iterations",
+        review_policy: None,
+        oversized_policy: false,
+        review_policy_max_bytes: None,
+        file_verdict: "CHANGES_REQUESTED",
+        formal_verdict: "",
+        reviewer_outcomes: "verdict\nverdict",
+        comments_json: "{\"comments\":[]}",
+        advance_head: false,
+        expected_verdict: "CHANGES_REQUESTED",
+        expected_state: "review_changes_requested",
+    };
+    let (root, _, _, _) = run_review_case(&case);
+    let trace = fs::read_to_string(root.join("docker-trace")).unwrap();
+    let networks = trace
+        .lines()
+        .filter_map(|line| line.strip_prefix("network create "))
+        .collect::<Vec<_>>();
+    assert_eq!(networks.len(), 2, "{trace}");
+    assert_ne!(networks[0], networks[1], "{trace}");
+
+    let first_removed = trace.find(&format!("network rm {}", networks[0])).unwrap();
+    let second_created = trace
+        .find(&format!("network create {}", networks[1]))
+        .unwrap();
+    assert!(first_removed < second_created, "{trace}");
+    for network in networks {
+        let run_id = network.strip_prefix("alucard-").unwrap();
+        assert!(trace.contains(&format!(
+            "run -d --rm --name alucard-postgres-{run_id} --network {network}"
+        )));
+        assert!(trace.contains(&format!("rm -f -v alucard-postgres-{run_id}")));
+        assert!(trace.contains(&format!("network rm {network}")));
+    }
+    fs::remove_dir_all(root).unwrap();
+}

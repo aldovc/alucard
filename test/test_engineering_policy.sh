@@ -75,9 +75,9 @@ assert_contains "ci-fix prompt keeps its own tighter guard" \
 echo "── doctor ──"
 
 assert_contains "doctor's required files include the fragment" \
-  "alucard-engineering-policy.md" "$(printf '%s\n' "${REQUIRED_TOOL_FILES[@]}")"
+  "alucard-engineering-policy.md" "$(required_tool_files)"
 assert_contains "doctor's required files include the pin mode section" \
-  "alucard-worker-github-issue-prompt.md" "$(printf '%s\n' "${REQUIRED_TOOL_FILES[@]}")"
+  "alucard-worker-github-issue-prompt.md" "$(required_tool_files)"
 
 # ── Superseded copies are gone from the role prompts ─────────────────────────
 echo "── superseded rules removed ──"

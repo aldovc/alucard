@@ -56,7 +56,7 @@ Install `flock` from `util-linux` if you plan to run multiple Alucard processes 
 curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | bash
 ```
 
-The installer clones Alucard into `~/.local/share/alucard`, links the CLI into `~/.local/bin`, and creates `alucard.env` from the example if it does not already exist. Add `~/.local/bin` to your `PATH` if needed. Re-run the installer to update.
+The installer clones Alucard into `~/.local/share/alucard` and downloads the latest release binary for the host (Linux x86-64 or ARM64) into its `bin/` directory. It links that binary into `~/.local/bin` as `alucard` and the Bash script as `alucard-bash`, and creates `alucard.env` from the example if it does not already exist. Both CLIs read the prompts, `Dockerfile`, and `alucard.env` from the install directory. Add `~/.local/bin` to your `PATH` if needed. Re-run the installer to update; it never overwrites an existing `alucard.env`. On an unsupported platform, or if the download fails, the installer stops and leaves the previous install unchanged.
 
 For a different installation directory, pass the variables to the shell running the installer:
 
@@ -196,7 +196,7 @@ The target defaults to the current directory. You can also select it with `--rep
 
 ### GitHub issues
 
-The default queue contains open issues labeled `ready-for-agent`. Alucard filters out issues labeled `in-progress` or `wip`, blocked issues, and issues already referenced by an open PR. Keep human work labeled `ready-for-human` instead of `ready-for-agent`. Use `Blocked by #N` in an issue body to declare a dependency on another issue.
+The default queue contains open issues labeled `ready-for-agent`. Alucard filters out issues labeled `ready-for-human`, `in-progress`, or `wip`, blocked issues, and issues already referenced by an open PR. Keep human work labeled `ready-for-human` instead of `ready-for-agent`. Use `Blocked by #N` in an issue body to declare a dependency on another issue. It orders `priority:high` issues first, then by ascending issue number.
 
 The worker picks one eligible issue and labels it `in-progress`. Complete work uses `Closes #N` in the PR body; partial work uses `Refs #N`. The issue closes when a complete PR merges. In queue mode, a worker that judges an issue too large proposes a split in an issue comment and moves it to `ready-for-human`.
 

@@ -1,0 +1,2 @@
+# The build context is the whole tool dir; cargo output is gigabytes the image never uses.
+/target
