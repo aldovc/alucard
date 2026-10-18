@@ -1201,6 +1201,21 @@ esac
         replay_calls(&fs::read_to_string(root.join("trace")).unwrap()),
         replay_calls(&trace)
     );
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        "## [>] recovery: Recovery task (PR #91)\n"
+    );
+    assert_eq!(
+        open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT pr_number FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| row.get::<_, Option<i64>>(0)
+            )
+            .unwrap(),
+        Some(91)
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1860,7 +1875,9 @@ esac
         let replay_calls = |trace: &str| {
             trace
                 .lines()
-                .filter(|line| line.starts_with("pr "))
+                .filter(|line| {
+                    line.starts_with("pr ") && !line.ends_with("--json state --jq .state")
+                })
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         };

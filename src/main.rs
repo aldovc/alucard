@@ -6,7 +6,7 @@ use alucard::{
     defer_operation, ensure_repository_identity, find_run, finish_operation, finish_run,
     github_queue, github_task_pull_requests, github_ticket_blockers, import_github_tasks,
     import_local_tasks, iteration_usage_comment_for_dirs, local_queue_with_open_issues,
-    local_queue_with_open_prs, lock_recovery_operations, log_event,
+    local_queue_with_open_prs, local_task_pull_requests, lock_recovery_operations, log_event,
     mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
     pending_recovery_operations, prepare_run, prior_stage_base_for_pr, recent_runs,
     reconcile_github_task_pull_request, record_recovery_failure, record_recovery_pr,
@@ -5464,12 +5464,7 @@ fn select_run_task(
     if let Some(file) = task_file {
         let contents = fs::read_to_string(file).map_err(|error| error.to_string())?;
         let mut parsed = parse_tasks(&contents).map_err(|errors| errors.join("\n"))?;
-        reconcile_local_tasks(file, &contents, &parsed, &options.repository)?;
-        if parsed
-            .tasks
-            .iter()
-            .any(|task| task.state == TaskState::InFlight && task.pr_number.is_some())
-        {
+        if reconcile_local_tasks(file, &contents, &parsed, &options.repository, database)? {
             parsed = parse_tasks(&fs::read_to_string(file).map_err(|error| error.to_string())?)
                 .map_err(|errors| errors.join("\n"))?;
         }
@@ -5606,8 +5601,33 @@ fn reconcile_local_tasks(
     contents: &str,
     parsed: &alucard::ParsedTasks,
     repository: &Path,
-) -> Result<(), String> {
-    let mut updates = Vec::new();
+    database: &Path,
+) -> Result<bool, String> {
+    let repository_id =
+        ensure_repository_identity(database, repository).map_err(|error| error.to_string())?;
+    let source_path =
+        repository_source_path(repository, file).map_err(|error| error.to_string())?;
+    let ledger_prs = local_task_pull_requests(
+        &open(database).map_err(|error| error.to_string())?,
+        &repository_id,
+        &source_path,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut updates = parsed
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Pending && task.previous_pr_number.is_none())
+        .filter_map(|task| {
+            let (_, number) = ledger_prs.iter().find(|(id, _)| *id == task.id)?;
+            Some(TaskHeadingUpdate {
+                id: task.id.clone(),
+                state: TaskState::InFlight,
+                pr_number: Some(*number),
+                previous_pr_number: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    let restored = updates.len();
     for task in parsed
         .tasks
         .iter()
@@ -5616,7 +5636,10 @@ fn reconcile_local_tasks(
         let number = task.pr_number.expect("filtered above");
         let state = match pull_request_state(repository, number) {
             Ok(state) => state,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                updates.truncate(restored);
+                break;
+            }
         };
         match state {
             Some(GithubPullRequestState::Merged) => updates.push(TaskHeadingUpdate {
@@ -5634,7 +5657,8 @@ fn reconcile_local_tasks(
             None => {}
         }
     }
-    write_task_headings(file, contents, &updates)
+    write_task_headings(file, contents, &updates)?;
+    Ok(!updates.is_empty())
 }
 
 fn pull_request_state(
@@ -6037,14 +6061,16 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             ))
         }
     };
-    if let Err(error) = reconcile_local_tasks(&task_file, &contents, &parsed, &options.repository) {
-        return fail(&format!("alucard: {error}"));
-    }
-    if parsed
-        .tasks
-        .iter()
-        .any(|task| task.state == TaskState::InFlight && task.pr_number.is_some())
-    {
+    let path = match database_path(db_path) {
+        Ok(path) => path,
+        Err(error) => return fail(&format!("alucard: {error}")),
+    };
+    let reconciled =
+        match reconcile_local_tasks(&task_file, &contents, &parsed, &options.repository, &path) {
+            Ok(reconciled) => reconciled,
+            Err(error) => return fail(&format!("alucard: {error}")),
+        };
+    if reconciled {
         let current = match fs::read_to_string(&task_file) {
             Ok(contents) => contents,
             Err(error) => {
@@ -6065,10 +6091,6 @@ fn queue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             }
         };
     }
-    let path = match database_path(db_path) {
-        Ok(path) => path,
-        Err(error) => return fail(&format!("alucard: {error}")),
-    };
     if let Err(error) = ensure_repository_identity(&path, &options.repository).and_then(|_| {
         let mut connection = open(&path)?;
         let repository_id = repository_ledger_id(&options.repository)?;
