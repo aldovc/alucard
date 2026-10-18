@@ -6456,7 +6456,7 @@ fn fetch_open_issue_numbers_required(repository: &Path) -> Result<Vec<i64>, Stri
         .collect()
 }
 
-const OPEN_PRS_QUERY: &str = "query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){pullRequests(states:OPEN,first:100){nodes{number,title,body,closingIssuesReferences(first:25){nodes{number}}}}}}";
+const OPEN_PRS_QUERY: &str = "query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){pullRequests(states:OPEN,first:100){nodes{number,title,body,labels(first:20){nodes{name}},closingIssuesReferences(first:25){nodes{number}}}}}}";
 
 fn fetch_open_prs(repository: &Path) -> Result<Vec<GithubPullRequest>, String> {
     let owner = String::from_utf8(gh_output(

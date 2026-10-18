@@ -3055,7 +3055,7 @@ fn first_rust_start_picks_up_open_bash_pull_requests_and_headings() {
         r##"#!/bin/sh
 printf '%s\n' "$*" >> "$ALUCARD_GH_TRACE"
 case "$1 $2" in
-  "issue list") printf '%s\n' '[{"number":42,"title":"Bash PR","body":"","labels":[{"name":"ready-for-agent"}]},{"number":43,"title":"Bash recovery","body":"","labels":[{"name":"ready-for-agent"}]}]' ;;
+  "issue list") printf '%s\n' '[{"number":42,"title":"Bash PR","body":"","labels":[{"name":"ready-for-agent"}]},{"number":43,"title":"Bash recovery","body":"","labels":[{"name":"ready-for-agent"}]},{"number":44,"title":"Human work","body":"","labels":[{"name":"ready-for-agent"}]}]' ;;
   "repo view") printf '%s\n' 'owner/repo' ;;
   "api graphql") cat "$ALUCARD_STATE/graphql" ;;
   "api --paginate") cat "$ALUCARD_STATE/rest" ;;
@@ -3076,8 +3076,9 @@ esac
     fs::write(
         state.join("graphql"),
         serde_json::json!([
-            {"number": 12, "title": "feat: Bash PR", "body": "Closes #42\n\nDone.", "closingIssuesReferences": {"nodes": [{"number": 42}]}},
-            {"number": 13, "title": "wip: alucard recovery — iter 1 (worker stopped: timeout, rc=124)", "body": format!("Refs #43{recovery_body}"), "closingIssuesReferences": {"nodes": []}},
+            {"number": 12, "title": "feat: Bash PR", "body": "Closes #42\n\nDone.", "labels": {"nodes": [{"name": "alucard"}]}, "closingIssuesReferences": {"nodes": [{"number": 42}]}},
+            {"number": 13, "title": "wip: alucard recovery — iter 1 (worker stopped: timeout, rc=124)", "body": format!("Refs #43{recovery_body}"), "labels": {"nodes": [{"name": "alucard"}]}, "closingIssuesReferences": {"nodes": []}},
+            {"number": 16, "title": "Human partial work", "body": "Refs #44", "closingIssuesReferences": {"nodes": []}},
         ])
         .to_string(),
     )
@@ -3144,6 +3145,7 @@ esac
         (13, "MERGED"),
         (14, "CLOSED"),
         (15, "MERGED"),
+        (16, "MERGED"),
     ] {
         fs::write(state.join(number.to_string()), outcome).unwrap();
     }
@@ -3151,7 +3153,7 @@ esac
         .into_iter()
         .map(|issue| issue["number"].as_i64().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(numbers, [42]);
+    assert_eq!(numbers, [42, 44]);
     let local = queue(&["--tasks", tasks_arg]);
     assert_eq!(local.len(), 1);
     assert_eq!(local[0]["id"], "recover");
@@ -3172,6 +3174,7 @@ esac
         [
             ("42".to_string(), "pending".to_string(), None, Some(12)),
             ("43".to_string(), "done".to_string(), Some(13), None),
+            ("44".to_string(), "pending".to_string(), None, None),
         ]
     );
     drop(connection);

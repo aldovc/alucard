@@ -2758,6 +2758,14 @@ pub struct GithubPullRequest {
     pub body: String,
     #[serde(default, rename = "closingIssuesReferences")]
     pub closing_issues_references: ClosingIssuesReferences,
+    #[serde(default)]
+    pub labels: PullRequestLabels,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct PullRequestLabels {
+    #[serde(default)]
+    pub nodes: Vec<GithubLabel>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
@@ -3251,13 +3259,21 @@ pub fn local_task_pull_requests(
         .map_err(Into::into)
 }
 
-/// Records each open PR whose body starts `Closes #N` or `Refs #N` as in flight on unclaimed pending GitHub task N.
+/// Records each open `alucard`-labelled PR whose body starts `Closes #N` or `Refs #N` as in flight on unclaimed pending GitHub task N.
 pub fn adopt_github_pull_requests(
     connection: &Connection,
     repository: &str,
     pull_requests: &[GithubPullRequest],
 ) -> Result<(), DatabaseError> {
     for pull_request in pull_requests {
+        if !pull_request
+            .labels
+            .nodes
+            .iter()
+            .any(|label| label.name == "alucard")
+        {
+            continue;
+        }
         let first_line = pull_request.body.lines().next().unwrap_or_default();
         let Some(issue) = first_line
             .strip_prefix("Closes #")
