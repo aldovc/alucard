@@ -3040,6 +3040,145 @@ esac
 }
 
 #[test]
+fn first_rust_start_picks_up_open_bash_pull_requests_and_headings() {
+    let root = temporary_path("bash-cutover");
+    let repository = root.join("repository");
+    let bin = root.join("bin");
+    let state = root.join("state");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    git_repository(&repository);
+    let gh_trace = root.join("gh-trace");
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        r##"#!/bin/sh
+printf '%s\n' "$*" >> "$ALUCARD_GH_TRACE"
+case "$1 $2" in
+  "issue list") printf '%s\n' '[{"number":42,"title":"Bash PR","body":"","labels":[{"name":"ready-for-agent"}]},{"number":43,"title":"Bash recovery","body":"","labels":[{"name":"ready-for-agent"}]}]' ;;
+  "repo view") printf '%s\n' 'owner/repo' ;;
+  "api graphql") cat "$ALUCARD_STATE/graphql" ;;
+  "api --paginate") cat "$ALUCARD_STATE/rest" ;;
+  "pr view") cat "$ALUCARD_STATE/$3" 2>/dev/null || echo OPEN ;;
+esac
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let docker = bin.join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\ncase \"$1 $2\" in 'image inspect') echo stamp ;; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let recovery_body = "\n\n**🤖 Alucard recovery PR** — the worker hit its time limit (rc=124) before opening a PR.";
+    fs::write(
+        state.join("graphql"),
+        serde_json::json!([
+            {"number": 12, "title": "feat: Bash PR", "body": "Closes #42\n\nDone.", "closingIssuesReferences": {"nodes": [{"number": 42}]}},
+            {"number": 13, "title": "wip: alucard recovery — iter 1 (worker stopped: timeout, rc=124)", "body": format!("Refs #43{recovery_body}"), "closingIssuesReferences": {"nodes": []}},
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        state.join("rest"),
+        serde_json::json!({"number": 14, "title": "wip: alucard recovery — iter 1 (worker stopped: timeout, rc=124)", "body": format!("Task: recover{recovery_body}")}).to_string(),
+    )
+    .unwrap();
+    let tasks = root.join("tasks.md");
+    fs::write(
+        &tasks,
+        "## [>] recover: Recovered locally (PR #14)\n\n## [>] shipped: Shipped locally (PR #15)\n",
+    )
+    .unwrap();
+    let environment = root.join("agent.env");
+    fs::write(
+        &environment,
+        "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
+    )
+    .unwrap();
+    let database = root.join("ledger.db");
+    let alucard = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_alucard"))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("ALUCARD_GH_TRACE", &gh_trace)
+            .env("ALUCARD_STATE", &state)
+            .env("ALUCARD_CACHE_DIR", root.join("cache"))
+            .args(["--db-path", database.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        output.stdout
+    };
+    let logs = root.join("logs");
+    let tasks_arg = tasks.to_str().unwrap();
+    for source in [&["--github"][..], &["--tasks", tasks_arg][..]] {
+        let mut args = vec!["run", "--env-file", environment.to_str().unwrap()];
+        args.extend(["--logs-root", logs.to_str().unwrap(), "--no-build"]);
+        args.extend(source);
+        args.push(repository.to_str().unwrap());
+        alucard(&args);
+    }
+    let trace = fs::read_to_string(&gh_trace).unwrap();
+    assert!(!trace.contains("--add-label in-progress"), "{trace}");
+    assert!(!logs.exists() || fs::read_dir(&logs).unwrap().next().is_none());
+    let queue = |args: &[&str]| -> Vec<serde_json::Value> {
+        let mut command = vec!["queue"];
+        command.extend(args);
+        command.push(repository.to_str().unwrap());
+        serde_json::from_slice(&alucard(&command)).unwrap()
+    };
+    assert!(queue(&["--github"]).is_empty());
+    assert!(queue(&["--tasks", tasks_arg]).is_empty());
+
+    fs::write(state.join("graphql"), "[]").unwrap();
+    fs::write(state.join("rest"), "").unwrap();
+    for (number, outcome) in [
+        (12, "CLOSED"),
+        (13, "MERGED"),
+        (14, "CLOSED"),
+        (15, "MERGED"),
+    ] {
+        fs::write(state.join(number.to_string()), outcome).unwrap();
+    }
+    let numbers = queue(&["--github"])
+        .into_iter()
+        .map(|issue| issue["number"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(numbers, [42]);
+    let local = queue(&["--tasks", tasks_arg]);
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0]["id"], "recover");
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        "## [ ] recover: Recovered locally (previous attempt: PR #14)\n\n## [x] shipped: Shipped locally (PR #15)\n"
+    );
+    let connection = open(&database).unwrap();
+    let statuses: Vec<(String, String, Option<i64>, Option<i64>)> = connection
+        .prepare("SELECT external_id, status, pr_number, previous_pr_number FROM tasks WHERE source = 'github' ORDER BY external_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        statuses,
+        [
+            ("42".to_string(), "pending".to_string(), None, Some(12)),
+            ("43".to_string(), "done".to_string(), Some(13), None),
+        ]
+    );
+    drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn github_queue_cli_reports_gh_failures_and_rejects_pins() {
     let root = temporary_path("github-queue");
     fs::create_dir_all(&root).unwrap();
