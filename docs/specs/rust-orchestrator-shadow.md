@@ -1,11 +1,11 @@
 # Rust orchestrator: shadow validation
 
-Phase 4 of `rust-orchestrator.md`, tracked in #142. The wave lead ran it on 2026-10-17. This is the record of the first pass. It found seven bugs, all fixed on `rust-rewrite` at `db3f646`. Several failure paths are still untested; see [Not covered](#not-covered). Accepting #142 and authorizing #143 are Aldo's decisions.
+Phase 4 of `rust-orchestrator.md`, tracked in #142. The wave lead ran a first pass on 2026-10-17 and a second on 2026-10-18. The first pass found seven bugs, all fixed on `rust-rewrite` at `db3f646`. The second pass covered CI fix and restart replay on that revision and found one more bug, #274 (open). Some paths are still untested; see [Not covered](#not-covered). Accepting #142 and authorizing #143 are Aldo's decisions.
 
 ## Setup
 
 - **Rust binary:** built with `cargo build --locked --offline` at the revision named in each row. Revisions marked "PR head" were tested before their squash merge. Each such head is tree-identical to its squash commit on `rust-rewrite`: `c9ac9ac` = `b5cac1d` (#264), `4b3c880` = `de8750f` (#266), `dc45604` = `fa225d8` (#269), `82749a7` = `79686f0` (#271), `085266c` = `db3f646` (#272).
-- **State:** isolated `--db-path`, `XDG_STATE_HOME` and `ALUCARD_CACHE_DIR` in a scratch directory. Aldo's installed alucard, ledger and state were not touched. The scratch directory, including the sandbox ledger, no longer exists.
+- **State:** isolated `--db-path`, `XDG_STATE_HOME` and `ALUCARD_CACHE_DIR`. Aldo's installed alucard, ledger and state were not touched. The first pass used a scratch directory, and that directory, including its sandbox ledger, no longer exists. The second pass keeps its ledger, state, sandbox clone and tasks file in `~/.local/state/alucard/rust-rewrite/shadow/r2/`.
 - **Host tools:** `gh` 2.45.0 (Ubuntu 24.04's package) and Git over SSH. The host has no HTTPS credential helper.
 - **Image:** `alucard-rust:latest`, ID `acb2e50e41dc`, Claude Code 2.1.289. Every role runs on `claude-opus-5-5`, except CI fix on `claude-sonnet-5-5`.
 - **Read-only target:** `aldovc/alucard`, the only real repository Aldo approved for observation.
@@ -13,7 +13,7 @@ Phase 4 of `rust-orchestrator.md`, tracked in #142. The wave lead ran it on 2026
 
 ## Evidence
 
-Run directories are under `~/.local/state/alucard/rust-rewrite/shadow/<dir>/` on the lead's host. Each holds `console.log` and, for runs that reached an agent, a run directory with `measurements.jsonl`, `events.log`, prompts and agent transcripts. The `run` record in `measurements.jsonl` names the Rust revision (`alucard_rev`) and task source. `merge`, `continue` and the read-only commands write no run record. Their revisions, like every exact command line, come from the lead's session transcript. `PROVENANCE.md` in that directory lists the commands and names the transcript.
+Run directories are under `~/.local/state/alucard/rust-rewrite/shadow/<dir>/` on the lead's host. Each holds `console.log` and, for runs that reached an agent, a run directory with `measurements.jsonl`, `events.log`, prompts and agent transcripts. The `run` record in `measurements.jsonl` names the Rust revision (`alucard_rev`) and task source. `merge`, `continue` and the read-only commands write no run record. For the first pass, their revisions and every exact command line come from the lead's session transcript. Each second-pass directory has a `command.txt`. `PROVENANCE.md` in that directory lists the commands and names the transcript.
 
 ## Read-only comparison (`aldovc/alucard`)
 
@@ -42,7 +42,10 @@ Local-task runs read a tasks file outside the repository. GitHub runs read issue
 | GitHub issue, `run --issue 7` | `db3f646` | `issue7`, `issue7b` | The first attempt stopped before dispatch because the repo lacked the queue labels (see below). After the labels were created, the harness labeled issue #7 `in-progress` before dispatch, and the worker opened PR #8 with `Closes #7`. The CI gate reported `no CI ran`, the review approved, and the PR was labeled `needs-human`. The worker removed `in-progress` as the shared worker prompt tells it to, the same as Bash. | none |
 | GitHub queue selection with CI, no `--issue` | `db3f646` | `queue-ci` | `main` had gained a CI workflow (`cd528a2`: every Markdown file starts with a `# ` title). The command was `alucard --db-path … run <clone> --env-file … --image alucard-rust:latest --no-build -n 1 --timeout-minutes 20 --logs-root …`, with no `--issue`, `--tasks` or `--github`, and `ALUCARD_TASKS_FILE` unset. Rust selected issue #9, the only `ready-for-agent` issue, and the run record shows task source `github`. PR #10 opened at `20ff329`, `ci / check` passed, and review approved that head. | none |
 | Human PR comment, `continue 10` | `db3f646` | `feedback` | The owner commented on PR #10 asking for a second line. The feedback agent pushed `d25c5d3`. `ci / check` passed on it and review approved with `Reviewed head: d25c5d3…`. The measurements record one feedback invocation and `ci_result: green`. | none |
-| Attempted CI fix, `run --issue 11` | `db3f646` | `cifix` | The issue asked for a file whose content fails CI. The worker followed verify-before-push and wrote `# plain note` instead. CI passed on PR #12 (`b709867`). The measurements show only worker and reviewer invocations. Review returned BLOCKED because the intended failure exercise was not performed. **No CI failure occurred and no CI-fix agent ran.** | none |
+| Attempted CI fix, `run --issue 11` (first pass) | `db3f646` | `cifix` | The issue asked for a file whose content fails CI. The worker followed verify-before-push and wrote `# plain note` instead. CI passed on PR #12 (`b709867`). The measurements show only worker and reviewer invocations. Review returned BLOCKED because the intended failure exercise was not performed. **No CI failure occurred and no CI-fix agent ran.** | none |
+| CI fix on a real CI failure, `continue 12` (second pass) | `db3f646` | `r2-cifix` | Authorized fixture outside the worker. The lead pushed `eebcb87` to PR #12's branch with the title removed, and `ci / check` failed. The lead also edited issue #11 to name `# plain note` as the end state. `continue 12` handed the failure to the CI-fix agent, which pushed `05a49ac`, and CI passed. Review cycle 1 requested changes: the fix had added `# Plain note` above the bare line instead of restoring the single line. The feedback agent pushed `4b213c2`, CI passed, and review cycle 2 approved with `Reviewed head: 4b213c2…`. The measurements record cifix and feedback stages and `ci_result: green`. | none |
+| Restart-time journal replay (second pass) | `db3f646` | `r2-replay-kill`, `r2-replay-restart1`, `r2-replay-restart2` | Authorized fixture: a host-only `gh` wrapper killed Rust with SIGKILL at `gh pr create` during a local-task recovery. That left the branch pushed at `71cb063`, `push` done, `create_recovery_pr` pending, no PR, and the task claim held by a dead owner. A restart with the real `gh` replayed the journal and created draft recovery PR #13 once, with `alucard`, `needs-human` and the parked marker. All five operations finished, the recovery row was recorded, the run became `interrupted` and the task stayed `in_flight`. Nothing was dispatched, and `queue` returned `[]`. A second restart created nothing. However, the task heading stayed `[ ]` and the ledger task lost its `pr_number`. | #274 (restart replay skips the #270 heading write; open) |
+| `runs` (second pass) | `db3f646` | `r2-runs.txt` | On the second-pass ledger it listed the replay run as `interrupted` and the continue run as `completed`, with their log paths. Not compared with Bash. | none |
 
 Sandbox records:
 
@@ -51,6 +54,9 @@ Sandbox records:
 - PR #10 owner comment: https://github.com/aldovc/alucard-smoke/pull/10#issuecomment-6229815259
 - PR #10 approval of `d25c5d3`: https://github.com/aldovc/alucard-smoke/pull/10#issuecomment-6229831296
 - PR #12 BLOCKED review: https://github.com/aldovc/alucard-smoke/pull/12#issuecomment-6229847731
+- PR #12 failing fixture run: https://github.com/aldovc/alucard-smoke/actions/runs/39114353252
+- PR #12 approval of `4b213c2`: https://github.com/aldovc/alucard-smoke/pull/12#issuecomment-6248110615
+- Replayed recovery PR: https://github.com/aldovc/alucard-smoke/pull/13
 
 ## Explained differences
 
@@ -59,6 +65,8 @@ Sandbox records:
 - **Missing queue labels.** On a repository without the README's one-time labels, Rust's claim fails before dispatch with `could not label GitHub issue: … 'in-progress' not found`, and nothing runs. In Bash the worker applies the label itself, so the failure would surface mid-run inside the agent. Rust's behavior is the safer one; the README already says to create the labels first.
 - **Queue selection moved into the harness.** Rust picks and claims the issue, then gives the worker the pinned-issue prompt (`alucard-worker-github-issue-prompt.md`) whether or not `--issue` was passed. The prompt and the task source therefore cannot tell `run` from `run --issue`; only the command line can.
 - **Turn cap with work done in one turn.** With `ALUCARD_WORKER_MAX_TURNS=1`, the worker created the files, committed, pushed and opened the PR within its one allowed turn (`error_max_turns`). Rust found the PR (#4) and ran the gates, as Bash does. Rust `de8750f`, evidence dir `recovery1`.
+- **`needs-human` stays after a later approval.** On PR #12 the first-pass BLOCKED review added `needs-human`, and the second-pass approval left it in place. Bash and Rust both remove that label on approval only for recovery PRs.
+- **Restart output.** The replay restart printed nothing about the recovery PR it created. Bash has no startup replay to compare.
 
 ## What the bugs had in common
 
@@ -73,9 +81,8 @@ Before cutover, run the Rust binary against real `gh` and GitHub at least once p
 
 ## Not covered
 
-- **CI-fix agent on a real CI failure.** Not exercised; see the PR #12 row. Covering it needs a failing head created outside the implementation worker, in an explicitly authorized sandbox fixture. Then observe the CI-fix invocation, the replacement head's checks and an exact-head approval. Workers must keep verifying before they push.
-- **Restart-time journal replay.** Not observed against GitHub. The recovery PRs above came from the normal end-of-iteration path. There is no reconciliation dry-run command. Local tests with real Git and SQLite and a stubbed `gh` cover replay (`startup_replays_pending_recovery_operations_idempotently`, `concurrent_startup_replays_one_recovery_pr` and `startup_replay_preserves_pending_operations_before_remote_mutations` in `tests/local_tasks.rs`). They are separate evidence from a real restart.
 - **Startup lock scope.** `reconcile_startup` holds the ledger-wide recovery lock across replay and remote PR lookups. A slow network call there blocks every other startup on the same ledger. This was not measured.
-- **`runs`.** Only the ad-hoc observation above. It has not been run against a surviving populated ledger or compared with Bash.
+- **Replay of other journaled operations.** The restart test interrupted only `create_recovery_pr`. Push, label and marker replay rely on the local tests (`startup_replays_pending_recovery_operations_idempotently`, `concurrent_startup_replays_one_recovery_pr`, `startup_replay_preserves_pending_operations_before_remote_mutations` in `tests/local_tasks.rs`, which use real Git and SQLite with a stubbed `gh`). There is no reconciliation dry-run command.
+- **`runs` against Bash.** Rust `runs` was observed on both ledgers but not compared with Bash.
 - **Postgres and Playwright targets.** Not run; alucard-smoke has neither. The stub-level tests from #236/#239 are the only evidence. Whether they need live runs before cutover is a separate decision.
 - **Fork PRs.** Not exercised.
