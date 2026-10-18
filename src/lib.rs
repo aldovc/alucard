@@ -3251,6 +3251,41 @@ pub fn local_task_pull_requests(
         .map_err(Into::into)
 }
 
+/// Records each open PR whose body starts `Closes #N` or `Refs #N` as in flight on unclaimed pending GitHub task N.
+pub fn adopt_github_pull_requests(
+    connection: &Connection,
+    repository: &str,
+    pull_requests: &[GithubPullRequest],
+) -> Result<(), DatabaseError> {
+    for pull_request in pull_requests {
+        let first_line = pull_request.body.lines().next().unwrap_or_default();
+        let Some(issue) = first_line
+            .strip_prefix("Closes #")
+            .or_else(|| first_line.strip_prefix("Refs #"))
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .filter(|issue| !issue.is_empty())
+        else {
+            continue;
+        };
+        connection.execute(
+            "UPDATE tasks SET status = 'in_flight', pr_number = ?1, updated_at = datetime('now')
+             WHERE repository_id = ?2 AND source = 'github' AND source_path = '' AND external_id = ?3
+               AND status = 'pending'
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims
+                 WHERE repository_id = tasks.repository_id AND resource_kind = 'task'
+                   AND resource_key = tasks.id AND state = 'active'
+               )",
+            (pull_request.number, repository, issue),
+        )?;
+    }
+    Ok(())
+}
+
 /// Updates an unclaimed GitHub task after GitHub confirms its PR is terminal.
 pub fn reconcile_github_task_pull_request(
     connection: &Connection,

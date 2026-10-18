@@ -1,8 +1,8 @@
 //! Alucard orchestrator: the Rust port of the `alucard` Bash script.
 
 use alucard::{
-    abandoned_pull_request_claims, abandoned_task_claims, acquire_pr, archive_prompt,
-    begin_operation, begin_operation_with_payload, build_image, compose_role_prompt, database_path,
+    abandoned_pull_request_claims, abandoned_task_claims, acquire_pr, adopt_github_pull_requests,
+    archive_prompt, begin_operation, begin_operation_with_payload, build_image, compose_role_prompt, database_path,
     defer_operation, ensure_repository_identity, find_run, finish_operation, finish_run,
     github_queue, github_task_pull_requests, github_ticket_blockers, import_github_tasks,
     import_local_tasks, iteration_usage_comment_for_dirs, local_queue_with_open_issues,
@@ -5630,6 +5630,8 @@ fn select_run_task(
         repository_ledger_id(&options.repository).map_err(|error| error.to_string())?;
     import_github_tasks(&mut connection, &repository_id, &fetched_issues)
         .map_err(|error| error.to_string())?;
+    adopt_github_pull_requests(&connection, &repository_id, &prs)
+        .map_err(|error| error.to_string())?;
     drop(connection);
     reconcile_github_tasks(database, &options.repository)?;
     let issues = if options.issue.is_some() {
@@ -6279,11 +6281,9 @@ fn github_queue_command(options: &QueueOptions, db_path: Option<PathBuf>) -> Exi
     let imported_tasks = issues.clone();
     if let Err(error) = ensure_repository_identity(&path, &options.repository).and_then(|_| {
         let mut connection = open(&path)?;
-        import_github_tasks(
-            &mut connection,
-            &repository_ledger_id(&options.repository)?,
-            &imported_tasks,
-        )
+        let repository_id = repository_ledger_id(&options.repository)?;
+        import_github_tasks(&mut connection, &repository_id, &imported_tasks)?;
+        adopt_github_pull_requests(&connection, &repository_id, &open_prs)
     }) {
         return fail(&format!("alucard: database error: {error}"));
     }
