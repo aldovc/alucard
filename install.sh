@@ -4,7 +4,7 @@
 set -euo pipefail
 
 REPO_URL="${ALUCARD_REPO_URL:-https://github.com/aldovc/alucard.git}"
-RELEASE_URL="${ALUCARD_RELEASE_URL:-https://github.com/aldovc/alucard/releases/latest/download}"
+RELEASE_URL="${ALUCARD_RELEASE_URL:-https://github.com/aldovc/alucard/releases/download}"
 ALUCARD_HOME="${ALUCARD_HOME:-$HOME/.local/share/alucard}"
 BIN_DIR="${ALUCARD_BIN_DIR:-$HOME/.local/bin}"
 
@@ -28,9 +28,16 @@ case "$os/$arch" in
   Linux/aarch64|Linux/arm64) target="aarch64-unknown-linux-musl" ;;
   *) die "unsupported platform: $os $arch (alucard ships Linux x86_64 and aarch64 binaries)";;
 esac
+# Binary and tool files come from the same release tag
+version="${ALUCARD_VERSION:-}"
+if [ -z "$version" ]; then
+  version="$(git ls-remote --tags --refs "$REPO_URL" 'v*' | sed 's#.*refs/tags/##' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)" || true
+  [ -n "$version" ] || die "could not resolve the latest release tag from $REPO_URL; existing install left unchanged"
+fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-binary_url="$RELEASE_URL/alucard-$target"
+binary_url="$RELEASE_URL/$version/alucard-$target"
 info "Downloading $binary_url"
 curl -fsSL -o "$tmp/alucard" "$binary_url" || die "failed to download $binary_url; existing install left unchanged"
 chmod +x "$tmp/alucard"
@@ -38,11 +45,13 @@ chmod +x "$tmp/alucard"
 
 # Clone or update
 if [ -d "$ALUCARD_HOME/.git" ]; then
-  info "Updating existing install at $ALUCARD_HOME"
-  git -C "$ALUCARD_HOME" pull --ff-only
+  info "Updating existing install at $ALUCARD_HOME to $version"
+  git -C "$ALUCARD_HOME" fetch -q --depth 1 origin tag "$version" \
+    || die "failed to fetch $version; existing install left unchanged"
+  git -C "$ALUCARD_HOME" -c advice.detachedHead=false checkout -q "$version"
 else
-  info "Installing alucard into $ALUCARD_HOME"
-  git clone --depth 1 "$REPO_URL" "$ALUCARD_HOME"
+  info "Installing alucard $version into $ALUCARD_HOME"
+  git -c advice.detachedHead=false clone -q --depth 1 --branch "$version" "$REPO_URL" "$ALUCARD_HOME"
 fi
 
 chmod +x "$ALUCARD_HOME/alucard" "$ALUCARD_HOME/entrypoint.sh"
