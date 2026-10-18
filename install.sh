@@ -3,7 +3,8 @@
 # Usage: curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | sh
 set -euo pipefail
 
-REPO_URL="https://github.com/aldovc/alucard.git"
+REPO_URL="${ALUCARD_REPO_URL:-https://github.com/aldovc/alucard.git}"
+RELEASE_URL="${ALUCARD_RELEASE_URL:-https://github.com/aldovc/alucard/releases/latest/download}"
 ALUCARD_HOME="${ALUCARD_HOME:-$HOME/.local/share/alucard}"
 BIN_DIR="${ALUCARD_BIN_DIR:-$HOME/.local/bin}"
 
@@ -17,6 +18,23 @@ for cmd in git docker gh jq; do
   command -v "$cmd" >/dev/null 2>&1 || warn "missing: $cmd (required before running alucard)"
 done
 command -v git >/dev/null 2>&1 || die "git is required to install alucard"
+command -v curl >/dev/null 2>&1 || die "curl is required to install alucard"
+
+# Fetch and check the binary before touching an existing install
+os="$(uname -s)"
+arch="$(uname -m)"
+case "$os/$arch" in
+  Linux/x86_64|Linux/amd64)  target="x86_64-unknown-linux-musl" ;;
+  Linux/aarch64|Linux/arm64) target="aarch64-unknown-linux-musl" ;;
+  *) die "unsupported platform: $os $arch (alucard ships Linux x86_64 and aarch64 binaries)";;
+esac
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+binary_url="$RELEASE_URL/alucard-$target"
+info "Downloading $binary_url"
+curl -fsSL -o "$tmp/alucard" "$binary_url" || die "failed to download $binary_url; existing install left unchanged"
+chmod +x "$tmp/alucard"
+"$tmp/alucard" version >/dev/null 2>&1 || die "downloaded binary does not run on this host; existing install left unchanged"
 
 # Clone or update
 if [ -d "$ALUCARD_HOME/.git" ]; then
@@ -29,10 +47,16 @@ fi
 
 chmod +x "$ALUCARD_HOME/alucard" "$ALUCARD_HOME/entrypoint.sh"
 
-# Symlink CLI into BIN_DIR
+# The binary finds its tool files through the Cargo.toml in ALUCARD_HOME
+mkdir -p "$ALUCARD_HOME/bin"
+cp "$tmp/alucard" "$ALUCARD_HOME/bin/.alucard.new"
+mv -f "$ALUCARD_HOME/bin/.alucard.new" "$ALUCARD_HOME/bin/alucard"
+
+# Symlink CLIs into BIN_DIR
 mkdir -p "$BIN_DIR"
-ln -sf "$ALUCARD_HOME/alucard" "$BIN_DIR/alucard"
-ok "alucard linked at $BIN_DIR/alucard"
+ln -sf "$ALUCARD_HOME/bin/alucard" "$BIN_DIR/alucard"
+ln -sf "$ALUCARD_HOME/alucard" "$BIN_DIR/alucard-bash"
+ok "alucard linked at $BIN_DIR/alucard, Bash CLI at $BIN_DIR/alucard-bash"
 
 # Create env file from example if not already present
 if [ ! -f "$ALUCARD_HOME/alucard.env" ]; then
