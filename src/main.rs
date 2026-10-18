@@ -8,8 +8,8 @@ use alucard::{
     import_local_tasks, iteration_usage_comment_for_dirs, local_queue_with_open_issues,
     local_queue_with_open_prs, local_task_pull_requests, lock_recovery_operations, log_event,
     mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
-    pending_recovery_operations, prepare_run, prior_stage_base_for_pr, recent_runs,
-    reconcile_github_task_pull_request, record_recovery_failure, record_recovery_pr,
+    pending_recovery_operations, prepare_run, prior_stage_base_for_pr, process_is_alive,
+    recent_runs, reconcile_github_task_pull_request, record_recovery_failure, record_recovery_pr,
     record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
     release_abandoned_pull_request_claim, release_abandoned_task_claim, repository_ledger_id,
     repository_source_path, run_claims, run_command as execute_command, run_pull_requests,
@@ -422,6 +422,7 @@ fn merge_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
     let (options, database, repository, check_command) = match (|| -> Result<_, String> {
         let tools = tool_dir().ok_or_else(|| "could not locate tool files".to_string())?;
         let options = MergeOptions::parse(args, &tools)?;
+        claim_implementation_guard(&options.queue.repository)?;
         let settings = optional_settings(&options.env_file)?;
         settings.apply_to_process();
         let database = database_path(db_path).map_err(|error| error.to_string())?;
@@ -1249,6 +1250,109 @@ fn resolve_repository_target(target: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("could not resolve target repository: {error}"))
 }
 
+/// Refuses to start while the Bash implementation operates on the same repository, holding this process's claim until it exits.
+fn claim_implementation_guard(target: &Path) -> Result<(), String> {
+    let root = if target.is_dir() {
+        let Some(root) = git_repository_root(target) else {
+            return Ok(());
+        };
+        Some(root)
+    } else {
+        None
+    };
+    let slug = match &root {
+        Some(root) => github_repo_slug(root),
+        None => github_ref(target),
+    };
+    let (key, guards, name) = match (slug, root) {
+        (Some(slug), _) => {
+            let slug = slug.to_lowercase();
+            let (owner, repository) = slug.split_once('/').unwrap_or_default();
+            (
+                format!("github.com/{slug}"),
+                cache_root().join("guards").join(owner),
+                repository.to_string(),
+            )
+        }
+        (None, Some(root)) => {
+            let git_dir = Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "--absolute-git-dir"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .ok_or_else(|| format!("could not claim {}: no git dir", root.display()))?;
+            (
+                root.display().to_string(),
+                PathBuf::from(String::from_utf8_lossy(&git_dir.stdout).trim()),
+                "alucard-guard".to_string(),
+            )
+        }
+        (None, None) => return Ok(()),
+    };
+    let guard_error = |error: std::io::Error| format!("could not claim {key}: {error}");
+    fs::create_dir_all(&guards).map_err(guard_error)?;
+    let pid = std::process::id();
+    fs::write(
+        guards.join(format!("{name}.rust.{pid}")),
+        std::env::args().collect::<Vec<_>>().join(" ") + "\n",
+    )
+    .map_err(guard_error)?;
+    let open = |implementation: &str| {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(guards.join(format!("{name}.{implementation}.lock")))
+    };
+    let own = open("rust").map_err(guard_error)?;
+    FileExt::lock_shared(&own).map_err(guard_error)?;
+    let bash = open("bash").map_err(guard_error)?;
+    let records = |implementation: &str| {
+        fs::read_dir(&guards)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let pid = path
+                    .file_name()?
+                    .to_str()?
+                    .strip_prefix(&format!("{name}.{implementation}."))?
+                    .parse::<i64>()
+                    .ok()?;
+                Some((pid, path))
+            })
+            .collect::<Vec<_>>()
+    };
+    if FileExt::try_lock_exclusive(&bash).is_ok() {
+        let dead_rust = records("rust")
+            .into_iter()
+            .filter(|(pid, _)| !process_is_alive(*pid));
+        for (_, path) in records("bash").into_iter().chain(dead_rust) {
+            let _ = fs::remove_file(path);
+        }
+        // The shared lock is this process's claim; it must outlive every return.
+        std::mem::forget(own);
+        return Ok(());
+    }
+    let _ = fs::remove_file(guards.join(format!("{name}.rust.{pid}")));
+    let holders = records("bash")
+        .into_iter()
+        .filter(|(pid, _)| process_is_alive(*pid))
+        .map(|(pid, path)| {
+            let command = fs::read_to_string(path).unwrap_or_default();
+            format!("pid {pid}: {}", command.trim())
+        })
+        .collect::<Vec<_>>();
+    let holders = if holders.is_empty() {
+        "pid unknown".to_string()
+    } else {
+        holders.join("; ")
+    };
+    Err(format!(
+        "alucard-bash is already running on {key}: {holders}; refusing to start the Rust alucard on the same repository"
+    ))
+}
+
 fn doctor_tasks(path: &std::path::Path, ok: &mut bool) {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -1435,6 +1539,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         match (|| -> Result<_, String> {
             let tools = tool_dir().ok_or_else(|| "could not locate tool files".to_string())?;
             let mut options = RunCommandOptions::parse(args, &tools)?;
+            claim_implementation_guard(&options.queue.repository)?;
             let settings = required_settings(&options.env_file)?;
             settings.apply_to_process();
             let database = database_path(db_path).map_err(|error| error.to_string())?;
@@ -1979,6 +2084,7 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             Err(error) => return Err(error),
         };
         options.queue.tasks = None;
+        claim_implementation_guard(&options.queue.repository)?;
         let settings = required_settings(&options.env_file)?;
         settings.apply_to_process();
         let database = database_path(db_path).map_err(|error| error.to_string())?;

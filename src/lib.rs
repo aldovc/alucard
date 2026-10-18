@@ -4809,7 +4809,7 @@ fn hostname() -> io::Result<String> {
         .into_owned())
 }
 
-fn process_is_alive(pid: i64) -> bool {
+pub fn process_is_alive(pid: i64) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };

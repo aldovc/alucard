@@ -348,6 +348,45 @@ with_repo_lock() {
   fi
 }
 
+# Refuse to start while the Rust implementation operates on the same repository.
+# Each implementation holds a shared flock on its own file for its lifetime,
+# so runs of one implementation coexist and a dead holder's lock is gone with
+# it. A GitHub repository is keyed by its lowercased slug in the cache, so a
+# checkout, owner/repo and a URL meet; any other checkout by its git dir.
+claim_implementation_guard() {
+  local target="$1" command_line="$2" slug="" key base holder pid holders=""
+  [ "$HAVE_FLOCK" = true ] || return 0
+  if [ -d "$target" ]; then
+    key=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) || return 0
+    slug=$(github_repo_slug "$key")
+    base="$(git -C "$key" rev-parse --absolute-git-dir)/alucard-guard"
+  else
+    slug=$(is_github_ref "$target")
+    [ -n "$slug" ] || return 0
+  fi
+  if [ -n "$slug" ]; then
+    slug=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')
+    key="github.com/$slug"
+    base="$DEFAULT_CACHE_DIR/guards/$slug"
+    mkdir -p "$(dirname "$base")"
+  fi
+  printf '%s\n' "$command_line" > "$base.bash.$$"
+  exec 8>>"$base.bash.lock"
+  flock -s 8
+  if ( flock -n 9 && rm -f "$base".rust.[0-9]* ) 9>>"$base.rust.lock"; then
+    for holder in "$base".bash.[0-9]*; do
+      kill -0 "${holder##*.}" 2>/dev/null || rm -f "$holder"
+    done
+    return 0
+  fi
+  for holder in "$base".rust.[0-9]*; do
+    pid=${holder##*.}
+    kill -0 "$pid" 2>/dev/null && holders+="${holders:+;} pid $pid: $(cat "$holder" 2>/dev/null)"
+  done
+  rm -f "$base.bash.$$"
+  die "the Rust alucard is already running on $key:${holders:- pid unknown}; refusing to start alucard-bash on the same repository"
+}
+
 # Clone or fetch the cached clone of a GitHub repo. Runs under the repo lock:
 # a second process arriving while the first is still cloning waits, then finds
 # the clone in place and fetches.
@@ -4174,6 +4213,7 @@ ${_toolchain_esc}
 
 command_run() {
   parse_repo_options "$@"
+  claim_implementation_guard "$TARGET_REPO" "$0 run $*"
 
   need_cmd git
   need_cmd gh
@@ -4697,6 +4737,7 @@ command_continue() {
 
   parse_repo_options "$@"
   [ -z "${PIN_ISSUE:-}" ] || die "--issue is only valid with alucard run"
+  claim_implementation_guard "$TARGET_REPO" "$0 continue $pr_num $*"
 
   need_cmd git
   need_cmd gh
@@ -4918,6 +4959,7 @@ command_merge() {
   done
   parse_repo_options ${rest[@]+"${rest[@]}"}
   [ -z "${PIN_ISSUE:-}" ] || die "--issue is only valid with alucard run"
+  claim_implementation_guard "$TARGET_REPO" "$0 merge $pr_num ${rest[*]+${rest[*]}}"
 
   need_cmd git
   need_cmd gh

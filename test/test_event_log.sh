@@ -184,6 +184,7 @@ git -C "$BILLING_REPO" push -u origin main >/dev/null
 
 need_cmd() { :; }
 parse_repo_options() {
+  TARGET_REPO="$BILLING_REPO"
   REPO_ABS="$BILLING_REPO"
   BASE_BRANCH="main"
   ITERATIONS=1
