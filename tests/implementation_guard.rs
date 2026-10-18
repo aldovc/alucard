@@ -77,7 +77,13 @@ impl Fixture {
         Self { root, local }
     }
 
-    fn command(&self, implementation: Implementation, target: &str, label: &str) -> Command {
+    fn command(
+        &self,
+        implementation: Implementation,
+        subcommand: &[&str],
+        target: &str,
+        label: &str,
+    ) -> Command {
         let mut command = match implementation {
             Implementation::Bash => {
                 let mut command = Command::new("bash");
@@ -93,7 +99,8 @@ impl Fixture {
             }
         };
         command
-            .args(["run", target, "--no-build", "--env-file"])
+            .args(subcommand)
+            .args([target, "--no-build", "--env-file"])
             .arg(self.root.join("alucard.env"))
             .args(["--logs-root"])
             .arg(self.root.join("logs"))
@@ -123,7 +130,12 @@ impl Fixture {
     /// Starts a run in its own process group and waits until it is past the guard.
     fn hold(&self, implementation: Implementation, label: &str) -> Child {
         let mut child = self
-            .command(implementation, self.local.to_str().unwrap(), label)
+            .command(
+                implementation,
+                &["run"],
+                self.local.to_str().unwrap(),
+                label,
+            )
             .process_group(0)
             .spawn()
             .unwrap();
@@ -186,44 +198,46 @@ fn bash_and_rust_refuse_each_other_on_one_repository() {
         let first = fixture.hold(holder, "holder");
         let second = fixture.hold(holder, "same-implementation");
 
-        let mut refused = fixture
-            .command(other, target, "refused")
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while refused.try_wait().unwrap().is_none() {
-            if fixture.reached("refused").exists() || Instant::now() > deadline {
-                kill_group(refused);
-                panic!("{other:?} started beside {holder:?}");
+        for subcommand in [&["run"][..], &["continue", "1"], &["merge", "1"]] {
+            let mut refused = fixture
+                .command(other, subcommand, target, "refused")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while refused.try_wait().unwrap().is_none() {
+                if fixture.reached("refused").exists() || Instant::now() > deadline {
+                    kill_group(refused);
+                    panic!("{other:?} {subcommand:?} started beside {holder:?}");
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let refused = refused.wait_with_output().unwrap();
-        let stderr = String::from_utf8_lossy(&refused.stderr);
-        assert!(
-            !refused.status.success(),
-            "{other:?} started beside {holder:?}"
-        );
-        for expected in [
-            format!("pid {}:", first.id()),
-            format!("pid {}:", second.id()),
-            format!("run {}", fixture.local.display()),
-            format!("running on {key}:"),
-        ] {
+            let refused = refused.wait_with_output().unwrap();
+            let stderr = String::from_utf8_lossy(&refused.stderr);
             assert!(
-                stderr.contains(&expected),
-                "{other:?} refusal lacks {expected:?}: {stderr}"
+                !refused.status.success(),
+                "{other:?} {subcommand:?} started beside {holder:?}"
+            );
+            for expected in [
+                format!("pid {}:", first.id()),
+                format!("pid {}:", second.id()),
+                format!("run {}", fixture.local.display()),
+                format!("running on {key}:"),
+            ] {
+                assert!(
+                    stderr.contains(&expected),
+                    "{other:?} {subcommand:?} refusal lacks {expected:?}: {stderr}"
+                );
+            }
+            assert!(
+                !fixture.reached("refused").exists(),
+                "the refused {subcommand:?} called a tool"
+            );
+            assert!(
+                !fixture.root.join("cache/owner").exists(),
+                "the refused {subcommand:?} fetched a clone"
             );
         }
-        assert!(
-            !fixture.reached("refused").exists(),
-            "the refused run called a tool"
-        );
-        assert!(
-            !fixture.root.join("cache/owner").exists(),
-            "the refused run fetched a clone"
-        );
 
         kill_group(first);
         kill_group(second);
