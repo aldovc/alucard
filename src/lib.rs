@@ -2763,9 +2763,30 @@ pub struct GithubPullRequest {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "PullRequestLabelsShape")]
 pub struct PullRequestLabels {
-    #[serde(default)]
     pub nodes: Vec<GithubLabel>,
+}
+
+/// REST returns a label array; GraphQL returns `{nodes: [...]}`.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum PullRequestLabelsShape {
+    Rest(Vec<GithubLabel>),
+    Graphql {
+        #[serde(default)]
+        nodes: Vec<GithubLabel>,
+    },
+}
+
+impl From<PullRequestLabelsShape> for PullRequestLabels {
+    fn from(shape: PullRequestLabelsShape) -> Self {
+        match shape {
+            PullRequestLabelsShape::Rest(nodes) | PullRequestLabelsShape::Graphql { nodes } => {
+                Self { nodes }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]

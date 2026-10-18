@@ -3085,7 +3085,7 @@ esac
     .unwrap();
     fs::write(
         state.join("rest"),
-        serde_json::json!({"number": 14, "title": "wip: alucard recovery — iter 1 (worker stopped: timeout, rc=124)", "body": format!("Task: recover{recovery_body}")}).to_string(),
+        serde_json::json!({"number": 14, "title": "wip: alucard recovery — iter 1 (worker stopped: timeout, rc=124)", "body": format!("Task: recover{recovery_body}"), "labels": [{"id": 1, "node_id": "LA_1", "name": "alucard", "color": "ededed", "default": false}]}).to_string(),
     )
     .unwrap();
     let tasks = root.join("tasks.md");
