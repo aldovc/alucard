@@ -151,19 +151,37 @@ fn kill_group(mut child: Child) {
 
 #[test]
 fn bash_and_rust_refuse_each_other_on_one_repository() {
-    for (holder, other, target) in [
+    for (index, (holder, other, target)) in [
         (
             Implementation::Rust,
             Implementation::Bash,
-            "owner/repository",
+            Some("owner/repository"),
         ),
         (
             Implementation::Bash,
             Implementation::Rust,
-            "https://github.com/OWNER/Repository.git",
+            Some("https://github.com/OWNER/Repository.git"),
         ),
-    ] {
-        let fixture = Fixture::new(&format!("{holder:?}").to_lowercase());
+        (Implementation::Bash, Implementation::Rust, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new(&index.to_string());
+        let key = match target {
+            Some(_) => "github.com/owner/repository".to_string(),
+            None => {
+                assert!(Command::new("git")
+                    .arg("-C")
+                    .arg(&fixture.local)
+                    .args(["remote", "remove", "origin"])
+                    .status()
+                    .unwrap()
+                    .success());
+                fixture.local.display().to_string()
+            }
+        };
+        let target = target.unwrap_or(fixture.local.to_str().unwrap());
 
         let first = fixture.hold(holder, "holder");
         let second = fixture.hold(holder, "same-implementation");
@@ -191,7 +209,7 @@ fn bash_and_rust_refuse_each_other_on_one_repository() {
             format!("pid {}:", first.id()),
             format!("pid {}:", second.id()),
             format!("run {}", fixture.local.display()),
-            "github.com/owner/repository".to_string(),
+            format!("running on {key}:"),
         ] {
             assert!(
                 stderr.contains(&expected),

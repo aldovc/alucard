@@ -1252,23 +1252,44 @@ fn resolve_repository_target(target: &Path) -> Result<PathBuf, String> {
 
 /// Refuses to start while the Bash implementation operates on the same repository, holding this process's claim until it exits.
 fn claim_implementation_guard(target: &Path) -> Result<(), String> {
-    let slug = if target.is_dir() {
+    let root = if target.is_dir() {
         let Some(root) = git_repository_root(target) else {
             return Ok(());
         };
-        github_repo_slug(&root).ok_or(root)
+        Some(root)
     } else {
-        match github_ref(target) {
-            Some(slug) => Ok(slug),
-            None => return Ok(()),
+        None
+    };
+    let slug = match &root {
+        Some(root) => github_repo_slug(root),
+        None => github_ref(target),
+    };
+    let (key, guards, name) = match (slug, root) {
+        (Some(slug), _) => {
+            let slug = slug.to_lowercase();
+            let (owner, repository) = slug.split_once('/').unwrap_or_default();
+            (
+                format!("github.com/{slug}"),
+                cache_root().join("guards").join(owner),
+                repository.to_string(),
+            )
         }
+        (None, Some(root)) => {
+            let git_dir = Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "--absolute-git-dir"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .ok_or_else(|| format!("could not claim {}: no git dir", root.display()))?;
+            (
+                root.display().to_string(),
+                PathBuf::from(String::from_utf8_lossy(&git_dir.stdout).trim()),
+                "alucard-guard".to_string(),
+            )
+        }
+        (None, None) => return Ok(()),
     };
-    let key = match slug {
-        Ok(slug) => format!("github.com/{}", slug.to_lowercase()),
-        Err(root) => root.display().to_string(),
-    };
-    let guards = cache_root().join("guards");
-    let name = key.replace('%', "%25").replace('/', "%2F");
     let guard_error = |error: std::io::Error| format!("could not claim {key}: {error}");
     fs::create_dir_all(&guards).map_err(guard_error)?;
     let pid = std::process::id();
@@ -1286,7 +1307,7 @@ fn claim_implementation_guard(target: &Path) -> Result<(), String> {
     let own = open("rust").map_err(guard_error)?;
     FileExt::lock_shared(&own).map_err(guard_error)?;
     let bash = open("bash").map_err(guard_error)?;
-    let records = || {
+    let records = |implementation: &str| {
         fs::read_dir(&guards)
             .into_iter()
             .flatten()
@@ -1295,7 +1316,7 @@ fn claim_implementation_guard(target: &Path) -> Result<(), String> {
                 let pid = path
                     .file_name()?
                     .to_str()?
-                    .strip_prefix(&format!("{name}.bash."))?
+                    .strip_prefix(&format!("{name}.{implementation}."))?
                     .parse::<i64>()
                     .ok()?;
                 Some((pid, path))
@@ -1303,7 +1324,10 @@ fn claim_implementation_guard(target: &Path) -> Result<(), String> {
             .collect::<Vec<_>>()
     };
     if FileExt::try_lock_exclusive(&bash).is_ok() {
-        for (_, path) in records() {
+        let dead_rust = records("rust")
+            .into_iter()
+            .filter(|(pid, _)| !process_is_alive(*pid));
+        for (_, path) in records("bash").into_iter().chain(dead_rust) {
             let _ = fs::remove_file(path);
         }
         // The shared lock is this process's claim; it must outlive every return.
@@ -1311,7 +1335,7 @@ fn claim_implementation_guard(target: &Path) -> Result<(), String> {
         return Ok(());
     }
     let _ = fs::remove_file(guards.join(format!("{name}.rust.{pid}")));
-    let holders = records()
+    let holders = records("bash")
         .into_iter()
         .filter(|(pid, _)| process_is_alive(*pid))
         .map(|(pid, path)| {
