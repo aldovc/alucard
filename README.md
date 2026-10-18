@@ -56,7 +56,7 @@ Install `flock` from `util-linux` if you plan to run multiple Alucard processes 
 curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | bash
 ```
 
-The installer clones Alucard into `~/.local/share/alucard`, links the CLI into `~/.local/bin`, and creates `alucard.env` from the example if it does not already exist. Add `~/.local/bin` to your `PATH` if needed. Re-run the installer to update.
+The installer clones Alucard into `~/.local/share/alucard` and downloads the latest release binary for the host (Linux x86-64 or ARM64) into its `bin/` directory. It links that binary into `~/.local/bin` as `alucard` and the Bash script as `alucard-bash`, and creates `alucard.env` from the example if it does not already exist. Both CLIs read the prompts, `Dockerfile`, and `alucard.env` from the install directory. Add `~/.local/bin` to your `PATH` if needed. Re-run the installer to update; it never overwrites an existing `alucard.env`. On an unsupported platform, or if the download fails, the installer stops and leaves the previous install unchanged.
 
 For a different installation directory, pass the variables to the shell running the installer:
 
