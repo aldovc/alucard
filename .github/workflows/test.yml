@@ -73,8 +73,13 @@ jobs:
       - name: Install
         run: |
           home="$RUNNER_TEMP/alucard"
-          ALUCARD_HOME="$home" ALUCARD_BIN_DIR="$RUNNER_TEMP/bin" \
-            ALUCARD_REPO_URL="file://$PWD" ALUCARD_RELEASE_URL="file://$PWD/dist" \
+          # The checkout has no release tags; install from a throwaway one
+          version="v0.0.0-ci"
+          git tag -f "$version" HEAD
+          mkdir -p "$RUNNER_TEMP/release/$version"
+          cp dist/alucard-* "$RUNNER_TEMP/release/$version/"
+          ALUCARD_HOME="$home" ALUCARD_BIN_DIR="$RUNNER_TEMP/bin" ALUCARD_VERSION="$version" \
+            ALUCARD_REPO_URL="file://$PWD" ALUCARD_RELEASE_URL="file://$RUNNER_TEMP/release" \
             bash install.sh
           "$RUNNER_TEMP/bin/alucard" version
           "$RUNNER_TEMP/bin/alucard-bash" version
