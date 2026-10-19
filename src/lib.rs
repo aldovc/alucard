@@ -696,9 +696,6 @@ mod agent_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
-    use std::sync::Mutex;
-
-    static PATH_LOCK: Mutex<()> = Mutex::new(());
 
     fn run_build(
         previous: &str,
@@ -731,7 +728,7 @@ mod agent_tests {
 
     #[test]
     fn build_cleanup_matches_bash_contract() {
-        let _path_lock = PATH_LOCK.lock().unwrap();
+        let _spawn_lock = super::spawn_lock();
         let old = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let new = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -788,7 +785,7 @@ mod agent_tests {
 
     #[test]
     fn preflight_reaps_failed_containers_and_reports_their_status() {
-        let _path_lock = PATH_LOCK.lock().unwrap();
+        let _path_lock = super::spawn_lock();
         let dir = env::temp_dir().join(format!("alucard-preflight-{}", uuid::Uuid::new_v4()));
         let repository = dir.join("repository");
         let bin = dir.join("bin");
@@ -1007,6 +1004,7 @@ mod agent_tests {
 
     #[test]
     fn preflight_clone_status_encodes_an_unsafe_branch_name() {
+        let _spawn_lock = super::spawn_lock();
         let dir = env::temp_dir().join(format!("alucard-preflight-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("package-lock.json"), "{}").unwrap();
@@ -1044,7 +1042,7 @@ mod agent_tests {
 
     #[test]
     fn invoke_cleans_up_when_codex_stdin_closes_early() {
-        let _path_lock = PATH_LOCK.lock().unwrap();
+        let _path_lock = super::spawn_lock();
         let dir = env::temp_dir().join(format!("alucard-invoke-cleanup-{}", uuid::Uuid::new_v4()));
         let bin = dir.join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -1837,6 +1835,7 @@ mod measurement_tests {
 
     #[test]
     fn repository_id_uses_the_origin_across_checkout_paths() {
+        let _spawn_lock = super::spawn_lock();
         let directory =
             std::env::temp_dir().join(format!("alucard-repository-id-{}", uuid::Uuid::new_v4()));
         let https_checkout = directory.join("checkout");
@@ -2379,6 +2378,12 @@ fn has_rate_limit_error(message: &str, anchored: bool) -> bool {
             .match_indices("rate")
             .any(|(index, _)| matches_rate_limit(&message[index..]))
     }
+}
+
+#[cfg(test)]
+fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn timeout_docker_command(timeout_minutes: u64, docker_args: &[String]) -> Command {
