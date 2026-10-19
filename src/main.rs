@@ -5764,7 +5764,10 @@ fn reconcile_local_tasks(
                     .iter()
                     .find_map(unpublished_checkout)
                     .map(|checkout| checkout.display().to_string());
-                if checkout.is_some() && checkout != task.held_checkout {
+                if matches!(task.state, TaskState::Pending | TaskState::Human)
+                    && checkout.is_some()
+                    && checkout != task.held_checkout
+                {
                     updates.push(TaskHeadingUpdate {
                         id: task.id.clone(),
                         state: TaskState::Human,

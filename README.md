@@ -367,6 +367,11 @@ Finish the work on the recovery branch, then run `alucard continue <PR>` to addr
 
 Alternatively, close the PR to let the task rejoin the queue. `alucard run --issue N` starts a fresh attempt immediately. For local tasks, closing an unmerged recovery PR returns the task to the queue on reconciliation.
 
+If a run is killed before recovery finishes, the next `run`, `continue`, or `merge` holds the task for a human when the run's checkout still has unpublished work. Each start prints `alucard: task <id> is held for a human: <reason>`, and `alucard runs` shows the reason. The task is not dispatched again. For a local task, the next `run` or `queue` changes its heading to `## [h] <id>: <title> (held: <checkout>)`. To clear a held task, do one of the following:
+
+- **Resume:** push the checkout's branch and open a PR from it. The next `run`, `continue`, or `merge` records the PR, and the heading becomes `[>] … (PR #N)`.
+- **Release:** discard the work in the checkout, then start any of those commands. For example, run `git -C <checkout> reset --hard origin/<base>`, `git -C <checkout> clean -fd`, and `git -C <checkout> stash clear`. The task returns to the queue, and the heading becomes `[ ]`.
+
 The run's final `Needs attention` list includes recovery PRs and issues parked for a human. An empty eligible queue does not mean every task is complete.
 
 ### Concurrent runs
