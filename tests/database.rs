@@ -3,7 +3,7 @@ mod test_support;
 use alucard::{
     abandoned_task_claims, acquire_pr, acquire_task, begin_operation, begin_operation_with_payload,
     defer_operation, finish_operation, heartbeat, import_github_tasks, import_local_tasks,
-    lock_recovery_operations, migrate, open, parse_tasks, pending_operations,
+    lock_repository_recovery_operations, migrate, open, parse_tasks, pending_operations,
     pending_recovery_operations, prepare_run, record_task_pr, record_task_pr_gate_state,
     record_task_pr_review, release, release_abandoned_task_claim, repository_id,
     repository_ledger_id, repository_source_path, run_command, start_continue_run, start_merge_run,
@@ -1312,7 +1312,7 @@ fn recovery_replay_lock_excludes_concurrent_recoverers() {
     let (release, release_receiver) = std::sync::mpsc::channel();
     let held_path = path.clone();
     let holder = thread::spawn(move || {
-        let _lock = lock_recovery_operations(&held_path).unwrap();
+        let _lock = lock_repository_recovery_operations(&held_path, "owner/repo").unwrap();
         locked_sender.send(()).unwrap();
         release_receiver.recv().unwrap();
     });
@@ -1322,11 +1322,12 @@ fn recovery_replay_lock_excludes_concurrent_recoverers() {
     let (done, done_receiver) = std::sync::mpsc::channel();
     let waiting_path = path.clone();
     let waiter = thread::spawn(move || {
-        let _lock = lock_recovery_operations(&waiting_path).unwrap();
+        let _lock = lock_repository_recovery_operations(&waiting_path, "owner/repo").unwrap();
         acquired_sender.send(()).unwrap();
         done_receiver.recv().unwrap();
     });
     assert!(acquired.recv_timeout(Duration::from_millis(50)).is_err());
+    drop(lock_repository_recovery_operations(&path, "owner/other").unwrap());
     release.send(()).unwrap();
     acquired.recv_timeout(Duration::from_secs(1)).unwrap();
     done.send(()).unwrap();

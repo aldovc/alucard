@@ -1460,6 +1460,26 @@ esac
     configure(&mut first);
     let mut first = first.spawn().unwrap();
     wait_for_file(&root.join("create-started"));
+    let other = root.join("other");
+    git_repository(&other);
+    let other_tasks = root.join("other-tasks.md");
+    fs::write(&other_tasks, "# Tasks\n").unwrap();
+    let mut unrelated = reconciliation_run(&root, &other, &database, &other_tasks, &bin);
+    configure(&mut unrelated);
+    let mut unrelated = unrelated.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = unrelated.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            unrelated.kill().unwrap();
+            fs::write(root.join("create-release"), "").unwrap();
+            panic!("startup for another repository waited for the stalled replay");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
     let mut second = reconciliation_run(&root, &repository, &database, &tasks, &bin);
     configure(&mut second);
     let mut second = second.spawn().unwrap();
