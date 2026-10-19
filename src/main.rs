@@ -5,7 +5,7 @@ use alucard::{
     archive_prompt, begin_operation, begin_operation_with_payload, build_image,
     compose_role_prompt, database_path, defer_operation, ensure_repository_identity, find_run,
     finish_operation, finish_run, github_queue, github_task_pull_requests, github_ticket_blockers,
-    import_github_tasks, import_local_tasks, iteration_usage_comment_for_dirs,
+    held_tasks, import_github_tasks, import_local_tasks, iteration_usage_comment_for_dirs,
     local_queue_with_open_issues, local_queue_with_open_prs, local_task_pull_requests,
     lock_recovery_operations, lock_repository_recovery_operations, log_event,
     mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
@@ -2634,6 +2634,12 @@ fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
             }
         }
     }
+    for held in held_tasks(database, &repository_id).map_err(|error| error.to_string())? {
+        eprintln!(
+            "alucard: task {} is held for a human: {}",
+            held.external_id, held.reason
+        );
+    }
     Ok(())
 }
 
@@ -3074,6 +3080,12 @@ fn abandoned_attempt_requires_recovery(attempt: &alucard::TaskClaimAttempt) -> O
             checkout.display()
         )),
     }
+}
+
+/// Returns the attempt's checkout when it holds work that is not on the remote.
+fn unpublished_checkout(attempt: &alucard::TaskClaimAttempt) -> Option<PathBuf> {
+    let checkout = PathBuf::from(attempt.logs_path.as_ref()?).join("repository");
+    (checkout.is_dir() && checkout_requires_preservation(&checkout) == Ok(true)).then_some(checkout)
 }
 
 fn reconcile_remote_pr(
@@ -5701,6 +5713,7 @@ fn mark_local_task_in_flight(task_file: Option<&Path>, task: &SelectedRunTask, n
                 state: TaskState::InFlight,
                 pr_number: Some(number),
                 previous_pr_number: None,
+                held_checkout: None,
             }],
         )
     }) {
@@ -5736,9 +5749,54 @@ fn reconcile_local_tasks(
                 state: TaskState::InFlight,
                 pr_number: Some(*number),
                 previous_pr_number: None,
+                held_checkout: None,
             })
         })
         .collect::<Vec<_>>();
+    let held = held_tasks(database, &repository_id).map_err(|error| error.to_string())?;
+    for task in &parsed.tasks {
+        match held.iter().find(|held| {
+            held.source == "local" && held.source_path == source_path && held.external_id == task.id
+        }) {
+            Some(held) => {
+                let checkout = run_retry_attempts(database, &held.run_id)
+                    .map_err(|error| error.to_string())?
+                    .iter()
+                    .find_map(unpublished_checkout)
+                    .map(|checkout| checkout.display().to_string());
+                if matches!(task.state, TaskState::Pending | TaskState::Human)
+                    && checkout.is_some()
+                    && checkout != task.held_checkout
+                {
+                    updates.push(TaskHeadingUpdate {
+                        id: task.id.clone(),
+                        state: TaskState::Human,
+                        pr_number: None,
+                        previous_pr_number: None,
+                        held_checkout: checkout,
+                    });
+                }
+            }
+            None if task.held_checkout.is_some() => {
+                let number = ledger_prs
+                    .iter()
+                    .find(|(id, _)| *id == task.id)
+                    .map(|(_, number)| *number);
+                updates.push(TaskHeadingUpdate {
+                    id: task.id.clone(),
+                    state: if number.is_some() {
+                        TaskState::InFlight
+                    } else {
+                        TaskState::Pending
+                    },
+                    pr_number: number,
+                    previous_pr_number: None,
+                    held_checkout: None,
+                });
+            }
+            None => {}
+        }
+    }
     let restored = updates.len();
     for task in parsed
         .tasks
@@ -5759,12 +5817,14 @@ fn reconcile_local_tasks(
                 state: TaskState::Done,
                 pr_number: Some(number),
                 previous_pr_number: None,
+                held_checkout: None,
             }),
             Some(GithubPullRequestState::Closed) => updates.push(TaskHeadingUpdate {
                 id: task.id.clone(),
                 state: TaskState::Pending,
                 pr_number: None,
                 previous_pr_number: Some(number),
+                held_checkout: None,
             }),
             None => {}
         }

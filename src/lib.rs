@@ -696,9 +696,6 @@ mod agent_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
-    use std::sync::Mutex;
-
-    static PATH_LOCK: Mutex<()> = Mutex::new(());
 
     fn run_build(
         previous: &str,
@@ -731,7 +728,7 @@ mod agent_tests {
 
     #[test]
     fn build_cleanup_matches_bash_contract() {
-        let _path_lock = PATH_LOCK.lock().unwrap();
+        let _spawn_lock = super::spawn_lock();
         let old = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let new = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -788,7 +785,7 @@ mod agent_tests {
 
     #[test]
     fn preflight_reaps_failed_containers_and_reports_their_status() {
-        let _path_lock = PATH_LOCK.lock().unwrap();
+        let _path_lock = super::spawn_lock();
         let dir = env::temp_dir().join(format!("alucard-preflight-{}", uuid::Uuid::new_v4()));
         let repository = dir.join("repository");
         let bin = dir.join("bin");
@@ -1007,6 +1004,7 @@ mod agent_tests {
 
     #[test]
     fn preflight_clone_status_encodes_an_unsafe_branch_name() {
+        let _spawn_lock = super::spawn_lock();
         let dir = env::temp_dir().join(format!("alucard-preflight-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("package-lock.json"), "{}").unwrap();
@@ -1044,7 +1042,7 @@ mod agent_tests {
 
     #[test]
     fn invoke_cleans_up_when_codex_stdin_closes_early() {
-        let _path_lock = PATH_LOCK.lock().unwrap();
+        let _path_lock = super::spawn_lock();
         let dir = env::temp_dir().join(format!("alucard-invoke-cleanup-{}", uuid::Uuid::new_v4()));
         let bin = dir.join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -1837,6 +1835,7 @@ mod measurement_tests {
 
     #[test]
     fn repository_id_uses_the_origin_across_checkout_paths() {
+        let _spawn_lock = super::spawn_lock();
         let directory =
             std::env::temp_dir().join(format!("alucard-repository-id-{}", uuid::Uuid::new_v4()));
         let https_checkout = directory.join("checkout");
@@ -2381,6 +2380,12 @@ fn has_rate_limit_error(message: &str, anchored: bool) -> bool {
     }
 }
 
+#[cfg(test)]
+fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn timeout_docker_command(timeout_minutes: u64, docker_args: &[String]) -> Command {
     let mut command = Command::new("timeout");
     command
@@ -2617,6 +2622,8 @@ pub struct LocalTask {
     pub blockers: Vec<String>,
     #[serde(skip)]
     pub issue_blockers: Vec<i64>,
+    #[serde(skip)]
+    pub held_checkout: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -2857,6 +2864,7 @@ pub struct TaskHeadingUpdate {
     pub state: TaskState,
     pub pr_number: Option<i64>,
     pub previous_pr_number: Option<i64>,
+    pub held_checkout: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2918,6 +2926,11 @@ pub fn parse_tasks(contents: &str) -> Result<ParsedTasks, Vec<String>> {
             if let Some(task) = current.take() {
                 tasks.push(task);
             }
+            let (title, held_checkout) = if marker == 'h' {
+                split_held_suffix(title)
+            } else {
+                (title, None)
+            };
             let (title, pr_number) = split_pr_suffix(title, "(PR #");
             let (title, previous_pr_number) = split_pr_suffix(title, "(previous attempt: PR #");
             current = Some(LocalTask {
@@ -2930,6 +2943,7 @@ pub fn parse_tasks(contents: &str) -> Result<ParsedTasks, Vec<String>> {
                 previous_pr_number,
                 blockers: Vec::new(),
                 issue_blockers: Vec::new(),
+                held_checkout: held_checkout.map(str::to_string),
             });
         } else if let Some(task) = current.as_mut() {
             if !task.body.is_empty() {
@@ -2984,6 +2998,14 @@ pub fn parse_tasks(contents: &str) -> Result<ParsedTasks, Vec<String>> {
     } else {
         Err(errors)
     }
+}
+
+fn split_held_suffix(title: &str) -> (&str, Option<&str>) {
+    title
+        .strip_suffix(')')
+        .and_then(|title| title.rsplit_once(" (held: "))
+        .filter(|(title, checkout)| !title.is_empty() && !checkout.is_empty())
+        .map_or((title, None), |(title, checkout)| (title, Some(checkout)))
 }
 
 fn split_pr_suffix<'a>(title: &'a str, prefix: &str) -> (&'a str, Option<i64>) {
@@ -3110,30 +3132,41 @@ pub fn write_task_headings(
             } else {
                 ""
             };
-            match (update.state, update.pr_number, update.previous_pr_number) {
-                (TaskState::InFlight, Some(number), _) => {
-                    let heading = line.trim_end_matches(['\r', '\n']);
-                    *line = format!(
-                        "{} (PR #{number}){ending}",
-                        heading.replacen("## [ ]", "## [>]", 1)
-                    );
+            let mut heading = line.trim_end_matches(['\r', '\n']).to_string();
+            if let Some(checkout) = &task.held_checkout {
+                heading = heading
+                    .strip_suffix(&format!(" (held: {checkout})"))
+                    .expect("parsed held suffix")
+                    .replacen("## [h]", "## [ ]", 1);
+            }
+            let heading = match (
+                update.state,
+                update.pr_number,
+                update.previous_pr_number,
+                update.held_checkout.as_deref(),
+            ) {
+                (TaskState::Human, _, _, Some(checkout)) => format!(
+                    "{} (held: {checkout})",
+                    heading.replacen("## [ ]", "## [h]", 1)
+                ),
+                (TaskState::InFlight, Some(number), _, _) => {
+                    format!("{} (PR #{number})", heading.replacen("## [ ]", "## [>]", 1))
                 }
-                (TaskState::Done, _, _) => {
-                    *line = line.replacen("## [>]", "## [x]", 1);
-                }
-                (TaskState::Pending, _, Some(number)) => {
-                    let heading = line.trim_end_matches(['\r', '\n']);
+                (TaskState::Done, _, _, _) => heading.replacen("## [>]", "## [x]", 1),
+                (TaskState::Pending, _, Some(number), _) => {
                     let suffix = format!("(PR #{number})");
                     let heading = heading.strip_suffix(&suffix).ok_or_else(|| {
                         format!("task {} heading is missing PR #{number}", task.id)
                     })?;
-                    *line = format!(
-                        "{}(previous attempt: PR #{number}){ending}",
+                    format!(
+                        "{}(previous attempt: PR #{number})",
                         heading.replacen("## [>]", "## [ ]", 1)
-                    );
+                    )
                 }
+                (TaskState::Pending, None, None, None) if task.held_checkout.is_some() => heading,
                 _ => return Err(format!("unsupported heading update for task {}", task.id)),
-            }
+            };
+            *line = format!("{heading}{ending}");
         }
         let rewritten = lines.concat();
         let temporary = path.with_extension(format!("tasks-{}.tmp", Uuid::new_v4()));
@@ -4931,6 +4964,43 @@ pub fn find_run(path: &Path, run_id: &str) -> Result<Option<Run>, DatabaseError>
         )
         .optional()
         .map_err(Into::into)
+}
+
+/// A task whose claim startup reconciliation holds for a human.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HeldTask {
+    pub source: String,
+    pub source_path: String,
+    pub external_id: String,
+    pub run_id: String,
+    pub reason: String,
+}
+
+/// Lists the repository's tasks held for a human with their reconciliation reasons.
+pub fn held_tasks(path: &Path, repository_id: &str) -> Result<Vec<HeldTask>, DatabaseError> {
+    let connection = open(path)?;
+    let mut statement = connection.prepare(
+        "SELECT tasks.source, tasks.source_path, tasks.external_id, runs.id, runs.reconciliation_reason
+         FROM tasks
+         JOIN claims ON claims.repository_id = tasks.repository_id AND claims.resource_kind = 'task'
+             AND claims.resource_key = tasks.id AND claims.state = 'active'
+         JOIN runs ON runs.id = claims.run_id
+         WHERE tasks.repository_id = ?1 AND tasks.status = 'human'
+             AND runs.reconciliation_reason IS NOT NULL
+         ORDER BY tasks.source, tasks.source_path, tasks.external_id",
+    )?;
+    let held = statement
+        .query_map([repository_id], |row| {
+            Ok(HeldTask {
+                source: row.get(0)?,
+                source_path: row.get(1)?,
+                external_id: row.get(2)?,
+                run_id: row.get(3)?,
+                reason: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(held)
 }
 
 /// Returns the recorded reason a crashed run still needs human reconciliation.
