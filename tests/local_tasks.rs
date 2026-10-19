@@ -38,6 +38,7 @@ fn task_heading_write_preserves_non_heading_bytes() {
             state: TaskState::Pending,
             pr_number: None,
             previous_pr_number: Some(12),
+            held_checkout: None,
         }],
     )
     .unwrap();
@@ -61,6 +62,7 @@ fn task_heading_write_preserves_previous_attempt_when_opening_pr() {
             state: TaskState::InFlight,
             pr_number: Some(5),
             previous_pr_number: None,
+            held_checkout: None,
         }],
     )
     .unwrap();
@@ -84,6 +86,7 @@ fn task_heading_write_rejects_changed_file() {
             state: TaskState::Done,
             pr_number: Some(12),
             previous_pr_number: None,
+            held_checkout: None,
         }],
     )
     .unwrap_err();
@@ -109,12 +112,14 @@ fn concurrent_task_heading_writes_report_a_conflict() {
             state: TaskState::Done,
             pr_number: Some(12),
             previous_pr_number: None,
+            held_checkout: None,
         },
         TaskHeadingUpdate {
             id: "one".to_string(),
             state: TaskState::Pending,
             pr_number: None,
             previous_pr_number: Some(12),
+            held_checkout: None,
         },
     ]
     .into_iter()
@@ -4878,6 +4883,39 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                         "checkout is unavailable"
                     }
                 ));
+                let (owner, logs): (String, String) = connection
+                    .query_row(
+                        "SELECT id, logs_path FROM runs WHERE id = (SELECT run_id FROM claims WHERE id = ?1)",
+                        [&first_claim],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                let checkout = Path::new(&logs).join("repository");
+                let (line, heading) = if scenario == "missing-checkout" {
+                    (
+                        format!(
+                            "alucard: task first is held for a human: attempt {owner} checkout is unavailable at {}",
+                            checkout.display()
+                        ),
+                        "## [ ] first: First task\n\nBody\n".to_string(),
+                    )
+                } else {
+                    (
+                        format!(
+                            "alucard: task first is held for a human: attempt {owner} has unpublished work at {}",
+                            checkout.display()
+                        ),
+                        format!(
+                            "## [h] first: First task (held: {})\n\nBody\n",
+                            checkout.display()
+                        ),
+                    )
+                };
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(&line),
+                    "{output:?}"
+                );
+                assert_eq!(fs::read_to_string(&tasks).unwrap(), heading);
                 let second = reconciliation_run(&root, &repository, &database, &tasks, &bin)
                     .env("ALUCARD_DOCKER_TRACE", &docker_trace)
                     .env("ALUCARD_GH_CALLS", &gh_calls)
@@ -4885,6 +4923,45 @@ fn startup_reconciliation_preserves_active_retries_and_stages_remote_updates() {
                     .output()
                     .unwrap();
                 assert!(second.status.success(), "{second:?}");
+                assert!(
+                    String::from_utf8_lossy(&second.stderr).contains(&line),
+                    "{second:?}"
+                );
+                assert_eq!(fs::read_to_string(&tasks).unwrap(), heading);
+                let queue = Command::new(env!("CARGO_BIN_EXE_alucard"))
+                    .env(
+                        "PATH",
+                        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                    )
+                    .current_dir(&repository)
+                    .args([
+                        "--db-path",
+                        database.to_str().unwrap(),
+                        "queue",
+                        "--tasks",
+                        tasks.to_str().unwrap(),
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(queue.status.success(), "{queue:?}");
+                assert_eq!(String::from_utf8_lossy(&queue.stdout).trim(), "[]");
+                assert_eq!(fs::read_to_string(&tasks).unwrap(), heading);
+                if scenario == "unpublished-work" {
+                    fs::remove_file(checkout.join("unfinished")).unwrap();
+                    let released = reconciliation_run(&root, &repository, &database, &tasks, &bin)
+                        .env("ALUCARD_DOCKER_TRACE", &docker_trace)
+                        .env("ALUCARD_GH_CALLS", &gh_calls)
+                        .env("ALUCARD_SCENARIO", scenario)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        !String::from_utf8_lossy(&released.stderr).contains("is held"),
+                        "{released:?}"
+                    );
+                    assert!(fs::read_to_string(&tasks)
+                        .unwrap()
+                        .starts_with("## [ ] first: First task\n"));
+                }
             }
             _ => unreachable!(),
         }
