@@ -7,16 +7,17 @@ use alucard::{
     finish_operation, finish_run, github_queue, github_task_pull_requests, github_ticket_blockers,
     import_github_tasks, import_local_tasks, iteration_usage_comment_for_dirs,
     local_queue_with_open_issues, local_queue_with_open_prs, local_task_pull_requests,
-    lock_recovery_operations, log_event, mark_claim_needs_reconciliation, migrate, open,
-    operation_exists, parse_tasks, pending_recovery_operations, prepare_run,
-    prior_stage_base_for_pr, process_is_alive, recent_runs, reconcile_github_task_pull_request,
-    record_recovery_failure, record_recovery_pr, record_task_pr, record_task_pr_gate_state,
-    record_task_pr_review, release, release_abandoned_pull_request_claim,
-    release_abandoned_task_claim, repository_ledger_id, repository_source_path, run_claims,
-    run_command as execute_command, run_pull_requests, run_reconciliation_reason, run_recovery,
-    run_retry_attempts, start_continue_run, start_merge_run, start_task_retry_run, start_task_run,
-    status, task_claim_attempts, task_id, task_is_pending, toolchain_preflight, transition_task,
-    usage_report_for_dirs, warn_if_stale_image, write_iteration_measurement, write_run_measurement,
+    lock_recovery_operations, lock_repository_recovery_operations, log_event,
+    mark_claim_needs_reconciliation, migrate, open, operation_exists, parse_tasks,
+    pending_recovery_operations, prepare_run, prior_stage_base_for_pr, process_is_alive,
+    recent_runs, reconcile_github_task_pull_request, record_recovery_failure, record_recovery_pr,
+    record_task_pr, record_task_pr_gate_state, record_task_pr_review, release,
+    release_abandoned_pull_request_claim, release_abandoned_task_claim, repository_ledger_id,
+    repository_source_path, run_claims, run_command as execute_command, run_pull_requests,
+    run_reconciliation_reason, run_recovery, run_retry_attempts, start_continue_run,
+    start_merge_run, start_task_retry_run, start_task_run, status, task_claim_attempts, task_id,
+    task_is_pending, toolchain_preflight, transition_task, usage_report_for_dirs,
+    warn_if_stale_image, write_iteration_measurement, write_run_measurement,
     write_stage_measurement, write_task_headings, ActiveCommand, AgentExit, AgentInvocation,
     AgentResult, AgentRole, AgentSettings, GithubPullRequest, GithubPullRequestState, GithubTask,
     IterationMeasurement, Provider, RecoveryPullRequest, RunOptions, StageMeasurement,
@@ -2477,9 +2478,12 @@ enum ReconciliationAction {
 }
 
 fn reconcile_startup(database: &Path, repository: &Path) -> Result<(), String> {
-    let _lock = lock_recovery_operations(database).map_err(|error| error.to_string())?;
-    let repository_id =
-        ensure_repository_identity(database, repository).map_err(|error| error.to_string())?;
+    let repository_id = {
+        let _lock = lock_recovery_operations(database).map_err(|error| error.to_string())?;
+        ensure_repository_identity(database, repository).map_err(|error| error.to_string())?
+    };
+    let _lock = lock_repository_recovery_operations(database, &repository_id)
+        .map_err(|error| error.to_string())?;
     replay_recovery_operations(database, repository, &repository_id)?;
     for claim in abandoned_pull_request_claims(database, &repository_id)
         .map_err(|error| error.to_string())?

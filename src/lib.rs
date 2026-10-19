@@ -4201,10 +4201,25 @@ pub fn pending_operations(
     Ok(operations)
 }
 
-/// Acquires the per-ledger lock held across startup recovery replay network calls.
+/// Acquires the per-ledger lock held while startup resolves repository identity.
 pub fn lock_recovery_operations(path: &Path) -> Result<RecoveryOperationLock, DatabaseError> {
+    exclusive_lock(path, &path.with_extension("recovery.lock"))
+}
+
+/// Acquires the per-repository lock held across startup recovery replay network calls.
+pub fn lock_repository_recovery_operations(
+    path: &Path,
+    repository_id: &str,
+) -> Result<RecoveryOperationLock, DatabaseError> {
+    let key = format!("{:x}", Sha256::digest(repository_id.as_bytes()));
+    exclusive_lock(
+        path,
+        &path.with_extension(format!("recovery.{}.lock", &key[..16])),
+    )
+}
+
+fn exclusive_lock(path: &Path, lock_path: &Path) -> Result<RecoveryOperationLock, DatabaseError> {
     prepare_directory(path)?;
-    let lock_path = path.with_extension("recovery.lock");
     let file = File::options()
         .read(true)
         .write(true)
