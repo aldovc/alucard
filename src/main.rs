@@ -1904,8 +1904,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
                         );
                         return ExitCode::from(2);
                     }
-                    if classification == alucard::AgentExit::Transport
-                        && attempt < options.transport_attempts
+                    if matches!(
+                        classification,
+                        alucard::AgentExit::Transport | alucard::AgentExit::NoWorktree
+                    ) && attempt < options.transport_attempts
                     {
                         attempt += 1;
                         let retry_run = match start_task_retry_run(
