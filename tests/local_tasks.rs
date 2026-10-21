@@ -1509,7 +1509,9 @@ esac
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(status.success());
-    let mut second = reconciliation_run(&root, &repository, &database, &tasks, &bin);
+    let second_tasks = root.join("second-tasks.md");
+    fs::write(&second_tasks, "# Tasks\n").unwrap();
+    let mut second = reconciliation_run(&root, &repository, &database, &second_tasks, &bin);
     configure(&mut second);
     let replay_lookups = || {
         fs::read_to_string(root.join("trace"))
@@ -1530,7 +1532,7 @@ esac
     }
     fs::write(root.join("create-release"), "").unwrap();
     assert!(first.wait().unwrap().success());
-    second.wait().unwrap();
+    assert!(second.wait().unwrap().success());
 
     let trace = fs::read_to_string(root.join("trace")).unwrap();
     assert_eq!(
