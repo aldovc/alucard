@@ -5,7 +5,7 @@ PASS=0
 FAIL=0
 
 # Agent containers and operator shells carry ALUCARD_* settings (providers,
-# models) that change what the sourced functions do. Tests set their own.
+# models) that change what the tested commands do. Tests set their own.
 while read -r _v; do unset "$_v"; done < <(compgen -e | grep '^ALUCARD_' || true)
 # Stubs trace with printf %q, which escapes non-ASCII outside a UTF-8 locale.
 export LC_ALL=C.UTF-8

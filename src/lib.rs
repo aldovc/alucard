@@ -1213,10 +1213,26 @@ mod agent_tests {
             ("", "ANTHROPIC_API_KEY", None),
             ("", "OPENAI_API_KEY", Some("ANTHROPIC_API_KEY")),
             ("ALUCARD_PROVIDER=codex", "OPENAI_API_KEY", None),
-            ("ALUCARD_PROVIDER=codex", "ANTHROPIC_API_KEY", Some("OPENAI_API_KEY")),
-            ("ALUCARD_REVIEWER_PROVIDER=codex", "ANTHROPIC_API_KEY OPENAI_API_KEY", None),
-            ("ALUCARD_REVIEWER_PROVIDER=codex", "ANTHROPIC_API_KEY", Some("OPENAI_API_KEY")),
-            ("ALUCARD_REVIEWER_PROVIDER=codex", "OPENAI_API_KEY", Some("ANTHROPIC_API_KEY")),
+            (
+                "ALUCARD_PROVIDER=codex",
+                "ANTHROPIC_API_KEY",
+                Some("OPENAI_API_KEY"),
+            ),
+            (
+                "ALUCARD_REVIEWER_PROVIDER=codex",
+                "ANTHROPIC_API_KEY OPENAI_API_KEY",
+                None,
+            ),
+            (
+                "ALUCARD_REVIEWER_PROVIDER=codex",
+                "ANTHROPIC_API_KEY",
+                Some("OPENAI_API_KEY"),
+            ),
+            (
+                "ALUCARD_REVIEWER_PROVIDER=codex",
+                "OPENAI_API_KEY",
+                Some("ANTHROPIC_API_KEY"),
+            ),
         ] {
             let values = std::iter::once(("GITHUB_TOKEN", "token"))
                 .chain(providers.split_once('='))
