@@ -3,7 +3,7 @@ mod test_support;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use test_support::copy_tool_installation;
@@ -76,7 +76,7 @@ fn without_ledger_check(output: std::process::Output) -> String {
 }
 
 #[test]
-fn version_matches_bash() {
+fn version_matches_git_describe() {
     let root = env!("CARGO_MANIFEST_DIR");
     let run = |cmd: &mut Command| {
         let out = cmd.arg("version").current_dir(root).output().unwrap();
@@ -91,30 +91,18 @@ fn version_matches_bash() {
         .unwrap();
     assert!(describe.status.success());
     let expected = String::from_utf8(describe.stdout).unwrap();
-    let bash = run(Command::new("bash").arg(format!("{root}/alucard")));
-    assert_eq!(bash, expected);
     assert_eq!(rust, expected);
     assert_ne!(rust.trim(), "unknown");
 }
 
 #[test]
-fn top_level_help_matches_bash() {
-    let root = env!("CARGO_MANIFEST_DIR");
+fn top_level_help_matches_committed_text() {
     for arguments in [Vec::<&str>::new(), vec!["help"], vec!["-h"], vec!["--help"]] {
-        let bash = Command::new("bash")
-            .arg("alucard")
-            .args(&arguments)
-            .current_dir(root)
-            .output()
-            .unwrap();
         let rust = Command::new(env!("CARGO_BIN_EXE_alucard"))
             .args(&arguments)
-            .current_dir(root)
             .output()
             .unwrap();
-        assert!(bash.status.success());
         assert!(rust.status.success());
-        assert_eq!(bash.stdout, include_bytes!("fixtures/top-level-help.txt"));
         assert_eq!(rust.stdout, include_bytes!("fixtures/top-level-help.txt"));
     }
 }
@@ -244,32 +232,18 @@ impl DoctorFixture {
         }
     }
 
-    fn doctor(&self, mut command: Command) -> Command {
-        command.current_dir(&self.repository).env(
-            "PATH",
-            format!("{}:/usr/bin:/bin", self.directory.join("bin").display()),
-        );
-        command
-    }
-
-    fn rust(&self) -> Command {
+    fn doctor(&self) -> Command {
         let mut command = Command::new(&self.binary);
         command
             .arg("--db-path")
             .arg(self.directory.join("ledger.db"))
-            .arg("doctor");
-        self.doctor(command)
-    }
-
-    fn bash(&self) -> Command {
-        fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("alucard"),
-            self.tools.join("alucard"),
-        )
-        .unwrap();
-        let mut command = Command::new("bash");
-        command.arg(self.tools.join("alucard")).arg("doctor");
-        self.doctor(command)
+            .arg("doctor")
+            .current_dir(&self.repository)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.directory.join("bin").display()),
+            );
+        command
     }
 
     fn expected(&self, lines: &[String]) -> String {
@@ -297,7 +271,7 @@ impl Drop for DoctorFixture {
 }
 
 #[test]
-fn doctor_matches_bash_before_ledger_checks() {
+fn doctor_reports_prerequisites_before_ledger_checks() {
     let fixture = DoctorFixture::new("doctor");
     let env_file = fixture.directory.join("doctor.env");
     fs::write(
@@ -311,14 +285,8 @@ fn doctor_matches_bash_before_ledger_checks() {
         format!("ok: target repo {}", fixture.repository.display()),
         "ok: target repo has origin remote".to_string(),
     ]);
-    let bash = fixture
-        .bash()
-        .args([".", "--env-file", env_file.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8(bash.stdout).unwrap().trim(), expected);
     let rust = fixture
-        .rust()
+        .doctor()
         .args([".", "--env-file", env_file.to_str().unwrap()])
         .output()
         .unwrap();
@@ -326,7 +294,7 @@ fn doctor_matches_bash_before_ledger_checks() {
 }
 
 #[test]
-fn doctor_empty_environment_defaults_match_bash() {
+fn doctor_falls_back_to_defaults_for_an_empty_environment() {
     let fixture = DoctorFixture::new("doctor-empty-defaults");
     let expected = fixture.expected(&[
         format!(
@@ -336,11 +304,7 @@ fn doctor_empty_environment_defaults_match_bash() {
         format!("ok: target repo {}", fixture.repository.display()),
         "ok: target repo has origin remote".to_string(),
     ]);
-    let bash = empty_environment_defaults(&mut fixture.bash())
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8(bash.stdout).unwrap().trim(), expected);
-    let rust = empty_environment_defaults(&mut fixture.rust())
+    let rust = empty_environment_defaults(&mut fixture.doctor())
         .output()
         .unwrap();
 
@@ -349,7 +313,7 @@ fn doctor_empty_environment_defaults_match_bash() {
 }
 
 #[test]
-fn doctor_empty_cache_directory_matches_bash() {
+fn doctor_falls_back_to_xdg_cache_for_an_empty_cache_directory() {
     let fixture = DoctorFixture::new("doctor-empty-cache");
     let cache = fixture.directory.join("cache");
     let expected = fixture.expected(&[
@@ -362,16 +326,8 @@ fn doctor_empty_cache_directory_matches_bash() {
             cache.display()
         ),
     ]);
-    let bash = fixture
-        .bash()
-        .arg("owner/repo")
-        .env("ALUCARD_CACHE_DIR", "")
-        .env("XDG_CACHE_HOME", &cache)
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8(bash.stdout).unwrap().trim(), expected);
     let rust = fixture
-        .rust()
+        .doctor()
         .arg("owner/repo")
         .env("ALUCARD_CACHE_DIR", "")
         .env("XDG_CACHE_HOME", &cache)
