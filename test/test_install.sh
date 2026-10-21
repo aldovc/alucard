@@ -41,7 +41,13 @@ assert_eq "first install links the latest binary" "alucard v0.2.0" "$("$ALUCARD_
 assert_eq "first install checks out the latest tag, not the branch head" \
   "$(git -C "$SRC" rev-parse v0.2.0)" "$(git -C "$ALUCARD_HOME" rev-parse HEAD)"
 
+[ -e "$ALUCARD_BIN_DIR/alucard-bash" ] && fail "install links no Bash CLI" || pass "install links no Bash CLI"
+
+# An install from a release that still shipped the Bash CLI.
+ln -s "$ALUCARD_HOME/alucard" "$ALUCARD_BIN_DIR/alucard-bash"
 ALUCARD_VERSION=v0.1.0 run_install >/dev/null
+[ -L "$ALUCARD_BIN_DIR/alucard-bash" ] && fail "upgrade removes the stale alucard-bash link" \
+  || pass "upgrade removes the stale alucard-bash link"
 assert_eq "ALUCARD_VERSION selects the binary" "alucard v0.1.0" "$("$ALUCARD_BIN_DIR/alucard" version)"
 assert_eq "ALUCARD_VERSION selects the checkout" \
   "$(git -C "$SRC" rev-parse v0.1.0)" "$(git -C "$ALUCARD_HOME" rev-parse HEAD)"

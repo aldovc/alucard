@@ -18,21 +18,20 @@ jobs:
       - name: Run test suite
         run: |
           # </dev/null so a test that reads stdin fails fast instead of
-          # hanging the job until the workflow timeout.
-          for t in test/test_*.sh; do
+          # hanging the job until the workflow timeout. test_merge.sh and
+          # test_continue_feedback_stall.sh need the built binary, so cargo
+          # test runs them in the rust job.
+          for t in test/test_install.sh test/test_entrypoint.sh; do
             echo "== $t"
             bash "$t" </dev/null || exit 1
           done
 
       # --severity=warning skips info-level notes (SC2015 `&& … || true` and
       # SC2016 single-quoted GraphQL are deliberate idioms throughout).
-      # SC2034 is excluded because the test fixtures set globals that the
-      # sourced functions consume — shellcheck cannot see across the source
-      # boundary and flags every one as unused.
       - name: ShellCheck
         run: |
-          shellcheck --severity=warning --exclude=SC2034 \
-            alucard entrypoint.sh install.sh test-*.sh test/*.sh
+          shellcheck --severity=warning \
+            entrypoint.sh install.sh test-*.sh test/*.sh
 
   rust:
     strategy:
@@ -82,7 +81,6 @@ jobs:
             ALUCARD_REPO_URL="file://$PWD" ALUCARD_RELEASE_URL="file://$RUNNER_TEMP/release" \
             bash install.sh
           "$RUNNER_TEMP/bin/alucard" version
-          "$RUNNER_TEMP/bin/alucard-bash" version
           doctor="$("$RUNNER_TEMP/bin/alucard" doctor 2>&1 || true)"
           echo "$doctor"
           grep -qxF "ok: tool files in $home" <<<"$doctor"

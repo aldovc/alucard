@@ -54,18 +54,21 @@ else
   git -c advice.detachedHead=false clone -q --depth 1 --branch "$version" "$REPO_URL" "$ALUCARD_HOME"
 fi
 
-chmod +x "$ALUCARD_HOME/alucard" "$ALUCARD_HOME/entrypoint.sh"
+chmod +x "$ALUCARD_HOME/entrypoint.sh"
 
 # The binary finds its tool files through the Cargo.toml in ALUCARD_HOME
 mkdir -p "$ALUCARD_HOME/bin"
 cp "$tmp/alucard" "$ALUCARD_HOME/bin/.alucard.new"
 mv -f "$ALUCARD_HOME/bin/.alucard.new" "$ALUCARD_HOME/bin/alucard"
 
-# Symlink CLIs into BIN_DIR
+# Symlink the CLI into BIN_DIR
 mkdir -p "$BIN_DIR"
 ln -sf "$ALUCARD_HOME/bin/alucard" "$BIN_DIR/alucard"
-ln -sf "$ALUCARD_HOME/alucard" "$BIN_DIR/alucard-bash"
-ok "alucard linked at $BIN_DIR/alucard, Bash CLI at $BIN_DIR/alucard-bash"
+# Releases up to v0.7.1 also linked the Bash CLI, which no longer exists
+if [ "$(readlink "$BIN_DIR/alucard-bash" 2>/dev/null)" = "$ALUCARD_HOME/alucard" ]; then
+  rm -f "$BIN_DIR/alucard-bash"
+fi
+ok "alucard linked at $BIN_DIR/alucard"
 
 # Create env file from example if not already present
 if [ ! -f "$ALUCARD_HOME/alucard.env" ]; then
