@@ -7061,7 +7061,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_prompt_matches_bash() {
+    fn reviewer_prompt_layout() {
         let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
         let status = "No Python or Node manifest found — dependency preflight skipped.";
         let task = SelectedRunTask {
@@ -7079,73 +7079,25 @@ mod tests {
             parent_context: String::new(),
         };
         let instructions = compose_role_prompt(tools, "alucard-reviewer-prompt.md", None).unwrap();
-        let bash = Command::new("bash")
-            .args([
-                "-c",
-                r#"source "$1/alucard"
-printf '<instructions>\n%s\n</instructions>\n<pr_num>%s</pr_num>\n<review_cycle>%s of %s</review_cycle>\n<toolchain_status>\n' "$2" "$3" "$4" "$5"
-printf '%s' "$6" | xml_escape
-printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blockers>'"#,
-                "bash",
-                tools.to_str().unwrap(),
-                &instructions,
-                "17",
-                "1",
-                "10",
-                status,
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            bash.status.success(),
-            "{}",
-            String::from_utf8_lossy(&bash.stderr)
-        );
+        let expected = format!("<instructions>\n{instructions}\n</instructions>\n<pr_num>17</pr_num>\n<review_cycle>1 of 10</review_cycle>\n<toolchain_status>\n{status}\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blockers>");
         assert_eq!(
             reviewer_prompt(tools, &task, 17, 1, 10, status, "", "").unwrap(),
-            String::from_utf8(bash.stdout).unwrap()
+            expected
         );
     }
 
     #[test]
-    fn feedback_prompt_matches_bash() {
+    fn feedback_prompt_layout() {
         let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
         let branch = "feature/add-branch-context";
         let status = "status <safe>";
         let findings = "Finding <one> & two";
         let policy = "Policy <rule>";
         let instructions = compose_role_prompt(tools, "alucard-feedback-prompt.md", None).unwrap();
-        let bash = Command::new("bash")
-            .args([
-                "-c",
-                r#"source "$1/alucard"
-prompt="$(printf '<instructions>\n%s\n</instructions>\n<pr_num>%s</pr_num>\n<branch>' "$2" "$3")$(printf '%s' "$4" | xml_escape)</branch>
-<toolchain_status>
-$(printf '%s' "$5" | xml_escape)
-</toolchain_status>
-<review_findings>
-$(printf '%s' "$6" | xml_escape)
-</review_findings>"
-append_review_policy "$prompt" "$7""#,
-                "bash",
-                tools.to_str().unwrap(),
-                &instructions,
-                "17",
-                branch,
-                status,
-                findings,
-                policy,
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            bash.status.success(),
-            "{}",
-            String::from_utf8_lossy(&bash.stderr)
-        );
+        let expected = format!("<instructions>\n{instructions}\n</instructions>\n<pr_num>17</pr_num>\n<branch>feature/add-branch-context</branch>\n<toolchain_status>\nstatus &lt;safe&gt;\n</toolchain_status>\n<review_findings>\nFinding &lt;one&gt; &amp; two\n</review_findings>\n<review_policy>\nPolicy &lt;rule&gt;\n</review_policy>");
         assert_eq!(
             feedback_prompt(tools, 17, branch, status, findings, policy).unwrap(),
-            String::from_utf8(bash.stdout).unwrap()
+            expected
         );
     }
 
@@ -7220,6 +7172,89 @@ append_review_policy "$prompt" "$7""#,
     }
 
     #[test]
+    fn engineering_policy_reaches_role_prompts_ahead_of_the_worker_mode() {
+        let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |file: &str| fs::read_to_string(tools.join(file)).unwrap();
+        // A line unique to the policy, so a match cannot come from a role prompt.
+        let policy = "Similar-looking code is not automatically duplication";
+        let task = |issue: Option<GithubTask>, local_id: Option<String>| SelectedRunTask {
+            ledger_id: String::new(),
+            issue,
+            local_id,
+            local_title: String::new(),
+            local_body: String::new(),
+            parent_context: String::new(),
+        };
+        let issue_task = task(
+            Some(GithubTask {
+                number: 1,
+                title: String::new(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: None,
+            }),
+            None,
+        );
+        let local_task = task(None, Some("1".to_string()));
+
+        for (task, mode_file) in [
+            (&issue_task, "alucard-worker-github-issue-prompt.md"),
+            (&local_task, "alucard-worker-local-prompt.md"),
+        ] {
+            let prompt = worker_prompt(tools, task, "main", "", "").unwrap();
+            let mode = prompt.find(read(mode_file).lines().next().unwrap());
+            let policy = prompt.find(policy);
+            assert!(
+                matches!((policy, mode), (Some(policy), Some(mode)) if policy < mode),
+                "{mode_file}: policy at {policy:?}, mode section at {mode:?}"
+            );
+        }
+        assert!(reviewer_prompt(tools, &issue_task, 1, 1, 1, "", "", "")
+            .unwrap()
+            .contains(policy));
+        assert!(feedback_prompt(tools, 1, "branch", "", "", "")
+            .unwrap()
+            .contains(policy));
+        assert!(!ci_fix_prompt(tools, 1, "branch", "")
+            .unwrap()
+            .contains(policy));
+        assert!(read("alucard-ci-fix-prompt.md")
+            .contains("Edit only the files needed to fix the failing checks"));
+        for file in [
+            "alucard-engineering-policy.md",
+            "alucard-worker-github-issue-prompt.md",
+        ] {
+            assert!(
+                REQUIRED_TOOL_FILES.lines().any(|line| line == file),
+                "{file}"
+            );
+        }
+        for (file, superseded) in [
+            ("alucard-worker-prompt.md", "Repeat per criterion"),
+            (
+                "alucard-worker-prompt.md",
+                "No logic block appears in two places",
+            ),
+            (
+                "alucard-worker-prompt.md",
+                "carries domain meaning is a named constant",
+            ),
+            (
+                "alucard-reviewer-prompt.md",
+                "The fix is extraction, not tolerance",
+            ),
+            ("alucard-reviewer-prompt.md", "### Magic values"),
+            ("alucard-reviewer-prompt.md", "Stringly-typed dispatch"),
+            (
+                "alucard-feedback-prompt.md",
+                "literal with domain meaning that should be a named constant",
+            ),
+        ] {
+            assert!(!read(file).contains(superseded), "{file}: {superseded}");
+        }
+    }
+
+    #[test]
     fn review_audit_text_keeps_the_human_handoff_protocol() {
         assert!(no_ci_comment()
             .contains("Review continues, but an approval will not mark this PR ready to merge."));
@@ -7231,42 +7266,7 @@ append_review_policy "$prompt" "$7""#,
     }
 
     #[test]
-    fn worker_prompt_matches_bash_for_pinned_issues_and_local_tasks() {
-        let bash_prompt =
-            |mode: &str, queue: &str, commits: &str, instructions: &str, tasks: &Path| {
-                let output = Command::new("bash")
-                    .args([
-                        "-c",
-                        r#"source "$5/alucard"
-TASK_SOURCE="$4"
-PIN_ISSUE=""
-BASE_BRANCH="main"
-TOOLCHAIN_STATUS="No Python or Node manifest found — dependency preflight skipped."
-if [ "$TASK_SOURCE" = file ]; then
-  TASKS_FILE_ABS="$6"
-else
-  PIN_ISSUE=42
-fi
-build_worker_prompt "$1" "$2" "$3"
-printf '%s' "$FULL_PROMPT""#,
-                        "bash",
-                        queue,
-                        commits,
-                        instructions,
-                        mode,
-                        env!("CARGO_MANIFEST_DIR"),
-                        tasks.to_str().unwrap(),
-                    ])
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                String::from_utf8(output.stdout).unwrap()
-            };
-
+    fn worker_prompt_layout_for_pinned_issues_and_local_tasks() {
         let commits = "123\n2026-10-13\nsubject\nbody---";
         let issue = GithubTask {
             number: 42,
@@ -7291,7 +7291,8 @@ printf '%s' "$FULL_PROMPT""#,
             Some("alucard-worker-github-issue-prompt.md"),
         )
         .unwrap();
-        let issue_queue = serde_json::json!([issue]).to_string();
+        let toolchain = "<toolchain_status>\nNo Python or Node manifest found — dependency preflight skipped.\n</toolchain_status>";
+        let issue_expected = format!("<instructions>{issue_instructions}</instructions>\n<base_branch>main</base_branch>\n<commits>{commits}</commits>\n{toolchain}\n<issue>{{\"number\":42,\"title\":\"Pinned &lt;issue&gt;\",\"labels\":[\"ready-for-agent\"]}}</issue>");
         assert_eq!(
             worker_prompt(
                 Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -7301,13 +7302,7 @@ printf '%s' "$FULL_PROMPT""#,
                 "No Python or Node manifest found — dependency preflight skipped.",
             )
             .unwrap(),
-            bash_prompt(
-                "github",
-                &issue_queue,
-                commits,
-                &issue_instructions,
-                Path::new(env!("CARGO_MANIFEST_DIR")),
-            )
+            issue_expected
         );
 
         let tasks = Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/tasks-basic.md");
@@ -7327,15 +7322,7 @@ printf '%s' "$FULL_PROMPT""#,
             Some("alucard-worker-local-prompt.md"),
         )
         .unwrap();
-        let local_queue = format!(
-            "[{}]",
-            serde_json::to_string(&WorkerLocalTaskPrompt {
-                id: local_task.local_id.as_deref(),
-                title: &local_task.local_title,
-                body: &local_task.local_body,
-            })
-            .unwrap()
-        );
+        let local_expected = format!("<instructions>{local_instructions}</instructions>\n<task_source>file</task_source>\n<base_branch>main</base_branch>\n<commits>{commits}</commits>\n{toolchain}\n<parent_context># Demo plan — basic fixture\n\nShared context for the parser tests: constraints live here, above the first\ntask heading, and travel with every task as the parent context.</parent_context>\n<task>{{\"id\":\"1\",\"title\":\"First queued task\",\"body\":\"What to build: the first eligible thing.\\n\\nBlocked by: none\"}}</task>");
         assert_eq!(
             worker_prompt(
                 Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -7345,7 +7332,7 @@ printf '%s' "$FULL_PROMPT""#,
                 "No Python or Node manifest found — dependency preflight skipped.",
             )
             .unwrap(),
-            bash_prompt("file", &local_queue, commits, &local_instructions, &tasks)
+            local_expected
         );
     }
 
@@ -7479,33 +7466,17 @@ printf '%s' "$FULL_PROMPT""#,
 
     #[test]
     // Bash leaves CI-fix branch text raw; Rust escapes it to match feedback safely.
-    fn ci_fix_prompt_matches_bash_for_plain_branch_names() {
+    fn ci_fix_prompt_layout_for_plain_branch_names() {
         let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
         let branch = "feature/add-branch-context";
         let failure_log = "selected <failure> & log";
-        let bash = Command::new("bash")
-            .args([
-                "-c",
-                r#"source "$1/alucard"
-printf '<instructions>\n%s\n</instructions>\n<pr_num>%s</pr_num>\n<branch>%s</branch>\n<failure_log>\n' "$(<"$1/alucard-ci-fix-prompt.md")" "$2" "$3"
-printf '%s' "$4" | xml_escape
-printf '\n</failure_log>'"#,
-                "bash",
-                tools.to_str().unwrap(),
-                "17",
-                branch,
-                failure_log,
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            bash.status.success(),
-            "{}",
-            String::from_utf8_lossy(&bash.stderr)
+        let expected = format!(
+            "<instructions>\n{}\n</instructions>\n<pr_num>17</pr_num>\n<branch>feature/add-branch-context</branch>\n<failure_log>\nselected &lt;failure&gt; &amp; log\n</failure_log>",
+            fs::read_to_string(tools.join("alucard-ci-fix-prompt.md")).unwrap().trim_end_matches('\n')
         );
         assert_eq!(
             ci_fix_prompt(tools, 17, branch, failure_log).unwrap(),
-            String::from_utf8(bash.stdout).unwrap()
+            expected
         );
     }
 
@@ -7994,7 +7965,7 @@ printf '\n</failure_log>'"#,
     }
 
     #[test]
-    fn wrapup_prompt_matches_bash() {
+    fn wrapup_prompt_layout() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let task = SelectedRunTask {
             ledger_id: String::new(),
@@ -8010,29 +7981,10 @@ printf '\n</failure_log>'"#,
             local_body: String::new(),
             parent_context: String::new(),
         };
-        let bash = Command::new("bash")
-            .args([
-                "-c",
-                r#"source "$1/alucard"
-TOOL_DIR="$1"
-BASE_BRANCH=main
-prompt="<instructions>
-$(<"$TOOL_DIR/alucard-wrapup-prompt.md")
-</instructions>
-<ticket>$(printf '%s' 'issue #42' | xml_escape)</ticket>
-<stop_reason>The worker ran out of turns or hit its time limit (rc=1) before opening a PR.</stop_reason>
-<base_branch>${BASE_BRANCH}</base_branch>
-<base_sha>abc</base_sha>
-<worker_last_words>
-$(printf '%s' 'last & <words>' | xml_escape)
-</worker_last_words>"
-printf '%s' "$prompt""#,
-                "bash",
-                root.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        assert!(bash.status.success());
+        let expected = format!(
+            "<instructions>\n{}\n</instructions>\n<ticket>issue #42</ticket>\n<stop_reason>The worker ran out of turns or hit its time limit (rc=1) before opening a PR.</stop_reason>\n<base_branch>main</base_branch>\n<base_sha>abc</base_sha>\n<worker_last_words>\nlast &amp; &lt;words&gt;\n</worker_last_words>",
+            fs::read_to_string(root.join("alucard-wrapup-prompt.md")).unwrap().trim_end_matches('\n')
+        );
         assert_eq!(
             wrapup_prompt(
                 root,
@@ -8044,7 +7996,7 @@ printf '%s' "$prompt""#,
                 "last & <words>",
             )
             .unwrap(),
-            String::from_utf8(bash.stdout).unwrap()
+            expected
         );
     }
 

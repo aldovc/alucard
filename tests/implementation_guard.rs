@@ -1,9 +1,29 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// alucard-bash's implementation guard: claims `$1.bash.lock` shared, then refuses while any Rust run holds `$1.rust.lock`.
+const BASH_GUARD: &str = r#"base=$1
+mkdir -p "$(dirname "$base")"
+printf '%s\n' "$ALUCARD_TEST_COMMAND" > "$base.bash.$$"
+exec 8>>"$base.bash.lock"
+flock -s 8
+if ( flock -n 9 && rm -f "$base".rust.[0-9]* ) 9>>"$base.rust.lock"; then
+  echo guard >> "$ALUCARD_TEST_REACHED"
+  exec sleep 600
+fi
+holders=""
+for holder in "$base".rust.[0-9]*; do
+  pid=${holder##*.}
+  kill -0 "$pid" 2>/dev/null && holders="$holders${holders:+;} pid $pid: $(cat "$holder")"
+done
+rm -f "$base.bash.$$"
+echo "refusing to start beside Rust:$holders" >&2
+exit 1
+"#;
 
 #[derive(Clone, Copy, Debug)]
 enum Implementation {
@@ -86,24 +106,30 @@ impl Fixture {
     ) -> Command {
         let mut command = match implementation {
             Implementation::Bash => {
-                let mut command = Command::new("bash");
-                command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("alucard"));
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", BASH_GUARD, "sh"])
+                    .arg(self.guard_base())
+                    .env(
+                        "ALUCARD_TEST_COMMAND",
+                        format!("alucard-bash {} {target}", subcommand.join(" ")),
+                    );
                 command
             }
             Implementation::Rust => {
                 let mut command = Command::new(env!("CARGO_BIN_EXE_alucard"));
                 command
                     .arg("--db-path")
-                    .arg(self.root.join(format!("{label}.db")));
+                    .arg(self.root.join(format!("{label}.db")))
+                    .args(subcommand)
+                    .args([target, "--no-build", "--env-file"])
+                    .arg(self.root.join("alucard.env"))
+                    .args(["--logs-root"])
+                    .arg(self.root.join("logs"));
                 command
             }
         };
         command
-            .args(subcommand)
-            .args([target, "--no-build", "--env-file"])
-            .arg(self.root.join("alucard.env"))
-            .args(["--logs-root"])
-            .arg(self.root.join("logs"))
             .current_dir(&self.root)
             .env(
                 "PATH",
@@ -121,6 +147,23 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         command
+    }
+
+    /// The guard file prefix alucard-bash derives: the cached GitHub slug, or the git dir of a checkout without an origin.
+    fn guard_base(&self) -> PathBuf {
+        let has_origin = Command::new("git")
+            .arg("-C")
+            .arg(&self.local)
+            .args(["config", "--get", "remote.origin.url"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        if has_origin {
+            self.root.join("cache/guards/owner/repository")
+        } else {
+            self.local.join(".git/alucard-guard")
+        }
     }
 
     fn reached(&self, label: &str) -> PathBuf {
@@ -218,12 +261,15 @@ fn bash_and_rust_refuse_each_other_on_one_repository() {
                 !refused.status.success(),
                 "{other:?} {subcommand:?} started beside {holder:?}"
             );
-            for expected in [
+            let mut expected = vec![
                 format!("pid {}:", first.id()),
                 format!("pid {}:", second.id()),
                 format!("run {}", fixture.local.display()),
-                format!("running on {key}:"),
-            ] {
+            ];
+            if let Implementation::Rust = other {
+                expected.push(format!("running on {key}:"));
+            }
+            for expected in expected {
                 assert!(
                     stderr.contains(&expected),
                     "{other:?} {subcommand:?} refusal lacks {expected:?}: {stderr}"

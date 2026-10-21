@@ -63,3 +63,25 @@ pub fn github_ssh_origin(
         .success());
     [("GIT_SSH_COMMAND", ssh), ("GIT_CONFIG_GLOBAL", config)]
 }
+
+/// Copies the required tool files and the built binary into `directory/tools`, returning the binary path.
+#[allow(dead_code)]
+pub fn copy_tool_installation(directory: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let tools = directory.join("tools");
+    let binary_dir = tools.join("bin");
+    std::fs::create_dir_all(&binary_dir).unwrap();
+    for file in include_str!("../required-tool-files.txt").lines() {
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file),
+            tools.join(file),
+        )
+        .unwrap();
+    }
+    let binary = binary_dir.join("alucard");
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_alucard"), &binary).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_alucard"), &binary).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    binary
+}

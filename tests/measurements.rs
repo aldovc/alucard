@@ -67,7 +67,7 @@ fn extracts_claude_and_codex_usage() {
 }
 
 #[test]
-fn formats_bash_compatible_usage_table_and_iteration_comment() {
+fn formats_usage_table_and_iteration_comment() {
     let root = temporary_path("usage-report");
     fs::create_dir_all(&root).unwrap();
     let claude = r#"{"type":"result","num_turns":42,"total_cost_usd":1.234,"modelUsage":{"claude-sonnet-4-5":{"inputTokens":1000,"outputTokens":2000,"cacheReadInputTokens":50000,"cacheCreationInputTokens":9000}}}"#;
@@ -86,44 +86,41 @@ fn formats_bash_compatible_usage_table_and_iteration_comment() {
     .unwrap();
     fs::write(root.join("iter-10-review-1.jsonl"), claude).unwrap();
 
-    let comment = root.join("comment");
-    let report = root.join("report");
-    let gh = root.join("gh");
-    fs::write(
-        &gh,
-        "#!/bin/sh\ncase \"$1 $2\" in\n  'pr view') printf '%s\\n' '' ;;\n  'pr comment') printf '%s' \"$5\" > \"$ALUCARD_COMMENT\" ;;\nesac\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let output = Command::new("bash")
-        .args([
-            "-c",
-            r#"source "$1/alucard"
-print_usage_report "$2" > "$3"
-post_iteration_usage 1 754 "$1" "$2" 754"#,
-            "bash",
-            env!("CARGO_MANIFEST_DIR"),
-            root.to_str().unwrap(),
-            report.to_str().unwrap(),
-        ])
-        .env("ALUCARD_COMMENT", &comment)
-        .env(
-            "PATH",
-            format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
-        )
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let report_expected = format!(
+        "
+=== Alucard Token Usage: {} ===
+Agent                        Input    Output    Cache Read   Cache Write  Turns      Cost
+--------------------------------------------------------------------------------------
+worker 1-attempt-1            1000      2000         50000          9000     42    $1.234
+feedback 1.3                     7         4             3             0      1         -
+review 1.2                    1000      2000         50000          9000     42    $1.234
+review 1.2-attempt-2          1000      2000         50000          9000     42    $1.234
+review 10.1                   1000      2000         50000          9000     42    $1.234
+--------------------------------------------------------------------------------------
+TOTAL                         4007      8004        200003         36000    169    $4.936
 
-    assert_eq!(usage_report(&root), fs::read_to_string(&report).unwrap());
+",
+        root.file_name().unwrap().to_str().unwrap()
+    );
+    let comment_expected = "**🤖 Alucard token usage (iteration 1)**
+
+Duration: 12m 34s · Review rounds: 1 · Feedback rounds: 2
+
+<details><summary>Per-agent breakdown</summary>
+
+| Agent | Input | Output | Cache Read | Cache Write | Turns | Cost |
+|-------|------:|-------:|-----------:|------------:|------:|-----:|
+| worker attempt 1 | 1000 | 2000 | 50000 | 9000 | 42 | $1.234 |
+| feedback 1.3 | 7 | 4 | 3 | 0 | 1 | - |
+| review 1.2 | 1000 | 2000 | 50000 | 9000 | 42 | $1.234 |
+| review 1.2-attempt-2 | 1000 | 2000 | 50000 | 9000 | 42 | $1.234 |
+| **TOTAL** | **3007** | **6004** | **150003** | **27000** | **127** | **$3.702** |
+
+</details>";
+    assert_eq!(usage_report(&root), report_expected);
     assert_eq!(
         iteration_usage_comment(&root, 1, Some(754)).unwrap(),
-        fs::read_to_string(&comment).unwrap()
+        comment_expected
     );
     fs::remove_dir_all(root).unwrap();
 }

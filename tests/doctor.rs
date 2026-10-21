@@ -5,8 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-const REQUIRED_TOOL_FILES: &str = include_str!("../required-tool-files.txt");
+use test_support::copy_tool_installation;
 
 fn run(command: &mut Command) {
     assert!(command.status().unwrap().success());
@@ -22,25 +21,6 @@ fn temp_dir() -> PathBuf {
     ));
     fs::create_dir_all(&directory).unwrap();
     directory
-}
-
-fn copy_tool_installation(directory: &Path) -> PathBuf {
-    let tools = directory.join("tools");
-    let binary_dir = tools.join("bin");
-    fs::create_dir_all(&binary_dir).unwrap();
-    for file in REQUIRED_TOOL_FILES.lines() {
-        fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join(file),
-            tools.join(file),
-        )
-        .unwrap();
-    }
-    let binary = binary_dir.join("alucard");
-    if fs::hard_link(env!("CARGO_BIN_EXE_alucard"), &binary).is_err() {
-        fs::copy(env!("CARGO_BIN_EXE_alucard"), &binary).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    binary
 }
 
 fn doctor(binary: &Path, repository: &Path, bin: &Path) -> std::process::Output {

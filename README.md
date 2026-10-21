@@ -437,7 +437,7 @@ shellcheck --severity=warning --exclude=SC2034 \
   alucard entrypoint.sh install.sh test-*.sh test/*.sh
 ```
 
-For prompt changes, run `bash test/test_engineering_policy.sh` to verify prompt assembly.
+For prompt changes, run `cargo test engineering_policy` to verify prompt assembly.
 
 ## Releases
 
