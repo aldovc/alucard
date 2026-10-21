@@ -55,7 +55,7 @@ remote state remains readable after cutover.  `{...}` denotes a runtime value,
 not part of the literal prefix.
 
 | Remote value | Exact format written | Reader |
-|---|---|---|---|
+|---|---|---|
 | Wrapper comment prefix | `**🤖 Alucard` | `review_gate`, `command_continue`, `harness_approved_sha` |
 | Blocked findings | `**🤖 Alucard blocked findings** (cycle {N}/{MAX})` | `review_gate` (comment body starts-with filter) |
 | Parked recovery comment | `**🤖 Alucard recovery PR parked** — opened as a draft and labeled \`needs-human\` by the harness.` | `review_gate` (authenticated comment) |
