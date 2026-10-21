@@ -8,7 +8,7 @@ set -euo pipefail
 # with a code the harness maps to "get a fresh worktree" instead. The cwd is
 # checked rather than a fixed path because preflight runs in a subdirectory
 # of the checkout, and so the same test works on a host without /work. Keep
-# the number in step with the no-worktree exit code in src/lib.rs.
+# the number in step with NO_WORKTREE_RC in the alucard script.
 if ! git -c safe.directory='*' rev-parse --git-dir >/dev/null 2>&1; then
   echo "alucard: $PWD is not inside a git checkout — the worktree is missing; not starting the agent" >&2
   exit 78
