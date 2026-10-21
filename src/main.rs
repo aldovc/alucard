@@ -349,11 +349,7 @@ fn is_uint(value: &str) -> bool {
 }
 
 fn print_usage() {
-    let (_, usage) = include_str!("../alucard")
-        .split_once("usage() {\n  cat <<'EOF'\n")
-        .expect("Bash usage declaration");
-    let (usage, _) = usage.split_once("\nEOF\n}").expect("Bash usage terminator");
-    println!("{usage}");
+    print!("{}", include_str!("usage.txt"));
 }
 
 struct MergeOptions {

@@ -8,15 +8,7 @@ exec </dev/null
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
-if [ -z "${ALUCARD:-}" ]; then
-  ALUCARD="$SCRIPT_DIR/../alucard"
-  # shellcheck disable=SC1090
-  source "$ALUCARD"
-  USES_RUST_BINARY=false
-else
-  BOT_REVIEWED_HEAD="Reviewed head:"
-  USES_RUST_BINARY=true
-fi
+: "${ALUCARD:?set ALUCARD to the alucard binary}"
 
 TEST_DIR=$(mktemp -d /tmp/alucard_test_merge.XXXXXX)
 trap 'rm -rf "$TEST_DIR"' EXIT
@@ -83,7 +75,7 @@ chmod +x "$MOCK_BIN/gh"
 approval_comments() {
   jq -n --arg body "**🤖 Alucard review cycle 1/10: APPROVED**
 
-${BOT_REVIEWED_HEAD} \`$1\`
+Reviewed head: \`$1\`
 
 LGTM" --arg login "${2:-alucard-bot}" '[{author: {login: $login}, body: $body}]'
 }
@@ -118,11 +110,7 @@ setup_repos() {
 }
 
 run_merge() {
-  local -a command=("$ALUCARD")
-  if "$USES_RUST_BINARY"; then
-    command+=(--db-path "$LEDGER")
-  fi
-  command+=(merge 9 "$TARGET" --env-file "${MERGE_ENV_FILE:-$TEST_DIR/alucard.env}" \
+  local -a command=("$ALUCARD" --db-path "$LEDGER" merge 9 "$TARGET" --env-file "${MERGE_ENV_FILE:-$TEST_DIR/alucard.env}" \
     --logs-root "$TEST_DIR/logs" "$@")
   if [ -n "${MERGE_TIMEOUT:-}" ]; then
     command=(timeout --kill-after 1s "$MERGE_TIMEOUT" "${command[@]}")
@@ -146,7 +134,6 @@ run_merge() {
 assert_merge_lifecycle() {
   local expected_status="$1"
   local run_id run
-  "$USES_RUST_BINARY" || return 0
   run_id=$("$ALUCARD" --db-path "$LEDGER" runs | awk -F '\t' '$3 == "merge" && !run_id { run_id=$1 } END { print run_id }')
   run=$("$ALUCARD" --db-path "$LEDGER" runs show "$run_id")
   assert_contains "the merge run is terminal" "status: $expected_status" "$run"
@@ -154,7 +141,6 @@ assert_merge_lifecycle() {
 }
 
 seed_pending_recovery_annotation() {
-  "$USES_RUST_BINARY" || return 0
   "$ALUCARD" --db-path "$LEDGER" db migrate >/dev/null
   python3 - "$LEDGER" "$(git -C "$TARGET" remote get-url origin)" <<'PY'
 import sqlite3
@@ -211,16 +197,14 @@ assert_eq "the stale PR head is polled until it advances" "2" \
 assert_contains "and deletes the branch" "git/refs/heads/$BRANCH" "$TRACE"
 assert_merge_lifecycle completed
 
-if "$USES_RUST_BINARY"; then
-  echo ""
-  echo "── explicit logs root without fallback environment ──"
-  setup_repos current
-  NO_LOG_FALLBACK=true run_merge --check-command 'true'
-  unset NO_LOG_FALLBACK
-  assert_eq "merge succeeds without a log-root fallback" "0" "$RC"
-  assert_contains "the merge log is persisted below the flag root" "$TEST_DIR/logs/" \
-    "$("$ALUCARD" --db-path "$LEDGER" runs | awk -F '\t' '$3 == "merge" { print $4; exit }')"
-fi
+echo ""
+echo "── explicit logs root without fallback environment ──"
+setup_repos current
+NO_LOG_FALLBACK=true run_merge --check-command 'true'
+unset NO_LOG_FALLBACK
+assert_eq "merge succeeds without a log-root fallback" "0" "$RC"
+assert_contains "the merge log is persisted below the flag root" "$TEST_DIR/logs/" \
+  "$("$ALUCARD" --db-path "$LEDGER" runs | awk -F '\t' '$3 == "merge" { print $4; exit }')"
 
 echo ""
 echo "── approved head already contains the base ──"
@@ -307,24 +291,20 @@ run_merge
 assert_eq "merge refuses without a check command" "1" "$RC"
 assert_contains "and says how to give one" "ALUCARD_CHECK_COMMAND" "$OUT"
 
-if "$USES_RUST_BINARY"; then
-  echo ""
-  echo "── explicit merge env file ──"
-  setup_repos current
-  printf 'ALUCARD_CHECK_COMMAND=true\n' > "$TEST_DIR/merge.env"
-  MERGE_ENV_FILE="$TEST_DIR/merge.env" run_merge
-  assert_eq "merge loads its explicit env file" "0" "$RC"
-fi
+echo ""
+echo "── explicit merge env file ──"
+setup_repos current
+printf 'ALUCARD_CHECK_COMMAND=true\n' > "$TEST_DIR/merge.env"
+MERGE_ENV_FILE="$TEST_DIR/merge.env" run_merge
+assert_eq "merge loads its explicit env file" "0" "$RC"
 
 echo ""
 echo "── dry run ──"
 setup_repos stale
 seed_pending_recovery_annotation
-if "$USES_RUST_BINARY"; then
-  run_merge
-  assert_eq "invalid merge configuration does not replay recovery" "" "$TRACE"
-  assert_eq "invalid merge configuration leaves recovery pending" "pending" "$(pending_recovery_annotation_phase)"
-fi
+run_merge
+assert_eq "invalid merge configuration does not replay recovery" "" "$TRACE"
+assert_eq "invalid merge configuration leaves recovery pending" "pending" "$(pending_recovery_annotation_phase)"
 
 run_merge --check-command "$PASSING_CHECK" --dry-run
 assert_eq "a passing dry run succeeds" "0" "$RC"
@@ -334,12 +314,10 @@ assert_not_contains "nothing is merged" "pr merge" "$TRACE"
 assert_not_contains "nothing is recovered" "pr edit" "$TRACE"
 assert_contains "the evidence is printed instead" "would comment on PR #9" "$OUT"
 assert_eq "the dry-run check sees the rebased tree" "base moved" "$(cat "$STATE/checked")"
-if "$USES_RUST_BINARY"; then
-  assert_eq "dry run leaves recovery pending" "pending" "$(pending_recovery_annotation_phase)"
-  run_merge --check-command 'true'
-  assert_eq "a real merge replays recovery" "done" "$(pending_recovery_annotation_phase)"
-  assert_contains "the pending recovery annotation is replayed" \
-    "api --silent -X POST" "$TRACE"
-fi
+assert_eq "dry run leaves recovery pending" "pending" "$(pending_recovery_annotation_phase)"
+run_merge --check-command 'true'
+assert_eq "a real merge replays recovery" "done" "$(pending_recovery_annotation_phase)"
+assert_contains "the pending recovery annotation is replayed" \
+  "api --silent -X POST" "$TRACE"
 
 finish

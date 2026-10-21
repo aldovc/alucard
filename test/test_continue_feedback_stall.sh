@@ -2,23 +2,13 @@
 # `alucard continue` runs feedback once, then the gates. A feedback agent that
 # dies without advancing the branch must stop before those gates — the same
 # stall decision review_gate already makes inside its loop — and hand the PR to
-# a human. Driven through continue with mocked docker/gh, the way
-# test_review_no_verdict.sh covers the no-verdict path.
+# a human. Driven through continue with mocked docker/gh.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ALUCARD_BIN=${ALUCARD:-}
+: "${ALUCARD:?set ALUCARD to the alucard binary}"
 source "$SCRIPT_DIR/lib.sh"
 export ALUCARD_CI_POLL_INTERVAL=0
-if [ -z "$ALUCARD_BIN" ]; then
-  ALUCARD="$SCRIPT_DIR/../alucard"
-  # shellcheck disable=SC1090
-  source "$ALUCARD"
-  USES_RUST_BINARY=false
-else
-  ALUCARD="$ALUCARD_BIN"
-  USES_RUST_BINARY=true
-fi
 
 TEST_DIR=$(mktemp -d /tmp/alucard_test_continue_stall.XXXXXX)
 trap 'rm -rf "$TEST_DIR"' EXIT
@@ -183,11 +173,7 @@ run_continue() {
   rm -rf "$_seed"
 
   set +e
-  local -a command=("$ALUCARD")
-  if "$USES_RUST_BINARY"; then
-    command+=(--db-path "$LEDGER")
-  fi
-  command+=(continue 88 "$TARGET" --no-build --max-review-cycles 1 \
+  local -a command=("$ALUCARD" --db-path "$LEDGER" continue 88 "$TARGET" --no-build --max-review-cycles 1 \
     --env-file "$TEST_DIR/alucard.env" --logs-root "$TEST_DIR/logs")
   PATH="$MOCK_BIN:$PATH" \
   ALUCARD_TEST_TRACE="$TRACE" \
@@ -216,18 +202,10 @@ run_continue
 assert_eq "continue exits zero after handing off" "0" "$CONTINUE_RC"
 assert_eq "only the feedback agent ran — gates did not" \
   "1" "$(grep -c '^agent launch$' "$TRACE" || true)"
-if ! "$USES_RUST_BINARY"; then
-  assert_contains "the stall is logged" \
-    "stopping before gates" "$EVENTS"
-fi
 assert_contains "the PR gets the needs-human label" \
   "issues/88/labels" "$GH"
 assert_contains "the comment names the continue stall" \
   "feedback agent stopped without publishing — needs human" "$GH"
-if ! "$USES_RUST_BINARY"; then
-  assert_contains "the comment points at the turn cap" \
-    "ALUCARD_FEEDBACK_MAX_TURNS" "$GH"
-fi
 assert_not_contains "review gate never starts" \
   "Review gate" "$OUT"
 retained=$(<"$TEST_DIR/retained-path")
@@ -274,9 +252,7 @@ assert_contains "the review gate started without feedback" "Review gate" "$OUT"
 # ── Scenario 4: an authenticated recovery PR with no ledger row is adopted ──
 echo ""
 echo "── continue: recovery PR adoption ──"
-if "$USES_RUST_BINARY"; then
-  rm -f "$LEDGER"
-fi
+rm -f "$LEDGER"
 COMMENTS_JSON=$(jq -n --arg marker '**🤖 Alucard recovery PR parked** — opened as a draft and labeled `needs-human` by the harness. When the review gate approves this PR it marks it ready, removes the label, turns the `Refs` line into `Closes`, and replaces the stub title with the ticket'"'"'s.' \
   '{comments:[{body:$marker,createdAt:"2026-01-01T00:00:00Z",author:{login:"bot"}}]}')
 printf '1 %s\n' "$MAX_TURNS_RESULT" > "$TEST_DIR/script"
