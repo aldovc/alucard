@@ -525,6 +525,8 @@ case "$1 $2" in
     for argument in "$@"; do case "$argument" in *:/work:rw) worktree=${argument%:/work:rw} ;; esac; done
     printf '%s|%s\n' "$(git -C "$worktree" branch --show-current)" "$worktree" >> "$ALUCARD_TRACE"
     case "$ALUCARD_SCENARIO" in
+      no-worktree) exit 78 ;;
+      no-worktree-pr) [ "$(wc -l < "$ALUCARD_TRACE")" -eq 1 ] && exit 78 ;;
       billing)
         printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"error":"billing_error","modelUsage":{"test":{"inputTokens":1,"outputTokens":1}}}' ;;
       *) printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"API Error: Connection closed"}' ;;
@@ -546,7 +548,7 @@ case "$1 $2" in
   'pr list')
     case "$*" in
       *--head*)
-        if [ "$ALUCARD_SCENARIO" = pr ]; then
+        if [ "$ALUCARD_SCENARIO" = pr ] || { [ "$ALUCARD_SCENARIO" = no-worktree-pr ] && [ "$(wc -l < "$ALUCARD_TRACE")" -gt 1 ]; }; then
           printf '%s\n' '[{"number":59,"headRefName":"attempt","headRefOid":"attempt"}]'
         else echo '[]'; fi ;;
       *--label*)
@@ -5356,6 +5358,47 @@ fn test_transport_pr_retry() {
     );
     drop(connection);
     fs::remove_dir_all(pr_root).unwrap();
+}
+
+#[test]
+fn worker_retries_in_a_fresh_worktree_after_no_worktree() {
+    for (scenario, prs) in [("no-worktree", 0), ("no-worktree-pr", 1)] {
+        let root = temporary_path(scenario);
+        let output = run_transport_case(&root, scenario, 1);
+        assert!(output.status.success(), "{output:?}");
+        let attempts = fs::read_to_string(root.join("trace")).unwrap();
+        let attempts = attempts.lines().collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 2, "{scenario}");
+        assert_ne!(
+            attempts[0].split_once('|').unwrap().1,
+            attempts[1].split_once('|').unwrap().1
+        );
+        let connection = open(&root.join("ledger.db")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pull_requests", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            prs
+        );
+        if prs == 0 {
+            assert_eq!(
+                connection
+                    .query_row("SELECT status FROM tasks", [], |row| row
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "pending"
+            );
+            assert!(!fs::read_to_string(root.join("gh-trace"))
+                .unwrap_or_default()
+                .contains("pr create"));
+        } else {
+            let gh = fs::read_to_string(root.join("gh-trace")).unwrap();
+            assert!(gh.contains("Alucard CI gate"), "{gh}");
+        }
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]
