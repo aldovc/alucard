@@ -1,0 +1,113 @@
+Usage:
+  alucard run [TARGET_REPO] [options]
+  alucard queue [TARGET_REPO] [options]
+  alucard build [options]
+  alucard doctor [TARGET_REPO] [options]
+  alucard continue <PR_NUM> [TARGET_REPO] [options]
+  alucard merge <PR_NUM> [TARGET_REPO] [options]
+  alucard version
+
+TARGET_REPO accepts:
+  /path/to/local/repo          existing local git clone
+  owner/repo                   GitHub shorthand — auto-cloned on first run
+  https://github.com/owner/repo  full GitHub HTTPS URL
+
+Commands:
+  run       Run the autonomous worker loop.
+  queue     Print the currently eligible task queue as JSON — GitHub issues,
+            or a local tasks file when one is configured or auto-detected.
+  build     Build the Alucard Docker image.
+  doctor    Check local prerequisites without running the worker.
+  continue  Re-run the feedback+CI+review pipeline on a parked PR.
+  merge     Rebase a harness-approved PR onto its base, run the full check
+            command on this machine, post the result, and squash-merge.
+  version   Print the CLI version and exit.
+
+Run options:
+  -C, --repo PATH              Target git repository. Defaults to
+                               ALUCARD_TARGET_REPO or the current directory.
+  -n, --iterations N           Max iterations to run. Default: 20.
+  -t, --timeout-minutes N      Per-iteration timeout. Default: 30.
+      --base BRANCH            Base branch on origin. Default: main.
+      --env-file PATH          Credential env file. Default: ./alucard.env
+                               beside this CLI.
+      --image NAME             Docker image name. Default: ghcr.io/aldovc/alucard:latest.
+      --logs-root PATH         Directory for run logs. Default:
+                               ~/.local/state/alucard/logs (XDG_STATE_HOME
+                               honoured). A path under /tmp prints a warning.
+      --max-review-cycles N    Max reviewer→feedback loops per PR. Default: 10.
+      --no-build               Do not build the image if it is missing or
+                               stale. Warns instead of rebuilding.
+      --tasks PATH             Read tasks from a local tasks file instead of
+                               the GitHub issue queue. Defaults to
+                               ALUCARD_TASKS_FILE, else auto-detects
+                               .alucard/tasks.md in the target repo.
+      --github                 Force the GitHub issue queue even when a local
+                               tasks file exists.
+      --issue N                Run exactly one iteration on open GitHub
+                               issue N. Forces the GitHub task source.
+                               Cannot be combined with --tasks.
+
+Continue options:
+  <PR_NUM>                     Open PR number to continue (required, positional).
+  Same flags as run apply: -C, -t, --env-file, --image, --logs-root,
+  --max-review-cycles, --no-build.
+
+Merge options:
+  <PR_NUM>                     Open PR to merge (required, positional). Refused
+                               unless the harness reviewer approved its
+                               current head.
+      --check-command CMD      Full check command, run with bash in a fresh
+                               clone of the rebased branch on this machine,
+                               not in a container. Defaults to
+                               ALUCARD_CHECK_COMMAND (environment or env
+                               file). Never read from the PR. -t bounds it.
+      --dry-run                Rebase and run the checks, but push, comment,
+                               label and merge nothing.
+  Also accepts -C, -t, --env-file, --logs-root.
+
+Environment:
+  ALUCARD_CACHE_DIR            Where GitHub repos, and the shared Playwright
+                               browser cache, are kept between runs.
+                               Default: ~/.cache/alucard  (XDG_CACHE_HOME honoured)
+  ALUCARD_TASKS_FILE           Default tasks file for the local task source
+                               (equivalent to passing --tasks).
+  ALUCARD_CLAUDE_MODEL         Claude model for all agent roles. Default: sonnet
+  ALUCARD_CLAUDE_FALLBACK_MODEL
+                               Claude fallback model. Default: haiku
+  ALUCARD_EFFORT               Claude --effort level for all agent roles.
+                               Default: unset (flag omitted).
+  ALUCARD_CODEX_MODEL          Codex model for all agent roles. Default: gpt-5.6-terra
+  ALUCARD_<ROLE>_CLAUDE_MODEL, ALUCARD_<ROLE>_CLAUDE_FALLBACK_MODEL,
+  ALUCARD_<ROLE>_EFFORT, ALUCARD_<ROLE>_CODEX_MODEL
+                               Per-role overrides (ROLE is WORKER, CI_FIX,
+                               REVIEWER, or FEEDBACK), each falling back to
+                               the corresponding global var above, then its
+                               default.
+  ALUCARD_WORKER_MAX_TURNS     Worker --max-turns (Claude only). Default: 180
+  ALUCARD_WORKER_MAX_BUDGET    Worker --max-budget-usd (Claude only). Default: 10
+  ALUCARD_CI_FIX_MAX_TURNS     CI-fix --max-turns (Claude only). Default: 30
+  ALUCARD_CI_FIX_MAX_BUDGET    CI-fix --max-budget-usd (Claude only). Default: 2
+  ALUCARD_REVIEWER_MAX_TURNS   Reviewer --max-turns (Claude only). Default: 45
+  ALUCARD_REVIEWER_MAX_BUDGET  Reviewer --max-budget-usd (Claude only). Default: 2
+  ALUCARD_FEEDBACK_MAX_TURNS   Feedback --max-turns (Claude only). Default: 50
+  ALUCARD_FEEDBACK_MAX_BUDGET  Feedback --max-budget-usd (Claude only). Default: 2
+  ALUCARD_WRAPUP_MAX_TURNS     Wrap-up --max-turns (Claude only): the short agent
+                               that commits a stopped worker's leftovers and
+                               writes the recovery PR's handoff. 0 disables it.
+                               Runs with the WORKER role's provider and model.
+                               Default: 12
+  ALUCARD_WRAPUP_MAX_BUDGET    Wrap-up --max-budget-usd (Claude only). Default: 1
+  ALUCARD_TRANSPORT_RETRY_ATTEMPTS
+                               Extra attempts after a transport-classified worker
+                               failure, same ticket, fresh worktree each time.
+                               Default: 2 (3 total attempts).
+
+Examples:
+  alucard run owner/repo --iterations 1
+  alucard run owner/repo --issue 90
+  alucard run /path/to/target-repo --iterations 1 --timeout-minutes 10
+  ALUCARD_TARGET_REPO=/path/to/target-repo alucard run -n 20 -t 30
+  cd /path/to/target-repo && alucard queue
+  alucard continue 174 -C /path/to/target-repo
+  alucard merge 174 owner/repo --check-command 'just ci'

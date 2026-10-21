@@ -7101,9 +7101,11 @@ printf '\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blocker
             "{}",
             String::from_utf8_lossy(&bash.stderr)
         );
+        let expected = format!("<instructions>\n{instructions}\n</instructions>\n<pr_num>17</pr_num>\n<review_cycle>1 of 10</review_cycle>\n<toolchain_status>\n{status}\n</toolchain_status>\n<known_blockers>\nNone recorded.\n</known_blockers>");
+        assert_eq!(String::from_utf8(bash.stdout).unwrap(), expected);
         assert_eq!(
             reviewer_prompt(tools, &task, 17, 1, 10, status, "", "").unwrap(),
-            String::from_utf8(bash.stdout).unwrap()
+            expected
         );
     }
 
@@ -7143,9 +7145,11 @@ append_review_policy "$prompt" "$7""#,
             "{}",
             String::from_utf8_lossy(&bash.stderr)
         );
+        let expected = format!("<instructions>\n{instructions}\n</instructions>\n<pr_num>17</pr_num>\n<branch>feature/add-branch-context</branch>\n<toolchain_status>\nstatus &lt;safe&gt;\n</toolchain_status>\n<review_findings>\nFinding &lt;one&gt; &amp; two\n</review_findings>\n<review_policy>\nPolicy &lt;rule&gt;\n</review_policy>");
+        assert_eq!(String::from_utf8(bash.stdout).unwrap(), expected);
         assert_eq!(
             feedback_prompt(tools, 17, branch, status, findings, policy).unwrap(),
-            String::from_utf8(bash.stdout).unwrap()
+            expected
         );
     }
 
@@ -7292,6 +7296,8 @@ printf '%s' "$FULL_PROMPT""#,
         )
         .unwrap();
         let issue_queue = serde_json::json!([issue]).to_string();
+        let toolchain = "<toolchain_status>\nNo Python or Node manifest found — dependency preflight skipped.\n</toolchain_status>";
+        let issue_expected = format!("<instructions>{issue_instructions}</instructions>\n<base_branch>main</base_branch>\n<commits>{commits}</commits>\n{toolchain}\n<issue>{{\"number\":42,\"title\":\"Pinned &lt;issue&gt;\",\"labels\":[\"ready-for-agent\"]}}</issue>");
         assert_eq!(
             worker_prompt(
                 Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -7301,13 +7307,17 @@ printf '%s' "$FULL_PROMPT""#,
                 "No Python or Node manifest found — dependency preflight skipped.",
             )
             .unwrap(),
+            issue_expected
+        );
+        assert_eq!(
             bash_prompt(
                 "github",
                 &issue_queue,
                 commits,
                 &issue_instructions,
                 Path::new(env!("CARGO_MANIFEST_DIR")),
-            )
+            ),
+            issue_expected
         );
 
         let tasks = Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/tasks-basic.md");
@@ -7336,6 +7346,7 @@ printf '%s' "$FULL_PROMPT""#,
             })
             .unwrap()
         );
+        let local_expected = format!("<instructions>{local_instructions}</instructions>\n<task_source>file</task_source>\n<base_branch>main</base_branch>\n<commits>{commits}</commits>\n{toolchain}\n<parent_context># Demo plan — basic fixture\n\nShared context for the parser tests: constraints live here, above the first\ntask heading, and travel with every task as the parent context.</parent_context>\n<task>{{\"id\":\"1\",\"title\":\"First queued task\",\"body\":\"What to build: the first eligible thing.\\n\\nBlocked by: none\"}}</task>");
         assert_eq!(
             worker_prompt(
                 Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -7345,7 +7356,11 @@ printf '%s' "$FULL_PROMPT""#,
                 "No Python or Node manifest found — dependency preflight skipped.",
             )
             .unwrap(),
-            bash_prompt("file", &local_queue, commits, &local_instructions, &tasks)
+            local_expected
+        );
+        assert_eq!(
+            bash_prompt("file", &local_queue, commits, &local_instructions, &tasks),
+            local_expected
         );
     }
 
@@ -7503,9 +7518,14 @@ printf '\n</failure_log>'"#,
             "{}",
             String::from_utf8_lossy(&bash.stderr)
         );
+        let expected = format!(
+            "<instructions>\n{}\n</instructions>\n<pr_num>17</pr_num>\n<branch>feature/add-branch-context</branch>\n<failure_log>\nselected &lt;failure&gt; &amp; log\n</failure_log>",
+            fs::read_to_string(tools.join("alucard-ci-fix-prompt.md")).unwrap().trim_end_matches('\n')
+        );
+        assert_eq!(String::from_utf8(bash.stdout).unwrap(), expected);
         assert_eq!(
             ci_fix_prompt(tools, 17, branch, failure_log).unwrap(),
-            String::from_utf8(bash.stdout).unwrap()
+            expected
         );
     }
 
@@ -8033,6 +8053,11 @@ printf '%s' "$prompt""#,
             .output()
             .unwrap();
         assert!(bash.status.success());
+        let expected = format!(
+            "<instructions>\n{}\n</instructions>\n<ticket>issue #42</ticket>\n<stop_reason>The worker ran out of turns or hit its time limit (rc=1) before opening a PR.</stop_reason>\n<base_branch>main</base_branch>\n<base_sha>abc</base_sha>\n<worker_last_words>\nlast &amp; &lt;words&gt;\n</worker_last_words>",
+            fs::read_to_string(root.join("alucard-wrapup-prompt.md")).unwrap().trim_end_matches('\n')
+        );
+        assert_eq!(String::from_utf8(bash.stdout).unwrap(), expected);
         assert_eq!(
             wrapup_prompt(
                 root,
@@ -8044,7 +8069,7 @@ printf '%s' "$prompt""#,
                 "last & <words>",
             )
             .unwrap(),
-            String::from_utf8(bash.stdout).unwrap()
+            expected
         );
     }
 

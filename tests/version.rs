@@ -3,8 +3,10 @@ mod test_support;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use test_support::copy_tool_installation;
 
 fn empty_environment_defaults(command: &mut Command) -> &mut Command {
     command
@@ -82,8 +84,16 @@ fn version_matches_bash() {
         String::from_utf8(out.stdout).unwrap()
     };
     let rust = run(&mut Command::new(env!("CARGO_BIN_EXE_alucard")));
+    let describe = Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(describe.status.success());
+    let expected = String::from_utf8(describe.stdout).unwrap();
     let bash = run(Command::new("bash").arg(format!("{root}/alucard")));
-    assert_eq!(rust, bash);
+    assert_eq!(bash, expected);
+    assert_eq!(rust, expected);
     assert_ne!(rust.trim(), "unknown");
 }
 
@@ -104,7 +114,8 @@ fn top_level_help_matches_bash() {
             .unwrap();
         assert!(bash.status.success());
         assert!(rust.status.success());
-        assert_eq!(bash.stdout, rust.stdout);
+        assert_eq!(bash.stdout, include_bytes!("fixtures/top-level-help.txt"));
+        assert_eq!(rust.stdout, include_bytes!("fixtures/top-level-help.txt"));
     }
 }
 
@@ -178,133 +189,196 @@ fn legacy_run_shorthand_and_directory_command_dispatch_to_run() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// A copied tool installation, a target checkout with an origin, a migrated ledger and stubbed gh, jq and docker.
+struct DoctorFixture {
+    directory: PathBuf,
+    binary: PathBuf,
+    tools: PathBuf,
+    repository: PathBuf,
+}
+
+impl DoctorFixture {
+    fn new(name: &str) -> Self {
+        let directory = std::env::temp_dir().join(format!(
+            "alucard-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let binary = copy_tool_installation(&directory);
+        let bin = directory.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for (tool, status) in [("gh", 0), ("jq", 0), ("docker", 1)] {
+            let stub = bin.join(tool);
+            fs::write(&stub, format!("#!/bin/sh\nexit {status}\n")).unwrap();
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let repository = directory.join("repository");
+        for args in [
+            vec!["init", "-q", repository.to_str().unwrap()],
+            vec![
+                "-C",
+                repository.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                "https://example.test/repository.git",
+            ],
+        ] {
+            assert!(Command::new("git").args(args).status().unwrap().success());
+        }
+        assert!(Command::new(&binary)
+            .arg("--db-path")
+            .arg(directory.join("ledger.db"))
+            .args(["db", "migrate"])
+            .status()
+            .unwrap()
+            .success());
+        Self {
+            tools: directory.join("tools").canonicalize().unwrap(),
+            repository: repository.canonicalize().unwrap(),
+            directory,
+            binary,
+        }
+    }
+
+    fn doctor(&self, mut command: Command) -> Command {
+        command.current_dir(&self.repository).env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", self.directory.join("bin").display()),
+        );
+        command
+    }
+
+    fn rust(&self) -> Command {
+        let mut command = Command::new(&self.binary);
+        command
+            .arg("--db-path")
+            .arg(self.directory.join("ledger.db"))
+            .arg("doctor");
+        self.doctor(command)
+    }
+
+    fn bash(&self) -> Command {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("alucard"),
+            self.tools.join("alucard"),
+        )
+        .unwrap();
+        let mut command = Command::new("bash");
+        command.arg(self.tools.join("alucard")).arg("doctor");
+        self.doctor(command)
+    }
+
+    fn expected(&self, lines: &[String]) -> String {
+        [
+            "ok: git".to_string(),
+            "ok: gh".to_string(),
+            "ok: jq".to_string(),
+            "ok: docker".to_string(),
+            "ok: timeout".to_string(),
+            format!("ok: tool files in {}", self.tools.display()),
+        ]
+        .iter()
+        .chain(lines)
+        .chain([&"missing: Docker image ghcr.io/aldovc/alucard:latest (run: docker pull ghcr.io/aldovc/alucard:latest, or alucard build for a local image)".to_string()])
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+}
+
+impl Drop for DoctorFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
 #[test]
 fn doctor_matches_bash_before_ledger_checks() {
-    let root = env!("CARGO_MANIFEST_DIR");
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let directory =
-        std::env::temp_dir().join(format!("alucard-doctor-{}-{unique}", std::process::id()));
-    fs::create_dir(&directory).unwrap();
-    let env_file = directory.join("doctor.env");
-    let database = directory.join("ledger.db");
+    let fixture = DoctorFixture::new("doctor");
+    let env_file = fixture.directory.join("doctor.env");
     fs::write(
         &env_file,
         "GITHUB_TOKEN=test\nALUCARD_PROVIDER=codex\nOPENAI_API_KEY=test\n",
     )
     .unwrap();
-    assert!(Command::new(env!("CARGO_BIN_EXE_alucard"))
-        .args(["--db-path", database.to_str().unwrap(), "db", "migrate"])
-        .status()
-        .unwrap()
-        .success());
-    let bash = Command::new("bash")
-        .args([
-            "alucard",
-            "doctor",
-            ".",
-            "--env-file",
-            env_file.to_str().unwrap(),
-        ])
-        .current_dir(root)
+    let expected = fixture.expected(&[
+        format!("ok: env file {}", env_file.display()),
+        "ok: OPENAI_API_KEY".to_string(),
+        format!("ok: target repo {}", fixture.repository.display()),
+        "ok: target repo has origin remote".to_string(),
+    ]);
+    let bash = fixture
+        .bash()
+        .args([".", "--env-file", env_file.to_str().unwrap()])
         .output()
         .unwrap();
-    let rust = Command::new(env!("CARGO_BIN_EXE_alucard"))
-        .args([
-            "--db-path",
-            database.to_str().unwrap(),
-            "doctor",
-            ".",
-            "--env-file",
-            env_file.to_str().unwrap(),
-        ])
-        .current_dir(root)
+    assert_eq!(String::from_utf8(bash.stdout).unwrap().trim(), expected);
+    let rust = fixture
+        .rust()
+        .args([".", "--env-file", env_file.to_str().unwrap()])
         .output()
         .unwrap();
-    let rust = without_ledger_check(rust);
-    assert_eq!(String::from_utf8(bash.stdout).unwrap().trim(), rust);
-    fs::remove_dir_all(directory).unwrap();
+    assert_eq!(without_ledger_check(rust), expected);
 }
 
 #[test]
 fn doctor_empty_environment_defaults_match_bash() {
-    let root = env!("CARGO_MANIFEST_DIR");
-    let directory = std::env::temp_dir().join(format!(
-        "alucard-doctor-empty-defaults-{}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&directory).unwrap();
-    let database = directory.join("ledger.db");
-    assert!(Command::new(env!("CARGO_BIN_EXE_alucard"))
-        .args(["--db-path", database.to_str().unwrap(), "db", "migrate"])
-        .status()
-        .unwrap()
-        .success());
-
-    let mut bash = Command::new("bash");
-    bash.args(["alucard", "doctor"]).current_dir(root);
-    let bash = empty_environment_defaults(&mut bash).output().unwrap();
-    let mut rust = Command::new(env!("CARGO_BIN_EXE_alucard"));
-    rust.args(["--db-path", database.to_str().unwrap(), "doctor"])
-        .current_dir(root);
-    let rust = empty_environment_defaults(&mut rust).output().unwrap();
+    let fixture = DoctorFixture::new("doctor-empty-defaults");
+    let expected = fixture.expected(&[
+        format!(
+            "missing: env file {}",
+            fixture.tools.join("alucard.env").display()
+        ),
+        format!("ok: target repo {}", fixture.repository.display()),
+        "ok: target repo has origin remote".to_string(),
+    ]);
+    let bash = empty_environment_defaults(&mut fixture.bash())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(bash.stdout).unwrap().trim(), expected);
+    let rust = empty_environment_defaults(&mut fixture.rust())
+        .output()
+        .unwrap();
 
     assert!(!String::from_utf8_lossy(&rust.stderr).contains("tasks file not found"));
-    assert_eq!(
-        String::from_utf8(bash.stdout).unwrap().trim(),
-        without_ledger_check(rust)
-    );
-    fs::remove_dir_all(directory).unwrap();
+    assert_eq!(without_ledger_check(rust), expected);
 }
 
-#[cfg(unix)]
 #[test]
 fn doctor_empty_cache_directory_matches_bash() {
-    let root = env!("CARGO_MANIFEST_DIR");
-    let directory =
-        std::env::temp_dir().join(format!("alucard-doctor-empty-cache-{}", std::process::id()));
-    let bin = directory.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let gh = bin.join("gh");
-    fs::write(&gh, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
-    let database = directory.join("ledger.db");
-    assert!(Command::new(env!("CARGO_BIN_EXE_alucard"))
-        .args(["--db-path", database.to_str().unwrap(), "db", "migrate"])
-        .status()
-        .unwrap()
-        .success());
-    let path = format!("{}:/usr/bin:/bin", bin.display());
-
-    let bash = Command::new("bash")
-        .args(["alucard", "doctor", "owner/repo"])
-        .current_dir(root)
+    let fixture = DoctorFixture::new("doctor-empty-cache");
+    let cache = fixture.directory.join("cache");
+    let expected = fixture.expected(&[
+        format!(
+            "missing: env file {}",
+            fixture.tools.join("alucard.env").display()
+        ),
+        format!(
+            "ok: target repo is GitHub ref owner/repo (cache: {}/alucard/owner/repo)",
+            cache.display()
+        ),
+    ]);
+    let bash = fixture
+        .bash()
+        .arg("owner/repo")
         .env("ALUCARD_CACHE_DIR", "")
-        .env("XDG_CACHE_HOME", directory.join("cache"))
-        .env("PATH", &path)
+        .env("XDG_CACHE_HOME", &cache)
         .output()
         .unwrap();
-    let rust = Command::new(env!("CARGO_BIN_EXE_alucard"))
-        .args([
-            "--db-path",
-            database.to_str().unwrap(),
-            "doctor",
-            "owner/repo",
-        ])
-        .current_dir(root)
+    assert_eq!(String::from_utf8(bash.stdout).unwrap().trim(), expected);
+    let rust = fixture
+        .rust()
+        .arg("owner/repo")
         .env("ALUCARD_CACHE_DIR", "")
-        .env("XDG_CACHE_HOME", directory.join("cache"))
-        .env("PATH", path)
+        .env("XDG_CACHE_HOME", &cache)
         .output()
         .unwrap();
 
-    assert_eq!(
-        String::from_utf8(bash.stdout).unwrap().trim(),
-        without_ledger_check(rust)
-    );
-    fs::remove_dir_all(directory).unwrap();
+    assert_eq!(without_ledger_check(rust), expected);
 }
 
 #[test]
