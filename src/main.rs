@@ -7172,6 +7172,89 @@ mod tests {
     }
 
     #[test]
+    fn engineering_policy_reaches_role_prompts_ahead_of_the_worker_mode() {
+        let tools = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |file: &str| fs::read_to_string(tools.join(file)).unwrap();
+        // A line unique to the policy, so a match cannot come from a role prompt.
+        let policy = "Similar-looking code is not automatically duplication";
+        let task = |issue: Option<GithubTask>, local_id: Option<String>| SelectedRunTask {
+            ledger_id: String::new(),
+            issue,
+            local_id,
+            local_title: String::new(),
+            local_body: String::new(),
+            parent_context: String::new(),
+        };
+        let issue_task = task(
+            Some(GithubTask {
+                number: 1,
+                title: String::new(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: None,
+            }),
+            None,
+        );
+        let local_task = task(None, Some("1".to_string()));
+
+        for (task, mode_file) in [
+            (&issue_task, "alucard-worker-github-issue-prompt.md"),
+            (&local_task, "alucard-worker-local-prompt.md"),
+        ] {
+            let prompt = worker_prompt(tools, task, "main", "", "").unwrap();
+            let mode = prompt.find(read(mode_file).lines().next().unwrap());
+            let policy = prompt.find(policy);
+            assert!(
+                matches!((policy, mode), (Some(policy), Some(mode)) if policy < mode),
+                "{mode_file}: policy at {policy:?}, mode section at {mode:?}"
+            );
+        }
+        assert!(reviewer_prompt(tools, &issue_task, 1, 1, 1, "", "", "")
+            .unwrap()
+            .contains(policy));
+        assert!(feedback_prompt(tools, 1, "branch", "", "", "")
+            .unwrap()
+            .contains(policy));
+        assert!(!ci_fix_prompt(tools, 1, "branch", "")
+            .unwrap()
+            .contains(policy));
+        assert!(read("alucard-ci-fix-prompt.md")
+            .contains("Edit only the files needed to fix the failing checks"));
+        for file in [
+            "alucard-engineering-policy.md",
+            "alucard-worker-github-issue-prompt.md",
+        ] {
+            assert!(
+                REQUIRED_TOOL_FILES.lines().any(|line| line == file),
+                "{file}"
+            );
+        }
+        for (file, superseded) in [
+            ("alucard-worker-prompt.md", "Repeat per criterion"),
+            (
+                "alucard-worker-prompt.md",
+                "No logic block appears in two places",
+            ),
+            (
+                "alucard-worker-prompt.md",
+                "carries domain meaning is a named constant",
+            ),
+            (
+                "alucard-reviewer-prompt.md",
+                "The fix is extraction, not tolerance",
+            ),
+            ("alucard-reviewer-prompt.md", "### Magic values"),
+            ("alucard-reviewer-prompt.md", "Stringly-typed dispatch"),
+            (
+                "alucard-feedback-prompt.md",
+                "literal with domain meaning that should be a named constant",
+            ),
+        ] {
+            assert!(!read(file).contains(superseded), "{file}: {superseded}");
+        }
+    }
+
+    #[test]
     fn review_audit_text_keeps_the_human_handoff_protocol() {
         assert!(no_ci_comment()
             .contains("Review continues, but an approval will not mark this PR ready to merge."));
