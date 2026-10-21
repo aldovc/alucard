@@ -1206,6 +1206,35 @@ mod agent_tests {
             .any(|pair| pair == ["--model", "worker-model"]));
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn credentials_are_required_only_for_configured_providers() {
+        for (providers, keys, missing) in [
+            ("", "ANTHROPIC_API_KEY", None),
+            ("", "OPENAI_API_KEY", Some("ANTHROPIC_API_KEY")),
+            ("ALUCARD_PROVIDER=codex", "OPENAI_API_KEY", None),
+            ("ALUCARD_PROVIDER=codex", "ANTHROPIC_API_KEY", Some("OPENAI_API_KEY")),
+            ("ALUCARD_REVIEWER_PROVIDER=codex", "ANTHROPIC_API_KEY OPENAI_API_KEY", None),
+            ("ALUCARD_REVIEWER_PROVIDER=codex", "ANTHROPIC_API_KEY", Some("OPENAI_API_KEY")),
+            ("ALUCARD_REVIEWER_PROVIDER=codex", "OPENAI_API_KEY", Some("ANTHROPIC_API_KEY")),
+        ] {
+            let values = std::iter::once(("GITHUB_TOKEN", "token"))
+                .chain(providers.split_once('='))
+                .chain(keys.split(' ').map(|key| (key, "key")))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>();
+            let result = AgentSettings::from_values(values, None)
+                .unwrap()
+                .require_credentials(Path::new("alucard.env"));
+            assert_eq!(
+                result,
+                missing
+                    .map(|key| Err(format!("{key} is empty in alucard.env")))
+                    .unwrap_or(Ok(())),
+                "{providers} {keys}"
+            );
+        }
+    }
 }
 
 pub struct AgentInvocation<'a> {

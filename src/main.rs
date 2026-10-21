@@ -6911,6 +6911,34 @@ mod tests {
         assert_eq!(depth, Some(0));
     }
 
+    #[test]
+    fn github_repo_slug_accepts_only_github_origins() {
+        let root = std::env::temp_dir().join(format!("alucard-slug-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success())
+        };
+        git(&["init", "-q"]);
+        assert_eq!(github_repo_slug(&root), None);
+        git(&["remote", "add", "origin", "git@github.com:example/api.git"]);
+        for (origin, slug) in [
+            ("git@github.com:example/api.git", Some("example/api")),
+            ("https://github.com/example/web", Some("example/web")),
+            ("https://github.com/example/web.git", Some("example/web")),
+            ("/srv/git/example/web.git", None),
+            ("example/web", None),
+        ] {
+            git(&["remote", "set-url", "origin", origin]);
+            assert_eq!(github_repo_slug(&root).as_deref(), slug, "{origin}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     struct PathGuard(std::ffi::OsString);
 
     impl Drop for PathGuard {
