@@ -1,4 +1,4 @@
-//! Alucard orchestrator: the Rust port of the `alucard` Bash script.
+//! Alucard orchestrator CLI.
 
 use alucard::{
     abandoned_pull_request_claims, abandoned_task_claims, acquire_pr, adopt_github_pull_requests,

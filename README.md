@@ -56,7 +56,7 @@ Install `flock` from `util-linux` if you plan to run multiple Alucard processes 
 curl -fsSL https://raw.githubusercontent.com/aldovc/alucard/main/install.sh | bash
 ```
 
-The installer clones Alucard into `~/.local/share/alucard` and downloads the latest release binary for the host (Linux x86-64 or ARM64) into its `bin/` directory. It links that binary into `~/.local/bin` as `alucard` and the Bash script as `alucard-bash`, and creates `alucard.env` from the example if it does not already exist. Both CLIs read the prompts, `Dockerfile`, and `alucard.env` from the install directory. Add `~/.local/bin` to your `PATH` if needed. Re-run the installer to update; it never overwrites an existing `alucard.env`. On an unsupported platform, or if the download fails, the installer stops and leaves the previous install unchanged.
+The installer clones Alucard into `~/.local/share/alucard` and downloads the latest release binary for the host (Linux x86-64 or ARM64) into its `bin/` directory. It links that binary into `~/.local/bin` as `alucard` and creates `alucard.env` from the example if it does not already exist. The CLI reads the prompts, `Dockerfile`, and `alucard.env` from the install directory. Add `~/.local/bin` to your `PATH` if needed. Re-run the installer to update; it never overwrites an existing `alucard.env`, and it removes the `alucard-bash` link that releases up to v0.7.1 installed. While an `alucard-bash` from such a release is still running on a repository, `alucard` refuses to start on it. On an unsupported platform, or if the download fails, the installer stops and leaves the previous install unchanged.
 
 For a different installation directory, pass the variables to the shell running the installer:
 
@@ -424,18 +424,23 @@ Measurements and archived prompts stay local. Alucard also posts a usage summary
 
 ## Development
 
-The Bash CLI in [`alucard`](alucard) manages queues, clones, containers, and PR gates. [`entrypoint.sh`](entrypoint.sh) sets up container-side Git and GitHub authentication. Role instructions live in `alucard-*-prompt.md`, including separate worker modes and the recovery wrap-up prompt.
+The Rust CLI in [`src/`](src) manages queues, clones, containers, the run ledger, and PR gates. [`entrypoint.sh`](entrypoint.sh) sets up container-side Git and GitHub authentication. Role instructions live in `alucard-*-prompt.md`, including separate worker modes and the recovery wrap-up prompt.
 
 Read [AGENTS.md](AGENTS.md) and the [engineering policy](alucard-engineering-policy.md) before making changes. The CI checks are:
 
 ```bash
-for t in test/test_*.sh; do
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+
+for t in test/test_install.sh test/test_entrypoint.sh; do
   bash "$t" </dev/null || exit 1
 done
 
-shellcheck --severity=warning --exclude=SC2034 \
-  alucard entrypoint.sh install.sh test-*.sh test/*.sh
+shellcheck --severity=warning entrypoint.sh install.sh test-*.sh test/*.sh
 ```
+
+`cargo test` also runs `test/test_merge.sh` and `test/test_continue_feedback_stall.sh` against the built binary.
 
 For prompt changes, run `cargo test engineering_policy` to verify prompt assembly.
 
