@@ -1,4 +1,4 @@
-//! Alucard orchestrator: the Rust port of the `alucard` Bash script.
+//! Alucard orchestrator CLI.
 
 use alucard::{
     abandoned_pull_request_claims, abandoned_task_claims, acquire_pr, adopt_github_pull_requests,
@@ -349,11 +349,7 @@ fn is_uint(value: &str) -> bool {
 }
 
 fn print_usage() {
-    let (_, usage) = include_str!("../alucard")
-        .split_once("usage() {\n  cat <<'EOF'\n")
-        .expect("Bash usage declaration");
-    let (usage, _) = usage.split_once("\nEOF\n}").expect("Bash usage terminator");
-    println!("{usage}");
+    print!("{}", include_str!("usage.txt"));
 }
 
 struct MergeOptions {
@@ -6913,6 +6909,34 @@ mod tests {
             (depth >= 0).then_some(depth)
         });
         assert_eq!(depth, Some(0));
+    }
+
+    #[test]
+    fn github_repo_slug_accepts_only_github_origins() {
+        let root = std::env::temp_dir().join(format!("alucard-slug-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success())
+        };
+        git(&["init", "-q"]);
+        assert_eq!(github_repo_slug(&root), None);
+        git(&["remote", "add", "origin", "git@github.com:example/api.git"]);
+        for (origin, slug) in [
+            ("git@github.com:example/api.git", Some("example/api")),
+            ("https://github.com/example/web", Some("example/web")),
+            ("https://github.com/example/web.git", Some("example/web")),
+            ("/srv/git/example/web.git", None),
+            ("example/web", None),
+        ] {
+            git(&["remote", "set-url", "origin", origin]);
+            assert_eq!(github_repo_slug(&root).as_deref(), slug, "{origin}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     struct PathGuard(std::ffi::OsString);

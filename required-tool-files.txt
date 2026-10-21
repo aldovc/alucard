@@ -2,7 +2,6 @@ required-tool-files.txt
 Dockerfile
 entrypoint.sh
 alucard-worker-prompt.md
-alucard-worker-github-prompt.md
 alucard-worker-github-issue-prompt.md
 alucard-worker-local-prompt.md
 alucard-reviewer-prompt.md

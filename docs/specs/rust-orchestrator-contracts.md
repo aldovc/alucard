@@ -2,51 +2,55 @@
 
 This is the read-only behaviour matrix for the Rust port.  It records the
 observable Bash contract at the start of the rewrite; ticket numbers identify
-the Rust implementation responsible for keeping each behaviour.
+the Rust implementation responsible for keeping each behaviour.  #144 removed
+the Bash script and the tests below other than `test_merge.sh` and
+`test_continue_feedback_stall.sh`, which now run only against the binary; the
+last column names the Rust tests (by test target or `lib`/`main` unit module)
+that now cover each invariant.
 
 ## Test matrix
 
-| Bash test | Invariant | Rust ticket |
-|---|---|---|
-| `test_agent_settings.sh` | Role settings, defaults, and environment overrides select the recorded agent arguments. | #131 |
-| `test_build_image.sh` | `build` stamps its image and propagates build failures. | #131 |
-| `test_ci_checks_probe.sh` | CI availability is probed rather than assumed green. | #136 |
-| `test_ci_gate_failure_log.sh` | Failed CI records useful failure output before recovery. | #136 |
-| `test_ci_run_list_stale_sha.sh` | Checks for an older head SHA do not pass the CI gate. | #136 |
-| `test_concurrent_runs.sh` | Concurrent runs serialize cached-clone Git writes. | #130 |
-| `test_container_repo_context.sh` | Containers receive a usable repository context and failures recover safely. | #131 |
-| `test_continue_feedback_stall.sh` | `continue` preserves a stalled feedback path for human attention. | #138 |
-| `test_credentials.sh` | Provider selection requires only that provider's credentials. | #131 |
-| `test_engineering_policy.sh` | Prompt assembly includes the engineering policy in the defined order. | #131 |
-| `test_error_scan.sh` | Agent JSONL errors and exit codes classify failures consistently. | #137 |
-| `test_event_log.sh` | Run lifecycle events are appended to `events.log` in order. | #140 |
-| `test_feedback_stall.sh` | A feedback agent that does not publish cannot be treated as a successful fix. | #137 |
-| `test_feedback_toolchain.sh` | Feedback receives the toolchain preflight status. | #137 |
-| `test_findings_handoff.sh` | Review findings handed to feedback keep actionable content and human comments. | #137 |
-| `test_measurement_gates.sh` | Gate outcomes are represented in the measurement record. | #140 |
-| `test_measurement_run_loop.sh` | Worker usage and iteration measurements roll up into a run. | #140 |
-| `test_measurements.sh` | Measurement JSON preserves stages, unavailable usage, costs, and diffs. | #140 |
-| `test_merge.sh` | Merge requires current-head harness approval and leaves the branch safe on failure. | #139 |
-| `test_playwright_cache.sh` | Playwright cache seeding is stamped and safe to reuse. | #131 |
-| `test_preflight_manifests.sh` | Dependency manifests produce explicit toolchain preflight status. | #131 |
-| `test_pr_binding.sh` | Gates and usage bind to the PR opened by this worker attempt. | #133 |
-| `test_provider.sh` | Provider values select the matching CLI and reject invalid combinations. | #131 |
-| `test_review_approved_draft.sh` | Only an authenticated current approval unparks a recovery draft. | #137 |
-| `test_review_gate.sh` | Review verdicts, blocked findings, and human-comment filtering drive the gate. | #137 |
-| `test_review_no_verdict.sh` | A missing verdict is never approval and is surfaced for a human. | #137 |
-| `test_review_policy.sh` | Repository review policy is bounded and appended to reviewer input. | #137 |
-| `test_tasks_parser.sh` | Task headings and blockers produce the eligible local/GitHub queue and safe write-back. | #127, #128, #141 |
-| `test_timeout_recovery.sh` | A timeout preserves worker changes in a recovery path. | #133 |
-| `test_transport_pr_retry.sh` | A transport retry adopts the attempt's already-open PR rather than duplicating it. | #133 |
-| `test_transport_recovery.sh` | A clean transport failure retains its branch without a spurious recovery PR. | #133 |
-| `test_turn_budget.sh` | Exhausted turn budgets are classified and recovered as incomplete work. | #133 |
-| `test_usage_extract.sh` | Claude and Codex JSONL usage produces one normalized usage table/comment. | #140 |
-| `test_worker_recovery.sh` | Recovery PRs occupy their task and release the issue claim label. | #134 |
-| `test_worker_wrapup.sh` | Wrap-up runs before mechanical recovery and its handoff reaches the recovery PR. | #134 |
+| Bash test | Invariant | Rust ticket | Rust coverage |
+|---|---|---|---|
+| `test_agent_settings.sh` | Role settings, defaults, and environment overrides select the recorded agent arguments. | #131 | `agent_settings::role_settings_and_docker_arguments_match_bash_contract`, `agent_settings::blank_settings_fall_back_like_bash_parameter_expansion` |
+| `test_build_image.sh` | `build` stamps its image and propagates build failures. | #131 | `lib::build_cleanup_matches_bash_contract`, `agent_settings::prompt_and_image_stamp_match_bash_inputs` |
+| `test_ci_checks_probe.sh` | CI availability is probed rather than assumed green. | #136 | `main::ci_checks_denial_uses_run_list_for_later_gates`, `main::ci_registration_requires_the_pr_to_converge_on_origin` |
+| `test_ci_gate_failure_log.sh` | Failed CI records useful failure output before recovery. | #136 | `main::ci_fix_prompt_uses_the_current_head_failed_run_log`, `main::ci_fix_failed_run_log_is_limited_to_400_lines` |
+| `test_ci_run_list_stale_sha.sh` | Checks for an older head SHA do not pass the CI gate. | #136 | `main::ci_run_list_uses_only_the_current_head`, `main::ci_result_is_invalidated_when_the_head_moves_during_polling` |
+| `test_concurrent_runs.sh` | Concurrent runs serialize cached-clone Git writes. | #130 | `database::concurrent_preparation_keeps_working_clones_usable`, `database::prepared_runs_have_isolated_clones_branches_and_directories` |
+| `test_container_repo_context.sh` | Containers receive a usable repository context and failures recover safely. | #131 | `test/test_entrypoint.sh`, `main::github_repo_slug_accepts_only_github_origins`, `agent_settings::classifier_preserves_wedge_and_no_worktree_outcomes` |
+| `test_continue_feedback_stall.sh` | `continue` preserves a stalled feedback path for human attention. | #138 | `continue_feedback_stall` (runs the shell test against the binary) |
+| `test_credentials.sh` | Provider selection requires only that provider's credentials. | #131 | `lib::credentials_are_required_only_for_configured_providers`, `local_tasks::run_loads_env_file_for_host_commands_and_rejects_missing_credentials_early` |
+| `test_engineering_policy.sh` | Prompt assembly includes the engineering policy in the defined order. | #131 | `main::engineering_policy_reaches_role_prompts_ahead_of_the_worker_mode` |
+| `test_error_scan.sh` | Agent JSONL errors and exit codes classify failures consistently. | #137 | `agent_settings::provider_result_classification_matches_bash_contract`, `agent_settings::classifier_preserves_wedge_and_no_worktree_outcomes` |
+| `test_event_log.sh` | Run lifecycle events are appended to `events.log` in order. | #140 | `measurements::events_prompts_and_usage_summary_are_local_artifacts`, `database::runs_commands_list_recent_runs_and_show_claims_and_pull_requests` |
+| `test_feedback_stall.sh` | A feedback agent that does not publish cannot be treated as a successful fix. | #137 | `review_gate::run_reconciles_reviewer_verdicts_and_injects_review_policy` (feedback-stall cases) |
+| `test_feedback_toolchain.sh` | Feedback receives the toolchain preflight status. | #137 | `review_gate::run_reconciles_reviewer_verdicts_and_injects_review_policy` (feedback-toolchain cases), `main::feedback_prompt_layout` |
+| `test_findings_handoff.sh` | Review findings handed to feedback keep actionable content and human comments. | #137 | `main::feedback_findings_strip_only_nonactionable_top_level_sections`, `local_tasks::continue_passes_selected_human_comments_to_feedback` |
+| `test_measurement_gates.sh` | Gate outcomes are represented in the measurement record. | #140 | `review_gate::run_reconciles_reviewer_verdicts_and_injects_review_policy`, `local_tasks::continue_records_the_selected_measurement_base_source` |
+| `test_measurement_run_loop.sh` | Worker usage and iteration measurements roll up into a run. | #140 | `lib::run_measurement_has_the_complete_bash_compatible_schema`, `measurements::transport_retry_usage_includes_every_attempt_in_table_and_comment` |
+| `test_measurements.sh` | Measurement JSON preserves stages, unavailable usage, costs, and diffs. | #140 | `measurements::stage_measurement_buckets_test_paths_and_renames`, `measurements::stage_measurement_reports_when_the_tracked_base_advances` |
+| `test_merge.sh` | Merge requires current-head harness approval and leaves the branch safe on failure. | #139 | `merge` (runs the shell test against the binary) |
+| `test_playwright_cache.sh` | Playwright cache seeding is stamped and safe to reuse. | #131 | `agent_settings::run_and_continue_roles_mount_only_validated_playwright_caches`, `review_gate::unseeded_playwright_cache_is_not_mounted_for_agent_launches` |
+| `test_preflight_manifests.sh` | Dependency manifests produce explicit toolchain preflight status. | #131 | `agent_settings::toolchain_manifests_and_status_match_bash_contract` |
+| `test_pr_binding.sh` | Gates and usage bind to the PR opened by this worker attempt. | #133 | `local_tasks::test_pr_binding` |
+| `test_provider.sh` | Provider values select the matching CLI and reject invalid combinations. | #131 | `agent_settings::role_settings_and_docker_arguments_match_bash_contract`, `version::doctor_rejects_invalid_provider_settings` |
+| `test_review_approved_draft.sh` | Only an authenticated current approval unparks a recovery draft. | #137 | `review_gate::run_reconciles_reviewer_verdicts_and_injects_review_policy` (recovery cases) |
+| `test_review_gate.sh` | Review verdicts, blocked findings, and human-comment filtering drive the gate. | #137 | `review_gate::run_reconciles_reviewer_verdicts_and_injects_review_policy`, `main::reviewer_decision_file_falls_back_and_blocked_overrides_formal_review` |
+| `test_review_no_verdict.sh` | A missing verdict is never approval and is surfaced for a human. | #137 | `review_gate::run_reconciles_reviewer_verdicts_and_injects_review_policy` (review-no-verdict), `main::review_audit_text_keeps_the_human_handoff_protocol` |
+| `test_review_policy.sh` | Repository review policy is bounded and appended to reviewer input. | #137 | `main::reviewer_prompt_includes_local_task_and_bounded_review_policy` |
+| `test_tasks_parser.sh` | Task headings and blockers produce the eligible local/GitHub queue and safe write-back. | #127, #128, #141 | `local_tasks::parser_preserves_task_structure_and_queue_eligibility`, `local_tasks::issue_blockers_use_the_open_issue_set`, `local_tasks::task_heading_write_preserves_non_heading_bytes` |
+| `test_timeout_recovery.sh` | A timeout preserves worker changes in a recovery path. | #133 | `local_tasks::test_timeout_recovery`, `local_tasks::wrapup_timeout_still_creates_a_recovery_pr` |
+| `test_transport_pr_retry.sh` | A transport retry adopts the attempt's already-open PR rather than duplicating it. | #133 | `local_tasks::test_transport_pr_retry` |
+| `test_transport_recovery.sh` | A clean transport failure retains its branch without a spurious recovery PR. | #133 | `local_tasks::test_transport_recovery` |
+| `test_turn_budget.sh` | Exhausted turn budgets are classified and recovered as incomplete work. | #133 | `local_tasks::test_turn_budget` |
+| `test_usage_extract.sh` | Claude and Codex JSONL usage produces one normalized usage table/comment. | #140 | `measurements::extracts_claude_and_codex_usage`, `measurements::formats_usage_table_and_iteration_comment` |
+| `test_worker_recovery.sh` | Recovery PRs occupy their task and release the issue claim label. | #134 | `local_tasks::test_worker_recovery`, `main::recovery_github_artifacts_match_the_bash_protocol` |
+| `test_worker_wrapup.sh` | Wrap-up runs before mechanical recovery and its handoff reaches the recovery PR. | #134 | `local_tasks::wrapup_changes_are_committed_to_the_recovery_branch`, `main::wrapup_prompt_layout` |
 
 ## Remote protocol
 
-All of the following literal prefixes are defined in `alucard`, so existing
+All of the following literal prefixes were defined in the Bash `alucard` script and are still written and read by the Rust CLI, so existing
 remote state remains readable after cutover.  `{...}` denotes a runtime value,
 not part of the literal prefix.
 

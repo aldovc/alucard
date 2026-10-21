@@ -337,14 +337,14 @@ fn prompt_and_image_stamp_match_bash_inputs() {
     let prompt = compose_role_prompt(
         root,
         "alucard-worker-prompt.md",
-        Some("alucard-worker-github-prompt.md"),
+        Some("alucard-worker-github-issue-prompt.md"),
     )
     .unwrap();
     let expected = format!(
         "{}\n\n{}\n\n{}",
         fs::read_to_string(root.join("alucard-worker-prompt.md")).unwrap(),
         fs::read_to_string(root.join("alucard-engineering-policy.md")).unwrap(),
-        fs::read_to_string(root.join("alucard-worker-github-prompt.md")).unwrap(),
+        fs::read_to_string(root.join("alucard-worker-github-issue-prompt.md")).unwrap(),
     );
     assert_eq!(prompt, expected);
     assert_eq!(build_inputs_hash(root).unwrap().len(), 64);
