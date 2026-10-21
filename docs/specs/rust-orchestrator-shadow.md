@@ -85,9 +85,9 @@ Before cutover, run the Rust binary against real `gh` and GitHub at least once p
 
 ## Not covered
 
-- **Startup lock scope.** `reconcile_startup` holds the ledger-wide recovery lock across replay and remote PR lookups. A slow network call there blocks every other startup on the same ledger. This was not measured.
+- **Startup lock scope.** `reconcile_startup` held the ledger-wide recovery lock across replay and remote PR lookups, so a slow network call there blocked every other startup on the same ledger. This was not measured. Fixed after cutover in #276: startup holds the ledger-wide lock only while it resolves repository identity, then a per-repository lock for replay and lookups.
 - **Replay of other journaled operations.** The restart test interrupted only `create_recovery_pr`. Push, label and marker replay rely on the local tests (`startup_replays_pending_recovery_operations_idempotently`, `concurrent_startup_replays_one_recovery_pr`, `startup_replay_preserves_pending_operations_before_remote_mutations` in `tests/local_tasks.rs`, which use real Git and SQLite with a stubbed `gh`). There is no reconciliation dry-run command.
 - **`runs` against Bash.** Rust `runs` was observed on both ledgers but not compared with Bash.
 - **Playwright version mismatch.** Only a repository pinned to the image's Chromium was run. The mismatch message and the second-revision download were not observed live.
-- **Interrupted work visibility.** After SIGTERM with unpushed commits, the work is safe in the run checkout and the task is held, but only the ledger says so. There is no PR, the heading stays `[ ]`, and the restart prints nothing.
+- **Interrupted work visibility.** After SIGTERM with unpushed commits, the work was safe in the run checkout and the task was held, but only the ledger said so. There was no PR, the heading stayed `[ ]`, and the restart printed nothing. Fixed after cutover in #277: each restart prints the held task with its reason and checkout, and a local task's heading reads `[h] … (held: <checkout>)`.
 - **Fork PRs.** Not exercised.
