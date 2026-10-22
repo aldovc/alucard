@@ -270,6 +270,7 @@ fn postgres_agent_environment(postgres: Option<&RunPostgres>) -> (Option<&str>, 
 fn prepare_iteration_environment(
     repository: &Path,
     options: &RunCommandOptions,
+    base_revision: &str,
     run_id: &str,
     cache: &Path,
 ) -> Result<(Option<RunPostgres>, Option<PathBuf>, String), String> {
@@ -277,6 +278,7 @@ fn prepare_iteration_environment(
     let preflight = toolchain_preflight(
         repository,
         &options.base,
+        base_revision,
         &options.image,
         &options.env_file,
         options.timeout_minutes,
@@ -1531,7 +1533,17 @@ impl RunCommandOptions {
     }
 }
 
+fn help_requested(args: &[String]) -> bool {
+    tool_dir().is_some_and(|tools| {
+        RunCommandOptions::parse(args, &tools).is_ok_and(|options| options.queue.help)
+    })
+}
+
 fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
+    if help_requested(args) {
+        print_usage();
+        return ExitCode::SUCCESS;
+    }
     let (tools, options, settings, database, cache, github_repo, task_file) =
         match (|| -> Result<_, String> {
             let tools = tool_dir().ok_or_else(|| "could not locate tool files".to_string())?;
@@ -1644,6 +1656,7 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
         let (postgres, playwright_cache, toolchain_status) = match prepare_iteration_environment(
             &options.queue.repository,
             &options,
+            prepared.run.base_sha.as_deref().unwrap_or("HEAD"),
             &attempt_run.id,
             &cache,
         ) {
@@ -2050,6 +2063,10 @@ fn run_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
 }
 
 fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
+    if help_requested(args.get(1..).unwrap_or_default()) {
+        print_usage();
+        return ExitCode::SUCCESS;
+    }
     let (
         tools,
         options,
@@ -2164,8 +2181,13 @@ fn continue_command(args: &[String], db_path: Option<PathBuf>) -> ExitCode {
             local_body: String::new(),
             parent_context: String::new(),
         };
-        let (postgres, playwright_cache, toolchain_status) =
-            prepare_iteration_environment(&repository, &options, &continued.run.id, &cache_root())?;
+        let (postgres, playwright_cache, toolchain_status) = prepare_iteration_environment(
+            &repository,
+            &options,
+            &format!("origin/{}", options.base),
+            &continued.run.id,
+            &cache_root(),
+        )?;
         if interrupted() {
             return Err("interrupted".to_string());
         }
@@ -5959,7 +5981,7 @@ fn prepare_attempt(
     selected: &SelectedRunTask,
     run: &alucard::Run,
 ) -> Result<alucard::PreparedRun, alucard::RunError> {
-    prepare_run(
+    let prepared = prepare_run(
         database,
         RunOptions {
             repository: &options.queue.repository,
@@ -5971,7 +5993,19 @@ fn prepare_attempt(
             issue: selected.issue.as_ref().map(|issue| issue.number),
             run_id: Some(&run.id),
         },
-    )
+    )?;
+    let ticket = match (&selected.issue, &selected.local_id) {
+        (Some(issue), _) => format!("Issue #{}", issue.number),
+        (None, Some(id)) => format!("Task {id}"),
+        (None, None) => "Run".to_string(),
+    };
+    println!(
+        "{ticket}: worktree {} based on {} at {}",
+        prepared.clone.display(),
+        options.base,
+        prepared.run.base_sha.as_deref().unwrap_or("unknown")
+    );
+    Ok(prepared)
 }
 
 fn find_attempt_pr(

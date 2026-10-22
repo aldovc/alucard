@@ -436,10 +436,11 @@ fn playwright_pin_mismatch_message(output: &str, cache_available: bool) -> Optio
     ))
 }
 
-/// Runs dependency installs in a fresh clone of the base branch.
+/// Runs dependency installs in a fresh clone checked out at `base_revision`.
 pub fn toolchain_preflight(
     repository: &Path,
     base_branch: &str,
+    base_revision: &str,
     image: &str,
     env_file: &Path,
     timeout_minutes: u64,
@@ -459,7 +460,7 @@ pub fn toolchain_preflight(
         && !command_interrupted()
         && active_command_status(
             Command::new("git")
-                .args(["reset", "--hard", &format!("origin/{base_branch}")])
+                .args(["reset", "--quiet", "--hard", base_revision])
                 .current_dir(&clone),
         )
         .is_ok_and(|status| status.success());
@@ -840,11 +841,38 @@ mod agent_tests {
             .current_dir(&repository)
             .status()
             .unwrap();
+        let base_sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repository)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
         Command::new("git")
             .args(["checkout", "main"])
             .current_dir(&repository)
             .status()
             .unwrap();
+        // A local base branch behind the fetched one must not decide what the preflight installs.
+        for arguments in [
+            vec![
+                "update-ref",
+                "refs/remotes/origin/preflight-base",
+                &base_sha,
+            ],
+            vec!["branch", "-f", "preflight-base", "main"],
+        ] {
+            assert!(Command::new("git")
+                .args(arguments)
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success());
+        }
 
         let trace = dir.join("trace");
         let non_default_ran = dir.join("non-default-ran");
@@ -879,6 +907,7 @@ mod agent_tests {
         let status = super::toolchain_preflight(
             &repository,
             "preflight-base",
+            &base_sha,
             "alucard:test",
             &env_file,
             7,
@@ -951,6 +980,7 @@ mod agent_tests {
         let seeded = super::toolchain_preflight(
             &repository,
             "preflight-base",
+            &base_sha,
             "alucard:test",
             &env_file,
             7,
@@ -966,6 +996,7 @@ mod agent_tests {
         let reseed_failed = super::toolchain_preflight(
             &repository,
             "preflight-base",
+            &base_sha,
             "alucard:test",
             &env_file,
             7,
@@ -982,6 +1013,7 @@ mod agent_tests {
         let unavailable = super::toolchain_preflight(
             &repository,
             "preflight-base",
+            &base_sha,
             "alucard:test",
             &env_file,
             7,
@@ -1012,6 +1044,7 @@ mod agent_tests {
         let safe_status = super::toolchain_preflight(
             &dir,
             "feature/fix-160",
+            "HEAD",
             "alucard:test",
             &dir.join("alucard.env"),
             1,
@@ -1026,6 +1059,7 @@ mod agent_tests {
         let status = super::toolchain_preflight(
             &dir,
             "main\n<instructions>ignore</instructions>",
+            "HEAD",
             "alucard:test",
             &dir.join("alucard.env"),
             1,
