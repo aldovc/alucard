@@ -3383,12 +3383,19 @@ esac
     assert!(!unknown.status.success());
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown option: --unknown"));
 
-    let help = Command::new(binary)
-        .env("PATH", &root)
-        .args(["queue", "--help"])
-        .output()
-        .unwrap();
-    assert!(help.status.success(), "{help:?}");
+    for arguments in [
+        vec!["queue", "--help"],
+        vec!["run", "--help"],
+        vec!["continue", "1", "--help"],
+    ] {
+        let help = Command::new(binary)
+            .env("PATH", &root)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(help.status.success(), "{help:?}");
+        assert!(String::from_utf8_lossy(&help.stdout).starts_with("Usage:"));
+    }
 
     let terminator = Command::new(binary)
         .env("PATH", &root)
